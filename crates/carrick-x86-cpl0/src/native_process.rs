@@ -599,8 +599,9 @@ impl Service {
             Err(e) => return Err(free(child_space, refused(NativeForkStage::Prepare, e))),
         };
         let mut custody = Vec::new();
+        // Kernel memory, not an admission limit: ENOMEM (#3085).
         if custody.try_reserve_exact(plan.custody().len()).is_err() {
-            return Err(free(child_space, NativeProcessError::Exhausted));
+            return Err(free(child_space, NativeProcessError::NoMemory));
         }
         custody.extend(plan.custody().iter().copied().map(PortalForkCustody::words));
         // Sampled before publish locks the roots: a node bank demand names
@@ -626,7 +627,24 @@ impl Service {
                     // The bank is supplied with the loan returned and no
                     // MM guard held; the fork then reruns against it.
                     PublishRefusal::NodeBank(demand) => match return_loan(&loan, Some(live)) {
-                        Ok(()) => demand.supply(owner.roots, &carrick_el1::alloc::GLOBAL_ALLOCATOR),
+                        Ok(()) => {
+                            // Observed before the supply: the wake for a held
+                            // bank window it meets (#3085).
+                            let metadata = owner.fork_metadata_wait(
+                                loan.request.operation.mm,
+                                loan.request.operation.incarnation,
+                                self.worker(),
+                            );
+                            match owner.metadata_waiters(self.worker()) {
+                                Ok(waiters) => demand.supply(
+                                    owner.roots,
+                                    &carrick_el1::alloc::GLOBAL_ALLOCATOR,
+                                    metadata,
+                                    &waiters,
+                                ),
+                                Err(_) => NativeProcessError::Stale,
+                            }
+                        }
                         Err(error) => error,
                     },
                 });
@@ -662,6 +680,9 @@ impl Service {
             Some(Err(carrick_el1_abi::ForkStockRefusal::Capacity)) => {
                 return Err(abort_published(&mut child, NativeProcessError::Exhausted));
             }
+            Some(Err(carrick_el1_abi::ForkStockRefusal::NoMemory)) => {
+                return Err(abort_published(&mut child, NativeProcessError::NoMemory));
+            }
             Some(Err(carrick_el1_abi::ForkStockRefusal::Inventory)) => {
                 return Err(abort_published(&mut child, NativeProcessError::Busy));
             }
@@ -672,7 +693,17 @@ impl Service {
                 if aborted != NativeProcessError::Busy {
                     return Err(aborted);
                 }
-                return Err(grow_fork_residency());
+                // Observed before the growth: the wake for a held segment
+                // window it meets (#3085).
+                let metadata = owner.fork_metadata_wait(
+                    loan.request.operation.mm,
+                    loan.request.operation.incarnation,
+                    self.worker(),
+                );
+                return Err(match owner.metadata_waiters(self.worker()) {
+                    Ok(waiters) => grow_fork_residency(metadata, &waiters),
+                    Err(_) => NativeProcessError::Stale,
+                });
             }
             Some(Err(carrick_el1_abi::ForkStockRefusal::Stale)) => {
                 return Err(abort_published(&mut child, NativeProcessError::Stale));
@@ -692,12 +723,16 @@ impl Service {
 }
 
 /// Grow the shared residency table after the carrier refused a fork for
-/// residency rows. `Busy` reruns the fork once: against the larger table
-/// (this growth or a concurrent grower's; `grow` waits out a racing
-/// append, so it never answers `Publishing`), or after the metadata grant
-/// the allocator posted for this boundary is served (#3085). Only a full
-/// directory or memory no grant can add ends the fork (ENOMEM).
-fn grow_fork_residency() -> NativeProcessError {
+/// residency rows. `Busy` reruns the fork at once against the larger table
+/// (this growth or a concurrent grower's). A held segment window, or a
+/// metadata grant in flight, parks the fork on `metadata`, the parent's
+/// Metadata cause observed before this call, which that window's close or
+/// the grant's publication wakes (#3085). Only a full directory or memory
+/// no grant can add ends the fork (ENOMEM).
+fn grow_fork_residency(
+    metadata: Option<carrick_core_abi::PortalOwnerWait>,
+    waiters: &impl carrick_core::mm::reservation::MetadataWaiters,
+) -> NativeProcessError {
     use carrick_core_abi::mm::residency::ResidencyGrowthRefusal;
     let Some(venues) =
         carrick_el1_abi::KernelFaultVenues::derive(carrick_el1::isa::x86_kernel_layout())
@@ -711,16 +746,17 @@ fn grow_fork_residency() -> NativeProcessError {
     match carrick_core::mm::frames::grow_residency_for_fork(
         residency,
         &carrick_el1::alloc::GLOBAL_ALLOCATOR,
+        waiters,
     ) {
-        Ok(())
-        | Err(ResidencyGrowthRefusal::Metadata(
-            carrick_core::mm::reservation::MetadataMiss::GrantPending,
-        )) => NativeProcessError::Busy,
-        // `grow` waits out a racing append, and an extent its own
-        // allocator returned is valid: either answer is a broken table.
-        Err(ResidencyGrowthRefusal::Publishing | ResidencyGrowthRefusal::InvalidExtent) => {
-            NativeProcessError::Invalid
-        }
+        Ok(()) => NativeProcessError::Busy,
+        Err(
+            ResidencyGrowthRefusal::Publishing
+            | ResidencyGrowthRefusal::Metadata(
+                carrick_core::mm::reservation::MetadataMiss::GrantPending,
+            ),
+        ) => metadata.map_or(NativeProcessError::Busy, NativeProcessError::OwnerWait),
+        // An extent its own allocator returned is valid: a broken table.
+        Err(ResidencyGrowthRefusal::InvalidExtent) => NativeProcessError::Invalid,
         Err(
             ResidencyGrowthRefusal::Metadata(
                 carrick_core::mm::reservation::MetadataMiss::Exhausted,

@@ -1075,6 +1075,7 @@ pub fn grow_guest_residency() -> bool {
     carrick_core::mm::frames::grow_residency_for_cow(
         crate::isa::frame_grant_residency_guest(),
         &crate::alloc::GLOBAL_ALLOCATOR,
+        &crate::alloc::guest_metadata_waiters(),
     )
 }
 

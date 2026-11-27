@@ -297,6 +297,18 @@ impl<
         #[cfg(not(any(test, feature = "host-test")))]
         Err(MmError::Stale)
     }
+    /// The venue that wakes this carrier's Metadata waiters from `slot`
+    /// when a node bank or residency segment window closes (#3085). A
+    /// source-free (zone-less) portal has no waiters to wake.
+    pub fn metadata_waiters(
+        &self,
+        slot: u32,
+    ) -> Result<
+        Option<carrick_sched_core::spaces::notification::SpaceReleaseVenue<'_, Context>>,
+        MmError,
+    > {
+        Ok(self.space_access(slot)?.venue())
+    }
     pub fn root_any(
         &self,
         mm: ReservationMm,
@@ -483,6 +495,26 @@ impl<
             .find(mm.raw())
             .is_some_and(|index| self.spaces.active_editor(index).is_some());
         Some((editor, held))
+    }
+    /// Observe the fork parent's Metadata cause before the fork supplies a
+    /// node bank or residency segment with every guard released (#3085). A
+    /// grant in flight, or another supplier's held window, parks the fork
+    /// on this observation: the grant's publication and every window close
+    /// wake the cause, so a wake between this sample and the park is never
+    /// lost. `None` for a parent that is no longer this exact admitted MM.
+    pub fn fork_metadata_wait(
+        &self,
+        mm: ReservationMm,
+        incarnation: NonZeroU64,
+        slot: u32,
+    ) -> Option<carrick_core_abi::PortalOwnerWait> {
+        let handle = self
+            .admitted_handle(mm, slot)
+            .ok()
+            .filter(|handle| handle.incarnation() == incarnation)?;
+        self.observe_wait(handle, carrick_core_abi::PortalWaitCause::Metadata)
+            .ok()
+            .flatten()
     }
     /// Take the exact admitted MM's editor. A held editor, raised gate or closed target
     /// returns [`MmError::Wait`] carrying the observed release, so the caller
