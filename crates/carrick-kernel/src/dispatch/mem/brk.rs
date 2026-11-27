@@ -107,10 +107,11 @@ impl<'a> MemView<'a> {
                     Some((_, request)) => cx.memory.zero_pending_backing(*request),
                     None => cx.memory.zero_backing(shrink_start, shrink_len),
                 };
-                if scrub.is_err() {
+                if let Err(error) = scrub {
                     carrick_fatal!(
                         "dispatch::brk",
-                        "zero_backing failed during brk heap contraction"
+                        "zero_backing failed during brk heap contraction 0x{shrink_start:x}+0x{shrink_len:x} (delegated: {}): {error}",
+                        pending.is_some()
                     );
                 }
             }
