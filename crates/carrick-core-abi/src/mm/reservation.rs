@@ -630,6 +630,88 @@ pub enum MetadataMiss {
     Exhausted,
 }
 
+/// Who learns that a carrier metadata publication window closed: a node
+/// bank or residency segment append (#3085). An appender that meets the
+/// window held, or a metadata grant in flight, is "not now": it parks on
+/// its space's `SpaceWaitCause::Metadata`, observed before it tried. Every
+/// window close therefore wakes that cause, and every append takes its
+/// waiters as a parameter, so a close without the wake cannot be written.
+pub trait MetadataWaiters {
+    fn wake_metadata_waiters(&self);
+}
+
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> MetadataWaiters
+    for carrick_sched_core::spaces::notification::SpaceReleaseVenue<'_, C>
+{
+    fn wake_metadata_waiters(&self) {
+        self.zone.notify_metadata_waiters(*self);
+    }
+}
+
+/// A venue with no zone has no notification source, so no task can be
+/// parked on its Metadata cause: there is nobody to wake.
+impl<W: MetadataWaiters> MetadataWaiters for Option<W> {
+    fn wake_metadata_waiters(&self) {
+        if let Some(waiters) = self {
+            waiters.wake_metadata_waiters();
+        }
+    }
+}
+
+/// A zone-less venue (a host model or unit test): nobody to wake.
+pub const NO_METADATA_WAITERS: Option<
+    carrick_sched_core::spaces::notification::SpaceReleaseVenue<'static>,
+> = None;
+
+/// The append flag of one carrier metadata directory.
+pub trait PublicationFlag {
+    /// Take the window; `false` when another appender holds it.
+    fn try_open(&self) -> bool;
+    fn close(&self);
+}
+impl PublicationFlag for core::sync::atomic::AtomicU32 {
+    fn try_open(&self) -> bool {
+        use core::sync::atomic::Ordering;
+        self.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+    }
+    fn close(&self) {
+        self.store(0, core::sync::atomic::Ordering::Release);
+    }
+}
+impl PublicationFlag for core::sync::atomic::AtomicU64 {
+    fn try_open(&self) -> bool {
+        use core::sync::atomic::Ordering;
+        self.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+    }
+    fn close(&self) {
+        self.store(0, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// One held metadata append window (#3085). It never blocks: a held window
+/// is refused at [`Self::open`], and its holder's close, on every exit
+/// path, wakes the Metadata waiters the refused appender parked on.
+#[must_use = "the window closes, and wakes its waiters, when dropped"]
+pub struct MetadataPublicationWindow<'a, F: PublicationFlag, W: MetadataWaiters + ?Sized> {
+    flag: &'a F,
+    waiters: &'a W,
+}
+impl<'a, F: PublicationFlag, W: MetadataWaiters + ?Sized> MetadataPublicationWindow<'a, F, W> {
+    pub fn open(flag: &'a F, waiters: &'a W) -> Option<Self> {
+        // Lazily: a guard built for a refused open would close, in its
+        // drop, the window its holder still owns.
+        flag.try_open().then(|| Self { flag, waiters })
+    }
+}
+impl<F: PublicationFlag, W: MetadataWaiters + ?Sized> Drop for MetadataPublicationWindow<'_, F, W> {
+    fn drop(&mut self) {
+        self.flag.close();
+        self.waiters.wake_metadata_waiters();
+    }
+}
+
 #[derive(
     ::core::clone::Clone,
     ::core::marker::Copy,

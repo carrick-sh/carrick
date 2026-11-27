@@ -21,9 +21,7 @@ pub(super) const BANKS: usize = 256;
 pub struct NodeCapacity(u32);
 
 /// Why a node bank supply left the pool at the capacity it observed
-/// (#3085). There is no contention answer: a concurrent bank append is a
-/// short critical section the supply waits out, and a concurrent bank that
-/// grew the pool is success.
+/// (#3085). A concurrent bank that grew the pool is success, never here.
 #[derive(
     ::core::clone::Clone,
     ::core::marker::Copy,
@@ -34,6 +32,10 @@ pub struct NodeCapacity(u32);
 pub enum NodeBankShortfall {
     /// The `BANKS` table is full: the pool can never grow again.
     Full,
+    /// Another supplier holds the bank append window. Not now: its close
+    /// wakes every space's Metadata cause, which the caller observed before
+    /// it tried.
+    Publishing,
     /// The allocator had no extent for a bank: a grant in flight for this
     /// requester's boundary, or memory no grant can add.
     Metadata(MetadataMiss),
@@ -50,6 +52,8 @@ enum Append {
     Grown,
     /// The `BANKS` table is full.
     Full,
+    /// Another appender holds the window: this bank stays the caller's.
+    WindowHeld,
 }
 
 #[derive(::core::clone::Clone, ::core::marker::Copy)]
@@ -239,10 +243,12 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
     /// The pin authenticates both the host alias and the EL1 address; these
     /// domains need not be numerically equal. A concurrent publication makes
     /// this grant redundant and leaves it unpublished.
+    /// `waiters` are woken when this call's append window closes.
     pub fn provision_metadata<P: PinnedMetadataExtent>(
         &self,
         pin: &P,
         expected_generation: u32,
+        waiters: &impl MetadataWaiters,
     ) -> Result<(), Refusal> {
         let extent = pin.extent();
         let capacity = expected_generation
@@ -258,10 +264,12 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
             },
             extent.base(),
             capacity,
+            waiters,
         )? {
             Append::Published => Ok(()),
-            // Redundant: the caller retires its grant and decides again.
-            Append::Grown => Err(Refusal::Busy),
+            // Redundant, or the window is held: the caller retires its
+            // grant and decides again.
+            Append::Grown | Append::WindowHeld => Err(Refusal::Busy),
             Append::Full => Err(Refusal::MetadataRequired),
         }
     }
@@ -284,11 +292,13 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
     /// `observed` (this bank, or a concurrent one): rerun the operation.
     /// Every answer is one decision against one read of the bank count, so
     /// a concurrent supplier can only turn a refusal into `Ok`, never the
-    /// reverse; there is no contention answer to rerun on.
+    /// reverse. A held append window answers `Publishing`, and `waiters`
+    /// are woken when this call's own window closes.
     pub fn supply_node_bank(
         &self,
         allocator: &impl ReservationMetadataAllocator,
         observed: NodeCapacity,
+        waiters: &impl MetadataWaiters,
     ) -> Result<(), NodeBankShortfall> {
         let expected = observed.0;
         // One read decides growth and fullness together: `count` only
@@ -303,18 +313,26 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         let layout = Self::metadata_bank_layout();
         let (ptr, receipt) = match allocator.allocate_with_extent(layout) {
             Ok(allocation) => allocation,
+            // A peer holding the window may have taken the last extent for
+            // its bank: its close wakes the caller, never a false ENOMEM.
+            // The flag is read before the count: a holder publishes the
+            // count, then closes.
+            Err(_) if self.storage.publishing.load(Ordering::Acquire) != 0 => {
+                return Err(NodeBankShortfall::Publishing);
+            }
             // A peer's bank published while this allocation missed serves
             // the operation as well as this one would have.
             Err(_) if self.storage.capacity() > expected => return Ok(()),
             Err(miss) => return Err(NodeBankShortfall::Metadata(miss)),
         };
-        let append = self.install_bank(ptr, receipt, ptr as u64, expected);
+        let append = self.install_bank(ptr, receipt, ptr as u64, expected, waiters);
         if !matches!(append, Ok(Append::Published)) {
             allocator.deallocate(ptr, layout);
         }
         match append {
             Ok(Append::Published | Append::Grown) => Ok(()),
             Ok(Append::Full) => Err(NodeBankShortfall::Full),
+            Ok(Append::WindowHeld) => Err(NodeBankShortfall::Publishing),
             Err(_) => Err(NodeBankShortfall::Invalid),
         }
     }
@@ -328,12 +346,14 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         &self,
         allocator: &impl ReservationMetadataAllocator,
         expected_capacity: u32,
+        waiters: &impl MetadataWaiters,
     ) -> Result<(), Refusal> {
-        self.supply_node_bank(allocator, NodeCapacity(expected_capacity))
+        self.supply_node_bank(allocator, NodeCapacity(expected_capacity), waiters)
             .map_err(|shortfall| match shortfall {
                 NodeBankShortfall::Full | NodeBankShortfall::Metadata(_) => {
                     Refusal::MetadataRequired
                 }
+                NodeBankShortfall::Publishing => Refusal::Busy,
                 NodeBankShortfall::Invalid => Refusal::Invalid,
             })
     }
@@ -344,6 +364,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         receipt: ExtentGrantReceipt,
         base: u64,
         expected_capacity: u32,
+        waiters: &impl MetadataWaiters,
     ) -> Result<Append, Refusal> {
         let bytes = core::mem::size_of::<Node>() * BANK_NODES;
         if !base.is_multiple_of(core::mem::align_of::<Node>() as u64)
@@ -359,38 +380,23 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         }
         // SAFETY: this fresh allocation is exclusively owned until publication.
         unsafe { core::ptr::write_bytes(ptr, 0, bytes) };
-        // The append window never blocks, allocates or takes another lock
-        // (the bank was allocated and zeroed above), so a racing appender is
-        // waited out, never refused (#3085).
-        let mut attempt = 0;
-        while self
-            .storage
-            .publishing
-            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            carrick_sched_core::ShortLockWait::wait_short(
-                &carrick_sched_core::ShortLockSpin,
-                attempt,
-            );
-            attempt = attempt.wrapping_add(1);
-        }
+        // A held window is "not now", never waited out here: its holder's
+        // close wakes the Metadata cause the caller observed (#3085).
+        let Some(window) = MetadataPublicationWindow::open(&self.storage.publishing, waiters)
+        else {
+            return Ok(Append::WindowHeld);
+        };
         // One read of `count` under the window decides.
         let count = self.storage.count.load(Ordering::Relaxed);
-        let decision = if Storage::capacity_of(count) > expected_capacity {
-            Some(Append::Grown)
-        } else if count as usize >= BANKS {
-            Some(Append::Full)
-        } else if Storage::capacity_of(count) != expected_capacity {
+        if Storage::capacity_of(count) > expected_capacity {
+            return Ok(Append::Grown);
+        }
+        if count as usize >= BANKS {
+            return Ok(Append::Full);
+        }
+        if Storage::capacity_of(count) != expected_capacity {
             // An observation above the pool's capacity is no observation.
-            self.storage.publishing.store(0, Ordering::Release);
             return Err(Refusal::Invalid);
-        } else {
-            None
-        };
-        if let Some(decision) = decision {
-            self.storage.publishing.store(0, Ordering::Release);
-            return Ok(decision);
         }
         let index = count as usize;
         unsafe {
@@ -404,8 +410,17 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         self.storage
             .count
             .store(index as u32 + 1, Ordering::Release);
-        self.storage.publishing.store(0, Ordering::Release);
+        drop(window);
         Ok(Append::Published)
+    }
+
+    /// Hold (or release) the bank append window as another supplier would,
+    /// for a host test of the contended supply (#3085).
+    #[cfg(any(test, feature = "host-test"))]
+    pub fn hold_bank_window_for_test(&self, held: bool) {
+        self.storage
+            .publishing
+            .store(u32::from(held), Ordering::Release);
     }
 
     #[cfg(any(test, feature = "host-test"))]
@@ -530,8 +545,11 @@ impl<
         }
         let table = self.table;
         let capacity = self.node_capacity;
+        // The guard's own release venue wakes the Metadata waiters when the
+        // bank window closes (#3085); a source-free guard has none.
+        let waiters = self.release_venue.as_ref().map(|venue| venue.release);
         drop(self);
-        table.provision_nodes(allocator, capacity)
+        table.provision_nodes(allocator, capacity, &waiters)
     }
 }
 
@@ -628,6 +646,7 @@ mod tests {
                 },
                 ptr as u64,
                 table.storage.capacity(),
+                &Wakes::default(),
             )
             .unwrap();
         Resolver {
@@ -673,7 +692,9 @@ mod tests {
             calls: Cell::new(0),
         };
         let pin = resolver.pin(extent).unwrap();
-        table.provision_metadata(&pin, 0).unwrap();
+        table
+            .provision_metadata(&pin, 0, &Wakes::default())
+            .unwrap();
         let mut host = ResolvedReservationNodes::default();
         unsafe { host.refresh(&table, &resolver, NonNull::dangling()) }.unwrap();
         let mut model = table.lock_resolved(0, mm, &host, &NoRootWait).unwrap();
@@ -789,7 +810,9 @@ mod tests {
         drop(old_host);
         let empty = MetadataStorage::new();
         // A concurrent bank already supplied capacity: no second allocation.
-        table.provision_nodes(&empty, NODES as u32).unwrap();
+        table
+            .provision_nodes(&empty, NODES as u32, &Wakes::default())
+            .unwrap();
         assert_eq!(table.storage.capacity(), (NODES + BANK_NODES) as u32);
     }
 
@@ -827,7 +850,11 @@ mod tests {
             .unwrap();
         let observed = table.node_capacity();
         assert_eq!(observed, NodeCapacity(NODES as u32));
-        table.supply_node_bank(&allocator, observed).unwrap();
+        let wakes = Wakes::default();
+        table
+            .supply_node_bank(&allocator, observed, &wakes)
+            .unwrap();
+        assert_eq!(wakes.0.get(), 1);
         assert_eq!(table.storage.bank_count(), 1);
         assert_eq!(
             table.node_capacity(),
@@ -836,21 +863,23 @@ mod tests {
         // The same stale observation (a concurrent supplier's) adds nothing,
         // even with an allocator that has nothing to give.
         table
-            .supply_node_bank(&MetadataStorage::new(), observed)
+            .supply_node_bank(&MetadataStorage::new(), observed, &wakes)
             .unwrap();
         assert_eq!(table.storage.bank_count(), 1);
         // An allocator with no extent cannot add a bank: memory exhausted.
         assert_eq!(
-            table.supply_node_bank(&MetadataStorage::new(), table.node_capacity()),
+            table.supply_node_bank(&MetadataStorage::new(), table.node_capacity(), &wakes),
             Err(NodeBankShortfall::Metadata(MetadataMiss::Exhausted))
         );
         // A full table refuses before it allocates.
         table.storage.count.store(BANKS as u32, Ordering::Release);
         assert_eq!(
-            table.supply_node_bank(&allocator, table.node_capacity()),
+            table.supply_node_bank(&allocator, table.node_capacity(), &wakes),
             Err(NodeBankShortfall::Full)
         );
         table.storage.count.store(1, Ordering::Release);
+        // Only the one window this test opened woke waiters.
+        assert_eq!(wakes.0.get(), 1);
     }
 
     /// A peer's bank published inside this supply's check-then-act window:
@@ -870,7 +899,9 @@ mod tests {
             layout: core::alloc::Layout,
         ) -> Result<(*mut u8, ExtentGrantReceipt), MetadataMiss> {
             let observed = self.table.node_capacity();
-            self.table.supply_node_bank(self.peer, observed).unwrap();
+            self.table
+                .supply_node_bank(self.peer, observed, &Wakes::default())
+                .unwrap();
             self.supplied.set(self.supplied.get() + 1);
             self.then.allocate_with_extent(layout)
         }
@@ -910,7 +941,10 @@ mod tests {
             supplied: Cell::new(0),
             returned: Cell::new(0),
         };
-        assert_eq!(table.supply_node_bank(&missing, observed), Ok(()));
+        assert_eq!(
+            table.supply_node_bank(&missing, observed, &Wakes::default()),
+            Ok(())
+        );
         assert_eq!(missing.supplied.get(), 1);
         assert_eq!(missing.returned.get(), 0);
         assert_eq!(table.storage.bank_count(), BANKS as u32);
@@ -928,10 +962,61 @@ mod tests {
             supplied: Cell::new(0),
             returned: Cell::new(0),
         };
-        assert_eq!(table.supply_node_bank(&allocating, observed), Ok(()));
+        assert_eq!(
+            table.supply_node_bank(&allocating, observed, &Wakes::default()),
+            Ok(())
+        );
         assert_eq!(allocating.supplied.get(), 1);
         assert_eq!(table.storage.bank_count(), BANKS as u32 - 1);
         assert_eq!(allocating.returned.get(), 1);
+        table.storage.count.store(0, Ordering::Release);
+    }
+
+    /// Counts Metadata wakes: each closed bank window is one.
+    #[derive(Default)]
+    struct Wakes(Cell<usize>);
+    impl MetadataWaiters for Wakes {
+        fn wake_metadata_waiters(&self) {
+            self.0.set(self.0.get() + 1);
+        }
+    }
+
+    /// #3085: a supply that meets another supplier's bank window held is
+    /// "not now" (`Publishing`), returns its bank and wakes nobody; the
+    /// holder's close is what wakes the Metadata waiters, and the rerun
+    /// then publishes (contention once, then success).
+    #[test]
+    fn node_bank_supply_refuses_a_held_window_and_the_close_wakes() {
+        let table = table();
+        let mut backing = vec![0u8; 4 * 1024 * 1024];
+        let allocator = MetadataStorage::new();
+        allocator
+            .admit_bootstrap_region(backing.as_mut_ptr() as u64, backing.len())
+            .unwrap();
+        let wakes = Wakes::default();
+        let observed = table.node_capacity();
+        let before = allocator.diagnostics().allocated_bytes;
+        table.storage.publishing.store(1, Ordering::Release);
+        assert_eq!(
+            table.supply_node_bank(&allocator, observed, &wakes),
+            Err(NodeBankShortfall::Publishing)
+        );
+        assert_eq!(table.storage.bank_count(), 0);
+        assert_eq!(wakes.0.get(), 0);
+        assert_eq!(allocator.diagnostics().allocated_bytes, before);
+        // The holder may have taken the last extent: a miss under a held
+        // window is the same "not now", never ENOMEM.
+        assert_eq!(
+            table.supply_node_bank(&MetadataStorage::new(), observed, &wakes),
+            Err(NodeBankShortfall::Publishing)
+        );
+        // This test stands in for the holder by storing the flag; a real
+        // holder closes through the window guard, which wakes.
+        table.storage.publishing.store(0, Ordering::Release);
+        assert_eq!(table.supply_node_bank(&allocator, observed, &wakes), Ok(()));
+        assert_eq!(table.storage.bank_count(), 1);
+        assert_eq!(wakes.0.get(), 1);
+        assert_eq!(table.storage.publishing.load(Ordering::Acquire), 0);
         table.storage.count.store(0, Ordering::Release);
     }
 }

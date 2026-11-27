@@ -269,7 +269,10 @@ mod fork_residency_growth_tests {
             allocations: RefCell::new(Vec::new()),
         };
         for segments in [2usize, 4, 8] {
-            assert_eq!(grow_residency_for_fork(&table, &allocator), Ok(()));
+            assert_eq!(
+                grow_residency_for_fork(&table, &allocator, &carrick_core_abi::NO_METADATA_WAITERS),
+                Ok(())
+            );
             assert_eq!(table.extension_count(), segments - 1);
             // SAFETY: the test allocator's segments stay mapped at their
             // published addresses for this borrow.
@@ -288,20 +291,29 @@ mod fork_residency_growth_tests {
             budget: Cell::new(2),
             allocations: RefCell::new(Vec::new()),
         };
-        assert_eq!(grow_residency_for_fork(&table, &allocator), Ok(()));
+        assert_eq!(
+            grow_residency_for_fork(&table, &allocator, &carrick_core_abi::NO_METADATA_WAITERS),
+            Ok(())
+        );
         assert_eq!(table.extension_count(), 1);
         // Doubling wants two more; the allocator has one.
-        assert_eq!(grow_residency_for_fork(&table, &allocator), Ok(()));
+        assert_eq!(
+            grow_residency_for_fork(&table, &allocator, &carrick_core_abi::NO_METADATA_WAITERS),
+            Ok(())
+        );
         assert_eq!(table.extension_count(), 2);
         assert_eq!(
-            grow_residency_for_fork(&table, &allocator),
+            grow_residency_for_fork(&table, &allocator, &carrick_core_abi::NO_METADATA_WAITERS),
             Err(ResidencyGrowthRefusal::Metadata(
                 carrick_core_abi::MetadataMiss::Exhausted
             ))
         );
         assert_eq!(table.extension_count(), 2);
         allocator.budget.set(1);
-        assert_eq!(grow_residency_for_fork(&table, &allocator), Ok(()));
+        assert_eq!(
+            grow_residency_for_fork(&table, &allocator, &carrick_core_abi::NO_METADATA_WAITERS),
+            Ok(())
+        );
         assert_eq!(table.extension_count(), 3);
     }
 }
@@ -771,8 +783,9 @@ pub fn grow_residency_or_not_now(
     observed_extensions: usize,
     observed_retirement: u64,
     owner_wait: Option<PortalOwnerWait>,
+    waiters: &impl crate::mm::reservation::MetadataWaiters,
 ) -> Result<(), ResidencyGrowthContinuation> {
-    match table.grow(allocator, observed_extensions) {
+    match table.grow(allocator, observed_extensions, waiters) {
         Ok(()) => Ok(()),
         Err(refusal) => Err(ResidencyGrowthContinuation {
             observed_extensions,
@@ -786,14 +799,18 @@ pub fn grow_residency_or_not_now(
 /// Grow the residency table by one segment for a copy-on-write that found
 /// no slot for its rows (`GuestCowOutcome::ResidencyCapacity`). The caller
 /// holds no MM editor and no descriptor claim. `true` means rerun the
-/// copy-on-write: a segment was published by this caller or a racing owner
-/// (a racing append is waited out inside `grow`).
+/// copy-on-write: a segment was published by this caller or a racing owner,
+/// or one is being published now (the holder's close wakes `waiters`' peers).
 #[inline(never)]
 pub fn grow_residency_for_cow(
     table: &FrameGrantResidencyTable,
     allocator: &impl ReservationMetadataAllocator,
+    waiters: &impl crate::mm::reservation::MetadataWaiters,
 ) -> bool {
-    table.grow(allocator, table.extension_count()).is_ok()
+    matches!(
+        table.grow(allocator, table.extension_count(), waiters),
+        Ok(()) | Err(ResidencyGrowthRefusal::Publishing)
+    )
 }
 
 /// Grow the residency table for a fork the carrier refused with
@@ -810,12 +827,13 @@ pub fn grow_residency_for_cow(
 pub fn grow_residency_for_fork(
     table: &FrameGrantResidencyTable,
     allocator: &impl ReservationMetadataAllocator,
+    waiters: &impl crate::mm::reservation::MetadataWaiters,
 ) -> Result<(), ResidencyGrowthRefusal> {
     let observed = table.extension_count();
     // `observed + 1` segments exist, counting the bootstrap segment.
     let target = observed.saturating_mul(2).saturating_add(1);
     for index in observed..target {
-        if let Err(refusal) = table.grow(allocator, index) {
+        if let Err(refusal) = table.grow(allocator, index, waiters) {
             return if table.extension_count() > observed {
                 Ok(())
             } else {
@@ -889,6 +907,7 @@ pub unsafe fn serve_grant_with_venue<
                     observed_extensions,
                     observed_retirement,
                     owner_wait,
+                    &portal.metadata_waiters(worker)?,
                 ) {
                     Ok(()) => continue,
                     Err(continuation) => {

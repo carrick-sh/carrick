@@ -46,6 +46,7 @@ impl CowResolver for HardwareCowResolver {
         carrick_core::mm::frames::grow_residency_for_cow(
             carrick_el1::isa::frame_grant_residency_guest(),
             &carrick_el1::alloc::GLOBAL_ALLOCATOR,
+            &carrick_el1::alloc::guest_metadata_waiters(),
         )
     }
     fn executable_publication(&self) -> bool {
@@ -181,6 +182,7 @@ impl<D: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords> CowResol
         carrick_core::mm::frames::grow_residency_for_cow(
             self.residency,
             &carrick_el1::alloc::GLOBAL_ALLOCATOR,
+            &carrick_el1::alloc::guest_metadata_waiters(),
         )
     }
 
