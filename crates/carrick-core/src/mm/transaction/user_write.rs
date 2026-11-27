@@ -140,7 +140,7 @@ pub trait UserWriteVenue<Context: Copy + Send + Sync + zerocopy::FromZeros> {
 }
 
 /// A copy-on-write crossing's refusal, as the protocol's answer: a held
-/// editor is the editor-release wait sampled before the crossing.
+/// editor is the editor-release wait enrolled before the last probe.
 fn cow_crossing_refusal<E>(
     crossing: CowCrossing<E>,
     editor: Option<carrick_core_abi::PortalOwnerWait>,
@@ -150,6 +150,18 @@ fn cow_crossing_refusal<E>(
             UserWriteError::Owner(MmError::Wait(wait))
         }),
         CowCrossing::Failed(error) => UserWriteError::Mechanics(error),
+    }
+}
+
+/// The settlement crossing a write or a preparation rings (#2716).
+fn settle<Context: Copy + Send + Sync + zerocopy::FromZeros, V: UserWriteVenue<Context>>(
+    venue: &mut V,
+    request: Option<&UserWriteRequest<'_>>,
+    target: &UserWriteTarget,
+) -> Result<(), CowCrossing<V::Error>> {
+    match request {
+        Some(request) => venue.settle_completions(request),
+        None => venue.settle_preparation(target),
     }
 }
 
@@ -207,6 +219,25 @@ impl<
         self.write_user_target(target, None, PortalTransferIntent::UserRead, words, venue)
     }
 
+    /// One copy-on-write crossing, with "not now" as the editor's release
+    /// (#3061): an uncontended crossing costs nothing beyond itself. One
+    /// that meets the MM's editor held enrols on the editor's release (it
+    /// samples the release source after that refusal, so any later release
+    /// completes the wait) and probes once more. A second refusal parks the
+    /// copy on that wait; it never re-rings while the editor stays held.
+    fn cross_cow<E>(
+        &self,
+        handle: El1MmHandle,
+        mut crossing: impl FnMut() -> Result<(), CowCrossing<E>>,
+    ) -> Result<(), UserWriteError<E>> {
+        match crossing() {
+            Err(CowCrossing::EditorHeld) => {}
+            other => return other.map_err(|refusal| cow_crossing_refusal(refusal, None)),
+        }
+        let editor = self.observe_wait(handle, carrick_core_abi::PortalWaitCause::Editor)?;
+        crossing().map_err(|refusal| cow_crossing_refusal(refusal, editor))
+    }
+
     fn write_user_target<W: LiveDescriptorWords + ?Sized, V: UserWriteVenue<Context>>(
         &self,
         target: UserWriteTarget,
@@ -232,30 +263,26 @@ impl<
             if venues.slot != slot {
                 return Err(MmError::Stale.into());
             }
-            // The editor-release source, sampled before this pass's
-            // copy-on-write crossings probe the MM's editor: a crossing that
-            // meets the editor held parks on this wait, which a release after
-            // the sample completes, and never re-rings while it is held.
-            let editor =
-                self.observe_wait(target.handle, carrick_core_abi::PortalWaitCause::Editor)?;
             let step = self.select(&continuation, words, venues);
             // The settlement follows every selection, a failed one included:
             // an earlier supply of this call may still be owed to the venue
-            // (#2716). The selection's own error is the one reported.
-            let settled = match request.as_ref() {
-                Some(request) => venue.settle_completions(request),
-                None => venue.settle_preparation(&target),
+            // (#2716). The selection's own error is the one reported, and a
+            // failed selection's settlement is probed once, never re-probed:
+            // the selection's wait already parks this copy.
+            let step = match step {
+                Ok(step) => step,
+                Err(error) => {
+                    let _ = settle(venue, request.as_ref(), &target);
+                    return Err(error.into());
+                }
             };
-            let step = step?;
-            settled.map_err(|crossing| cow_crossing_refusal(crossing, editor))?;
+            self.cross_cow(target.handle, || settle(venue, request.as_ref(), &target))?;
             match step {
                 TransferStep::CowSupply(window) => {
                     if awaiting_supply_progress {
                         return Err(UserWriteError::Busy);
                     }
-                    venue
-                        .supply_cow(window)
-                        .map_err(|crossing| cow_crossing_refusal(crossing, editor))?;
+                    self.cross_cow(target.handle, || venue.supply_cow(window))?;
                     awaiting_supply_progress = true;
                 }
                 TransferStep::Selected(selected) => {
