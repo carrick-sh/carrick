@@ -1139,28 +1139,7 @@ impl AnonymousDescriptorDecode for X86AnonymousDecode {
             .then_some(FrameGpa::new(descriptor & ADDRESS))
     }
     fn private_state(descriptor: u64) -> carrick_mmu_core::aarch64::El1PrivateLeafState {
-        use carrick_mmu_core::aarch64::El1PrivateLeafState;
-        use carrick_mmu_core::x86::descriptor_txn::{
-            ADDRESS, NO_ACCESS, PREPARED, PRESENT, PRIVATE, RETIRED,
-        };
-        if descriptor & PRIVATE == 0 {
-            El1PrivateLeafState::Unowned
-        } else if descriptor & PRESENT != 0 {
-            El1PrivateLeafState::Resident
-        } else if descriptor & (NO_ACCESS | PREPARED | RETIRED) == NO_ACCESS
-            && descriptor & ADDRESS != 0
-        {
-            // A PROT_NONE page keeps its frame and its bytes (#2875): resident
-            // for every residency, retire and stock count. Only the fault
-            // and copy paths read its access, from the mapping.
-            El1PrivateLeafState::Resident
-        } else if descriptor & RETIRED != 0 {
-            El1PrivateLeafState::Retired
-        } else if descriptor & PREPARED != 0 && descriptor & ADDRESS != 0 {
-            El1PrivateLeafState::Prepared
-        } else {
-            El1PrivateLeafState::Malformed
-        }
+        carrick_mmu_core::x86::descriptor_txn::private_leaf_state(descriptor)
     }
 }
 
