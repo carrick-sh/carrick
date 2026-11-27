@@ -522,6 +522,9 @@ pub fn carrier_initial_boot<P: Personality>(request_va: u64) -> ! {
             zone.cpu_enter_user(slot, zone.current_record_ref(slot), now);
         }
     }
+    // The first entry to user owes no reschedule IPI (#3083): the host
+    // zeroes `CpuBinding::owed_resched`, and nothing on this boot path
+    // sends one, so it needs no last-chance delivery.
     // SAFETY: after host acknowledgement, the exact MM is published and the
     // user selectors/entry/stack came from the guest-owned image transaction.
     unsafe { carrick_x86_boot_iret(entry, stack) }

@@ -744,8 +744,8 @@ fn resend_owed() -> Resent {
 /// as broken. The delivery-status bit is a hardware handshake that clears
 /// once the APIC has handed the previous IPI to the interconnect, a few
 /// bus cycles; the SDM gives no number. One millisecond is orders of
-/// magnitude past it, so reaching it is a broken invariant, never
-/// contention.
+/// magnitude past it, so reaching it with no IPI sent is a broken
+/// invariant ([`ApicFault::IcrNeverAccepted`]), never contention.
 const ICR_IDLE_BOUND_NS: u128 = 1_000_000;
 
 /// The last-chance delivery point (#3083): this CPU returns to user, and
@@ -757,16 +757,38 @@ const ICR_IDLE_BOUND_NS: u128 = 1_000_000;
 /// be polling) and is then sent. An ICR busy past [`ICR_IDLE_BOUND_NS`] is
 /// a broken local APIC: fatal.
 pub fn deliver_owed_resched_before_user(site: UserReturn) {
+    // The bound runs from the first busy resend and restarts only when a
+    // resend makes progress: an APIC whose polls read idle while its sends
+    // stay busy still reaches it.
+    let mut since = None;
     loop {
         let resent = resend_owed();
-        #[cfg(feature = "test-support")]
         if resent.progress {
+            #[cfg(feature = "test-support")]
             RESCHED_RESEND_SITE.store(site as u8, Ordering::Release);
+            since = None;
         }
         if resent.clear {
             return;
         }
-        wait_icr_idle();
+        let start = *since.get_or_insert_with(read_tsc);
+        wait_icr_idle(start, site);
+    }
+}
+
+/// A local APIC that broke the ICR handshake: a broken invariant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApicFault {
+    /// The ICR stayed busy, or kept refusing the send, past
+    /// [`ICR_IDLE_BOUND_NS`] with no IPI sent, at this return to user.
+    IcrNeverAccepted { at: UserReturn },
+}
+
+impl core::fmt::Display for ApicFault {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::IcrNeverAccepted { at } => write!(f, "ApicFault::IcrNeverAccepted at {at:?}"),
+        }
     }
 }
 
@@ -784,19 +806,25 @@ pub enum UserReturn {
     Interrupt = 4,
 }
 
-fn wait_icr_idle() {
+/// Wait for this CPU's own ICR to read idle, within [`ICR_IDLE_BOUND_NS`]
+/// of `start` (the first resend that sent nothing), before the return to
+/// user `at`.
+fn wait_icr_idle(start: u64, at: UserReturn) {
     let Some(hz) = tsc_frequency() else {
         super::fatal_entry_binding();
     };
     let bound = u128::from(hz.get()) * ICR_IDLE_BOUND_NS / 1_000_000_000;
-    let start = read_tsc();
-    while icr_poll_busy() {
+    loop {
+        // Checked before the poll, so a poll that reads idle while the
+        // sends stay busy still ends here.
+        if u128::from(read_tsc().wrapping_sub(start)) > bound {
+            crate::x86_fatal_boot!(ApicFault::IcrNeverAccepted { at });
+        }
+        if !icr_poll_busy() {
+            return;
+        }
         #[cfg(feature = "test-support")]
         RESCHED_ICR_WAITS.fetch_add(1, Ordering::AcqRel);
-        if u128::from(read_tsc().wrapping_sub(start)) > bound {
-            // A local APIC that never finishes its own send is broken.
-            super::fatal_entry_binding();
-        }
         core::hint::spin_loop();
     }
 }
