@@ -909,9 +909,9 @@ pub(super) fn release_retired_child<M: CarrierMemoryIo>(
     released.then(|| retire_child_memory(memory, absence, inventory))
 }
 
-/// The carrier memory's part of a release. A refusal that quarantined the
-/// carrier is a broken invariant (#3132); any other refusal changed nothing
-/// and reruns at the next drain.
+/// The carrier memory's part of a release. Every refusal is a broken
+/// invariant that quarantined the carrier (`CarrierMemory::retire_child`:
+/// no drain can repair one, #3132, #3061), never "not now".
 fn retire_child_memory<M: CarrierMemoryIo>(
     memory: &mut CarrierMemory<M>,
     absence: &SlotAbsence,
@@ -919,10 +919,7 @@ fn retire_child_memory<M: CarrierMemoryIo>(
 ) -> ReleaseOutcome {
     match memory.retire_child(absence, inventory) {
         Ok(_) => ReleaseOutcome::Done,
-        Err(_) if memory.is_quarantined() => {
-            ReleaseOutcome::Broken(BrokenRelease::at("carrier memory retire_child"))
-        }
-        Err(_) => ReleaseOutcome::NotNow(ReleaseWait::NextDrain),
+        Err(_) => ReleaseOutcome::Broken(BrokenRelease::at("carrier memory retire_child")),
     }
 }
 

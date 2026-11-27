@@ -746,10 +746,11 @@ impl LifecycleWindow {
 /// [`MmReleaseReceipt`], and the receipt is spent at once on the owed
 /// returns the retired MM's root left in `returns`: those slots are freed
 /// only now, after the frames they name returned with the MM's inventory.
-/// "Not now" when the release could not finish, or when a root still
-/// publishes the MM and owes returns; those returns stay owed, and the next
-/// drain reruns this release (idempotent: an emptied MM retires nothing
-/// again).
+/// "Not now" when a residency row could not retire yet, or when a root
+/// still publishes the MM and owes returns; those returns stay owed, and the
+/// next drain reruns this release (idempotent: an emptied MM retires nothing
+/// again). `Broken` when the inventory refused ([`crate::MmRetireBroken`]:
+/// no drain can repair that) or `absent` names no MM.
 pub fn release_child_mm(
     inventory: &dyn crate::PhysicalFrameInventory,
     residency: &carrick_el1_abi::FrameGrantResidencyTable<
@@ -758,8 +759,14 @@ pub fn release_child_mm(
     returns: &dyn RetiredReturns,
     absent: &carrick_sched_core::ExcludedEditor<'_>,
 ) -> ReleaseOutcome {
-    match MmReleaseReceipt::released(absent, |mm| release_mm_memory(inventory, residency, mm)) {
-        None => ReleaseOutcome::NotNow(ReleaseWait::NextDrain),
+    let mut memory = ReleaseOutcome::Broken(BrokenRelease::at(
+        "release_child_mm: the excluded editor names no MM",
+    ));
+    match MmReleaseReceipt::released(absent, |mm| {
+        memory = release_mm_memory(inventory, residency, mm);
+        memory.is_done()
+    }) {
+        None => memory,
         Some(receipt) => ReleaseOutcome::done_or(
             returns.settle_whole_mm(receipt).is_ok(),
             ReleaseWait::OwedReturns,
@@ -796,24 +803,33 @@ pub fn release_unrun_child_mm(
     >,
     mm: ReservationMm,
 ) -> ReleaseOutcome {
-    ReleaseOutcome::done_or(
-        release_mm_memory(inventory, residency, mm),
-        ReleaseWait::NextDrain,
-    )
+    release_mm_memory(inventory, residency, mm)
 }
 
+/// The inventory rows, then the residency rows, of one excluded MM. An
+/// inventory refusal is `Broken` ([`crate::MmRetireBroken`]); a residency
+/// row that can't retire yet (an outstanding transfer pin) is "not now"
+/// until the next drain, and leaves the rest intact.
 fn release_mm_memory(
     inventory: &dyn crate::PhysicalFrameInventory,
     residency: &carrick_el1_abi::FrameGrantResidencyTable<
         impl carrick_el1_abi::FrameGrantResidencyAccess,
     >,
     mm: ReservationMm,
-) -> bool {
+) -> ReleaseOutcome {
     let Some(generation) = NonZeroU64::new(mm.raw()).map(carrick_guest_arch::MmGeneration::new)
     else {
-        return false;
+        return ReleaseOutcome::Broken(BrokenRelease::at(
+            "release_mm_memory: the MM's generation is zero",
+        ));
     };
-    inventory.retire_mm(generation).is_ok() && residency.retire_overlapping(mm.raw(), 0, u64::MAX)
+    if let Err(broken) = inventory.retire_mm(generation) {
+        return ReleaseOutcome::Broken(BrokenRelease::at(broken.invariant()));
+    }
+    ReleaseOutcome::done_or(
+        residency.retire_overlapping(mm.raw(), 0, u64::MAX),
+        ReleaseWait::NextDrain,
+    )
 }
 
 /// Ordered key of one MM in carrier custody.

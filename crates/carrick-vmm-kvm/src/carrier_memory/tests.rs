@@ -94,6 +94,11 @@ fn a_released_slot_whose_frame_another_mm_maps_quarantines_the_carrier() {
     );
 }
 #[test]
+fn a_retirement_without_a_carrier_root_quarantines_the_carrier() {
+    carrick_test_support::require_kvm!();
+    test_support::a_retirement_without_a_carrier_root_quarantines_the_carrier(real_memory_io);
+}
+#[test]
 fn a_released_slot_its_retiring_mm_still_maps_quarantines_the_carrier() {
     carrick_test_support::require_kvm!();
     test_support::a_released_slot_its_retiring_mm_still_maps_quarantines_the_carrier(

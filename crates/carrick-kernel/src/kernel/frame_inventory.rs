@@ -153,7 +153,7 @@ impl carrick_hal::PhysicalFrameInventory for PhysicalInventoryProjection {
     fn retire_mm(
         &self,
         mm: carrick_hal::MmGeneration,
-    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<usize, carrick_hal::MmRetireBroken> {
         let owners: BTreeSet<_> = self
             .inventory
             .state
@@ -1459,6 +1459,20 @@ pub enum FrameInventoryRetireMmError {
     Event(#[from] carrick_hal::FrameInventoryReservationError),
     #[error(transparent)]
     Apply(#[from] FrameInventoryError),
+}
+
+impl From<FrameInventoryRetireMmError> for carrick_hal::MmRetireBroken {
+    /// Every whole-MM retirement refusal is a broken invariant: see
+    /// [`carrick_hal::MmRetireBroken`].
+    fn from(error: FrameInventoryRetireMmError) -> Self {
+        Self::new(match error {
+            FrameInventoryRetireMmError::Capacity => "MM retirement event count overflows",
+            FrameInventoryRetireMmError::NotEmpty => "MM retirement left mappings live in the MM",
+            FrameInventoryRetireMmError::Reserve(_) => "MM retirement reservation refused",
+            FrameInventoryRetireMmError::Event(_) => "MM retirement event refused",
+            FrameInventoryRetireMmError::Apply(_) => "MM retirement batch refused",
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]

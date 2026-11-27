@@ -229,6 +229,21 @@ fn exec_replacement_moves_child_owner_and_settles_predecessor_once() {
         ),
         Err(ForkStockServiceError::StaleExecution)
     );
+    // A broken release ends the settle with its verdict, never a deferral,
+    // and keeps the receipt owed: nothing of the predecessor moved.
+    let broken = BrokenRelease::at("test: broken predecessor release");
+    assert_eq!(
+        stock.settle_exec_predecessor(
+            &mut NoTableLedger,
+            receipt,
+            absent(loan.request.child_mm).unwrap(),
+            |_| panic!("a broken release clears no table"),
+            |_, _| ReleaseOutcome::Broken(broken),
+        ),
+        Err(ForkStockServiceError::BrokenRelease(broken))
+    );
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert_eq!(stock.counters().reclaim_deferrals, 0);
     let predecessor_absent = absent(loan.request.child_mm).unwrap();
     stock
         .settle_exec_predecessor(
@@ -1735,6 +1750,99 @@ fn reclaim_releases_each_child_once_across_a_retire_failure() {
     assert_eq!(releases.get(), 1, "release ran exactly once");
 }
 
+/// A broken release ends the drain with its verdict: it is not counted as a
+/// deferral, the child stays quarantined with its stock held, and its tables
+/// are never cleared (#3061).
+#[test]
+fn reclaim_ends_on_a_broken_release_without_a_deferral() {
+    let mut stock = stock(UntaggedRoots, 4, 1);
+    let granted = loan(&mut stock, parent(), 302, 1, 1).unwrap();
+    commit(&mut stock, parent(), granted, 1, 0).unwrap();
+    retire(&mut stock, child_of(granted, 900)).unwrap();
+    let pages = stock.table_stock().len();
+    let broken = BrokenRelease::at("test: broken child release");
+    assert_eq!(
+        stock.reclaim(
+            &mut NoTableLedger,
+            mm(PARENT_MM),
+            absent,
+            |_| panic!("a broken release clears no table"),
+            |_| panic!("a broken release clears no lifecycle"),
+            |_| ReleaseOutcome::Broken(broken),
+        ),
+        Err(ForkStockServiceError::BrokenRelease(broken))
+    );
+    assert_eq!(stock.counters().reclaim_deferrals, 0);
+    assert_eq!(stock.counters().returned_children, 0);
+    assert!(stock.is_quarantined(mm(302)));
+    assert_eq!(stock.table_stock().len(), pages);
+}
+
+/// The shared release reads a frame-inventory refusal as `Broken`, never
+/// "not now": no drain can repair one (`MmRetireBroken`, #3061). Before
+/// the fix every refusal, `NotEmpty` included, deferred to the next drain.
+#[test]
+fn release_child_mm_reads_an_inventory_refusal_as_broken() {
+    use carrick_core_abi::{MmReleaseReceipt, Refusal, RetiredReturns};
+    struct Refusing;
+    #[allow(clippy::unimplemented)]
+    impl crate::PhysicalFrameInventory for Refusing {
+        fn bind(
+            &self,
+            _owner: crate::GuestFrameOwner,
+        ) -> std::sync::Arc<dyn crate::FrameCowAuthority> {
+            unimplemented!()
+        }
+        fn allocate_backing_ids(
+            &self,
+        ) -> Result<(crate::FrameId, crate::MappingId), Box<dyn std::error::Error + Send + Sync>>
+        {
+            Err("unused in test".into())
+        }
+        fn retire_mm(&self, _mm: MmGeneration) -> Result<usize, crate::MmRetireBroken> {
+            Err(crate::MmRetireBroken::new(
+                "MM retirement left mappings live in the MM",
+            ))
+        }
+        fn frame_is_mapped(&self, _frame: crate::FrameId) -> bool {
+            false
+        }
+    }
+    struct NoReturns;
+    impl RetiredReturns for NoReturns {
+        fn settle_whole_mm(&self, _: MmReleaseReceipt) -> Result<usize, Refusal> {
+            panic!("a refused inventory mints no release receipt")
+        }
+    }
+    let region = carrick_test_support::TestEl1Region::zeroed();
+    // SAFETY: aligned zero-valid residency ABI record in retained owned storage.
+    let residency = unsafe {
+        &*region
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET as usize)
+            .cast::<carrick_el1_abi::FrameGrantResidencyTable>()
+    };
+    let spaces = Box::new(carrick_sched_core::AddressSpaces::new());
+    let absence = absent(mm(302)).unwrap();
+    assert_eq!(
+        release_unpublished_child_mm(&spaces, &Refusing, residency, &NoReturns, &absence),
+        ReleaseOutcome::Broken(BrokenRelease::at(
+            "MM retirement left mappings live in the MM"
+        ))
+    );
+    // The same MM with a willing inventory and nothing owed is done.
+    struct Empty;
+    impl RetiredReturns for Empty {
+        fn settle_whole_mm(&self, _: MmReleaseReceipt) -> Result<usize, Refusal> {
+            Ok(0)
+        }
+    }
+    assert_eq!(
+        release_unpublished_child_mm(&spaces, &DummyInventory, residency, &Empty, &absence),
+        ReleaseOutcome::Done
+    );
+}
+
 /// Release happens inside reclaim, per candidate, before that candidate's
 /// stock is reissued: a later candidate's refusal neither skips nor undoes
 /// an earlier candidate's completed release and return.
@@ -2682,7 +2790,7 @@ impl crate::PhysicalFrameInventory for DummyInventory {
     fn retire_mm(
         &self,
         _mm: carrick_guest_arch::MmGeneration,
-    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<usize, crate::MmRetireBroken> {
         Ok(0)
     }
 

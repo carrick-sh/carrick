@@ -46,13 +46,15 @@ pub enum MmLife {
     Broken,
 }
 
-/// The release of one exiting MM is owed to the shell.
+/// The release of one exiting MM is owed to the shell: one attempt of it,
+/// so a ticket left over from an earlier attempt can't finish a later one.
 #[must_use = "a release ticket must be finished with CarrierCore::finish_release"]
 #[derive(Debug, Eq, PartialEq)]
 #[cfg_attr(test, derive(Clone, Hash))]
 pub struct ReleaseTicket {
     carrier: CarrierId,
     mm: MmKey,
+    attempt: u64,
 }
 
 impl ReleaseTicket {
@@ -153,6 +155,8 @@ impl<V: CoreVenue, M_, B, G: GrantPayload> CarrierCore<V, M_, B, G> {
         }
         record.life = MmLife::Releasing;
         record.chunk = None;
+        record.release_attempt = record.release_attempt.wrapping_add(1);
+        let attempt = record.release_attempt;
         self.chunks.retain(|_, chunk| chunk.mm != mm);
         let bases: Vec<u64> = self
             .grants
@@ -172,12 +176,14 @@ impl<V: CoreVenue, M_, B, G: GrantPayload> CarrierCore<V, M_, B, G> {
             ReleaseTicket {
                 carrier: self.carrier,
                 mm,
+                attempt,
             },
             returned,
         ))
     }
 
-    /// Phase 2: the shell's outcome for the release. `Done` retires the MM
+    /// Phase 2: the shell's outcome for the release attempt the ticket names
+    /// (any other ticket is `NotFound`). `Done` retires the MM
     /// (its record leaves the core); `NotNow` returns it to `Exiting`;
     /// `Broken` makes it `Broken`, and the venue ends the carrier. The
     /// outcome comes back for the shell to act on.
@@ -187,10 +193,9 @@ impl<V: CoreVenue, M_, B, G: GrantPayload> CarrierCore<V, M_, B, G> {
         outcome: ReleaseOutcome,
     ) -> Result<ReleaseOutcome, Refused<ReleaseTicket>> {
         let owed = ticket.carrier == self.carrier
-            && self
-                .mms
-                .get(&ticket.mm)
-                .is_some_and(|record| record.life == MmLife::Releasing);
+            && self.mms.get(&ticket.mm).is_some_and(|record| {
+                record.life == MmLife::Releasing && record.release_attempt == ticket.attempt
+            });
         if !owed {
             return Err(Refused {
                 offered: ticket,
