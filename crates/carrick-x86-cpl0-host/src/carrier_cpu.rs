@@ -834,7 +834,8 @@ impl<I: CarrierCpuIo> CarrierCpu<I> {
                 CarrierRunExit::PhysicalDoorbell {
                     port: carrick_x86::cpl0_entry::WORK_PORT
                         | carrick_el1_abi::NATIVE_EXEC_PORT
-                        | carrick_el1_abi::NATIVE_SPACE_RETIRED_PORT,
+                        | carrick_el1_abi::NATIVE_SPACE_RETIRED_PORT
+                        | carrick_x86::cpl0_entry::FATAL_PORT,
                     ..
                 }
             )
@@ -842,8 +843,11 @@ impl<I: CarrierCpuIo> CarrierCpu<I> {
             // Exit work can be published after the last child has left its
             // process root, an exec settlement crosses after leaving the
             // predecessor root, and a retired space's entry retirement can
-            // cross after its last slot left it (#3030). Only the boot-published maintenance root may
-            // stand here; it has no user task snapshot to save.
+            // cross after its last slot left it (#3030). A CPL0 fatal can be
+            // raised from the idle scheduler after `leave_space` (an idle
+            // CPU whose ICR never accepts its owed IPI, #3129): the executor
+            // decodes it as on any root. Only the boot-published maintenance
+            // root may stand here; it has no user task snapshot to save.
             self.custody = Custody::Loaded {
                 binding,
                 resume,
