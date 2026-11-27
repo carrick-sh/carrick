@@ -96,6 +96,12 @@ __asm__(".globl vfork_exec\n"
 #endif
 #define ROUNDS 16
 #define SPAN (16 * 4096)
+// With READERS, each sibling reads a large image into a large fresh map, so
+// every read's completion writes hundreds of never-touched destination pages.
+#define READ_SPAN (1024 * 1024)
+#ifdef READERS
+__attribute__((used)) static const char image_pad[512 * 1024] = {1};
+#endif
 #define CLONE_THREAD_FLAGS 0x50f00 /* VM | FS | FILES | SIGHAND | THREAD | SYSVSEM */
 static volatile int stop;
 static volatile int workers_done;
@@ -110,23 +116,36 @@ static long image_fd = -1;
 static long image_size;
 static struct exec_req req;
 
+// pread64 the whole image into `buf` from offset 0, as many calls as the
+// kernel takes (a read may be short): the bytes read, or the first -errno.
+static long read_all(long buf, long cap) {
+    long done = 0;
+    while (done < cap) {
+        long got = sc(17, image_fd, buf + done, cap - done, done, 0, 0);
+        if (got < 0) return got;
+        if (got == 0) break;
+        done += got;
+    }
+    return done;
+}
+
 static void read_image(void *unused) {
     (void)unused;
     while (!stop) {
-        long map = sc(9, 0, SPAN, 3, 0x22, -1, 0); // mmap PROT_READ|WRITE, PRIVATE|ANONYMOUS
+        long map = sc(9, 0, READ_SPAN, 3, 0x22, -1, 0); // mmap PROT_READ|WRITE, PRIVATE|ANONYMOUS
         if (map < 0 && map > -4096) {
             __sync_fetch_and_add(&bad, 1);
             break;
         }
-        long got = sc(17, image_fd, map, SPAN, 0, 0, 0); // pread64 into untouched memory
+        long got = read_all(map, READ_SPAN); // into untouched memory
         if (got != image_size) __sync_val_compare_and_swap(&read_answer, 0, got);
-        if (sc(11, map, SPAN, 0, 0, 0, 0) != 0) // munmap
+        if (sc(11, map, READ_SPAN, 0, 0, 0, 0) != 0) // munmap
             __sync_fetch_and_add(&bad, 1);
         sc(24, 0, 0, 0, 0, 0, 0); // sched_yield
     }
+    // A reader ends with its own raw `exit` (thread_spawn's return), so the
+    // root's exit_group meets no sleeping sibling: that is another shape.
     __sync_fetch_and_add(&workers_done, 1);
-    long pause[2] = {1, 0};
-    for (;;) sc(35, (long)pause, 0, 0, 0, 0, 0);
 }
 
 static void edit_memory(void *unused) {
@@ -167,6 +186,9 @@ static void spawn_rounds(void *unused) {
         rounds_done = round + 1;
     }
     spawner_done = 1;
+#ifdef READERS
+    return;
+#endif
     long pause[2] = {1, 0};
     for (;;) sc(35, (long)pause, 0, 0, 0, 0, 0);
 }
@@ -225,10 +247,10 @@ void start_c(long *sp) {
     req.envp = envp;
 #ifdef READERS
     image_fd = sc(257, -100, (long)argv[0], 0, 0, 0, 0); // openat(AT_FDCWD, image, O_RDONLY)
-    static char probe[SPAN];
-    probe[0] = 1;
-    image_size = image_fd < 0 ? -1 : sc(17, image_fd, (long)probe, SPAN, 0, 0, 0);
-    if (image_size <= 0 || image_size >= SPAN) sc(231, 92, 0, 0, 0, 0, 0);
+    static char probe[READ_SPAN];
+    for (long off = 0; off < READ_SPAN; off += 4096) probe[off] = 1;
+    image_size = image_fd < 0 ? -1 : read_all((long)probe, READ_SPAN);
+    if (image_size < (long)sizeof image_pad || image_size >= READ_SPAN) sc(231, 92, 0, 0, 0, 0, 0);
     for (int i = 0; i < WORKERS; i++) spawn(read_image);
 #else
     for (int i = 0; i < WORKERS; i++) spawn(edit_memory);
