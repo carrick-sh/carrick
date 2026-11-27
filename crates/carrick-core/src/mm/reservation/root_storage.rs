@@ -14,6 +14,32 @@ pub(super) const BANKS: usize = 256;
 #[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug, PartialEq, Eq)]
 pub struct NodeCapacity(u32);
 
+/// Why a node bank supply left the pool at the capacity it observed
+/// (#3085). There is no contention answer: a concurrent bank append is a
+/// short critical section the supply waits out, and a concurrent bank that
+/// grew the pool is success.
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug, PartialEq, Eq)]
+pub enum NodeBankShortfall {
+    /// The `BANKS` table is full: the pool can never grow again.
+    Full,
+    /// The allocator had no extent for a bank: a grant in flight for this
+    /// requester's boundary, or memory no grant can add.
+    Metadata(MetadataMiss),
+    /// The allocator's receipt does not cover the bank it returned.
+    Invalid,
+}
+
+/// The one decision an append makes under the bank window.
+enum Append {
+    /// This bank is published.
+    Published,
+    /// The pool already holds more than the caller observed (a racing
+    /// append): this bank is redundant and stays the caller's.
+    Grown,
+    /// The `BANKS` table is full.
+    Full,
+}
+
 #[derive(::core::clone::Clone, ::core::marker::Copy)]
 #[repr(C)]
 struct Bank {
@@ -42,7 +68,10 @@ impl Storage {
         self.count.load(Ordering::Acquire)
     }
     pub(super) fn capacity(&self) -> u32 {
-        NODES as u32 + self.count.load(Ordering::Acquire) * BANK_NODES as u32
+        Self::capacity_of(self.count.load(Ordering::Acquire))
+    }
+    const fn capacity_of(count: u32) -> u32 {
+        NODES as u32 + count * BANK_NODES as u32
     }
 }
 
@@ -208,7 +237,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
             .checked_mul(BANK_NODES as u32)
             .and_then(|n| n.checked_add(NODES as u32))
             .ok_or(Refusal::Invalid)?;
-        self.install_bank(
+        match self.install_bank(
             pin.host_base().as_ptr(),
             ExtentGrantReceipt {
                 base_va: extent.base(),
@@ -217,7 +246,12 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
             },
             extent.base(),
             capacity,
-        )
+        )? {
+            Append::Published => Ok(()),
+            // Redundant: the caller retires its grant and decides again.
+            Append::Grown => Err(Refusal::Busy),
+            Append::Full => Err(Refusal::MetadataRequired),
+        }
     }
     /// Published immutable bank generation; prepare a new pinned view only
     /// after this changes. The generation is monotonic for this table lifetime.
@@ -236,15 +270,41 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
     /// `MetadataRequired` against the `observed` capacity, holding no MM
     /// guard, editor or loan. `Ok` means the pool now holds more than
     /// `observed` (this bank, or a concurrent one): rerun the operation.
-    /// `Busy` is a concurrent bank publication in its short append window.
-    /// `MetadataRequired` means no bank can be added: the `BANKS` table is
-    /// full, or the allocator has no extent to give.
+    /// Every answer is one decision against one read of the bank count, so
+    /// a concurrent supplier can only turn a refusal into `Ok`, never the
+    /// reverse; there is no contention answer to rerun on.
     pub fn supply_node_bank(
         &self,
         allocator: &impl ReservationMetadataAllocator,
         observed: NodeCapacity,
-    ) -> Result<(), Refusal> {
-        self.provision_nodes(allocator, observed.0)
+    ) -> Result<(), NodeBankShortfall> {
+        let expected = observed.0;
+        // One read decides growth and fullness together: `count` only
+        // grows, and `BANKS` is its ceiling.
+        let count = self.storage.bank_count();
+        if Storage::capacity_of(count) > expected {
+            return Ok(());
+        }
+        if count as usize >= BANKS {
+            return Err(NodeBankShortfall::Full);
+        }
+        let layout = Self::metadata_bank_layout();
+        let (ptr, receipt) = match allocator.allocate_with_extent(layout) {
+            Ok(allocation) => allocation,
+            // A peer's bank published while this allocation missed serves
+            // the operation as well as this one would have.
+            Err(_) if self.storage.capacity() > expected => return Ok(()),
+            Err(miss) => return Err(NodeBankShortfall::Metadata(miss)),
+        };
+        let append = self.install_bank(ptr, receipt, ptr as u64, expected);
+        if !matches!(append, Ok(Append::Published)) {
+            allocator.deallocate(ptr, layout);
+        }
+        match append {
+            Ok(Append::Published | Append::Grown) => Ok(()),
+            Ok(Append::Full) => Err(NodeBankShortfall::Full),
+            Err(_) => Err(NodeBankShortfall::Invalid),
+        }
     }
 
     /// Supply one bank through GLOBAL_ALLOCATOR (or the same allocator in a
@@ -257,22 +317,13 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         allocator: &impl ReservationMetadataAllocator,
         expected_capacity: u32,
     ) -> Result<(), Refusal> {
-        if self.storage.capacity() > expected_capacity {
-            return Ok(());
-        }
-        if self.storage.count.load(Ordering::Acquire) as usize == BANKS {
-            return Err(Refusal::MetadataRequired);
-        }
-        let layout =
-            core::alloc::Layout::array::<Node>(BANK_NODES).map_err(|_| Refusal::Invalid)?;
-        let (ptr, receipt) = allocator
-            .allocate_with_extent(layout)
-            .ok_or(Refusal::MetadataRequired)?;
-        let result = self.install_bank(ptr, receipt, ptr as u64, expected_capacity);
-        if result.is_err() {
-            allocator.deallocate(ptr, layout);
-        }
-        result
+        self.supply_node_bank(allocator, NodeCapacity(expected_capacity))
+            .map_err(|shortfall| match shortfall {
+                NodeBankShortfall::Full | NodeBankShortfall::Metadata(_) => {
+                    Refusal::MetadataRequired
+                }
+                NodeBankShortfall::Invalid => Refusal::Invalid,
+            })
     }
 
     fn install_bank(
@@ -281,7 +332,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         receipt: ExtentGrantReceipt,
         base: u64,
         expected_capacity: u32,
-    ) -> Result<(), Refusal> {
+    ) -> Result<Append, Refusal> {
         let bytes = core::mem::size_of::<Node>() * BANK_NODES;
         if !base.is_multiple_of(core::mem::align_of::<Node>() as u64)
             || base < receipt.base_va
@@ -296,19 +347,40 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         }
         // SAFETY: this fresh allocation is exclusively owned until publication.
         unsafe { core::ptr::write_bytes(ptr, 0, bytes) };
-        self.storage
+        // The append window never blocks, allocates or takes another lock
+        // (the bank was allocated and zeroed above), so a racing appender is
+        // waited out, never refused (#3085).
+        let mut attempt = 0;
+        while self
+            .storage
             .publishing
-            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .map_err(|_| Refusal::Busy)?;
-        if self.storage.capacity() != expected_capacity {
-            self.storage.publishing.store(0, Ordering::Release);
-            return Err(Refusal::Busy);
+            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            carrick_sched_core::ShortLockWait::wait_short(
+                &carrick_sched_core::ShortLockSpin,
+                attempt,
+            );
+            attempt = attempt.wrapping_add(1);
         }
-        let index = self.storage.count.load(Ordering::Relaxed) as usize;
-        if index == BANKS {
+        // One read of `count` under the window decides.
+        let count = self.storage.count.load(Ordering::Relaxed);
+        let decision = if Storage::capacity_of(count) > expected_capacity {
+            Some(Append::Grown)
+        } else if count as usize >= BANKS {
+            Some(Append::Full)
+        } else if Storage::capacity_of(count) != expected_capacity {
+            // An observation above the pool's capacity is no observation.
             self.storage.publishing.store(0, Ordering::Release);
-            return Err(Refusal::MetadataRequired);
+            return Err(Refusal::Invalid);
+        } else {
+            None
+        };
+        if let Some(decision) = decision {
+            self.storage.publishing.store(0, Ordering::Release);
+            return Ok(decision);
         }
+        let index = count as usize;
         unsafe {
             (*self.storage.banks[index].get()).write(Bank {
                 guest_base: base,
@@ -321,7 +393,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
             .count
             .store(index as u32 + 1, Ordering::Release);
         self.storage.publishing.store(0, Ordering::Release);
-        Ok(())
+        Ok(Append::Published)
     }
 
     #[cfg(any(test, feature = "host-test"))]
@@ -755,17 +827,99 @@ mod tests {
             .supply_node_bank(&MetadataStorage::new(), observed)
             .unwrap();
         assert_eq!(table.storage.bank_count(), 1);
-        // An allocator with no extent cannot add a bank.
+        // An allocator with no extent cannot add a bank: memory exhausted.
         assert_eq!(
             table.supply_node_bank(&MetadataStorage::new(), table.node_capacity()),
-            Err(Refusal::MetadataRequired)
+            Err(NodeBankShortfall::Metadata(MetadataMiss::Exhausted))
         );
         // A full table refuses before it allocates.
         table.storage.count.store(BANKS as u32, Ordering::Release);
         assert_eq!(
             table.supply_node_bank(&allocator, table.node_capacity()),
-            Err(Refusal::MetadataRequired)
+            Err(NodeBankShortfall::Full)
         );
         table.storage.count.store(1, Ordering::Release);
+    }
+
+    /// A peer's bank published inside this supply's check-then-act window:
+    /// its allocation runs between this supply's read of the bank count and
+    /// its own decision.
+    struct PeerSupplies<'a> {
+        table: &'a SharedReservations,
+        peer: &'a MetadataStorage,
+        then: &'a MetadataStorage,
+        supplied: Cell<usize>,
+        returned: Cell<usize>,
+    }
+    // SAFETY: delegates to MetadataStorage, which owns its extents.
+    unsafe impl ReservationMetadataAllocator for PeerSupplies<'_> {
+        fn allocate_with_extent(
+            &self,
+            layout: core::alloc::Layout,
+        ) -> Result<(*mut u8, ExtentGrantReceipt), MetadataMiss> {
+            let observed = self.table.node_capacity();
+            self.table.supply_node_bank(self.peer, observed).unwrap();
+            self.supplied.set(self.supplied.get() + 1);
+            self.then.allocate_with_extent(layout)
+        }
+        fn deallocate(&self, ptr: *mut u8, layout: core::alloc::Layout) {
+            self.returned.set(self.returned.get() + 1);
+            self.then.deallocate(ptr, layout)
+        }
+    }
+
+    /// #3085: a supply is one decision. A peer that publishes a bank,
+    /// even the table's last, between this supply's read and its act turns
+    /// the answer into "grown, rerun", never a false refusal, whether this
+    /// supply's own allocation then misses or succeeds.
+    #[test]
+    fn node_bank_supply_never_refuses_a_pool_a_peer_grew() {
+        let table = table();
+        let mut peer_backing = vec![0u8; 4 * 1024 * 1024];
+        let peer = MetadataStorage::new();
+        peer.admit_bootstrap_region(peer_backing.as_mut_ptr() as u64, peer_backing.len())
+            .unwrap();
+        let mut own_backing = vec![0u8; 2 * 1024 * 1024];
+        let own = MetadataStorage::new();
+        own.admit_bootstrap_region(own_backing.as_mut_ptr() as u64, own_backing.len())
+            .unwrap();
+        let empty = MetadataStorage::new();
+        // One bank short of full, so the peer's bank is the table's last.
+        table
+            .storage
+            .count
+            .store(BANKS as u32 - 1, Ordering::Release);
+        let observed = table.node_capacity();
+        // The supply's allocation misses after the peer's last bank landed.
+        let missing = PeerSupplies {
+            table: &table,
+            peer: &peer,
+            then: &empty,
+            supplied: Cell::new(0),
+            returned: Cell::new(0),
+        };
+        assert_eq!(table.supply_node_bank(&missing, observed), Ok(()));
+        assert_eq!(missing.supplied.get(), 1);
+        assert_eq!(missing.returned.get(), 0);
+        assert_eq!(table.storage.bank_count(), BANKS as u32);
+        // The supply's allocation succeeds after a peer's bank landed: its
+        // bank is redundant, returned, and the answer is still "grown".
+        table
+            .storage
+            .count
+            .store(BANKS as u32 - 2, Ordering::Release);
+        let observed = table.node_capacity();
+        let allocating = PeerSupplies {
+            table: &table,
+            peer: &peer,
+            then: &own,
+            supplied: Cell::new(0),
+            returned: Cell::new(0),
+        };
+        assert_eq!(table.supply_node_bank(&allocating, observed), Ok(()));
+        assert_eq!(allocating.supplied.get(), 1);
+        assert_eq!(table.storage.bank_count(), BANKS as u32 - 1);
+        assert_eq!(allocating.returned.get(), 1);
+        table.storage.count.store(0, Ordering::Release);
     }
 }
