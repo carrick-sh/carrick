@@ -679,6 +679,7 @@
       "invalidation_members_counted": 0,
       "invalidation_kicks": 0,
       "invalidation_steady_state_shared_writes": 0,
+      "cross_cpu_shootdowns": 0,
       "softcpu_block_decodes": 0,
       "softcpu_block_emits": 0,
       "softcpu_code_page_walks": 0
