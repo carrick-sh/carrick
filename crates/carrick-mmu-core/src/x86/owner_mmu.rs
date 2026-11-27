@@ -172,6 +172,7 @@ impl crate::owner_mmu::OwnerGrantMmu for X86Mmu {
             DescriptorOutcome::Applied {
                 stores,
                 tables_linked,
+                ..
             } => {
                 let (Ok(live_stores), Ok(tables_linked)) =
                     (u32::try_from(stores), u8::try_from(tables_linked))

@@ -297,6 +297,7 @@ struct Words {
     stores: Cell<usize>,
     writes: Cell<usize>,
     fail: Cell<usize>,
+    invalidations: Cell<usize>,
 }
 impl Words {
     fn new() -> Self {
@@ -306,6 +307,7 @@ impl Words {
             stores: Cell::new(0),
             writes: Cell::new(0),
             fail: Cell::new(usize::MAX),
+            invalidations: Cell::new(0),
         }
     }
 }
@@ -344,7 +346,9 @@ impl LiveDescriptorWords for Words {
         Ok(())
     }
     fn publish_barrier(&self) {}
-    fn invalidate_range(&self, _: u64, _: u64) {}
+    fn invalidate_range(&self, _: u64, _: u64) {
+        self.invalidations.set(self.invalidations.get() + 1);
+    }
 }
 fn root(pa: u64) -> RootGpa {
     RootGpa::page_aligned(FrameGpa::new(pa)).unwrap()
@@ -1811,7 +1815,8 @@ fn whole_block_protection_edits_one_terminal_without_split_grants() {
         outcome,
         DescriptorOutcome::Applied {
             stores: 1,
-            tables_linked: 0
+            tables_linked: 0,
+            drain: TranslationDrain::Required,
         }
     ));
     assert_eq!(
@@ -2046,4 +2051,39 @@ fn hardware_walker_is_translate_leaf_hardware_with_refusal_split() {
     ] {
         assert!(seen.contains_key(class), "{class} not reached: {seen:?}");
     }
+}
+
+/// A fill of not-present entries (fresh tables and a first-touch leaf) leaves
+/// nothing any CPU may cache, so it drains nothing; replacing the present
+/// leaf it published (an unmap) drains its span (#3105).
+#[test]
+fn only_an_edit_of_a_present_entry_demands_a_translation_drain() {
+    let words = Words::new();
+    let first = apply(
+        &words,
+        map(0x4000, 0x800000, PAGE, LeafSize::Page),
+        &[root(0x2000), root(0x3000), root(0x4000)],
+    );
+    assert!(matches!(
+        first,
+        DescriptorOutcome::Applied {
+            tables_linked: 3,
+            drain: TranslationDrain::NotRequired,
+            ..
+        }
+    ));
+    assert_eq!(words.invalidations.get(), 0);
+    let unmap = apply(
+        &words,
+        DescriptorOp::Unmap(PageSpan::new(0x4000, PAGE)),
+        &[],
+    );
+    assert!(matches!(
+        unmap,
+        DescriptorOutcome::Applied {
+            drain: TranslationDrain::Required,
+            ..
+        }
+    ));
+    assert_eq!(words.invalidations.get(), 1);
 }
