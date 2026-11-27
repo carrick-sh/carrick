@@ -1869,6 +1869,20 @@ enum PendingSignalKind {
         remaining: Option<UserVa>,
     },
 }
+/// What [`NativeProcessEntry::park_signal_wait`] did with a signal-channel
+/// wait decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SignalPark {
+    /// The member parked (or yielded with its wait retained).
+    Parked,
+    /// The channel moved after the decision's snapshot: decide again.
+    Rerun,
+    /// The member's group is closing and has requested this member's exit
+    /// (#3081). Linux ends every thread at `exit_group`, whatever it is
+    /// blocked in, so the wait ends here and is never parked: the member
+    /// returns toward its checkpoint, which retires it.
+    GroupExiting,
+}
 struct PendingSignalWait {
     kind: PendingSignalKind,
     channel: Arc<WaitChannel>,
@@ -6715,7 +6729,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         channel: Arc<WaitChannel>,
         observed: carrick_sched_core::process::wait::TaskWakeGeneration,
         deadline: Option<carrick_guest_arch::Deadline>,
-    ) -> Result<bool, NativeFailure> {
+    ) -> Result<SignalPark, NativeFailure> {
         // A member parks one wait at a time, and a running member holds
         // none: its resume consumed it. A held wait is broken custody.
         if self.runtime.graph.lock().has_member_wait(&self.record) {
@@ -6738,8 +6752,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 probe: self.publication_wait_probe,
             },
         );
+        // Checked under the channel's bucket guard, before the generation:
+        // the closing owner publishes each member's exit request and then
+        // this channel (`publish_member_wait_channels`), so a decision that
+        // missed the request either sees it here or parks on a channel whose
+        // publication will wake it into this check.
+        if self.terminal_exit_requested() {
+            return Ok(SignalPark::GroupExiting);
+        }
         if channel.generation.generation() != observed {
-            return Ok(false);
+            return Ok(SignalPark::Rerun);
         }
         let sequence = zone.next_seq(record);
         self.arm_park_timer(record, sequence, deadline)?;
@@ -6777,7 +6799,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         .publish_owner_continuation(OwnerEntry::Syscall);
                 }
                 self.yield_retained_wait(record)?;
-                return Ok(true);
+                return Ok(SignalPark::Parked);
             }
             self.runtime.graph.lock().remove_signal_wait(&self.record);
             return Err(NativeFailure::Stale);
@@ -6785,7 +6807,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         drop(guard);
         zone.clear_current(self.source.slot);
         self.handoff = receipt;
-        Ok(true)
+        Ok(SignalPark::Parked)
     }
     fn resume_signal_wait(
         &mut self,
@@ -6852,16 +6874,26 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     carrick_personality_linux::abi::signal::LINUX_EAGAIN.guest_retval(),
                 ));
             }
-            if self.park_signal_wait(
+            match self.park_signal_wait(
                 pending.kind,
                 pending.channel.clone(),
                 observed,
                 pending.deadline,
             )? {
-                return Ok(LifecycleOutcome::Transferred {
-                    progress: carrick_core::Served::Idle,
-                    result: SyscallResult::new(0),
-                });
+                SignalPark::Parked => {
+                    return Ok(LifecycleOutcome::Transferred {
+                        progress: carrick_core::Served::Idle,
+                        result: SyscallResult::new(0),
+                    });
+                }
+                SignalPark::Rerun => {}
+                // The member never observes this answer: its checkpoint
+                // retires it on the way to user mode.
+                SignalPark::GroupExiting => {
+                    return Ok(returned(
+                        carrick_personality_linux::abi::signal::LINUX_EINTR.guest_retval(),
+                    ));
+                }
             }
         }
     }
@@ -6907,16 +6939,24 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             if let Some(hook) = self.runtime.signal_check_hook.lock().take() {
                 hook();
             }
-            if self.park_signal_wait(
+            match self.park_signal_wait(
                 PendingSignalKind::Sleep { remaining },
                 channel.clone(),
                 observed,
                 Some(deadline),
             )? {
-                return Ok(LifecycleOutcome::Transferred {
-                    progress: carrick_core::Served::Idle,
-                    result: SyscallResult::new(0),
-                });
+                SignalPark::Parked => {
+                    return Ok(LifecycleOutcome::Transferred {
+                        progress: carrick_core::Served::Idle,
+                        result: SyscallResult::new(0),
+                    });
+                }
+                SignalPark::Rerun => {}
+                // The member never observes this answer: its checkpoint
+                // retires it on the way to user mode.
+                SignalPark::GroupExiting => {
+                    return Ok(returned(carrick_syscall_abi::LINUX_EINTR.guest_retval()));
+                }
             }
         }
     }
@@ -7188,6 +7228,21 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .has_deliverable(self.record, blocked)
     }
 
+    /// The member's closing group has requested its exit: its published
+    /// host-exit request or, for an unregistered host birth, the page's
+    /// cancellation of that birth (#3081).
+    /// Takes the graph lock.
+    fn terminal_exit_requested(&self) -> bool {
+        if self.control.host_exit_requested() {
+            return true;
+        }
+        let graph = self.runtime.graph.lock();
+        graph.owner.task(self.key).is_ok_and(|row| {
+            self.control
+                .terminal_requested(row.native().resources().page)
+        })
+    }
+
     fn latch_default_terminating_exec_signal(&self) -> bool {
         let graph = self.runtime.graph.lock();
         let Ok(row) = graph.owner.task(self.key) else {
@@ -7340,11 +7395,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         let blocked = carrick_signal_core::policy::SigBlockMask::blocking_all_of(
             carrick_signal_core::SignalSet::from_bits(self.control.blocked().0),
         );
+        // A closing group's exit request ends the wait as a signal does: the
+        // member's checkpoint retires it before the answer reaches user mode
+        // (#3081).
         if row
             .native()
             .resources()
             .signals()
             .has_deliverable(self.record, blocked)
+            || self
+                .control
+                .terminal_requested(row.native().resources().page)
         {
             return Err(carrick_syscall_abi::LINUX_EINTR.guest_retval());
         }
@@ -7619,6 +7680,31 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         } else {
             None
         }
+    }
+    /// Wake every member parked on a signal channel of this closing group:
+    /// the task's own (sleeps, `rt_sigsuspend`, `rt_sigtimedwait`) and its
+    /// in-zone IPC waits, as signal arrival does. Each member's exit request
+    /// is already published, so each woken decision ends its wait
+    /// ([`SignalPark::GroupExiting`]) instead of parking again (#3081).
+    fn publish_member_wait_channels(&mut self) -> Result<(), NativeFailure> {
+        let channels: Vec<_> = {
+            let graph = self.runtime.graph.lock();
+            let own = graph
+                .owner
+                .task(self.key)
+                .map_err(|_| NativeFailure::Quarantined)?
+                .native()
+                .resources()
+                .channel
+                .clone();
+            own.into_iter()
+                .chain(graph.pending.ipc_channels(&self.key))
+                .collect()
+        };
+        for channel in &channels {
+            self.publish_channel(channel)?;
+        }
+        Ok(())
     }
     fn publish_channel(&mut self, channel: &Arc<WaitChannel>) -> Result<(), NativeFailure> {
         publish_signal_channel(
@@ -9060,6 +9146,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     self.interrupt_member_record(record)?;
                 }
             }
+            self.publish_member_wait_channels()?;
             // Native exception owners must have their cancellation checkpoint
             // queued before the host can admit its one-shot terminal wake batch.
             page.publish_exit_wait(self.binding.mm, WaitChannel::address(&channel));
@@ -12950,7 +13037,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             {
                 return Err(carrick_personality_linux::abi::signal::LINUX_EAGAIN);
             }
-            if self
+            match self
                 .park_signal_wait(
                     PendingSignalKind::Wait { set, info },
                     channel,
@@ -12959,7 +13046,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 )
                 .map_err(|error| carrick_syscall_abi::LinuxErrno::new(-error.errno() as i32))?
             {
-                return Ok(SignalWaitOutcome::Pending);
+                SignalPark::Parked => return Ok(SignalWaitOutcome::Pending),
+                SignalPark::Rerun => {}
+                SignalPark::GroupExiting => {
+                    return Err(carrick_personality_linux::abi::signal::LINUX_EINTR);
+                }
             }
         }
     }
@@ -13039,8 +13130,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 return Ok(false);
             }
             match self.park_signal_wait(PendingSignalKind::Suspend, channel, generation, None) {
-                Ok(true) => return Ok(true),
-                Ok(false) => continue,
+                Ok(SignalPark::Parked) => return Ok(true),
+                Ok(SignalPark::Rerun) => continue,
+                // As for an available signal: the suspend ends, and the
+                // checkpoint that restores its mask retires the member.
+                Ok(SignalPark::GroupExiting) => return Ok(false),
                 Err(error) => {
                     if self
                         .runtime
