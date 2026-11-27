@@ -30,8 +30,14 @@
  * syscall-free loop: that return is the last delivery point before it.
  * The peer is released before the hold, so no later syscall comes between
  * the hold and the loop. The return must wait for this CPU's own ICR to go
- * idle and send: the census right after the loop must read two busy sends,
- * one resend and one idle-ICR wait (exit 93 otherwise).
+ * idle (its next poll reads busy once) and send: the census right after the
+ * loop must read two busy sends, one resend, one wait that saw the ICR busy,
+ * and the resend at the syscall's own return (exit 93 otherwise).
+ *
+ * -DICR_FLAPPING (#3083): as LAST_RETURN, but every send finds the ICR
+ * busy while every idle-ICR poll reads it idle, a local APIC that never
+ * accepts its send. The hold's return must end the run with a CPL0 fatal
+ * at the bounded wait, never loop; the fixture never reaches its exit.
  *
  * Exit 7: the peer took the publication, and the ordered pass ran once.
  * 81: arming failed; 82: the peer never reached its stop; 83: the
@@ -53,17 +59,26 @@
 #define INJECT_RESCHED_BUSY_CENSUS         0xfffffffffffffe5e
 #define POLL_LIMIT                         0x1000000
 
-#ifdef LAST_RETURN
-#define BUSY_RESCHED 1
-#define BUSY_INJECT     INJECT_RESCHED_BUSY_TWICE
-#define BUSY_AFTER_HOLD 0x0001000100000002
-#define BUSY_AT_END     0x0001000100000002
+/* Census: sends found busy | resent << 16 | waits that saw it busy << 32
+ * | the last resend's return to user << 48 (1: the syscall's own). */
+#ifdef ICR_FLAPPING
+#define LAST_RETURN 1
+#define BUSY_INJECT     INJECT_RESCHED_ICR_FLAPPING
+#elif defined(LAST_RETURN)
+#define BUSY_INJECT     INJECT_RESCHED_BUSY_THROUGH_LAST_RETURN
 #else
 #define BUSY_INJECT     INJECT_RESCHED_BUSY_ONCE
-#define BUSY_AFTER_HOLD 0x100000001
-#define BUSY_AT_END     0x100000001
 #endif
-#define INJECT_RESCHED_BUSY_TWICE          0xfffffffffffffe5f
+#ifdef LAST_RETURN
+#define BUSY_RESCHED 1
+#define BUSY_AFTER_HOLD 0x0001000100010002
+#define BUSY_AT_END     0x0001000100010002
+#else
+#define BUSY_AFTER_HOLD 0x0001000000010001
+#define BUSY_AT_END     0x0001000000010001
+#endif
+#define INJECT_RESCHED_BUSY_THROUGH_LAST_RETURN 0xfffffffffffffe5f
+#define INJECT_RESCHED_ICR_FLAPPING        0xfffffffffffffe60
 #define SPIN_USER                          0x1000000
 #ifdef BUSY_RESCHED
 #define AFTER_IDLE_READ 1

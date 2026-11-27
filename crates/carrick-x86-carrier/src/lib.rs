@@ -87,7 +87,9 @@ macro_rules! export_carrier {
             );
             // A resolved fault's return to user is the last-chance delivery
             // point for the reschedule IPIs this CPU owes (#3083).
-            carrick_el1::isa::x86::interrupt::deliver_owed_resched_before_user();
+            carrick_el1::isa::x86::interrupt::deliver_owed_resched_before_user(
+                carrick_el1::isa::x86::interrupt::UserReturn::PageFault,
+            );
             code
         }
 

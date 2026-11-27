@@ -4495,6 +4495,28 @@ fn production_resched_ipi_busy_at_the_last_return_to_user_is_sent_before_it() {
     );
 }
 
+/// #3083 on x86 CPL0: the last-return witness above, with a local APIC
+/// whose sends always find the ICR busy while its polls read it idle. The
+/// last-chance wait's bound must hold across retries that send nothing:
+/// the run ends with a CPL0 fatal at the wait, never a loop past the
+/// child's bound.
+#[test]
+fn production_resched_ipi_never_accepted_at_the_last_return_is_fatal() {
+    const TEST_NAME: &str = "production_resched_ipi_never_accepted_at_the_last_return_is_fatal";
+    if !in_bounded_child(TEST_NAME, Duration::from_secs(20)) {
+        return;
+    }
+    let elf = kvm_pool_fixture::assemble_fixture("native_idle_peer_wake.S", &["-DICR_FLAPPING=1"]);
+    let Err(failure) = kvm_pool_fixture::try_run_instrumented_pool_fixture(&elf, 128) else {
+        panic!("a local APIC that never accepts its send must end the run");
+    };
+    let message = format!("{failure:?}");
+    assert!(
+        message.contains("CPL0 fatal exit at") && message.contains("src/isa/x86/interrupt.rs:"),
+        "expected the bounded ICR wait's fatal, got {message}"
+    );
+}
+
 /// #2321 on x86 CPL0: blocking wait4 on a production fork child that is
 /// already a zombie, with the pre-reap status copy contended once. An editor
 /// holder parks the caller once on the existing owner wait; a Busy copy is

@@ -863,7 +863,9 @@ pub fn carrier_validate_return<P: Personality>(frame: &mut NativeFrame, xsave: &
     // A return to user is the last-chance delivery point for the
     // reschedule IPIs this CPU owes after a busy ICR (#3083): the thread
     // may never enter the kernel again, so a still-busy ICR is waited out.
-    carrick_el1::isa::x86::interrupt::deliver_owed_resched_before_user();
+    carrick_el1::isa::x86::interrupt::deliver_owed_resched_before_user(
+        carrick_el1::isa::x86::interrupt::UserReturn::Syscall,
+    );
     if !frame.valid_user_return() {
         doorbell(FATAL_PORT, frame);
         halt();
