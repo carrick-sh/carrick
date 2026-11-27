@@ -50,6 +50,7 @@ mod explore;
 mod grant;
 mod holds;
 mod mm;
+mod release;
 
 pub use editor::{ExcludedMm, HostEdit, MmEditor, NotNow};
 pub use grant::{
@@ -58,6 +59,7 @@ pub use grant::{
 };
 pub use holds::{DrainContext, HoldError, HoldRetirement, SlotHolds};
 pub use mm::MmKey;
+pub use release::{BrokenRelease, MmLife, ReleaseOutcome, ReleaseTicket, ReleaseWait};
 #[cfg(all(test, feature = "loom"))]
 mod loom_models;
 #[cfg(all(test, not(feature = "loom")))]
@@ -267,6 +269,8 @@ pub enum Refusal {
     InFlight,
     /// An id or pin counter is exhausted.
     Exhausted,
+    /// The MM is live: its members may still use what a release would take.
+    Live,
 }
 
 /// A refusal that hands back what the caller offered.
@@ -1009,6 +1013,7 @@ impl<V: CoreVenue, M, B, G> CarrierCore<V, M, B, G> {
             }
         }
         self.check_grant_invariants()?;
+        self.check_release_invariants()?;
         match self.state {
             GenerationState::Vacant | GenerationState::Gone if !self.mappings.is_empty() => {
                 Err(Violation::MappingOutlivesGeneration)
@@ -1039,6 +1044,10 @@ pub enum Violation {
     ChunkWithoutMm,
     ChunkRoom,
     GrantOutsideChunk,
+    /// L1: an MM that is not live has an editor held.
+    EditorAfterExit,
+    /// L2: a releasing MM still holds a grant or a chunk.
+    ReleasingHolds,
 }
 
 impl<V: CoreVenue, M, B, G> Drop for CarrierCore<V, M, B, G> {

@@ -1187,7 +1187,7 @@ fn post_exec_native_fork_reserves_loaded_image_source_custody() {
             },
             clean,
             |_| bytes.iter().all(|byte| *byte == 0),
-            |_| true,
+            |_| carrick_core_abi::mm::ReleaseOutcome::Done,
         )
         .unwrap();
     assert!(stock.child_root(request.child_mm).is_none());

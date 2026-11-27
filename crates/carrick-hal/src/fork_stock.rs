@@ -20,6 +20,7 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroU64;
 
+use carrick_core_abi::mm::{BrokenRelease, ReleaseOutcome, ReleaseWait};
 use carrick_el1_abi::{
     ChildRetireRefusal, ExecutionBinding, ForkLifecycleLoan, ForkStockExchange, ForkStockLoan,
     ForkStockRefusal, ForkStockSettlement, MmReleaseReceipt, NativeChildRetire, ReservationMm,
@@ -363,6 +364,12 @@ pub enum ForkStockServiceError {
     /// The stock holds fewer table pages than an exec successor build needs.
     /// Not now, never fatal: the exec waits for stock to return.
     SuccessorTableCapacity,
+    /// A retired MM's release found a broken invariant: the carrier ends.
+    /// Never a deferral the next drain retries (#3132).
+    BrokenRelease(BrokenRelease),
+    /// A retired MM's release can't finish yet; the wait names what reruns
+    /// it. The predecessor stays owed, with nothing else changed.
+    ReleaseNotNow(ReleaseWait),
 }
 
 /// Per-child address-space tag. AArch64 tags every forked root with a
@@ -739,9 +746,10 @@ impl LifecycleWindow {
 /// [`MmReleaseReceipt`], and the receipt is spent at once on the owed
 /// returns the retired MM's root left in `returns`: those slots are freed
 /// only now, after the frames they name returned with the MM's inventory.
-/// `false`: the release failed, or a root still publishes the MM and owes
-/// returns; those returns stay owed, and the caller's existing retry reruns
-/// this release (idempotent: an emptied MM retires nothing again).
+/// "Not now" when the release could not finish, or when a root still
+/// publishes the MM and owes returns; those returns stay owed, and the next
+/// drain reruns this release (idempotent: an emptied MM retires nothing
+/// again).
 pub fn release_child_mm(
     inventory: &dyn crate::PhysicalFrameInventory,
     residency: &carrick_el1_abi::FrameGrantResidencyTable<
@@ -749,9 +757,32 @@ pub fn release_child_mm(
     >,
     returns: &dyn RetiredReturns,
     absent: &carrick_sched_core::ExcludedEditor<'_>,
-) -> bool {
-    MmReleaseReceipt::released(absent, |mm| release_mm_memory(inventory, residency, mm))
-        .is_some_and(|receipt| returns.settle_whole_mm(receipt).is_ok())
+) -> ReleaseOutcome {
+    match MmReleaseReceipt::released(absent, |mm| release_mm_memory(inventory, residency, mm)) {
+        None => ReleaseOutcome::NotNow(ReleaseWait::NextDrain),
+        Some(receipt) => ReleaseOutcome::done_or(
+            returns.settle_whole_mm(receipt).is_ok(),
+            ReleaseWait::OwedReturns,
+        ),
+    }
+}
+
+/// [`release_child_mm`] for a retired MM whose space the guest must first
+/// unpublish: "not now" until it has, since only the unpublish proves no EL1
+/// editor of the MM can exist.
+pub fn release_unpublished_child_mm(
+    spaces: &carrick_sched_core::AddressSpaces,
+    inventory: &dyn crate::PhysicalFrameInventory,
+    residency: &carrick_el1_abi::FrameGrantResidencyTable<
+        impl carrick_el1_abi::FrameGrantResidencyAccess,
+    >,
+    returns: &dyn RetiredReturns,
+    absence: &SlotAbsence,
+) -> ReleaseOutcome {
+    match spaces.unpublished(absence.mm().raw()) {
+        Some(absent) => release_child_mm(inventory, residency, returns, &absent),
+        None => ReleaseOutcome::NotNow(ReleaseWait::Unpublish),
+    }
 }
 
 /// Roll back the carrier-wide per-MM state of a fork child that never ran:
@@ -764,8 +795,11 @@ pub fn release_unrun_child_mm(
         impl carrick_el1_abi::FrameGrantResidencyAccess,
     >,
     mm: ReservationMm,
-) -> bool {
-    release_mm_memory(inventory, residency, mm)
+) -> ReleaseOutcome {
+    ReleaseOutcome::done_or(
+        release_mm_memory(inventory, residency, mm),
+        ReleaseWait::NextDrain,
+    )
 }
 
 fn release_mm_memory(
@@ -2513,14 +2547,16 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
     /// Consume an exact exec predecessor receipt after translation switch.
     /// Carrier release runs once; table clearing and tag retirement must both
     /// succeed before stock is reusable. A stale or duplicate receipt cannot
-    /// act on a later MM that recycled either numeric identity.
+    /// act on a later MM that recycled either numeric identity. A release
+    /// that answers "not now" keeps the receipt owed (`ReleaseNotNow`); a
+    /// broken one is `BrokenRelease`, which the venue must make fatal.
     pub fn settle_exec_predecessor(
         &mut self,
         ledger: &mut impl ForkTableLedger,
         receipt: ExecPredecessorReceipt<T::Tag>,
         absence: SlotAbsence,
         mut clear_tables: impl FnMut(&[RootGpa]) -> bool,
-        mut release: impl FnMut(&C, &SlotAbsence) -> bool,
+        mut release: impl FnMut(&C, &SlotAbsence) -> ReleaseOutcome,
     ) -> Result<(), ForkStockServiceError> {
         let Some(mut pending) = self.exec_predecessors.remove(&receipt.sequence) else {
             return Err(ForkStockServiceError::StaleExecution);
@@ -2537,11 +2573,20 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             return Err(ForkStockServiceError::StaleExecution);
         }
         if !pending.released {
-            if let ExecPredecessorPhysical::Child(physical) = &pending.physical
-                && !release(physical, &absence)
-            {
-                self.exec_predecessors.insert(receipt.sequence, pending);
-                return Err(ForkStockServiceError::MemoryAccessFailed);
+            if let ExecPredecessorPhysical::Child(physical) = &pending.physical {
+                let stopped = match release(physical, &absence) {
+                    ReleaseOutcome::Done => None,
+                    ReleaseOutcome::NotNow(wait) => {
+                        Some(ForkStockServiceError::ReleaseNotNow(wait))
+                    }
+                    ReleaseOutcome::Broken(broken) => {
+                        Some(ForkStockServiceError::BrokenRelease(broken))
+                    }
+                };
+                if let Some(error) = stopped {
+                    self.exec_predecessors.insert(receipt.sequence, pending);
+                    return Err(error);
+                }
             }
             pending.released = true;
         }
@@ -3343,11 +3388,12 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
     /// Drain quarantine. A child MM is reclaimed only when it is not
     /// active in the authenticated execution venue and `occupancy` proves no zone slot has it installed.
     /// Its tables and lifecycle record are cleared and its tag retired
-    /// before anything reenters the reusable stock. A child whose release,
-    /// clear or tag retirement fails is deferred (counted, still
-    /// quarantined, retried at the next drain); only a broken custody
-    /// invariant (a quarantined MM with neither a committed child nor
-    /// borrowed parent tables) is an error.
+    /// before anything reenters the reusable stock. A child whose release
+    /// answers "not now", or whose clear or tag retirement fails, is
+    /// deferred (counted, still quarantined, retried at the next drain).
+    /// Only a broken invariant is an error: a release that answers `Broken`
+    /// (`BrokenRelease`), or a quarantined MM with neither a committed child
+    /// nor borrowed parent tables.
     pub fn reclaim(
         &mut self,
         ledger: &mut impl ForkTableLedger,
@@ -3355,7 +3401,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         occupancy: impl Fn(ReservationMm) -> Option<SlotAbsence>,
         mut clear_tables: impl FnMut(&[RootGpa]) -> bool,
         mut clear_lifecycle: impl FnMut(ForkLifecycleLoan) -> bool,
-        mut release: impl FnMut(&SlotAbsence) -> bool,
+        mut release: impl FnMut(&SlotAbsence) -> ReleaseOutcome,
     ) -> Result<usize, ForkStockServiceError> {
         let active = execution.into().active.and_then(MmKey::of);
         let candidates: Vec<(MmKey, SlotAbsence)> = self
@@ -3399,12 +3445,19 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             // stock stays held, the deferral is counted, and the next drain
             // retries it. Guest behaviour never turns into a carrier fault.
             let deferred = if let Some((lifecycle, tag)) = child {
-                if self
+                let outcome = if self
                     .quarantine
                     .get(&key)
                     .is_some_and(|state| !state.released)
-                    && !release(&absence)
                 {
+                    release(&absence)
+                } else {
+                    ReleaseOutcome::Done
+                };
+                if let ReleaseOutcome::Broken(broken) = outcome {
+                    return Err(ForkStockServiceError::BrokenRelease(broken));
+                }
+                if !outcome.is_done() {
                     true
                 } else {
                     self.quarantine

@@ -1,6 +1,7 @@
 //! Physical custody service for CPL0-selected anonymous windows. No host VMA
 //! selection or live descriptor store occurs at this boundary.
 use super::*;
+use carrick_core::mm::own::{BrokenRelease, ReleaseOutcome, ReleaseWait};
 use carrick_el1_abi::{MmPortalSlots, PortalGrantWindow};
 use carrick_guest_arch::KernelVa;
 use carrick_hal::fork_stock::{
@@ -807,69 +808,97 @@ fn resolve_cpl0_residency<M: CarrierMemoryIo>(
     Ok(resolved)
 }
 
-/// A release that quarantined the carrier found a broken invariant (#3132:
-/// a released slot that a frame still names): that ends the run, never the
-/// deferral the stock counts and retries on its next drain, which could
-/// only loop while the guest kept running. The stock's release callbacks
-/// answer a bool, so each drain asks this once the stock returns.
-pub(super) fn fatal_if_quarantined<M: CarrierMemoryIo>(
-    memory: &CarrierMemory<M>,
-) -> Result<(), TrapError> {
-    if memory.is_quarantined() {
-        return Err(fail(
-            "carrier memory quarantined (a broken invariant) at a retired-child release drain",
-        ));
+/// A release step that must finish now: a fork refused or aborted before
+/// commit rolls back an MM nothing ever ran, so "not now" has nothing to wait
+/// for, and both "not now" and broken end the run.
+pub(super) fn release_done(outcome: ReleaseOutcome, what: &str) -> Result<(), TrapError> {
+    match outcome {
+        ReleaseOutcome::Done => Ok(()),
+        other => Err(fail(format!("{what}: {other:?}"))),
     }
-    Ok(())
+}
+
+/// The verdict of a release a drain ran: `Broken` ends the run (#3132).
+pub(super) fn broken_release_fatal(broken: BrokenRelease) -> TrapError {
+    fail(format!(
+        "a retired MM's release found a broken invariant at {}",
+        broken.site()
+    ))
 }
 
 /// Release a reclaimed child's carrier-wide state: its frame-inventory rows
 /// and COW residency (shared composition), then its CR3/alias registrations
-/// and the memslots admitted only for it.
+/// and the memslots admitted only for it. A retired MM goes through the
+/// core's two-phase release (#3061 PR 1b): the core hands back its grants,
+/// the steps here run, and their outcome settles the core's record.
 pub(super) fn release_retired_child<M: CarrierMemoryIo>(
     memory: &mut CarrierMemory<M>,
     inventory: &dyn carrick_hal::PhysicalFrameInventory,
     absence: &SlotAbsence,
     release: ChildRelease<'_>,
-) -> Result<crate::carrier_memory::RetiredChild, TrapError> {
-    let residency = resolve_cpl0_residency(memory)?;
-    let residency_view = residency
-        .view()
-        .ok_or_else(|| fail("cpl0 residency view unavailable"))?;
+) -> ReleaseOutcome {
+    let broken = |site| ReleaseOutcome::Broken(BrokenRelease::at(site));
+    let Ok(residency) = resolve_cpl0_residency(memory) else {
+        return broken("cpl0 residency resolution");
+    };
+    let Some(residency_view) = residency.view() else {
+        return broken("cpl0 residency view");
+    };
     let released = match release {
         ChildRelease::Retired { returns, zone, mms } => {
-            match zone.spaces.unpublished(absence.mm().raw()) {
-                Some(absent) => {
-                    // The retired MM's replacement grants, claimed or not, go
-                    // with it: no member is left to claim one and no exclusion
-                    // will settle one. Its inventory release below retires
-                    // their frames with the rest of its mappings.
-                    // SAFETY: retained aligned atomic-only kernel record
-                    // initialized at boot.
-                    let pool: &carrick_el1_abi::CowGrantPool = unsafe {
-                        memory.retained_record(FrameGpa::new(
-                            KERNEL_REGION_GPA + carrick_el1_abi::EL1_COW_GRANT_POOL_OFFSET,
-                        ))
-                    }
-                    .map_err(|error| fail(error.to_string()))?;
-                    pool.release_mm(&absent);
-                    let key = NonZeroU64::new(absent.key())
-                        .ok_or_else(|| fail("retired child null MM"))?;
-                    drop(
-                        mms.retire_mm(carrick_core::mm::own::MmKey::new(key))
-                            .map_err(|refusal| {
-                                fail(format!("retired child COW grants: {refusal:?}"))
-                            })?,
-                    );
-                    carrick_hal::fork_stock::release_child_mm(
-                        inventory,
-                        &residency_view,
-                        returns,
-                        &absent,
-                    )
+            // The guest unpublished the space: no member is left, and no
+            // exclusion will settle anything of it again.
+            let Some(absent) = zone.spaces.unpublished(absence.mm().raw()) else {
+                return ReleaseOutcome::NotNow(ReleaseWait::Unpublish);
+            };
+            let Some(key) = NonZeroU64::new(absent.key()).map(carrick_core::mm::own::MmKey::new)
+            else {
+                return broken("retired child null MM");
+            };
+            match mms.exit_mm(key) {
+                Ok(()) => {}
+                Err(carrick_core::mm::own::MmRefusal::NotNow(_)) => {
+                    return ReleaseOutcome::NotNow(ReleaseWait::NextDrain);
                 }
-                None => false,
+                Err(carrick_core::mm::own::MmRefusal::Refused(_)) => {
+                    return broken("retired child core exit");
+                }
             }
+            // The retired MM's replacement grants, claimed or not, go
+            // with it: no member is left to claim one and no exclusion
+            // will settle one. Its inventory release below retires
+            // their frames with the rest of its mappings.
+            // SAFETY: retained aligned atomic-only kernel record
+            // initialized at boot.
+            let Ok(pool) = (unsafe {
+                memory.retained_record::<carrick_el1_abi::CowGrantPool>(FrameGpa::new(
+                    KERNEL_REGION_GPA + carrick_el1_abi::EL1_COW_GRANT_POOL_OFFSET,
+                ))
+            }) else {
+                return broken("cow grant pool record");
+            };
+            pool.release_mm(&absent);
+            let (ticket, grants) = match mms.begin_release(key) {
+                Ok(begun) => begun,
+                Err(carrick_core::mm::own::MmRefusal::NotNow(_)) => {
+                    return ReleaseOutcome::NotNow(ReleaseWait::NextDrain);
+                }
+                Err(carrick_core::mm::own::MmRefusal::Refused(_)) => {
+                    return broken("retired child core release");
+                }
+            };
+            drop(grants);
+            let outcome = carrick_hal::fork_stock::release_child_mm(
+                inventory,
+                &residency_view,
+                returns,
+                &absent,
+            )
+            .then(|| retire_child_memory(memory, absence, inventory));
+            return match mms.finish_release(ticket, outcome) {
+                Ok(outcome) => outcome,
+                Err(_) => broken("retired child release ticket"),
+            };
         }
         ChildRelease::Unrun => carrick_hal::fork_stock::release_unrun_child_mm(
             inventory,
@@ -877,12 +906,24 @@ pub(super) fn release_retired_child<M: CarrierMemoryIo>(
             absence.mm(),
         ),
     };
-    if !released {
-        return Err(fail("retired child inventory or residency release"));
+    released.then(|| retire_child_memory(memory, absence, inventory))
+}
+
+/// The carrier memory's part of a release. A refusal that quarantined the
+/// carrier is a broken invariant (#3132); any other refusal changed nothing
+/// and reruns at the next drain.
+fn retire_child_memory<M: CarrierMemoryIo>(
+    memory: &mut CarrierMemory<M>,
+    absence: &SlotAbsence,
+    inventory: &dyn carrick_hal::PhysicalFrameInventory,
+) -> ReleaseOutcome {
+    match memory.retire_child(absence, inventory) {
+        Ok(_) => ReleaseOutcome::Done,
+        Err(_) if memory.is_quarantined() => {
+            ReleaseOutcome::Broken(BrokenRelease::at("carrier memory retire_child"))
+        }
+        Err(_) => ReleaseOutcome::NotNow(ReleaseWait::NextDrain),
     }
-    memory
-        .retire_child(absence, inventory)
-        .map_err(|e| fail(e.to_string()))
 }
 
 /// The residency rows one fork publishes: a one-page row in the parent and
@@ -1416,15 +1457,17 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                             mms: &mut mms.borrow_mut(),
                         },
                     )
-                    .is_ok()
                 },
             )
             .map(|_| ())
-            // A refused release, clear or tag retirement defers only that
-            // child (counted as `reclaim_deferral`, retried next drain).
-            // What remains is a broken custody invariant, never guest input.
-            .map_err(|e| fail(format!("fork quarantine custody invariant: {e:?}")))?;
-        fatal_if_quarantined(&self._vm)?;
+            // A release that answers "not now", or a refused clear or tag
+            // retirement, defers only that child (counted as
+            // `reclaim_deferral`, retried next drain). What remains is a
+            // broken invariant, never guest input.
+            .map_err(|e| match e {
+                ForkStockServiceError::BrokenRelease(broken) => broken_release_fatal(broken),
+                e => fail(format!("fork quarantine custody invariant: {e:?}")),
+            })?;
         // An adopted exec's predecessor whose release was deferred settles
         // with the same drain.
         self.settle_exec_predecessors()
@@ -2075,11 +2118,14 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             if root_installed.get() {
                 let absence = SlotAbsence::scan(loan.request.child_mm, [])
                     .ok_or_else(|| fail("unpublished child MM slot absence"))?;
-                release_retired_child(
-                    &mut self._vm,
-                    &*frame_inventory,
-                    &absence,
-                    ChildRelease::Unrun,
+                release_done(
+                    release_retired_child(
+                        &mut self._vm,
+                        &*frame_inventory,
+                        &absence,
+                        ChildRelease::Unrun,
+                    ),
+                    "refused child rollback",
                 )?;
             } else {
                 let residency = self.cow_residency()?;
@@ -2090,7 +2136,9 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                     &*frame_inventory,
                     &view,
                     loan.request.child_mm,
-                ) {
+                )
+                .is_done()
+                {
                     return Err(fail("unpublished child inventory rollback"));
                 }
             }
@@ -2163,11 +2211,14 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         if is_abort && had_admitted {
             let absence = SlotAbsence::scan(loan.request.child_mm, [])
                 .ok_or_else(|| fail("aborted child MM slot absence"))?;
-            release_retired_child(
-                &mut self._vm,
-                &*self.frame_inventory,
-                &absence,
-                ChildRelease::Unrun,
+            release_done(
+                release_retired_child(
+                    &mut self._vm,
+                    &*self.frame_inventory,
+                    &absence,
+                    ChildRelease::Unrun,
+                ),
+                "aborted child rollback",
             )?;
         }
         // SAFETY: settlement is a fully initialized array of sixteen u64 words.

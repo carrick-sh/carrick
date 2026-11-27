@@ -373,19 +373,25 @@ fn settle_native_exec_predecessor(
             absence,
             |pages| crate::fork_stock::ForkStockHostCustody::clear_tables(custody, pages),
             |_, absence| {
-                zone.spaces
-                    .unpublished(absence.mm().raw())
-                    .is_some_and(|absent| {
-                        carrick_hal::fork_stock::release_child_mm(
-                            &*inventory,
-                            &residency,
-                            returns,
-                            &absent,
-                        )
-                    })
+                carrick_hal::fork_stock::release_unpublished_child_mm(
+                    &zone.spaces,
+                    &*inventory,
+                    &residency,
+                    returns,
+                    absence,
+                )
             },
         )
     };
+    if let Err(carrick_hal::fork_stock::ForkStockServiceError::BrokenRelease(broken)) = settled {
+        // A broken invariant ends the run, never a deferral the next drain
+        // retries (#3132).
+        carrick_fatal::carrick_fatal!(
+            "hvf::fork_stock",
+            "exec predecessor release found a broken invariant at {}",
+            broken.site()
+        );
+    }
     if settled.is_err() {
         return false;
     }
@@ -1720,7 +1726,7 @@ fn reclaim_fork_stock(
         .view()
         .ok_or(ForkStockServiceError::InvalidRecord)?;
     let returns = retained_reservations(region).ok_or(ForkStockServiceError::InvalidRecord)?;
-    stock.owner.reclaim(
+    let reclaimed = stock.owner.reclaim(
         ledger,
         execution,
         |mm| {
@@ -1738,18 +1744,25 @@ fn reclaim_fork_stock(
         |pages| crate::fork_stock::ForkStockHostCustody::clear_tables(custody, pages),
         |life| lifecycle_window(custody, life).is_some_and(|window| window.clear(life)),
         |absence| {
-            zone.spaces
-                .unpublished(absence.mm().raw())
-                .is_some_and(|absent| {
-                    carrick_hal::fork_stock::release_child_mm(
-                        &*inventory,
-                        &residency,
-                        returns,
-                        &absent,
-                    )
-                })
+            carrick_hal::fork_stock::release_unpublished_child_mm(
+                &zone.spaces,
+                &*inventory,
+                &residency,
+                returns,
+                absence,
+            )
         },
-    )
+    );
+    // A broken invariant ends the run here, once for every caller, never a
+    // refusal the guest sees or a deferral the next drain retries (#3132).
+    if let Err(ForkStockServiceError::BrokenRelease(broken)) = reclaimed {
+        carrick_fatal::carrick_fatal!(
+            "hvf::fork_stock",
+            "fork quarantine release found a broken invariant at {}",
+            broken.site()
+        );
+    }
+    reclaimed
 }
 
 /// The guest's shared reservation table in the retained carrier region,
