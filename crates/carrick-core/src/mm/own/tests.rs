@@ -314,10 +314,27 @@ fn grant_carrier() -> CarrierId {
     unsafe { CarrierId::assume_unique(NonZeroU64::MIN) }
 }
 
-fn cow_demand(ipa: u64) -> CowDemand {
-    CowDemand {
-        page: 0x1000,
-        replacement: GpaExtent::new(ipa, 0x4000).unwrap(),
+/// A core whose chunks hold two 16 KiB grants.
+fn small_arena() -> GrantCore {
+    let mut core = GrantCore::new(grant_carrier());
+    core.set_cow_geometry(CowArenaGeometry::new(0x4000, 0x8000).unwrap())
+        .unwrap();
+    core
+}
+
+/// Supply one grant of `excluded`'s MM, mapping a chunk at `chunk` if the
+/// core asks for one.
+fn supply(core: &mut GrantCore, excluded: &ExcludedMm<'_>, chunk: u64) -> (SupplyTicket, bool) {
+    match core.supply_cow(excluded, 0x1000).unwrap() {
+        CowSupply::Carved(ticket) => (ticket, false),
+        CowSupply::NeedsChunk(demand) => {
+            assert_eq!(demand.len(), 0x8000);
+            (
+                core.admit_chunk(demand, GpaExtent::new(chunk, 0x8000).unwrap())
+                    .unwrap(),
+                true,
+            )
+        }
     }
 }
 
@@ -330,23 +347,18 @@ fn a_cow_grant_settles_once_under_its_own_mm_and_retires_with_it() {
         MmKey::new(NonZeroU64::MIN),
         MmKey::new(NonZeroU64::new(2).unwrap()),
     );
-    let mut core = GrantCore::new(grant_carrier());
+    let mut core = small_arena();
     let (xa, xb) = (ExcludedMm::claimed(a), ExcludedMm::claimed(b));
-    for (excluded, ipa, payload) in [(&xa, 0x10_000, 1), (&xa, 0x20_000, 2), (&xb, 0x30_000, 3)] {
-        let ticket = core.supply_cow(excluded, cow_demand(ipa)).unwrap();
+    for (excluded, chunk, payload) in [(&xa, 0x10_000, 1), (&xa, 0, 2), (&xb, 0x30_000, 3)] {
+        let (ticket, _) = supply(&mut core, excluded, chunk);
         assert_eq!(
-            core.supply_cow(excluded, cow_demand(0x40_000)),
+            core.supply_cow(excluded, 0x1000),
             Err(MmRefusal::Refused(Refusal::InFlight)),
             "one host edit of an MM at a time"
         );
         core.finish_supply_cow(ticket, Supplied::Published(payload))
             .unwrap();
     }
-    assert_eq!(
-        core.supply_cow(&xb, cow_demand(0x12_000)),
-        Err(MmRefusal::Refused(Refusal::Collision)),
-        "G1: replacement extents never overlap"
-    );
     let proof = core.begin_settle(&xb).unwrap();
     assert_eq!(
         core.settle_cow(&proof, &1),
@@ -364,6 +376,89 @@ fn a_cow_grant_settles_once_under_its_own_mm_and_retires_with_it() {
     returned.sort();
     assert_eq!(returned, [1, 2]);
     assert_eq!(core.grant_count(), 0);
+    assert_eq!(core.chunk_count(), 1, "b's chunk stays with b");
+    assert!(core.retire_mm(b).unwrap().is_empty());
+    assert!(core.teardown().is_ok());
+}
+
+/// #3099: grants are carved from the MM's chunk, so N supplies ask the
+/// shell for ceil(N / grants-per-chunk) chunks, never one mapping each.
+/// A chunk is refused before it is stored when it is the wrong size,
+/// misaligned or overlaps another MM's, and the demand comes back whole.
+#[test]
+fn an_mms_grants_are_carved_from_its_chunks_and_a_bad_chunk_is_refused_whole() {
+    let (a, b) = (
+        MmKey::new(NonZeroU64::MIN),
+        MmKey::new(NonZeroU64::new(2).unwrap()),
+    );
+    let mut core = small_arena();
+    let (xa, xb) = (ExcludedMm::claimed(a), ExcludedMm::claimed(b));
+    let mut chunks = 0;
+    let mut extents = vec![];
+    for n in 0..5u64 {
+        let (ticket, mapped) = supply(&mut core, &xa, 0x10_000 + (n / 2) * 0x8000);
+        chunks += usize::from(mapped);
+        extents.push(ticket.extent());
+        core.finish_supply_cow(ticket, Supplied::Published(n as u8))
+            .unwrap();
+    }
+    assert_eq!(chunks, 3, "5 grants of 2 per chunk need 3 chunks");
+    assert_eq!(core.chunk_count(), 3);
+    assert_eq!(
+        extents
+            .iter()
+            .map(|e| e.ipa())
+            .collect::<std::vec::Vec<_>>(),
+        [0x10_000, 0x14_000, 0x18_000, 0x1c_000, 0x20_000],
+        "carved from each chunk's base up"
+    );
+    let CowSupply::NeedsChunk(demand) = core.supply_cow(&xb, 0x1000).unwrap() else {
+        panic!("b has no chunk");
+    };
+    let demand = core
+        .admit_chunk(demand, GpaExtent::new(0x20_000, 0x8000).unwrap())
+        .expect_err("overlaps a's chunk")
+        .offered;
+    let demand = core
+        .admit_chunk(demand, GpaExtent::new(0x40_000, 0x4000).unwrap())
+        .expect_err("not a chunk's size")
+        .offered;
+    let demand = core
+        .admit_chunk(demand, GpaExtent::new(0x40_800, 0x8000).unwrap())
+        .expect_err("not grant-aligned")
+        .offered;
+    assert_eq!(core.editor(b), Some(MmEditor::Host(HostEdit::CowChunk)));
+    core.cancel_chunk(demand).unwrap();
+    assert_eq!(core.editor(b), Some(MmEditor::Free));
+    assert_eq!(core.chunk_count(), 3, "refused chunks were never stored");
+    let mut returned = core.retire_all_mms().unwrap();
+    returned.sort();
+    assert_eq!(returned, [0, 1, 2, 3, 4]);
+    assert_eq!(core.chunk_count(), 0, "every arena retires with its MM");
+    assert!(core.teardown().is_ok());
+}
+
+/// A failed publication gives its grant's space back to the chunk, and the
+/// next supply carves the same extent again.
+#[test]
+fn a_failed_supply_returns_its_space_to_the_chunk() {
+    let mut core = small_arena();
+    let excluded = ExcludedMm::claimed(MmKey::new(NonZeroU64::MIN));
+    let (first, _) = supply(&mut core, &excluded, 0x10_000);
+    core.finish_supply_cow(first, Supplied::Published(1))
+        .unwrap();
+    let (second, mapped) = supply(&mut core, &excluded, 0);
+    assert!(!mapped);
+    let lost = second.extent();
+    core.finish_supply_cow(second, Supplied::Failed).unwrap();
+    let (again, mapped) = supply(&mut core, &excluded, 0);
+    assert!(!mapped, "the chunk has room again");
+    assert_eq!(again.extent(), lost);
+    core.finish_supply_cow(again, Supplied::Published(2))
+        .unwrap();
+    let mut returned = core.retire_all_mms().unwrap();
+    returned.sort();
+    assert_eq!(returned, [1, 2]);
     assert!(core.teardown().is_ok());
 }
 
@@ -372,9 +467,9 @@ fn a_cow_grant_settles_once_under_its_own_mm_and_retires_with_it() {
 #[test]
 fn a_core_dropped_holding_a_cow_grant_reaches_its_venue() {
     let caught = std::panic::catch_unwind(|| {
-        let mut core = GrantCore::new(grant_carrier());
+        let mut core = small_arena();
         let excluded = ExcludedMm::claimed(MmKey::new(NonZeroU64::MIN));
-        let ticket = core.supply_cow(&excluded, cow_demand(0x10_000)).unwrap();
+        let (ticket, _) = supply(&mut core, &excluded, 0x10_000);
         core.finish_supply_cow(ticket, Supplied::Published(1))
             .unwrap();
         drop(core);

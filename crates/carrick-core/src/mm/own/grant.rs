@@ -18,13 +18,26 @@
 //! - [`CarrierCore::retire_mm`] returns every grant of a retired MM, claimed
 //!   or not: no member is left to complete one.
 //!
+//! Replacements come from a **per-MM arena** (#3099): the core carves each
+//! grant from the MM's current chunk, and asks the shell for a new chunk
+//! ([`CowSupply::NeedsChunk`]) only when the MM has none with room. The shell
+//! installs one backend mapping per chunk (one KVM memslot for 128 grants),
+//! never one per grant, and the chunk lives exactly as long as its MM: it
+//! leaves the core with [`CarrierCore::retire_mm`], as the shell's chunk
+//! mapping leaves with the MM's retirement.
+//!
 //! Invariants, checked by [`CarrierCore::check_invariants`]:
 //! - **G1** no two grants' replacement extents overlap;
 //! - **G2** every grant names an admitted MM;
 //! - **G3** a grant is `Supplying` exactly while its MM's editor is
-//!   `Host(CowSupply(that grant))`.
+//!   `Host(CowSupply(that grant))`;
+//! - **G4** every grant lies inside the carved prefix of a chunk of its own
+//!   MM; chunks never overlap, are of the arena's chunk size and belong to
+//!   an admitted MM; an MM has at most one chunk with room, and its record
+//!   names exactly that one.
 
 use alloc::vec::Vec;
+use core::num::NonZeroU64;
 
 use super::editor::{ExcludedMm, HostEdit, MmEditor, NotNow};
 use super::mm::{MmKey, MmRecord};
@@ -63,12 +76,91 @@ pub(super) struct CowGrantRecord<G> {
     pub(super) state: GrantState<G>,
 }
 
-/// One copy-on-write demand of an excluded MM: the faulting page and the
-/// replacement extent the shell will map for it.
+/// The sizes of an MM's replacement arena: each grant, and each chunk the
+/// shell maps for grants to be carved from.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct CowDemand {
-    pub page: u64,
-    pub replacement: GpaExtent,
+pub struct CowArenaGeometry {
+    grant: NonZeroU64,
+    chunk: NonZeroU64,
+}
+
+impl CowArenaGeometry {
+    /// Production: 16 KiB grants (`COW_GRANT_SIZE`) from 2 MiB chunks, so
+    /// one backend mapping serves 128 copy-on-write pages.
+    pub const PRODUCTION: Self = Self {
+        grant: NonZeroU64::new(carrick_core_abi::COW_GRANT_SIZE).unwrap(),
+        chunk: NonZeroU64::new(2 * 1024 * 1024).unwrap(),
+    };
+
+    /// `None` unless the grant is a power of two and the chunk a non-zero
+    /// multiple of it.
+    pub const fn new(grant: u64, chunk: u64) -> Option<Self> {
+        match (NonZeroU64::new(grant), NonZeroU64::new(chunk)) {
+            (Some(g), Some(c)) if grant.is_power_of_two() && chunk.is_multiple_of(grant) => {
+                Some(Self { grant: g, chunk: c })
+            }
+            _ => None,
+        }
+    }
+    pub const fn grant(self) -> u64 {
+        self.grant.get()
+    }
+    pub const fn chunk(self) -> u64 {
+        self.chunk.get()
+    }
+}
+
+/// One chunk of an MM's replacement arena. Grants are carved from its base
+/// up; `carved` bytes are in use or were.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(super) struct ChunkRecord {
+    pub(super) mm: MmKey,
+    pub(super) extent: GpaExtent,
+    pub(super) carved: u64,
+}
+
+impl ChunkRecord {
+    fn has_room(&self) -> bool {
+        self.carved < self.extent.len().get()
+    }
+    fn carved_end(&self) -> u64 {
+        self.extent.ipa() + self.carved
+    }
+}
+
+/// The excluded MM has no chunk with room: the shell maps one of
+/// [`Self::len`] bytes and returns it with [`CarrierCore::admit_chunk`], or
+/// reports that it could not with [`CarrierCore::cancel_chunk`]. The MM's
+/// editor is recorded as `Host(CowChunk)` while this is out.
+#[must_use = "a chunk demand must be answered with admit_chunk or cancel_chunk"]
+#[derive(Debug, Eq, PartialEq)]
+#[cfg_attr(test, derive(Clone, Hash))]
+pub struct ChunkDemand {
+    carrier: CarrierId,
+    mm: MmKey,
+    len: u64,
+}
+
+impl ChunkDemand {
+    pub fn mm(&self) -> MmKey {
+        self.mm
+    }
+    /// The chunk size; the shell aligns the chunk to the grant size.
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+}
+
+/// What a copy-on-write supply needs next.
+#[must_use = "a COW supply must be finished or its chunk demand answered"]
+#[derive(Debug, Eq, PartialEq)]
+#[cfg_attr(test, derive(Clone, Hash))]
+pub enum CowSupply {
+    /// A grant was carved from the MM's current chunk: the shell publishes
+    /// it (no backend mapping call) and finishes the ticket.
+    Carved(SupplyTicket),
+    /// The MM's arena has no room: the shell maps a chunk first.
+    NeedsChunk(ChunkDemand),
 }
 
 /// A supply is owed to the shell's backend and pool.
@@ -143,45 +235,161 @@ impl<V: CoreVenue, M, B, G: GrantPayload> CarrierCore<V, M, B, G> {
         }
     }
 
-    /// Reserve a replacement grant for one COW demand of the excluded MM.
-    /// The shell maps and publishes it, then reports with
-    /// [`Self::finish_supply_cow`]. A refusal leaves the core unchanged.
-    pub fn supply_cow(
-        &mut self,
-        excluded: &ExcludedMm<'_>,
-        demand: CowDemand,
-    ) -> Result<SupplyTicket, MmRefusal> {
-        let extent = demand.replacement;
-        if demand.page & 0xfff != 0 {
-            return Err(MmRefusal::Refused(Refusal::NotFound));
+    /// The geometry this core carves replacement arenas with.
+    pub fn cow_geometry(&self) -> CowArenaGeometry {
+        self.cow_geometry
+    }
+
+    /// Use `geometry` for every arena (explorer and tests: a small chunk).
+    /// Refused once any chunk exists.
+    pub fn set_cow_geometry(&mut self, geometry: CowArenaGeometry) -> Result<(), Refusal> {
+        if !self.chunks.is_empty() {
+            return Err(Refusal::InFlight);
         }
-        if super::collides(&self.grants, extent, |g| g.extent.end()) {
-            return Err(MmRefusal::Refused(Refusal::Collision));
+        self.cow_geometry = geometry;
+        Ok(())
+    }
+
+    /// The next grant id, or `Exhausted`.
+    fn next_grant_id(&self) -> Result<(GrantId, u64), MmRefusal> {
+        let next = self
+            .next_grant
+            .checked_add(1)
+            .ok_or(MmRefusal::Refused(Refusal::Exhausted))?;
+        Ok((
+            GrantId {
+                carrier: self.carrier,
+                raw: self.next_grant,
+            },
+            next,
+        ))
+    }
+
+    /// Carve the next grant of the chunk at `base` for `mm` and record it
+    /// `Supplying`. The caller has checked the chunk has room and set the
+    /// MM's editor to `Host(CowSupply(grant))`.
+    fn carve_grant(&mut self, base: u64, grant: GrantId, next: u64) -> Option<SupplyTicket> {
+        let size = self.cow_geometry.grant();
+        let chunk = self.chunks.get_mut(&base)?;
+        let extent = GpaExtent::new(chunk.carved_end(), size)?;
+        let mm = chunk.mm;
+        chunk.carved += size;
+        let room = chunk.has_room();
+        if let Some(record) = self.mms.get_mut(&mm) {
+            record.chunk = room.then_some(base);
         }
-        let Some(next) = self.next_grant.checked_add(1) else {
-            return Err(MmRefusal::Refused(Refusal::Exhausted));
-        };
-        let grant = GrantId {
-            carrier: self.carrier,
-            raw: self.next_grant,
-        };
-        // The last check: a refusal here leaves the core unchanged.
-        self.take_editor(excluded, HostEdit::CowSupply(grant))?;
         self.next_grant = next;
         self.grants.insert(
             extent.ipa(),
             CowGrantRecord {
                 id: grant,
-                mm: excluded.mm(),
+                mm,
                 extent,
                 state: GrantState::Supplying,
             },
         );
-        Ok(SupplyTicket {
-            grant,
-            mm: excluded.mm(),
-            extent,
-        })
+        Some(SupplyTicket { grant, mm, extent })
+    }
+
+    /// Supply one copy-on-write demand of the excluded MM, for the page at
+    /// `page`. The grant is carved from the MM's current chunk when it has
+    /// room ([`CowSupply::Carved`]); otherwise the shell maps a chunk first
+    /// ([`CowSupply::NeedsChunk`]). The demand is the same whether an EL0
+    /// write fault or a kernel user copy published it. A refusal leaves the
+    /// core unchanged.
+    pub fn supply_cow(
+        &mut self,
+        excluded: &ExcludedMm<'_>,
+        page: u64,
+    ) -> Result<CowSupply, MmRefusal> {
+        if page & 0xfff != 0 {
+            return Err(MmRefusal::Refused(Refusal::NotFound));
+        }
+        let (grant, next) = self.next_grant_id()?;
+        let current = self.mms.get(&excluded.mm()).and_then(|record| record.chunk);
+        let Some(base) = current else {
+            // The last check: a refusal here leaves the core unchanged.
+            self.take_editor(excluded, HostEdit::CowChunk)?;
+            return Ok(CowSupply::NeedsChunk(ChunkDemand {
+                carrier: self.carrier,
+                mm: excluded.mm(),
+                len: self.cow_geometry.chunk(),
+            }));
+        };
+        self.take_editor(excluded, HostEdit::CowSupply(grant))?;
+        match self.carve_grant(base, grant, next) {
+            Some(ticket) => Ok(CowSupply::Carved(ticket)),
+            // G4 says the current chunk exists and has room.
+            None => Err(MmRefusal::Refused(Refusal::NotFound)),
+        }
+    }
+
+    /// The shell mapped `extent` as a chunk of the demanding MM's arena:
+    /// admit it and carve the demand's grant from it. A refusal (another
+    /// carrier's demand, the wrong size or alignment, an overlap with a
+    /// chunk) hands the demand back with nothing changed; the shell then
+    /// unmaps the extent and cancels.
+    pub fn admit_chunk(
+        &mut self,
+        demand: ChunkDemand,
+        extent: GpaExtent,
+    ) -> Result<SupplyTicket, Refused<ChunkDemand>> {
+        let refuse = |demand, reason| {
+            Err(Refused {
+                offered: demand,
+                reason,
+            })
+        };
+        let owed = demand.carrier == self.carrier
+            && self.mms.get(&demand.mm).map(|m| m.editor)
+                == Some(MmEditor::Host(HostEdit::CowChunk));
+        if !owed {
+            return refuse(demand, Refusal::NotFound);
+        }
+        if extent.len().get() != self.cow_geometry.chunk()
+            || !extent.ipa().is_multiple_of(self.cow_geometry.grant())
+        {
+            return refuse(demand, Refusal::NotInsideAnInstalledMapping);
+        }
+        if super::collides(&self.chunks, extent, |c| c.extent.end()) {
+            return refuse(demand, Refusal::Collision);
+        }
+        let Ok((grant, next)) = self.next_grant_id() else {
+            return refuse(demand, Refusal::Exhausted);
+        };
+        self.chunks.insert(
+            extent.ipa(),
+            ChunkRecord {
+                mm: demand.mm,
+                extent,
+                carved: 0,
+            },
+        );
+        if let Some(record) = self.mms.get_mut(&demand.mm) {
+            record.editor = MmEditor::Host(HostEdit::CowSupply(grant));
+        }
+        match self.carve_grant(extent.ipa(), grant, next) {
+            Some(ticket) => Ok(ticket),
+            None => refuse(demand, Refusal::NotFound),
+        }
+    }
+
+    /// The shell could not map the demanded chunk: return the MM's editor
+    /// to its exclusion, with nothing supplied.
+    pub fn cancel_chunk(&mut self, demand: ChunkDemand) -> Result<(), Refused<ChunkDemand>> {
+        match self.mms.get_mut(&demand.mm) {
+            Some(record)
+                if demand.carrier == self.carrier
+                    && record.editor == MmEditor::Host(HostEdit::CowChunk) =>
+            {
+                record.editor = MmEditor::Free;
+                Ok(())
+            }
+            _ => Err(Refused {
+                offered: demand,
+                reason: Refusal::NotFound,
+            }),
+        }
     }
 
     /// The shell reported on a supply. `Published` provisions the grant with
@@ -215,6 +423,19 @@ impl<V: CoreVenue, M, B, G: GrantPayload> CarrierCore<V, M, B, G> {
             }
             Supplied::Failed => {
                 self.grants.remove(&ticket.extent.ipa());
+                // The grant was its chunk's last carve (the MM's editor
+                // kept every other carve out): give the space back.
+                if let Some((&base, chunk)) = self
+                    .chunks
+                    .range_mut(..=ticket.extent.ipa())
+                    .next_back()
+                    .filter(|(_, c)| c.carved_end() == ticket.extent.end())
+                {
+                    chunk.carved -= ticket.extent.len().get();
+                    if let Some(record) = self.mms.get_mut(&ticket.mm) {
+                        record.chunk = Some(base);
+                    }
+                }
             }
         }
         Ok(ticket.grant)
@@ -282,6 +503,9 @@ impl<V: CoreVenue, M, B, G: GrantPayload> CarrierCore<V, M, B, G> {
             Some(MmEditor::Host(_)) => return Err(MmRefusal::Refused(Refusal::InFlight)),
         }
         self.mms.remove(&mm);
+        // Its arena goes with it: the shell's chunk mappings retire with
+        // the MM (on x86, `CarrierMemory::retire_child`).
+        self.chunks.retain(|_, chunk| chunk.mm != mm);
         let mut returned = Vec::new();
         let bases: Vec<u64> = self
             .grants
@@ -327,6 +551,11 @@ impl<V: CoreVenue, M, B, G: GrantPayload> CarrierCore<V, M, B, G> {
         self.grants.len()
     }
 
+    /// How many arena chunks the core holds, over every MM.
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+
     /// The editor state of `mm`, if it is admitted.
     pub fn editor(&self, mm: MmKey) -> Option<MmEditor> {
         self.mms.get(&mm).map(|record| record.editor)
@@ -347,9 +576,62 @@ impl<V: CoreVenue, M, B, G> CarrierCore<V, M, B, G> {
         true
     }
 
-    /// G1 to G3.
+    /// G4: the arenas.
+    fn check_arena_invariants(&self) -> Result<(), super::Violation> {
+        use super::Violation;
+        let geometry = self.cow_geometry;
+        let mut previous_end = None;
+        for (&base, chunk) in &self.chunks {
+            if base != chunk.extent.ipa() {
+                return Err(Violation::IndexKey);
+            }
+            if previous_end.is_some_and(|end| end > base) {
+                return Err(Violation::ChunksOverlap);
+            }
+            previous_end = Some(chunk.extent.end());
+            let room = chunk.has_room();
+            if chunk.extent.len().get() != geometry.chunk()
+                || !base.is_multiple_of(geometry.grant())
+                || chunk.carved > geometry.chunk()
+                || !chunk.carved.is_multiple_of(geometry.grant())
+            {
+                return Err(Violation::ChunkShape);
+            }
+            let Some(record) = self.mms.get(&chunk.mm) else {
+                return Err(Violation::ChunkWithoutMm);
+            };
+            if room != (record.chunk == Some(base)) {
+                return Err(Violation::ChunkRoom);
+            }
+        }
+        for (mm, record) in &self.mms {
+            if let Some(base) = record.chunk
+                && self
+                    .chunks
+                    .get(&base)
+                    .is_none_or(|chunk| chunk.mm != *mm || !chunk.has_room())
+            {
+                return Err(Violation::ChunkRoom);
+            }
+        }
+        for grant in self.grants.values() {
+            let inside = super::holder(&self.chunks, grant.extent.ipa(), |c| c.extent.end())
+                .is_some_and(|(_, chunk)| {
+                    chunk.mm == grant.mm
+                        && grant.extent.len().get() == geometry.grant()
+                        && grant.extent.end() <= chunk.carved_end()
+                });
+            if !inside {
+                return Err(Violation::GrantOutsideChunk);
+            }
+        }
+        Ok(())
+    }
+
+    /// G1 to G4.
     pub(super) fn check_grant_invariants(&self) -> Result<(), super::Violation> {
         use super::Violation;
+        self.check_arena_invariants()?;
         let mut previous_end = None;
         for (&base, grant) in &self.grants {
             if base != grant.extent.ipa() || grant.id.carrier != self.carrier {
