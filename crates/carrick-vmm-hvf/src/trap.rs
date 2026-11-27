@@ -8518,9 +8518,9 @@ impl HvfInner {
                         vcpu.get_reg(Reg::X29).unwrap_or(0),
                         read,
                     );
-                    return Err(TrapError::El1StackOverflow(
+                    return Err(TrapError::El1StackOverflow(Box::new(
                         overflow.with_backtrace(backtrace),
-                    ));
+                    )));
                 }
                 if x0 == carrick_core_abi::NATIVE_RUN_FAILURE_SENTINEL {
                     // Only EL1's supervisor-owned stack record may name a failure;
