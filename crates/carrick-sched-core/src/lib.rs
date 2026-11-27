@@ -6875,7 +6875,11 @@ fn write_set_bits(out: &mut impl core::fmt::Write, words: &[AtomicU64]) -> core:
 }
 
 /// Slot-lock spins EL1 allows itself before it gives up on another slot.
+#[cfg(not(all(test, feature = "loom")))]
 const EL1_SLOT_LOCK_SPINS: u32 = 1024;
+/// One under loom: a lock busy once is a lock whose spin ran out (#3083).
+#[cfg(all(test, feature = "loom"))]
+const EL1_SLOT_LOCK_SPINS: u32 = 1;
 
 /// Spin until the lock is free: for a slot's own run queue, whose lock is
 /// only ever held for a few instructions by a party that is running.
