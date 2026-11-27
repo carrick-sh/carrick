@@ -581,6 +581,73 @@ fn mounted_static_x86_sigign_fork_rounds_beyond_lifecycle_stock() {
     fork_rounds_beyond_stock(&["-DAUTOREAP", "-DIGNORE_SIGCHLD"]);
 }
 
+/// Run `x86_fork_cow_pages.S` with `pages` COW faults in the fork child
+/// and return the run's peak memslot count. The output and exit status
+/// must match native: the child's stores stay private and none is lost.
+fn fork_child_cow_pages(pages: u64, run_id: &str, deadline: Duration) -> Option<u64> {
+    if skip_without_kvm() {
+        return None;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("fork-cow-pages");
+    compile_assembly_with_flags("x86_fork_cow_pages.S", &elf, &[&format!("-DPAGES={pages}")]);
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(60))
+        .output()
+        .expect("native fork COW oracle");
+    assert_eq!(
+        (native.status.code(), native.stdout.as_slice()),
+        (Some(7), &b"A\n"[..])
+    );
+    let (observed, _) = run_mounted_binary_within(
+        &elf,
+        run_id,
+        true,
+        &empty_image_archive(),
+        None,
+        deadline,
+        &[],
+    );
+    assert_eq!(
+        observed.status.code(),
+        Some(7),
+        "{pages} COW pages: 97 = parent saw a child store; 98 = lost child store; 99 = syscall failure; stderr: {}",
+        String::from_utf8_lossy(&observed.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(
+        observed
+            .stdout
+            .strip_prefix(b"A\n")
+            .expect("fork COW pages stdout"),
+    )
+    .unwrap();
+    report["report"]["execution_witness"]["peak_memslots"].as_u64()
+}
+
+/// #3099: a COW replacement is carved from its MM's arena, so a fork child
+/// taking 4096 COW faults costs about 4096 / 128 chunk memslots, never one
+/// memslot per page. The bound leaves room for the carrier's own slots and
+/// every other grant the run makes (a COW-free run peaks well below it).
+#[test]
+fn mounted_static_x86_fork_child_cow_pages_share_arena_memslots() {
+    let Some(peak) = fork_child_cow_pages(4096, "x86-fork-cow-arena", Duration::from_secs(30))
+    else {
+        return;
+    };
+    assert!(
+        peak < 4096 / 2,
+        "4096 COW pages held {peak} memslots at once: one per page, not one per 2 MiB chunk"
+    );
+}
+
+/// #3099: past KVM's memslot limit (32764 here). One memslot per COW page
+/// ended the carrier ("carrier memslot capacity") partway through the
+/// child's stores; from the arena the run matches native.
+#[test]
+fn mounted_static_x86_fork_child_cow_past_the_memslot_limit_matches_native() {
+    fork_child_cow_pages(34_000, "x86-fork-cow-past-limit", Duration::from_secs(120));
+}
+
 fn fork_rounds_beyond_stock(flags: &[&str]) {
     if skip_without_kvm() {
         return;
