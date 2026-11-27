@@ -368,6 +368,51 @@ fn refusal_evidence(
     evidence
 }
 
+/// The ring's counted refusals as compat-report rows (#3152): every native
+/// ordinal and caller the census's refusal evidence holds, named by its
+/// canonical syscall. Always on, independent of `CARRICK_EL1_CENSUS`.
+pub fn ring_refusals(
+    counters: &carrick_el1_abi::Counters,
+    isa: carrick_spec::syscall_census::CensusIsa,
+) -> Vec<crate::compat::RingRefusalCount> {
+    use carrick_spec::syscall_census::{CallerClass, CensusIsa};
+    refusal_evidence(Some(counters), isa)
+        .rows
+        .into_iter()
+        .filter_map(|row| {
+            let count = row.refused.saturating_add(row.venue_refused);
+            let canonical = match isa {
+                CensusIsa::Aarch64 => Some(carrick_abi::CanonicalNr::new(row.nr)),
+                CensusIsa::X86_64 => carrick_syscall_abi::syscall_x86_64::canonical_x86_64(
+                    carrick_abi::NativeNr(row.nr),
+                ),
+            }
+            .filter(|_| row.nr < 512);
+            let name = canonical
+                .and_then(|nr| carrick_abi::syscall::lookup_aarch64(nr.raw()))
+                .map_or_else(
+                    // 512 is the explicitly incomplete overflow bucket: an
+                    // ordinal the ring could not name.
+                    || match row.nr {
+                        512.. => "unknown".to_owned(),
+                        nr => format!("native{nr}"),
+                    },
+                    |call| call.name.to_owned(),
+                );
+            (count != 0).then(|| crate::compat::RingRefusalCount {
+                number: canonical.map_or(u64::MAX, |nr| nr.raw()),
+                native: row.nr,
+                name,
+                caller: match row.caller {
+                    CallerClass::Root => crate::compat::RingRefusalCaller::Root,
+                    CallerClass::NativeChild => crate::compat::RingRefusalCaller::NativeChild,
+                },
+                count,
+            })
+        })
+        .collect()
+}
+
 /// Persist the mapped census before handing the terminal result to the caller.
 /// Publication failures fail the run instead of delivering unqualified success.
 pub fn publish_terminal(
