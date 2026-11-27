@@ -1929,7 +1929,10 @@ fn probe_zone_runnable(
             .lost_adoptions
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    zone.sweep_cancelled(slot);
+    // Kick the idle CPUs this probe's lock releases owe a scan (#3083).
+    let passes = carrick_sched_core::OwedPasses::new();
+    zone.sweep_cancelled(slot, &passes);
+    passes.deliver(carrick_kernel::el1_zone::resched_slot);
     carrick_kernel::el1_zone::hand_back_wanted(slot);
     if registration.is_spare() {
         // No guest CPU runs this vCPU: nothing queued on it is this
@@ -1951,7 +1954,10 @@ fn probe_zone_runnable(
     {
         return Ok(ZoneProbe::Consumed(Some(running)));
     }
-    if let Some(service) = zone.take_service_head_for_executor(slot) {
+    let passes = carrick_sched_core::OwedPasses::new();
+    let service = zone.take_service_head_for_executor(slot, &passes);
+    passes.deliver(carrick_kernel::el1_zone::resched_slot);
+    if let Some(service) = service {
         let record = match service {
             carrick_el1_abi::ServiceHead::FirstEntry(custody) => {
                 #[cfg(any(test, feature = "test-support"))]

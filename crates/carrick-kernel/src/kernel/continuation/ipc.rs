@@ -166,9 +166,7 @@ impl IpcHostServices for ZoneHostServices {
                         &mut |placement| placed.push(placement),
                         &passes,
                     );
-                    (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(
-                        passes,
-                    );
+                    passes.deliver(crate::el1_zone::resched_slot);
                     owed
                 };
             }

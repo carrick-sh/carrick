@@ -232,9 +232,7 @@ pub(super) fn resume_selected<'a, X: ForkStockCrossing>(
                 &carrick_sched_core::ShortLockSpin,
                 &passes,
             );
-            (|p| crate::sched::object_wait::deliver_owed_passes(source.zone, source.slot, p))(
-                passes,
-            );
+            crate::sched::object_wait::deliver_owed_passes(source.zone, source.slot, passes);
             owed
         };
         return NativeResume::Left(None);
@@ -387,7 +385,7 @@ fn resume_unregistered(
             let passes = carrick_sched_core::OwedPasses::new();
             let owed =
                 zone.release_current(slot, record, &carrick_sched_core::ShortLockSpin, &passes);
-            (|p| crate::sched::object_wait::deliver_owed_passes(zone, slot, p))(passes);
+            crate::sched::object_wait::deliver_owed_passes(zone, slot, passes);
             owed
         };
         return crate::sched::ResumeAction::Left;
@@ -444,7 +442,7 @@ fn resume_unregistered(
                     },
                     &passes,
                 );
-                (|p| crate::sched::object_wait::deliver_owed_passes(zone, slot, p))(passes);
+                crate::sched::object_wait::deliver_owed_passes(zone, slot, passes);
                 owed
             }
             .is_err()
@@ -454,7 +452,7 @@ fn resume_unregistered(
                 let _ = {
                     let passes = carrick_sched_core::OwedPasses::new();
                     let owed = zone.unswitch(slot, record, &passes);
-                    (|p| crate::sched::object_wait::deliver_owed_passes(zone, slot, p))(passes);
+                    crate::sched::object_wait::deliver_owed_passes(zone, slot, passes);
                     owed
                 };
             }
@@ -485,19 +483,17 @@ fn resume_unregistered(
                 // The neutral owner commits exact terminal intent at the
                 // physical release seam, before a queued DirectLoad can
                 // observe the saved record's absence.
-                match {
-                    let passes = carrick_sched_core::OwedPasses::new();
-                    let owed = custody.retire_zone_current(
-                        control,
-                        &mut membership,
-                        binding,
-                        source,
-                        record,
-                        &passes,
-                    );
-                    (|p| crate::sched::object_wait::deliver_owed_passes(zone, slot, p))(passes);
-                    owed
-                } {
+                let passes = carrick_sched_core::OwedPasses::new();
+                let owed = custody.retire_zone_current(
+                    control,
+                    &mut membership,
+                    binding,
+                    source,
+                    record,
+                    &passes,
+                );
+                crate::sched::object_wait::deliver_owed_passes(zone, slot, passes);
+                match owed {
                     Ok(_) => {
                         if let Some(entry) = control.entry() {
                             carrick_core::lifecycle::retire_cancelled_pool_member(
@@ -520,16 +516,12 @@ fn resume_unregistered(
                 use carrick_core::terminal::LosingMemberSettlement;
                 match error {
                     MemberMembershipError::AlreadyTerminal => {
-                        match {
-                            let passes = carrick_sched_core::OwedPasses::new();
-                            let owed = carrick_core::terminal::settle_losing_zone_current(
-                                control, binding, source, record, &passes,
-                            );
-                            (|p| crate::sched::object_wait::deliver_owed_passes(zone, slot, p))(
-                                passes,
-                            );
-                            owed
-                        } {
+                        let passes = carrick_sched_core::OwedPasses::new();
+                        let owed = carrick_core::terminal::settle_losing_zone_current(
+                            control, binding, source, record, &passes,
+                        );
+                        crate::sched::object_wait::deliver_owed_passes(zone, slot, passes);
+                        match owed {
                             Some(LosingMemberSettlement::Released(_)) => {
                                 task.linux.mark_native_terminal_work(slot);
                             }
