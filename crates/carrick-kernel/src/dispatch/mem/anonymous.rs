@@ -2461,7 +2461,7 @@ impl MemView<'_> {
         let new_address: GuestPtr = cx.typed_arg(4);
         let root = self.mem().lock().delegated_root().cloned();
         if let Some(root) = root {
-            let request = match super::mmap::mremap_request(
+            let request = match carrick_personality_linux::mm::mremap::request(
                 self.linux_page_size(),
                 old_address.0,
                 old_size,
@@ -2497,10 +2497,10 @@ impl MemView<'_> {
         &self,
         cx: &mut MutationSyscallCtx<'_, '_, '_, M>,
         root: &DelegatedRoot,
-        request: super::mmap::MremapRequest,
+        request: carrick_personality_linux::mm::mremap::Request,
     ) -> Result<Option<DispatchOutcome>, DispatchError> {
         use carrick_el1::memory::reservations::MoveTarget;
-        let super::mmap::MremapRequest {
+        let carrick_personality_linux::mm::mremap::Request {
             old_address,
             old_size,
             new_size,
