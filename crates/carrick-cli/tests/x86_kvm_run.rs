@@ -1748,6 +1748,55 @@ fn mounted_static_x86_root_and_its_thread_sleep_in_ring() {
     );
 }
 
+/// #3081: `exit_group` ends every thread of the group, whatever it is
+/// blocked in. Four `CLONE_THREAD` siblings park in `nanosleep` loops and
+/// the root calls `exit_group(7)` once they all have. Linux exits 7 at
+/// once; a group exit that leaves a sleeper parked holds the run open, and
+/// the root's answer never becomes the run's status.
+fn exit_group_beside_sleepers_matches_native(defines: &[&str], label: &str) {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join(label);
+    let mut flags = vec![
+        "-fno-stack-protector",
+        "-fno-asynchronous-unwind-tables",
+        "-O1",
+    ];
+    flags.extend_from_slice(defines);
+    compile_assembly_with_flags("x86_exit_group_beside_sleepers.c", &elf, &flags);
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native exit-group-beside-sleepers oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+
+    let guest = run_mounted_binary(&elf, label, false);
+    assert_eq!(
+        (guest.status.code(), guest.stdout.as_slice()),
+        (native.status.code(), native.stdout.as_slice()),
+        "None is a run still open at its bound: a sibling outlived exit_group. \
+         96 a failed stack map, 97 a failed clone, 98 siblings that never parked, \
+         99 a root that came back from exit_group. Stdout: {} Stderr: {}",
+        String::from_utf8_lossy(&guest.stdout),
+        String::from_utf8_lossy(&guest.stderr)
+    );
+}
+
+/// The siblings sleep a second at a time, as #3050's readers did.
+#[test]
+fn mounted_static_x86_exit_group_ends_siblings_sleeping_in_nanosleep() {
+    exit_group_beside_sleepers_matches_native(&[], "exit-group-sleepers");
+}
+
+/// The siblings' sleep outlasts the bound, so no sleep timeout can end
+/// them first: only the group exit can.
+#[test]
+fn mounted_static_x86_exit_group_ends_siblings_in_a_long_nanosleep() {
+    exit_group_beside_sleepers_matches_native(&["-DSLEEP_SECS=30"], "exit-group-long-sleepers");
+}
+
 /// #3105: four threads of one MM first-touch fresh anonymous pages, as Go's
 /// and pip's heaps grow. A first touch fills a not-present entry, and x86
 /// caches translations only from present entries (Intel SDM vol. 3A 4.10.2.3
