@@ -1314,6 +1314,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'_, C> {
 
 impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'a, C> {
     fn drain_completion(&self, waker: Waker, effects: &mut WakeEffects, handed: &mut u32) {
+        let passes = OwedPasses::new();
         let mut cursor = self.queue().head.load(Ordering::Relaxed);
         while let Some(record) = RecordId::from_raw(cursor) {
             let rec = self.zone.record(record);
@@ -1331,12 +1332,17 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'a, C> {
                         true,
                     ),
                     Waker::Host => {
-                        match self
-                            .zone
-                            .place_in_guest(record, from, None, &BoundedSpin(0), |rec| {
+                        match self.zone.place_in_guest(
+                            record,
+                            from,
+                            None,
+                            &BoundedSpin(0),
+                            |rec| {
                                 self.unlink(record);
                                 self.zone.mark_woken(rec, 0);
-                            }) {
+                            },
+                            &passes,
+                        ) {
                             Placement::Placed(placement) => {
                                 if placement.resched {
                                     effects.push_sgi(placement.slot);
@@ -1369,6 +1375,7 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'a, C> {
                 let _ = transfer;
             }
         }
+        passes.fold_into(effects);
     }
     fn queue(&self) -> &ObjectQueue {
         self.zone.object_queue(self.key.index as usize)
@@ -1394,6 +1401,7 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'a, C> {
         &self,
         handed: &mut impl FnMut(RecordRef),
         placed: &mut impl FnMut(HostPlacement),
+        passes: &OwedPasses,
     ) -> Result<HostObjectWakeReport, ObjectWaitError> {
         self.queue()
             .epoch
@@ -1410,12 +1418,17 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'a, C> {
             let from @ Claim::Parked { .. } = rec.claim() else {
                 continue;
             };
-            match self
-                .zone
-                .place_in_guest(record, from, None, &SpinForever, |rec| {
+            match self.zone.place_in_guest(
+                record,
+                from,
+                None,
+                &SpinForever,
+                |rec| {
                     self.unlink(record);
                     self.zone.mark_woken(rec, 0);
-                }) {
+                },
+                passes,
+            ) {
                 Placement::Placed(placement) => {
                     report.queued += 1;
                     placed(placement);
@@ -2732,6 +2745,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         exact: RecordRef,
         seq: u32,
         completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
+        passes: &OwedPasses,
     ) -> Result<bool, ()> {
         let record = exact.id;
         let Some(rec) = self.live(exact) else {
@@ -2749,7 +2763,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             Err(ObjectWaitError::Busy) => return Err(()),
             Err(_) => return Ok(false),
         };
-        let Some(slot_guard) = self.slot_lock(slot, &SpinForever) else {
+        let Some(slot_guard) = self.slot_lock(slot, &SpinForever, passes) else {
             return Err(());
         };
         if self.live(exact).is_none()

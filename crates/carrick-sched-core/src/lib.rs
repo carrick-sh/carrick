@@ -1584,12 +1584,90 @@ const SLOT_LOCK_HELD: u32 = 1;
 /// while [`SLOT_LOCK_HELD`] is.
 const SLOT_LOCK_SCAN_OWED: u32 = 2;
 
+/// The idle slots that released run-queue locks owe another scan (#3083): a
+/// scan enrolled on a busy lock ([`SLOT_LOCK_SCAN_OWED`]) and its release
+/// owes every idle slot an SGI, for a scan that already reached WFI. Every
+/// lock-taking zone operation takes one, and its caller delivers it in its
+/// own venue: folded into the [`WakeEffects`] it sends
+/// ([`Self::fold_into`]), or sent slot by slot ([`Self::deliver`]). Those
+/// are the only ways to empty it, and dropping one that still owes a pass
+/// is a broken invariant (a debug assertion): a scan would sleep past work.
+#[must_use = "an owed idle-scan pass must be delivered: fold it into the sent WakeEffects or deliver it"]
+pub struct OwedPasses {
+    slots: core::cell::Cell<[u64; ZONE_SLOT_WORDS]>,
+}
+
+impl OwedPasses {
+    /// A sink that owes nothing yet.
+    pub const fn new() -> Self {
+        Self {
+            slots: core::cell::Cell::new([0; ZONE_SLOT_WORDS]),
+        }
+    }
+
+    fn owe(&self, slot: SlotId) {
+        let mut slots = self.slots.get();
+        slots[slot.index() / 64] |= 1 << (slot.index() % 64);
+        self.slots.set(slots);
+    }
+
+    /// Whether `slot` is owed a pass.
+    pub fn owes(&self, slot: SlotId) -> bool {
+        self.slots.get()[slot.index() / 64] & (1 << (slot.index() % 64)) != 0
+    }
+
+    /// Whether no pass is owed.
+    pub fn is_empty(&self) -> bool {
+        self.slots.get().iter().all(|word| *word == 0)
+    }
+
+    /// Fold the owed passes into the SGIs `effects` sends.
+    pub fn fold_into(self, effects: &mut WakeEffects) {
+        for (word, owed) in effects.sgi.iter_mut().zip(self.slots.take()) {
+            *word |= owed;
+        }
+    }
+
+    /// Deliver each owed pass to `send` (a venue with no [`WakeEffects`],
+    /// such as the host's reschedule kick).
+    pub fn deliver(self, mut send: impl FnMut(SlotId)) {
+        for (word_index, word) in self.slots.take().into_iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                if let Some(slot) = SlotId::from_index(word_index * 64 + bit) {
+                    send(slot);
+                }
+            }
+        }
+    }
+}
+
+impl Default for OwedPasses {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for OwedPasses {
+    fn drop(&mut self) {
+        debug_assert!(
+            self.is_empty(),
+            "an owed idle-scan pass was dropped undelivered: {:?}",
+            self.slots.get()
+        );
+    }
+}
+
 /// A held slot run-queue lock. Its release is the one way the lock word is
 /// cleared, and it delivers what the word owes: a release that finds an
-/// idle scan enrolled ([`SLOT_LOCK_SCAN_OWED`]) owes idle slots a scan.
+/// idle scan enrolled ([`SLOT_LOCK_SCAN_OWED`]) owes idle slots a scan, into
+/// the [`OwedPasses`] the lock was taken with.
 pub struct SlotGuard<'a, C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     zone: &'a ZoneTables<C>,
     slot: SlotId,
+    passes: &'a OwedPasses,
 }
 
 impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for SlotGuard<'_, C> {
@@ -1598,7 +1676,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for SlotGuard<'_, C> {
             .lock
             .swap(0, Ordering::AcqRel);
         if word & SLOT_LOCK_SCAN_OWED != 0 {
-            self.zone.owe_scan_passes(self.slot);
+            self.zone.owe_scan_passes(self.slot, self.passes);
         }
     }
 }
@@ -1715,10 +1793,6 @@ pub struct ZoneTables<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     /// One bit per slot whose run queue is not empty (a hint for stealing;
     /// the slot's lock decides).
     queued_map: [AtomicU64; ZONE_SLOTS.div_ceil(64)],
-    /// One bit per idle slot owed a reschedule SGI because a run-queue lock
-    /// an idle scan enrolled on was released ([`Self::owe_scan_passes`]);
-    /// taken by [`Self::take_scan_passes`] (#3083).
-    scan_passes: [AtomicU64; ZONE_SLOTS.div_ceil(64)],
     pub counters: ZoneCounters,
     entries: [ZoneEntry; ZONE_ENTRIES],
     records: [ZoneRecord<C>; ZONE_RECORDS],
@@ -2250,16 +2324,20 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> HostTransfer<'_, C> {
         }
     }
 
-    fn place_in_guest(self, except: SlotId) -> Result<HostPlacement, Self> {
+    fn place_in_guest(self, except: SlotId, passes: &OwedPasses) -> Result<HostPlacement, Self> {
         let from = Claim::Transferring {
             seq: self.seq,
             cancelled: false,
             host_requested: false,
         };
-        match self
-            .zone
-            .place_in_guest(self.record.id, from, Some(except), &SpinForever, |_| {})
-        {
+        match self.zone.place_in_guest(
+            self.record.id,
+            from,
+            Some(except),
+            &SpinForever,
+            |_| {},
+            passes,
+        ) {
             Placement::Placed(placement) => Ok(placement),
             Placement::NoSlot | Placement::Lost => Err(self),
         }
@@ -2854,8 +2932,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// The executor of `slot`, stopped at an exit, takes the thread that
     /// needs it from the head of its run queue (host-owned from here): a
     /// service thread, or a thread ready at EL0 in another address space.
-    pub fn take_service_head(&self, slot: SlotId) -> Option<RecordRef> {
-        let guard = self.slot_lock(slot, &SpinForever)?;
+    pub fn take_service_head(&self, slot: SlotId, passes: &OwedPasses) -> Option<RecordRef> {
+        let guard = self.slot_lock(slot, &SpinForever, passes)?;
         let s = self.slot(slot);
         let record = RecordId::from_raw(s.head.load(Ordering::Acquire))?;
         let rec = self.record(record);
@@ -2888,8 +2966,12 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// Take the executor's service head. An unadopted birth is published with
     /// its exact incarnation, then acquired as activation custody. Concurrent
     /// current executors may win that custody; stale executors cannot take it.
-    pub fn take_service_head_for_executor(&self, slot: SlotId) -> Option<ServiceHead> {
-        let guard = self.slot_lock(slot, &SpinForever)?;
+    pub fn take_service_head_for_executor(
+        &self,
+        slot: SlotId,
+        passes: &OwedPasses,
+    ) -> Option<ServiceHead> {
+        let guard = self.slot_lock(slot, &SpinForever, passes)?;
         let s = self.slot(slot);
         let record = RecordId::from_raw(s.head.load(Ordering::Acquire))?;
         let rec = self.record(record);
@@ -3006,6 +3088,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     pub fn place_first_entry(
         &self,
         custody: FirstEntryPlacement,
+        passes: &OwedPasses,
     ) -> Result<HostPlacement, FirstEntryPlacement> {
         let from = Claim::Placing {
             incarnation: custody.record.incarnation,
@@ -3013,7 +3096,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         };
         self.record(custody.record.id)
             .apply_first_entry_request(custody.record.incarnation);
-        if let Some(placement) = self.place_from_claim(custody.record.id, from) {
+        if let Some(placement) = self.place_from_claim(custody.record.id, from, passes) {
             return Ok(placement);
         }
         // A requested placement still belongs to this producer. Preserve
@@ -3027,8 +3110,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 host_requested: true,
             };
             if let Some(placement) = self
-                .requeue_from_claim(slot, custody.record.id, from)
-                .or_else(|| self.requeue_from_claim(slot, custody.record.id, requested))
+                .requeue_from_claim(slot, custody.record.id, from, passes)
+                .or_else(|| self.requeue_from_claim(slot, custody.record.id, requested, passes))
             {
                 return Ok(placement);
             }
@@ -3055,12 +3138,17 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// is live: a service thread no other slot will take waits for this
     /// slot's driver, which is away on the host or about to drive it.
     /// Deliver the returned reschedule receipt when its vCPU is in the guest.
-    pub fn requeue_on(&self, slot: SlotId, record: RecordId) -> Option<HostPlacement> {
+    pub fn requeue_on(
+        &self,
+        slot: SlotId,
+        record: RecordId,
+        passes: &OwedPasses,
+    ) -> Option<HostPlacement> {
         let from = self.record(record).claim();
         if !matches!(from, Claim::Host { .. } | Claim::FirstEntryHost { .. }) {
             return None;
         }
-        self.requeue_from_claim(slot, record, from)
+        self.requeue_from_claim(slot, record, from, passes)
     }
 
     fn requeue_from_claim(
@@ -3068,9 +3156,10 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         slot: SlotId,
         record: RecordId,
         from: Claim,
+        passes: &OwedPasses,
     ) -> Option<HostPlacement> {
         let Placement::Placed(placement) =
-            self.requeue_claimed(slot, record, from, &SpinForever, || true, |_| {})
+            self.requeue_claimed(slot, record, from, &SpinForever, || true, |_| {}, passes)
         else {
             return None;
         };
@@ -3099,8 +3188,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         wait: &impl LockWait<C>,
         admits: impl FnOnce() -> bool,
         claimed: impl FnOnce(&ZoneRecord<C>),
+        passes: &OwedPasses,
     ) -> Placement {
-        let Some(guard) = self.slot_lock(slot, wait) else {
+        let Some(guard) = self.slot_lock(slot, wait, passes) else {
             return Placement::NoSlot;
         };
         if !admits() {
@@ -3131,9 +3221,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// from now on: it loaded a thread there, or waits in the guest on it,
     /// and comes back to the slot at every exit. This is the only way a slot
     /// becomes live; another executor that drove it before has lost it.
-    pub fn drive(&self, slot: SlotId, driver: u64) {
+    pub fn drive(&self, slot: SlotId, driver: u64, passes: &OwedPasses) {
         debug_assert!(driver != 0 && driver & SLOT_AWAY == 0);
-        if let Some(_guard) = self.slot_lock(slot, &SpinForever) {
+        if let Some(_guard) = self.slot_lock(slot, &SpinForever, passes) {
             self.slot(slot).drive.store(driver, Ordering::Release);
         }
     }
@@ -3151,10 +3241,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         driver: u64,
         take: &mut impl FnMut(RecordRef),
         placed: &mut impl FnMut(HostPlacement),
+        passes: &OwedPasses,
     ) -> bool {
         let s = self.slot(slot);
         {
-            let Some(_guard) = self.slot_lock(slot, &SpinForever) else {
+            let Some(_guard) = self.slot_lock(slot, &SpinForever, passes) else {
                 return false;
             };
             if s.driver() != Some(driver) {
@@ -3162,16 +3253,16 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             }
             s.drive.store(driver | SLOT_AWAY, Ordering::Release);
         }
-        self.vacate(slot, take, placed);
+        self.vacate(slot, take, placed, passes);
         true
     }
 
     /// Executor `driver` is back from the host wait [`Self::step_away`]
     /// began, with its guest CPU: placements may choose `slot` again, if it
     /// still drives it.
-    pub fn step_back(&self, slot: SlotId, driver: u64) {
+    pub fn step_back(&self, slot: SlotId, driver: u64, passes: &OwedPasses) {
         let s = self.slot(slot);
-        if let Some(_guard) = self.slot_lock(slot, &SpinForever)
+        if let Some(_guard) = self.slot_lock(slot, &SpinForever, passes)
             && s.driver() == Some(driver)
         {
             s.drive.store(driver, Ordering::Release);
@@ -3195,10 +3286,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         driver: u64,
         take: &mut impl FnMut(RecordRef),
         placed: &mut impl FnMut(HostPlacement),
+        passes: &OwedPasses,
     ) -> bool {
         let s = self.slot(slot);
         {
-            let Some(_guard) = self.slot_lock(slot, &SpinForever) else {
+            let Some(_guard) = self.slot_lock(slot, &SpinForever, passes) else {
                 return false;
             };
             if s.driver() != Some(driver) || s.state().in_guest() || s.current().is_some() {
@@ -3206,7 +3298,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             }
             s.drive.store(0, Ordering::Release);
         }
-        self.vacate(slot, take, placed);
+        self.vacate(slot, take, placed, passes);
         true
     }
 
@@ -3215,6 +3307,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         slot: SlotId,
         take: &mut impl FnMut(RecordRef),
         placed: &mut impl FnMut(HostPlacement),
+        passes: &OwedPasses,
     ) {
         // Threads ready at EL0 move straight to other slots; what stays needs
         // an executor (a service thread, or one the host asked for).
@@ -3229,22 +3322,32 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 }
             },
             placed,
+            passes,
         );
-        let _ = self.drain_slot(slot, &mut |record, discard| {
-            if discard {
-                self.free_record(record.id);
-            } else {
-                take(record);
-            }
-        });
+        let _ = self.drain_slot(
+            slot,
+            &mut |record, discard| {
+                if discard {
+                    self.free_record(record.id);
+                } else {
+                    take(record);
+                }
+            },
+            passes,
+        );
     }
 
     /// The executor of `slot`, stopped at an exit, takes back every queued
     /// thread the host asked for while EL1 held it (its claim was refused
     /// and the slot kicked): host-owned, passed to `take` for the caller to
     /// hand to its thread's host continuation, where the host acts on it.
-    pub fn take_host_wanted(&self, slot: SlotId, take: &mut impl FnMut(RecordRef)) -> usize {
-        let Some(guard) = self.slot_lock(slot, &SpinForever) else {
+    pub fn take_host_wanted(
+        &self,
+        slot: SlotId,
+        take: &mut impl FnMut(RecordRef),
+        passes: &OwedPasses,
+    ) -> usize {
+        let Some(guard) = self.slot_lock(slot, &SpinForever, passes) else {
             return 0;
         };
         let mut taken = 0;
@@ -3285,8 +3388,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
 
     /// The executor of `slot`, stopped at an exit, frees the records on its
     /// run queue whose threads the host retired while EL1 held them.
-    pub fn sweep_cancelled(&self, slot: SlotId) -> usize {
-        let Some(guard) = self.slot_lock(slot, &SpinForever) else {
+    pub fn sweep_cancelled(&self, slot: SlotId, passes: &OwedPasses) -> usize {
+        let Some(guard) = self.slot_lock(slot, &SpinForever, passes) else {
             return 0;
         };
         let mut freed = 0;
@@ -3954,6 +4057,22 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         unlink_wait: impl FnOnce(),
         nonblocking: bool,
     ) -> bool {
+        let passes = OwedPasses::new();
+        let claimed =
+            self.claim_for_el1_owing(claim, waker, effects, unlink_wait, nonblocking, &passes);
+        passes.fold_into(effects);
+        claimed
+    }
+
+    fn claim_for_el1_owing(
+        &self,
+        claim: (RecordId, u32, u64),
+        waker: SlotId,
+        effects: &mut WakeEffects,
+        unlink_wait: impl FnOnce(),
+        nonblocking: bool,
+        passes: &OwedPasses,
+    ) -> bool {
         let (record, seq, index) = claim;
         let rec = self.record(record);
         let home = rec.home();
@@ -3973,11 +4092,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             .filter(|target| *target != waker);
         if let Some(target) = target
             && let Some(slot_guard) = if nonblocking {
-                self.slot_lock(target, &BoundedSpin(0))
+                self.slot_lock(target, &BoundedSpin(0), passes)
             } else if runs_on_waker {
-                self.slot_lock(target, &BoundedSpin(EL1_SLOT_LOCK_SPINS))
+                self.slot_lock(target, &BoundedSpin(EL1_SLOT_LOCK_SPINS), passes)
             } else {
-                self.slot_lock(target, &SpinForever)
+                self.slot_lock(target, &SpinForever, passes)
             }
         {
             // This is the target's only attempt. Apply its full owner
@@ -4040,9 +4159,17 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                     unlink_wait();
                 };
                 let placed = if nonblocking {
-                    self.requeue_claimed(owner, record, from, &BoundedSpin(0), admits, claimed)
+                    self.requeue_claimed(
+                        owner,
+                        record,
+                        from,
+                        &BoundedSpin(0),
+                        admits,
+                        claimed,
+                        passes,
+                    )
                 } else {
-                    self.requeue_claimed(owner, record, from, &SpinForever, admits, claimed)
+                    self.requeue_claimed(owner, record, from, &SpinForever, admits, claimed, passes)
                 };
                 match placed {
                     Placement::Placed(placement) => {
@@ -4077,9 +4204,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         // slot changed since the plan and the waker may run it, or no other
         // slot owns it and the waker's executor may serve it on this CPU.
         let slot_guard = if nonblocking {
-            self.slot_lock(waker, &BoundedSpin(0))
+            self.slot_lock(waker, &BoundedSpin(0), passes)
         } else {
-            self.slot_lock(waker, &SpinForever)
+            self.slot_lock(waker, &SpinForever, passes)
         };
         let Some(slot_guard) = slot_guard else {
             return false;
@@ -4291,7 +4418,12 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     }
 
     /// Take `slot`'s run-queue lock, waiting per `wait`.
-    pub fn slot_lock(&self, slot: SlotId, wait: &impl LockWait<C>) -> Option<SlotGuard<'_, C>> {
+    pub fn slot_lock<'a>(
+        &'a self,
+        slot: SlotId,
+        wait: &impl LockWait<C>,
+        passes: &'a OwedPasses,
+    ) -> Option<SlotGuard<'a, C>> {
         #[cfg(all(test, not(feature = "loom")))]
         tests::observe_slot_lock(slot);
         let lock = &self.slot(slot).lock;
@@ -4301,7 +4433,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 .compare_exchange(0, SLOT_LOCK_HELD, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
-                return Some(SlotGuard { zone: self, slot });
+                return Some(SlotGuard {
+                    zone: self,
+                    slot,
+                    passes,
+                });
             }
             attempt = attempt.saturating_add(1);
             if !wait.wait(attempt) {
@@ -4316,7 +4452,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// `None` is "not now": the holder's release owes this scan (whose idle
     /// bit is published) another pass ([`Self::owe_scan_passes`]), never an
     /// empty queue.
-    fn slot_lock_or_enrol_scan(&self, slot: SlotId) -> Option<SlotGuard<'_, C>> {
+    fn slot_lock_or_enrol_scan<'a>(
+        &'a self,
+        slot: SlotId,
+        passes: &'a OwedPasses,
+    ) -> Option<SlotGuard<'a, C>> {
         let lock = &self.slot(slot).lock;
         let mut word = lock.load(Ordering::Relaxed);
         loop {
@@ -4328,7 +4468,13 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             // Release on the enrolment: the releaser's swap reads it, and so
             // the idle bit this scan published before it.
             match lock.compare_exchange_weak(word, next, Ordering::AcqRel, Ordering::Relaxed) {
-                Ok(_) if next == SLOT_LOCK_HELD => return Some(SlotGuard { zone: self, slot }),
+                Ok(_) if next == SLOT_LOCK_HELD => {
+                    return Some(SlotGuard {
+                        zone: self,
+                        slot,
+                        passes,
+                    });
+                }
                 Ok(_) => break,
                 Err(current) => word = current,
             }
@@ -4337,7 +4483,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         // enrolment (its release then owed a pass already).
         lock.compare_exchange(0, SLOT_LOCK_HELD, Ordering::Acquire, Ordering::Relaxed)
             .ok()
-            .map(|_| SlotGuard { zone: self, slot })
+            .map(|_| SlotGuard {
+                zone: self,
+                slot,
+                passes,
+            })
     }
 
     /// Append `record` to the run queue `guard` holds. The first thread
@@ -4410,13 +4560,14 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         &self,
         record: RecordRef,
         wait: &impl LockWait<C>,
+        passes: &OwedPasses,
     ) -> Option<bool> {
         if self.live(record)?.entry_count() != 0 {
             return Some(false);
         }
         for raw in 0..ZONE_SLOTS {
             let slot = SlotId::new(raw as u8);
-            let _guard = self.slot_lock(slot, wait)?;
+            let _guard = self.slot_lock(slot, wait, passes)?;
             let state = self.slot(slot);
             if state.tail.load(Ordering::Acquire) == record.id.raw() {
                 return Some(false);
@@ -4569,8 +4720,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// ([`Self::take_service_head`]).
     /// Returns whether this call published the queued record. A subsequent
     /// claimant may already own it when the caller observes this result.
-    pub fn unswitch(&self, slot: SlotId, record: RecordId) -> bool {
-        self.unswitch_with(slot, record, &SpinForever, || {})
+    pub fn unswitch(&self, slot: SlotId, record: RecordId, passes: &OwedPasses) -> bool {
+        self.unswitch_with(slot, record, &SpinForever, || {}, passes)
     }
 
     /// [`Self::unswitch`], waiting for the slot lock as `wait` says. False:
@@ -4582,6 +4733,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         record: RecordId,
         wait: &impl LockWait<C>,
         rollback: impl FnOnce(),
+        passes: &OwedPasses,
     ) -> bool {
         let rec = self.record(record);
         let from = rec.claim();
@@ -4592,7 +4744,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         if owner != slot {
             return false;
         }
-        let Some(guard) = self.slot_lock(slot, wait) else {
+        let Some(guard) = self.slot_lock(slot, wait, passes) else {
             return false;
         };
         if !rec.cas(from, Claim::Queued { slot, seq })
@@ -4630,8 +4782,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     }
 
     /// Remove and return the head of `slot`'s run queue.
-    fn pop_head(&self, slot: SlotId) -> Option<RecordId> {
-        let guard = self.slot_lock(slot, &SpinForever)?;
+    fn pop_head(&self, slot: SlotId, passes: &OwedPasses) -> Option<RecordId> {
+        let guard = self.slot_lock(slot, &SpinForever, passes)?;
         let record = RecordId::from_raw(self.slot(slot).head.load(Ordering::Relaxed))?;
         self.remove_locked(&guard, record).then_some(record)
     }
@@ -4640,12 +4792,13 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// running one (`OnCpu`). The caller loads its context and applies
     /// [`SwitchedIn::result`]. A cancelled record at the head is left for the
     /// executor to discard (nothing is switched in).
-    pub fn switch_in(&self, slot: SlotId) -> Option<RecordId> {
-        self.switch_in_full(slot).map(|switched| switched.record)
+    pub fn switch_in(&self, slot: SlotId, passes: &OwedPasses) -> Option<RecordId> {
+        self.switch_in_full(slot, passes)
+            .map(|switched| switched.record)
     }
 
     /// [`Self::switch_in`] with what the caller must apply.
-    pub fn switch_in_full(&self, slot: SlotId) -> Option<SwitchedIn> {
+    pub fn switch_in_full(&self, slot: SlotId, passes: &OwedPasses) -> Option<SwitchedIn> {
         let head = self.runnable_head(slot)?;
         if self.record(head).needs_host() {
             // EL1 never runs it at EL0: the caller leaves for the host.
@@ -4657,7 +4810,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             return None;
         }
         let record = {
-            let guard = self.slot_lock(slot, &SpinForever)?;
+            let guard = self.slot_lock(slot, &SpinForever, passes)?;
             if !self.remove_locked(&guard, head) {
                 return None;
             }
@@ -4871,23 +5024,39 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// runnable at the tail of the slot's run queue, to resume with its
     /// registers as they were. Room was made by the switch that follows (the
     /// caller switched the head in first).
-    pub fn requeue_preempted(&self, slot: SlotId, record: RecordId) -> Requeue {
-        self.requeue_resumed(slot, record, false)
+    pub fn requeue_preempted(
+        &self,
+        slot: SlotId,
+        record: RecordId,
+        passes: &OwedPasses,
+    ) -> Requeue {
+        self.requeue_resumed(slot, record, false, passes)
     }
 
     /// Requeue a checkpointed native owner record back onto the head of `slot`'s
     /// run queue with [`Handback::Resumed`] so its next selection immediately
     /// resumes its published context and `OwnerContinuation` without re-applying
     /// an earlier wait's wake handback.
-    pub fn requeue_checkpoint_head(&self, slot: SlotId, record: RecordId) -> Requeue {
-        self.requeue_resumed(slot, record, true)
+    pub fn requeue_checkpoint_head(
+        &self,
+        slot: SlotId,
+        record: RecordId,
+        passes: &OwedPasses,
+    ) -> Requeue {
+        self.requeue_resumed(slot, record, true, passes)
     }
 
-    fn requeue_resumed(&self, slot: SlotId, record: RecordId, push_front: bool) -> Requeue {
+    fn requeue_resumed(
+        &self,
+        slot: SlotId,
+        record: RecordId,
+        push_front: bool,
+        passes: &OwedPasses,
+    ) -> Requeue {
         // The claim and queue membership become visible together to a host
         // requester. It must not observe Queued before push.
         let rec = self.record(record);
-        let Some(guard) = self.slot_lock(slot, &SpinForever) else {
+        let Some(guard) = self.slot_lock(slot, &SpinForever, passes) else {
             return Requeue::Refused(rec.claim());
         };
         let observed = rec.claim();
@@ -4938,13 +5107,25 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// that may take them (at a tick, before preempting). Returns how many
     /// moved; their SGIs go to `effects`.
     pub fn migrate_queued(&self, slot: SlotId, effects: &mut WakeEffects) -> usize {
+        let passes = OwedPasses::new();
+        let moved = self.migrate_queued_owing(slot, effects, &passes);
+        passes.fold_into(effects);
+        moved
+    }
+
+    fn migrate_queued_owing(
+        &self,
+        slot: SlotId,
+        effects: &mut WakeEffects,
+        passes: &OwedPasses,
+    ) -> usize {
         // The queueing half of the idle scan's pair ([`Self::take_idle_work`]):
         // the threads queued here are visible before the idle map is read.
         fence(Ordering::SeqCst);
         let mut moved = 0;
         let len = self.slot(slot).queued();
         for _ in 0..len {
-            let Some(record) = self.pop_head(slot) else {
+            let Some(record) = self.pop_head(slot, passes) else {
                 break;
             };
             let rec = self.record(record);
@@ -4954,7 +5135,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 None
             };
             let placed = target.is_some_and(|target| {
-                let Some(guard) = self.slot_lock(target, &BoundedSpin(EL1_SLOT_LOCK_SPINS)) else {
+                let Some(guard) = self.slot_lock(target, &BoundedSpin(EL1_SLOT_LOCK_SPINS), passes)
+                else {
                     return false;
                 };
                 if !self.accepts(target, rec, false) {
@@ -4982,7 +5164,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             if placed {
                 moved += 1;
                 self.counters.el1_migrations.fetch_add(1, Ordering::Relaxed);
-            } else if let Some(guard) = self.slot_lock(slot, &SpinForever) {
+            } else if let Some(guard) = self.slot_lock(slot, &SpinForever, passes) {
                 // Back at the tail: the order of the rest is kept.
                 self.push_locked(&guard, record, None);
                 drop(guard);
@@ -5031,10 +5213,10 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// `released` another scan. The enrolled scan published its idle bit
     /// before it enrolled, so this read sees it. Each is owed a reschedule
     /// (the durable half its pre-WFI recheck reads, [`Self::take_resched`])
-    /// and an SGI (for one already in WFI), taken by
-    /// [`Self::take_scan_passes`]. A slot that left idle meanwhile takes
-    /// one spurious pass.
-    fn owe_scan_passes(&self, released: SlotId) {
+    /// and an SGI (for one already in WFI), into `passes` for the releaser's
+    /// caller to send. A slot that left idle meanwhile takes one spurious
+    /// pass.
+    fn owe_scan_passes(&self, released: SlotId, passes: &OwedPasses) {
         fence(Ordering::SeqCst);
         for (word_index, word) in self.idle_map.iter().enumerate() {
             let mut bits = word.load(Ordering::Acquire);
@@ -5048,16 +5230,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                     continue;
                 }
                 self.owe_resched(idle);
-                self.scan_passes[word_index].fetch_or(1 << bit, Ordering::AcqRel);
+                passes.owe(idle);
             }
-        }
-    }
-
-    /// Move the SGIs released run-queue locks owe idle scans
-    /// ([`Self::owe_scan_passes`]) into `effects`.
-    pub fn take_scan_passes(&self, effects: &mut WakeEffects) {
-        for (word, owed) in effects.sgi.iter_mut().zip(self.scan_passes.iter()) {
-            *word |= owed.swap(0, Ordering::AcqRel);
         }
     }
 
@@ -5230,8 +5404,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         result: u64,
         retry_ticks: u64,
         completion: &dyn Fn(object_wait::OwnedObjectWakeEffects<'_, C>),
+        passes: &OwedPasses,
     ) -> Option<u64> {
-        match self.expire_timer(slot, now, result, completion) {
+        match self.expire_timer(slot, now, result, completion, passes) {
             Ok(_) => self.timer_deadline(slot),
             Err(()) => Some(now.saturating_add(retry_ticks.max(1))),
         }
@@ -5248,6 +5423,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         now: u64,
         result: u64,
         completion: &dyn Fn(object_wait::OwnedObjectWakeEffects<'_, C>),
+        passes: &OwedPasses,
     ) -> Result<bool, ()> {
         let Some(ticket) = self
             .timers
@@ -5269,7 +5445,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         let entry_id = rec.first_entry.load(Ordering::Acquire);
         if entry_id == NIL {
             // A timed object park (an epoll wait): its queue, not a bucket.
-            let expired = self.expire_object_park(slot, ticket.record, seq, completion)?;
+            let expired = self.expire_object_park(slot, ticket.record, seq, completion, passes)?;
             self.timers.remove(ticket);
             if expired {
                 self.counters.el1_timeouts.fetch_add(1, Ordering::Relaxed);
@@ -5280,7 +5456,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         let Some(guard) = self.lock(bucket, &BoundedSpin(EL1_SLOT_LOCK_SPINS)) else {
             return Err(());
         };
-        let Some(slot_guard) = self.slot_lock(slot, &SpinForever) else {
+        let Some(slot_guard) = self.slot_lock(slot, &SpinForever, passes) else {
             return Err(());
         };
         if self.entry(entry_id).bucket.load(Ordering::Relaxed) as usize != guard.bucket
@@ -5306,7 +5482,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// queues a thread either sees `IdleWfi` (and sends the SGI) or its
     /// thread is seen here (and the slot does not park): returns whether the
     /// slot may execute WFI now.
-    pub fn enter_idle(&self, slot: SlotId, wfi: bool) -> bool {
+    pub fn enter_idle(&self, slot: SlotId, wfi: bool, passes: &OwedPasses) -> bool {
         let s = self.slot(slot);
         let word = &self.idle_map[slot.index() / 64];
         if !wfi {
@@ -5314,7 +5490,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             word.fetch_or(1 << (slot.index() % 64), Ordering::AcqRel);
             return false;
         }
-        let Some(_guard) = self.slot_lock(slot, &SpinForever) else {
+        let Some(_guard) = self.slot_lock(slot, &SpinForever, passes) else {
             return false;
         };
         if s.len.load(Ordering::Acquire) != 0 {
@@ -5344,8 +5520,8 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// The executor holds `slot`'s stopped vCPU: under the slot's lock, stop
     /// every other vCPU from queueing on it, so the drain that follows takes
     /// everything queued there.
-    pub fn leave_guest(&self, slot: SlotId, wait: &impl LockWait<C>) {
-        let guard = self.slot_lock(slot, wait);
+    pub fn leave_guest(&self, slot: SlotId, wait: &impl LockWait<C>, passes: &OwedPasses) {
+        let guard = self.slot_lock(slot, wait, passes);
         self.slot(slot)
             .state
             .store(SlotState::Host as u32, Ordering::Release);
@@ -5363,8 +5539,13 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// Each callback receives the incarnation captured before host ownership
     /// was published, so cancellation/reuse cannot retarget its delivery.
     /// The switched-in record, if any, is left for the caller.
-    pub fn drain_slot(&self, slot: SlotId, take: &mut impl FnMut(RecordRef, bool)) -> SlotDrain {
-        let guard = self.slot_lock(slot, &SpinForever);
+    pub fn drain_slot(
+        &self,
+        slot: SlotId,
+        take: &mut impl FnMut(RecordRef, bool),
+        passes: &OwedPasses,
+    ) -> SlotDrain {
+        let guard = self.slot_lock(slot, &SpinForever, passes);
         let s = self.slot(slot);
         let mut drain = SlotDrain {
             woken: 0,
@@ -5493,8 +5674,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         slot: SlotId,
         record: RecordId,
         wait: &impl LockWait<C>,
+        passes: &OwedPasses,
     ) -> CurrentRelease {
-        self.release_current_with(slot, record, wait, || true)
+        self.release_current_with(slot, record, wait, || true, passes)
             .unwrap_or(CurrentRelease::Requeued)
     }
 
@@ -5506,6 +5688,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         record: RecordId,
         wait: &impl LockWait<C>,
         mut finish: impl RecordRelease,
+        passes: &OwedPasses,
     ) -> Option<CurrentRelease> {
         let s = self.slot(slot);
         let rec = self.record(record);
@@ -5515,7 +5698,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         }
         if owned
             && rec.has_object_operation()
-            && self.unswitch_with(slot, record, wait, || finish.rollback())
+            && self.unswitch_with(slot, record, wait, || finish.rollback(), passes)
         {
             return Some(CurrentRelease::Requeued);
         }
@@ -5598,8 +5781,15 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// Publish what the host loaded on `slot`: the zone key of its address
     /// space (0: not a zone process), the guest CPU its executor is bound to
     /// (`None`: any) and the loaded thread's affinity mask (0: any).
-    pub fn publish_slot(&self, slot: SlotId, mm: u64, cpu: Option<u32>, affinity: u64) {
-        self.publish_slot_with_affinity(slot, mm, cpu, AffinitySource::UNBOUND);
+    pub fn publish_slot(
+        &self,
+        slot: SlotId,
+        mm: u64,
+        cpu: Option<u32>,
+        affinity: u64,
+        passes: &OwedPasses,
+    ) {
+        self.publish_slot_with_affinity(slot, mm, cpu, AffinitySource::UNBOUND, passes);
         self.slot(slot).affinity.store(affinity, Ordering::Release);
     }
 
@@ -5611,9 +5801,10 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         mm: u64,
         cpu: Option<u32>,
         source: AffinitySource,
+        passes: &OwedPasses,
     ) {
         debug_assert!(driver != 0 && driver & SLOT_AWAY == 0);
-        self.publish_slot_owner(slot, mm, cpu, source, Some(driver));
+        self.publish_slot_owner(slot, mm, cpu, source, Some(driver), passes);
     }
 
     /// Bind a live control authority before guest entry. The execution lane
@@ -5624,8 +5815,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         mm: u64,
         cpu: Option<u32>,
         source: AffinitySource,
+        passes: &OwedPasses,
     ) {
-        self.publish_slot_owner(slot, mm, cpu, source, None);
+        self.publish_slot_owner(slot, mm, cpu, source, None, passes);
     }
 
     fn publish_slot_owner(
@@ -5635,8 +5827,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         cpu: Option<u32>,
         source: AffinitySource,
         driver: Option<u64>,
+        passes: &OwedPasses,
     ) {
-        let guard = self.slot_lock(slot, &SpinForever);
+        let guard = self.slot_lock(slot, &SpinForever, passes);
         let s = self.slot(slot);
         s.terminal[0].store(0, Ordering::Release);
         s.mm.store(mm, Ordering::Release);
@@ -5652,7 +5845,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         fence(Ordering::SeqCst);
         // CPU is now published. Only this returning driver is targeted, so
         // its entry consumes resched debt without a remote host kick.
-        self.probe_held_inner(Some(slot), &mut |_, _| {});
+        self.probe_held_inner(Some(slot), &mut |_, _| {}, passes);
     }
 
     /// Refresh only the retained affinity source on re-entry. Terminal
@@ -5677,10 +5870,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// then refuses to sleep), or this scan steals it. A slot that scanned
     /// only its own queue slept past a thread a peer's migration left
     /// queued behind a thread that would not yield its CPU.
-    pub fn take_idle_work(&self, slot: SlotId) -> Option<SwitchedIn> {
-        self.enter_idle(slot, false);
+    pub fn take_idle_work(&self, slot: SlotId, passes: &OwedPasses) -> Option<SwitchedIn> {
+        self.enter_idle(slot, false, passes);
         fence(Ordering::SeqCst);
-        self.switch_in_full(slot).or_else(|| self.steal(slot))
+        self.switch_in_full(slot, passes)
+            .or_else(|| self.steal(slot, passes))
     }
 
     /// EL1 on idle `thief`: take a queued thread it may run from another
@@ -5690,7 +5884,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// Never inlined: the idle loop's frame stays live beneath every resumed
     /// thread, and this search returns before the selected thread runs.
     #[inline(never)]
-    pub fn steal(&self, thief: SlotId) -> Option<SwitchedIn> {
+    pub fn steal(&self, thief: SlotId, passes: &OwedPasses) -> Option<SwitchedIn> {
         for (word_index, word) in self.queued_map.iter().enumerate() {
             let mut bits = word.load(Ordering::Acquire);
             while bits != 0 {
@@ -5702,7 +5896,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 if victim == thief {
                     continue;
                 }
-                if let Some(switched) = self.steal_from(thief, victim) {
+                if let Some(switched) = self.steal_from(thief, victim, passes) {
                     return Some(switched);
                 }
             }
@@ -5710,12 +5904,12 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         None
     }
 
-    fn steal_from(&self, thief: SlotId, victim: SlotId) -> Option<SwitchedIn> {
+    fn steal_from(&self, thief: SlotId, victim: SlotId, passes: &OwedPasses) -> Option<SwitchedIn> {
         // A busy victim is "not now": the scan enrols on the holder's
         // release, which owes it another pass (#3083).
-        let guard = match self.slot_lock(victim, &BoundedSpin(EL1_SLOT_LOCK_SPINS)) {
+        let guard = match self.slot_lock(victim, &BoundedSpin(EL1_SLOT_LOCK_SPINS), passes) {
             Some(guard) => guard,
-            None => self.slot_lock_or_enrol_scan(victim)?,
+            None => self.slot_lock_or_enrol_scan(victim, passes)?,
         };
         let s = self.slot(victim);
         let cpu = self.slot(thief).cpu.load(Ordering::Relaxed);
@@ -5767,7 +5961,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             // queue it on the thief, whose idle loop then leaves for the
             // host with it at its head.
             if self.needs_executor(thief, rec) {
-                if let Some(own) = self.slot_lock(thief, &SpinForever) {
+                if let Some(own) = self.slot_lock(thief, &SpinForever, passes) {
                     self.push_locked(&own, record, None);
                 }
                 return None;
@@ -5821,20 +6015,24 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// host cannot send: [`HostPlacement::resched`] tells the caller to force
     /// that vCPU out, and its run loop delivers the SGI
     /// ([`Self::take_resched`]).
-    pub fn place_from_host(&self, record: RecordId) -> Option<HostPlacement> {
+    pub fn place_from_host(&self, record: RecordId, passes: &OwedPasses) -> Option<HostPlacement> {
         let rec = self.record(record);
         let from = rec.claim();
         if !matches!(from, Claim::Host { .. } | Claim::FirstEntryHost { .. }) {
             return None;
         }
-        self.place_from_claim(record, from)
+        self.place_from_claim(record, from, passes)
     }
 
     /// Retain a native readiness/exception completion when every driver
     /// is outside the guest. Queue custody survives a driver stepping away;
     /// an eligible returning or idle driver can take/steal it. This does not
     /// grant execution on the queue's CPU or bypass MM/affinity admission.
-    pub fn place_native_handback(&self, record: RecordRef) -> Option<NativePlacement> {
+    pub fn place_native_handback(
+        &self,
+        record: RecordRef,
+        passes: &OwedPasses,
+    ) -> Option<NativePlacement> {
         let rec = self.live(record)?;
         if !rec.needs_native_handback() {
             return None;
@@ -5843,7 +6041,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         if !matches!(from, Claim::Host { .. }) {
             return None;
         }
-        if let Some(placement) = self.place_from_claim(record.id, from) {
+        if let Some(placement) = self.place_from_claim(record.id, from, passes) {
             return Some(NativePlacement::Placed(placement));
         }
         let held = Claim::Held { seq: from.seq() };
@@ -5855,11 +6053,16 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         fence(Ordering::SeqCst);
         // Post before probing: a concurrent driver either observes our bit,
         // or this probe observes its published CPU and driver.
-        self.probe_held_record(record.id, None)
+        self.probe_held_record(record.id, None, passes)
             .or(Some(NativePlacement::Held))
     }
 
-    fn probe_held_record(&self, id: RecordId, target: Option<SlotId>) -> Option<NativePlacement> {
+    fn probe_held_record(
+        &self,
+        id: RecordId,
+        target: Option<SlotId>,
+        passes: &OwedPasses,
+    ) -> Option<NativePlacement> {
         let bit = 1 << (id.index() % 64);
         let word = &self.held_map[id.index() / 64];
         if word.fetch_and(!bit, Ordering::SeqCst) & bit == 0 {
@@ -5869,14 +6072,14 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         if !matches!(from, Claim::Held { .. }) {
             return None;
         }
-        if let Some(placement) = self.place_held_claim(id, from, target) {
+        if let Some(placement) = self.place_held_claim(id, from, target, passes) {
             return Some(NativePlacement::Placed(placement));
         }
         word.fetch_or(bit, Ordering::SeqCst);
         fence(Ordering::SeqCst);
         // One post-publication probe closes the race with a trigger that
         // took the bit before a new driver/affinity was published.
-        if let Some(placement) = self.place_held_claim(id, from, target) {
+        if let Some(placement) = self.place_held_claim(id, from, target, passes) {
             // Leave any stale hint: clearing it could erase a new hold.
             return Some(NativePlacement::Placed(placement));
         }
@@ -5888,15 +6091,16 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         id: RecordId,
         from: Claim,
         target: Option<SlotId>,
+        passes: &OwedPasses,
     ) -> Option<HostPlacement> {
         let Some(slot) = target else {
-            return self.place_from_claim(id, from);
+            return self.place_from_claim(id, from, passes);
         };
         let rec = self.record(id);
         if rec.home().is_some_and(|home| home != slot) {
             return None;
         }
-        let guard = self.slot_lock(slot, &SpinForever)?;
+        let guard = self.slot_lock(slot, &SpinForever, passes)?;
         if !OwnerCustody::Driven.holds(self, slot, rec)
             || !rec.cas(
                 from,
@@ -5923,6 +6127,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         &self,
         target: Option<SlotId>,
         placed: &mut impl FnMut(RecordId, HostPlacement),
+        passes: &OwedPasses,
     ) {
         for (index, word) in self.held_map.iter().enumerate() {
             let mut bits = word.load(Ordering::SeqCst);
@@ -5930,7 +6135,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 let bit = bits.trailing_zeros() as usize;
                 bits &= bits - 1;
                 if let Some(NativePlacement::Placed(p)) =
-                    self.probe_held_record(RecordId((index * 64 + bit) as u32), target)
+                    self.probe_held_record(RecordId((index * 64 + bit) as u32), target, passes)
                 {
                     placed(RecordId((index * 64 + bit) as u32), p);
                 }
@@ -5942,23 +6147,33 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// Each held record is taken by clearing its hint; claim CAS is authority.
     pub fn probe_held(&self, effects: &mut WakeEffects) {
         fence(Ordering::SeqCst);
-        self.probe_held_inner(None, &mut |id, placement| {
-            if placement.resched {
-                effects.request_reschedule(placement.slot);
-            }
-            self.kick_peers_of_away_owner(self.record(id), placement.slot, effects);
-        });
+        let passes = OwedPasses::new();
+        self.probe_held_inner(
+            None,
+            &mut |id, placement| {
+                if placement.resched {
+                    effects.request_reschedule(placement.slot);
+                }
+                self.kick_peers_of_away_owner(self.record(id), placement.slot, effects);
+            },
+            &passes,
+        );
+        passes.fold_into(effects);
     }
 
     /// Native handbacks never borrow an unchecked default slot. Host-backed
     /// continuations keep their existing owner-queue policy.
-    pub fn place_host_handback(&self, record: RecordRef) -> Option<HostHandback> {
+    pub fn place_host_handback(
+        &self,
+        record: RecordRef,
+        passes: &OwedPasses,
+    ) -> Option<HostHandback> {
         let rec = self.live(record)?;
         let placement = if rec.has_native_execution_owner() {
-            self.place_native_handback(record)?
+            self.place_native_handback(record, passes)?
         } else {
             let owner = rec.home().or(rec.last_slot()).unwrap_or(SlotId::new(0));
-            NativePlacement::Placed(self.requeue_on(owner, record.id)?)
+            NativePlacement::Placed(self.requeue_on(owner, record.id, passes)?)
         };
         Some(HostHandback {
             placement,
@@ -5976,8 +6191,13 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// owner (its exit, a signal) settled meanwhile, needs nothing. Every
     /// host venue of a carrier zone delivers its handbacks here (#2031,
     /// #2783); none completes or drops one.
-    pub fn hand_back_to_owner(&self, record: RecordRef, resched: &mut impl FnMut(SlotId)) {
-        let Some(handback) = self.place_host_handback(record) else {
+    pub fn hand_back_to_owner(
+        &self,
+        record: RecordRef,
+        resched: &mut impl FnMut(SlotId),
+        passes: &OwedPasses,
+    ) {
+        let Some(handback) = self.place_host_handback(record, passes) else {
             return;
         };
         let NativePlacement::Placed(placement) = handback.placement else {
@@ -5997,7 +6217,12 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         }
     }
 
-    fn place_from_claim(&self, record: RecordId, from: Claim) -> Option<HostPlacement> {
+    fn place_from_claim(
+        &self,
+        record: RecordId,
+        from: Claim,
+        passes: &OwedPasses,
+    ) -> Option<HostPlacement> {
         let rec = self.record(record);
         let seq = rec.parked_sequence(from);
         let service = rec.needs_host() || rec.needs_host_first_entry();
@@ -6006,7 +6231,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         if let Some(home) = rec.home() {
             // The host believes its thread runs on its home slot: only that
             // slot may run it, and only while it is in the guest.
-            let guard = self.slot_lock(home, &SpinForever)?;
+            let guard = self.slot_lock(home, &SpinForever, passes)?;
             let state = self.slot(home).state();
             if !(if native {
                 OwnerCustody::Driven.holds(self, home, rec)
@@ -6050,7 +6275,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                         && OwnerCustody::Driven.holds(self, *slot, rec)
                 }),
         ) {
-            let Some(guard) = self.slot_lock(slot, &SpinForever) else {
+            let Some(guard) = self.slot_lock(slot, &SpinForever, passes) else {
                 continue;
             };
             let state = self.slot(slot).state();
@@ -6106,6 +6331,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         except: Option<SlotId>,
         wait: &impl LockWait<C>,
         claimed: impl FnOnce(&ZoneRecord<C>),
+        passes: &OwedPasses,
     ) -> Placement {
         let rec = self.record(record);
         let seq = match from {
@@ -6140,7 +6366,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             if candidates[..index].contains(candidate) {
                 continue;
             }
-            let Some(guard) = self.slot_lock(slot, wait) else {
+            let Some(guard) = self.slot_lock(slot, wait, passes) else {
                 continue;
             };
             let state = self.slot(slot).state();
@@ -6181,6 +6407,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         mm: Option<u64>,
         handed: &mut impl FnMut(RecordRef, bool),
         placed: &mut impl FnMut(HostPlacement),
+        passes: &OwedPasses,
     ) -> usize {
         let mut moved = 0;
         loop {
@@ -6190,7 +6417,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             let mut batch = [const { None }; 32];
             let mut taken = 0;
             {
-                let Some(guard) = self.slot_lock(slot, &SpinForever) else {
+                let Some(guard) = self.slot_lock(slot, &SpinForever, passes) else {
                     return moved;
                 };
                 let mut cursor = self.slot(slot).head.load(Ordering::Acquire);
@@ -6225,7 +6452,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 let transfer = if rec.is_cancelled() {
                     transfer
                 } else {
-                    match transfer.place_in_guest(slot) {
+                    match transfer.place_in_guest(slot, passes) {
                         Ok(placement) => {
                             placed(placement);
                             moved += 1;
@@ -6274,6 +6501,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         place: bool,
         handed: &mut impl FnMut(HostTransfer<'a, C>),
         placed: &mut impl FnMut(HostPlacement),
+        passes: &OwedPasses,
     ) -> u32 {
         let bucket = &self.buckets[guard.bucket];
         let mut done = 0u32;
@@ -6287,11 +6515,18 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 let rec = self.record(record);
                 let from = Claim::Parked { seq };
                 let outcome = if place && rec.entry_count() == 1 {
-                    self.place_in_guest(record, from, None, &SpinForever, |rec| {
-                        self.mark_woken(rec, index);
-                        self.unlink(guard, cursor);
-                        self.drop_entry(rec, cursor);
-                    })
+                    self.place_in_guest(
+                        record,
+                        from,
+                        None,
+                        &SpinForever,
+                        |rec| {
+                            self.mark_woken(rec, index);
+                            self.unlink(guard, cursor);
+                            self.drop_entry(rec, cursor);
+                        },
+                        passes,
+                    )
                 } else {
                     Placement::NoSlot
                 };
@@ -6436,6 +6671,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         kind: Handback,
         wait: &impl LockWait<C>,
         completion: &dyn Fn(object_wait::OwnedObjectWakeEffects<'_, C>),
+        passes: &OwedPasses,
     ) -> HostClaim {
         let rec = self.record(r.id);
         if kind == Handback::GroupStop {
@@ -6447,7 +6683,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             // This tagged write is harmless even if r was retired/reused.
             rec.request_cancel(r.incarnation);
         }
-        self.claim_for_host_inner(r, rec, seq, kind, wait, completion)
+        self.claim_for_host_inner(r, rec, seq, kind, wait, completion, passes)
     }
 
     fn claim_for_host_inner(
@@ -6458,6 +6694,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         kind: Handback,
         wait: &impl LockWait<C>,
         completion: &dyn Fn(object_wait::OwnedObjectWakeEffects<'_, C>),
+        passes: &OwedPasses,
     ) -> HostClaim {
         loop {
             let claim = rec.claim();
@@ -6513,7 +6750,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                     if seq.is_some_and(|wanted| wanted != current) {
                         return HostClaim::Stale;
                     }
-                    let Some(guard) = self.slot_lock(slot, &SpinForever) else {
+                    let Some(guard) = self.slot_lock(slot, &SpinForever, passes) else {
                         return HostClaim::Stale;
                     };
                     if rec.claim() != claim || !self.remove_locked(&guard, r.id) {
