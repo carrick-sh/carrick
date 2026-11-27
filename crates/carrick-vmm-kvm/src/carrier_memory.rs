@@ -11,7 +11,7 @@ pub use carrick_mmu_core::x86::descriptor_txn::{
 pub use carrick_x86_cpl0_host::carrier_memory::{
     BackingExtent, BackingHandle, BackingIdentity, CarrierMemoryIo, CarrierMemoryRegion,
     InheritedFrameSelectionError, Invalidation, InventoryRetirement, InventoryTransaction,
-    MemoryError, PreparedBacking, ShootdownPlan, TranslationDrain,
+    MemoryError, PreparedBacking, SettlementCustody, ShootdownPlan, TranslationDrain,
 };
 pub use std::num::NonZeroU64;
 pub use std::sync::Arc;
