@@ -817,7 +817,7 @@ pub(super) fn fatal_if_quarantined<M: CarrierMemoryIo>(
 ) -> Result<(), TrapError> {
     if memory.is_quarantined() {
         return Err(fail(
-            "carrier memory quarantined while releasing a retired child",
+            "carrier memory quarantined (a broken invariant) at a retired-child release drain",
         ));
     }
     Ok(())
