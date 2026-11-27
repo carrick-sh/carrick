@@ -3,6 +3,7 @@
 //! This preparation has no public vCPU/run handle. The accepted N1 editor must
 //! enclose publication and physical rollback; M5 will bind execution admission.
 use crate::guest_ram::{GuestRam, WindowKind};
+use carrick_core::mm::own::{DrainContext, HoldError, MmKey, SlotHolds};
 use carrick_el1_abi::GuestMmuPublication;
 use carrick_guest_arch::{AddressContext, FrameGpa, RootGpa};
 pub use carrick_mmu_core::x86::descriptor_txn::BackingIdentity;
@@ -492,9 +493,28 @@ struct Slot {
     /// time, never through the slot's own backing identity.
     arena: bool,
     bootstrap: bool,
-    alias_count: usize,
-    allowed: Vec<NonZeroU64>,
-    drains: Vec<AddressContext<RootGpa>>,
+}
+
+/// The context a slot's drain debt names (#3127): a slot is held until
+/// every context that unlinked an alias into it drains.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
+struct SlotDrain(AddressContext<RootGpa>);
+impl DrainContext for SlotDrain {
+    fn mm(&self) -> MmKey {
+        MmKey::new(self.0.mm.raw())
+    }
+}
+fn key(mm: NonZeroU64) -> MmKey {
+    MmKey::new(mm)
+}
+fn hold_error(reason: HoldError) -> MemoryError {
+    error(format!("carrier slot holds: {reason:?}"))
 }
 
 /// N1 supplies the real frame-inventory transaction. publish authenticates
@@ -628,12 +648,10 @@ pub struct CarrierMemory<M: CarrierMemoryIo> {
     aliases: BTreeMap<NonZeroU64, BTreeMap<u64, Alias>>,
     alias_visits: usize,
     roots: BTreeMap<NonZeroU64, AddressContext<RootGpa>>,
-    /// Slots each MM is admitted to (`Slot::allowed`), so retiring an MM
-    /// never scans every slot.
-    admitted: BTreeMap<NonZeroU64, BTreeSet<u32>>,
-    /// Slots whose `drains` name a context of each MM (from unlinked
-    /// aliases), so a retired MM's drain debt is dropped without a scan.
-    drained_by: BTreeMap<NonZeroU64, BTreeSet<u32>>,
+    /// Who holds each slot: admissions, descriptor aliases and drain debts
+    /// (#3127). A slot is revoked by the retirement that drops its last
+    /// hold, and only then; nothing else decides which slots to revoke.
+    holds: SlotHolds<u32, SlotDrain>,
     limit: u32,
     /// The most memslots this carrier held at once (#3099 witness).
     peak_slots: usize,
@@ -694,8 +712,7 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
             aliases: BTreeMap::new(),
             alias_visits: 0,
             roots: BTreeMap::new(),
-            admitted: BTreeMap::new(),
-            drained_by: BTreeMap::new(),
+            holds: SlotHolds::new(),
             limit,
             peak_slots: 0,
             generation: 0,
@@ -909,11 +926,12 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
                     inherited_identities: BTreeMap::new(),
                     arena: false,
                     bootstrap: false,
-                    alias_count: 0,
-                    allowed: Vec::new(),
-                    drains: Vec::new(),
                 },
             );
+            if let Err(reason) = self.holds.register(slot) {
+                self.quarantined = true;
+                return Err(hold_error(reason));
+            }
             self.by_gpa.insert(b.extent.base.raw(), slot);
             self.free.remove(&slot);
             self.peak_slots = self.peak_slots.max(self.slots.len());
@@ -932,6 +950,10 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
                 self.by_gpa.remove(&slot.backing.extent.base.raw());
                 if slot.backing.extent.is_host_file_window() {
                     self.window_slots -= 1;
+                }
+                if let Err(reason) = self.holds.forget(handle.slot) {
+                    self.quarantined = true;
+                    return Err(hold_error(reason));
                 }
             }
             self.free.insert(handle.slot);
@@ -982,70 +1004,32 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
             .ok_or_else(|| error("retired MM has no carrier CR3 root"))?;
         // Bind to the exact retired root incarnation, not just the MM number.
         let authority = inventory.bind(context.into());
-        // Phase 1: validate, mutating nothing.
-        let mut held: BTreeMap<u32, usize> = BTreeMap::new();
-        for alias in self.aliases.get(&mm).into_iter().flat_map(BTreeMap::values) {
-            *held.entry(alias.slot).or_default() += 1;
-        }
-        for (index, count) in &held {
-            let slot = self
-                .slots
-                .get(index)
-                .ok_or_else(|| error("retired MM alias names no carrier slot"))?;
-            if slot.alias_count < *count {
-                return Err(error("retired MM alias count underflow"));
-            }
-        }
+        // Phase 1: validate, mutating nothing. The ledger names every slot
+        // whose last hold this retirement drops, whatever kind it was: the
+        // MM's admission, its aliases, or the drain debt of an alias it
+        // unlinked (#3127). Those, and only those, are revoked.
+        let plan = self.holds.retirement(key(mm));
         let mut private = Vec::new();
-        // The slots this MM's retirement may revoke: those admitted only for
-        // it, and orphans, whose admitted MMs all retired while a descendant
-        // still held inherited aliases into them (`allowed` is empty and only
-        // this MM's aliases remain). Without the orphans, a slot whose owner
-        // retired before its last inheritor stayed registered for the run.
-        let admitted = self.admitted.get(&mm);
-        let orphans = held.keys().filter(|index| {
-            !admitted.is_some_and(|slots| slots.contains(*index))
-                && self
-                    .slots
-                    .get(*index)
-                    .is_some_and(|slot| slot.allowed.is_empty())
-        });
-        for index in admitted.into_iter().flatten().chain(orphans) {
+        for index in &plan.released {
             let slot = self
                 .slots
                 .get(index)
-                .ok_or_else(|| error("retired MM admitted to no carrier slot"))?;
-            let remaining = slot.alias_count - held.get(index).copied().unwrap_or(0);
-            // A shared file window slot is one per file chunk, kept for the
-            // run and reused by every later fault (#1338).
-            if !(slot.allowed == [mm] || slot.allowed.is_empty())
-                || remaining != 0
-                || slot.bootstrap
-                || slot.backing.extent.is_host_file_window()
-            {
+                .ok_or_else(|| error("retired MM holds no carrier slot"))?;
+            // Bootstrap memory and a shared file window slot (one per file
+            // chunk, reused by every later fault, #1338) stay for the run.
+            if slot.bootstrap || slot.backing.extent.is_host_file_window() {
                 continue;
             }
-            // An orphan this retirement can't revoke yet (another MM's drain
-            // or root) is left as it was, never refused: the retirement of
-            // a slot's own MM must not wait on an unrelated one.
-            let orphan = slot.allowed.is_empty();
             // `revoke`'s preconditions, checked now so the revoke cannot
-            // refuse after the bookkeeping below has run.
+            // refuse after the bookkeeping below has run. Nothing else holds
+            // the slot, so each is a broken invariant, never a wait.
             let extent = &slot.backing.extent;
             let start = extent.base.raw();
             let end = start + extent.len as u64;
-            let foreign_root = self.roots.iter().any(|(owner, root)| {
+            if self.roots.iter().any(|(owner, root)| {
                 *owner != mm && (start..end).contains(&root.root.address().raw())
-            });
-            let foreign_drain = slot.drains.iter().any(|drained| drained.mm.raw() != mm);
-            if orphan && (foreign_root || foreign_drain) {
-                continue;
-            }
-            if foreign_root {
+            }) {
                 return Err(error("retired child slot holds a live CR3/table arena"));
-            }
-            if foreign_drain {
-                return Err(error("retired child slot owes a live context drain"));
             }
             // An arena chunk holds one frame per grant, each retired with
             // the MM; none may still be mapped.
@@ -1059,37 +1043,24 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
                         .is_some()
                 })
             {
-                if orphan {
-                    continue;
-                }
                 return Err(error("retired child memslot frame is still mapped"));
             }
             private.push(slot.handle);
         }
-        // Phase 2: bookkeeping, infallible after the checks above.
-        self.roots.remove(&mm);
-        let mut aliases = 0;
-        for alias in self.aliases.remove(&mm).unwrap_or_default().into_values() {
-            if let Some(slot) = self.slots.get_mut(&alias.slot) {
-                slot.alias_count -= 1;
-                if let Some(gpa) = alias.inherited {
-                    slot.inherited_identities.remove(&(mm, gpa.raw()));
-                }
-            }
-            aliases += 1;
+        let aliases = self.aliases.get(&mm).map_or(0, BTreeMap::len);
+        if aliases != plan.aliases {
+            return Err(error("retired MM alias count mismatch"));
         }
-        // The absence proof discharges every pending drain of this MM's
+        // Phase 2: bookkeeping, infallible after the checks above. The
+        // absence proof discharges every pending drain of this MM's
         // contexts, so shared slots do not accumulate retired children.
-        for index in self.drained_by.remove(&mm).unwrap_or_default() {
-            if let Some(slot) = self.slots.get_mut(&index) {
-                slot.drains.retain(|drained| drained.mm.raw() != mm);
+        self.roots.remove(&mm);
+        for alias in self.aliases.remove(&mm).unwrap_or_default().into_values() {
+            if let (Some(slot), Some(gpa)) = (self.slots.get_mut(&alias.slot), alias.inherited) {
+                slot.inherited_identities.remove(&(mm, gpa.raw()));
             }
         }
-        for index in self.admitted.remove(&mm).unwrap_or_default() {
-            if let Some(slot) = self.slots.get_mut(&index) {
-                slot.allowed.retain(|allowed| *allowed != mm);
-            }
-        }
+        self.holds.retire(key(mm));
         // Phase 3: revoke the private slots (only the ioctl can fail).
         let mut drain = QuarantinedContextDrain { context };
         let mut retired = AlreadyRetiredInventory { authority };
@@ -1119,7 +1090,7 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
         let slot = self.record(handle)?;
         if slot.bootstrap
             || slot.arena
-            || slot.alias_count != 0
+            || self.holds.alias_count(handle.slot) != 0
             || !slot.frame_identities.is_empty()
         {
             return Err(error(
@@ -1167,8 +1138,7 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
             .get_mut(&handle.slot)
             .ok_or_else(|| error("missing arena chunk slot"))?;
         slot.arena = true;
-        slot.allowed.push(mm);
-        self.admitted.entry(mm).or_default().insert(handle.slot);
+        self.holds.admit(handle.slot, key(mm)).map_err(hold_error)?;
         Ok(handle)
     }
 
@@ -1191,7 +1161,7 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
             .ok_or_else(|| error("grant outside every arena chunk"))?;
         let pages = (0..len / PAGE).map(|page| gpa.raw() + page * PAGE);
         if !slot.arena
-            || slot.allowed != [mm]
+            || self.holds.admitted(slot.handle.slot) != [key(mm)]
             || len == 0
             || !gpa.raw().is_multiple_of(PAGE)
             || !len.is_multiple_of(PAGE)
@@ -1274,18 +1244,9 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
         {
             return Err(error("stale shared-frame edge"));
         }
-        let slot = self
-            .slots
-            .get_mut(&edge.handle.slot)
-            .ok_or_else(|| error("missing shared slot"))?;
-        if !slot.allowed.contains(&mm) {
-            slot.allowed.push(mm);
-            self.admitted
-                .entry(mm)
-                .or_default()
-                .insert(edge.handle.slot);
-        }
-        Ok(())
+        self.holds
+            .admit(edge.handle.slot, key(mm))
+            .map_err(hold_error)
     }
     fn locate(&self, pa: FrameGpa, len: usize) -> Option<&Slot> {
         let (_, index) = self.by_gpa.range(..=pa.raw()).next_back()?;
@@ -1528,18 +1489,15 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
         {
             return Err(error("inherited child alias already occupied"));
         }
-        let count = self
-            .record(edge.handle)?
-            .alias_count
-            .checked_add(1)
-            .ok_or_else(|| error("inherited physical alias count exhausted"))?;
         let slot = self
             .slots
             .get_mut(&edge.handle.slot)
             .ok_or_else(|| error("missing inherited registration"))?;
+        self.holds
+            .alias(edge.handle.slot, key(child.mm.raw()))
+            .map_err(hold_error)?;
         slot.inherited_identities
             .insert((child.mm.raw(), edge.gpa.raw()), identity);
-        slot.alias_count = count;
         self.aliases.entry(child.mm.raw()).or_default().insert(
             edge.span.va,
             Alias {
@@ -1588,7 +1546,10 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
             || len != PAGE
             || !va.is_multiple_of(PAGE)
             || !ipa.is_multiple_of(PAGE)
-            || !slot.allowed.contains(&parent.mm.raw())
+            || !self
+                .holds
+                .admitted(slot.handle.slot)
+                .contains(&key(parent.mm.raw()))
             || !self.leaf_names(parent, span, gpa)
         {
             return Err(error("inherited window row names no parent window leaf"));
@@ -1629,22 +1590,12 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
         }) {
             return Err(error("inherited child alias already occupied"));
         }
-        let count = slot
-            .alias_count
-            .checked_add(1)
-            .ok_or_else(|| error("inherited window alias count exhausted"))?;
-        let slot = self
-            .slots
-            .get_mut(&edge.handle.slot)
-            .ok_or_else(|| error("missing inherited window registration"))?;
-        slot.alias_count = count;
-        if !slot.allowed.contains(&child.mm.raw()) {
-            slot.allowed.push(child.mm.raw());
-            self.admitted
-                .entry(child.mm.raw())
-                .or_default()
-                .insert(edge.handle.slot);
-        }
+        self.holds
+            .alias(edge.handle.slot, key(child.mm.raw()))
+            .map_err(hold_error)?;
+        self.holds
+            .admit(edge.handle.slot, key(child.mm.raw()))
+            .map_err(hold_error)?;
         self.aliases.entry(child.mm.raw()).or_default().insert(
             edge.span.va,
             Alias {
@@ -1721,7 +1672,10 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
         };
         if slot.bootstrap
             || expected != identity
-            || (inherited.is_none() && !slot.allowed.is_empty() && !slot.allowed.contains(&mm))
+            || (inherited.is_none() && {
+                let allowed = self.holds.admitted(slot.handle.slot);
+                !allowed.is_empty() && !allowed.contains(&key(mm))
+            })
         {
             return Err(error(
                 "unauthenticated backing or missing explicit shared-frame edge",
@@ -1781,7 +1735,7 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
         self.admit()?;
         if handles
             .iter()
-            .any(|handle| !self.record(*handle).is_ok_and(|slot| slot.alias_count == 0))
+            .any(|handle| self.record(*handle).is_err() || self.holds.alias_count(handle.slot) != 0)
         {
             return Err(error("prepared backing already has guest aliases"));
         }
@@ -1846,18 +1800,16 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
             }
         }
         if let Some(index) = target {
-            let Some(slot) = self.slots.get_mut(&index) else {
-                self.quarantined = true;
-                return Err(error("missing authenticated slot after guest edit"));
+            let mm = key(txn.id.mm_key);
+            let admitted = if self.holds.admitted(index).is_empty() {
+                self.holds.admit(index, mm)
+            } else {
+                Ok(())
             };
-            if slot.allowed.is_empty() {
-                slot.allowed.push(txn.id.mm_key);
-                self.admitted
-                    .entry(txn.id.mm_key)
-                    .or_default()
-                    .insert(index);
+            if let Err(reason) = admitted.and_then(|()| self.holds.alias(index, mm)) {
+                self.quarantined = true;
+                return Err(hold_error(reason));
             }
-            slot.alias_count += 1;
             self.aliases.entry(txn.id.mm_key).or_default().insert(
                 txn.op.span().va,
                 Alias {
@@ -2052,7 +2004,14 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
                 self.quarantined = true;
                 return;
             };
-            slot.alias_count -= 1;
+            if self
+                .holds
+                .unalias(alias.slot, key(mm), SlotDrain(context))
+                .is_err()
+            {
+                self.quarantined = true;
+                return;
+            }
             if let Some(gpa) = alias.inherited {
                 slot.inherited_identities.remove(&(mm, gpa.raw()));
             }
@@ -2070,12 +2029,11 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
                             inherited: alias.inherited,
                         },
                     );
-                    slot.alias_count += 1;
+                    if self.holds.alias(alias.slot, key(mm)).is_err() {
+                        self.quarantined = true;
+                        return;
+                    }
                 }
-            }
-            if !slot.drains.contains(&context) {
-                slot.drains.push(context);
-                self.drained_by.entry(mm).or_default().insert(alias.slot);
             }
         }
     }
@@ -2132,10 +2090,10 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
         }) {
             return Err(error("carrier backing retains a published CR3/table arena"));
         }
-        if slot.alias_count != 0 {
+        if self.holds.alias_count(handle.slot) != 0 {
             return Err(error("carrier backing still has descriptor aliases"));
         }
-        for &context in &slot.drains {
+        for &SlotDrain(context) in self.holds.drains(handle.slot) {
             drain.drain(ShootdownPlan {
                 context,
                 invalidation: Invalidation::ReloadCr3,
@@ -2164,10 +2122,9 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
             if slot.backing.extent.is_host_file_window() {
                 self.window_slots -= 1;
             }
-            for mm in &slot.allowed {
-                if let Some(slots) = self.admitted.get_mut(mm) {
-                    slots.remove(&handle.slot);
-                }
+            if let Err(reason) = self.holds.forget(handle.slot) {
+                self.quarantined = true;
+                return Err(hold_error(reason));
             }
         }
         self.free.insert(handle.slot);
