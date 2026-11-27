@@ -576,6 +576,15 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
     }
     fn set(&mut self, pa: u64, after: u64) -> Result<(), DescriptorRefusal> {
         let before = self.read(pa)?;
+        // `after` may come from an earlier read of this entry: the walker
+        // may have set ACCESSED or DIRTY since (#3133). A present store
+        // never takes away the walker's bits; `replace_live_entry` carries
+        // any it sets after this read.
+        let after = if before & after & PRESENT != 0 {
+            after | before & WALKER_SET
+        } else {
+            after
+        };
         if before == after {
             return Ok(());
         }
@@ -1113,8 +1122,14 @@ pub fn apply_descriptor_plan<W: LiveDescriptorWords + ?Sized, J: DescriptorJourn
                         break;
                     }
                 }
-                _ => {
+                // Changed by something other than the walker.
+                Ok(None) => {
                     error = Some((DescriptorRefusal::Contended, true));
+                    break;
+                }
+                // A backend error keeps its own reason.
+                Err(reason) => {
+                    error = Some((reason, true));
                     break;
                 }
             }
