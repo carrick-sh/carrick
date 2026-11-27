@@ -147,6 +147,7 @@ surfaces = [
   { path = "crates/carrick-core/src/mm/own/editor.rs", contract = "kernel.el1.fork-cow" },
   { path = "crates/carrick-core/src/mm/own/explore.rs", contracts = [] },
   { path = "crates/carrick-core/src/mm/own/grant.rs", contract = "kernel.el1.fork-cow" },
+  { path = "crates/carrick-core/src/mm/own/holds.rs", contract = "kernel.el1.fork-cow" },
   { path = "crates/carrick-core/src/mm/own/loom_models.rs", contracts = [] },
   { path = "crates/carrick-core/src/mm/own/mm.rs", contract = "kernel.el1.fork-cow" },
   { path = "crates/carrick-core/src/mm/own/tests.rs", contracts = [] },
