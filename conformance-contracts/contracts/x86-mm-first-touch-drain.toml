@@ -1,0 +1,50 @@
+schema_version = 1
+id = "x86.mm.first-touch-drain"
+title = "An x86 first touch drains no translation on another CPU"
+guest_surfaces = ["vmm:kvm", "fault:first-touch", "kernel:stage1-mmu", "syscall:mmap"]
+semantic_authority = [
+  "Intel SDM vol. 3A 4.10.2.3 and 4.10.3.1: TLBs and paging-structure caches hold translations only from present entries",
+  "Intel SDM vol. 3A 4.10.4.3: changing a not-present entry to present needs no invalidation",
+  "native x86_64 Linux execution of the identical static fixture",
+]
+fixture = "carrick-cli::x86_kvm_run::mounted_static_x86_threads_first_touch_publishes_no_shootdown_per_fault (x86_threads_first_touch.c, four CLONE_VM threads released together by a futex, PAGES fresh private anonymous pages each)"
+scale_points = [32, 128, 512]
+rationale = """
+A descriptor edit that only fills not-present entries (a first-touch leaf, a
+newly linked table) leaves nothing any CPU may cache, so it needs no drain on
+this CPU or another. Only an edit that replaced a present entry must drain
+every CPU running the MM before its old frames or tables are released, and a
+rollback always drains. The applied x86 outcome carries a typed
+TranslationDrain computed from the plan's journal, and only Required
+invalidates or publishes a shootdown rendezvous; ARM's DescriptorApplied
+already derives flush_required from the same rule (a store over a VALID
+descriptor). On main every committed x86 fault published a rendezvous while a
+sibling ran the MM (#3105: 72% of guest samples with four threads, about
+0.9 ms per fault against 0.5 us natively). The run's rendezvous count is
+therefore bounded by a constant, independent of the pages touched. The row
+also requires the four threads to have overlapped (private grants settled
+on both CPUs, at least one while the other CPU ran the guest), so a run
+whose threads serialized cannot pass vacuously. The x86 owner-grant
+adapter (owner_mmu.rs) still reports flush_required for any store, a local
+CR3 reload only; it is outside this contract.
+"""
+
+[bindings]
+vm_free = [
+  "carrick-mmu-core::x86::descriptor_txn::tests::only_an_edit_of_a_present_entry_demands_a_translation_drain",
+]
+embed = [
+  "KVM production carrier: carrick-cli::x86_kvm_run::mounted_static_x86_threads_first_touch_publishes_no_shootdown_per_fault",
+]
+
+[bindings.unresolved]
+docker = "Docker is unavailable on this x86 KVM worker; native x86_64 Linux runs of the exact ELF provide the local oracle."
+runtime_ratio = "The per-fault time also carries the exact-MM editor and one host nested page fault per fresh page (#3105 items 2 and 3); the ratio is measured by paired A/B, not asserted here."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "cross_cpu_shootdowns"
+base = 16
+per_unit = 0
+layers = ["embed-structural"]
+rationale = "ExecutionWitness.shootdown_rendezvous counts the run's published cross-CPU shootdown requests (ShootdownTable.next_generation). First touches of 4 x 32, 4 x 128 and 4 x 512 fresh pages publish none; the base covers the run's own edits of present entries while a sibling runs the MM."

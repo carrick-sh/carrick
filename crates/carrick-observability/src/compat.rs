@@ -545,6 +545,10 @@ pub struct ExecutionWitness {
     /// Grants observed while the other CPU was actually inside KVM_RUN.
     #[serde(default)]
     pub peer_active_private_grants: u64,
+    /// Cross-CPU translation drains (shootdown rendezvous) the run
+    /// published. A fill of not-present entries needs none (#3105).
+    #[serde(default)]
+    pub shootdown_rendezvous: u64,
     /// Real stage-2 physical services, counted separately from Linux host dispatch.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub physical_crossing_families: Vec<ExecutionFamilyCount>,

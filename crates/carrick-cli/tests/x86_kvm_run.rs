@@ -1582,6 +1582,124 @@ fn mounted_static_x86_root_and_its_thread_sleep_in_ring() {
     );
 }
 
+/// #3105: four threads of one MM first-touch fresh anonymous pages, as Go's
+/// and pip's heaps grow. A first touch fills a not-present entry, and x86
+/// caches translations only from present entries (Intel SDM vol. 3A 4.10.2.3
+/// and 4.10.3.1), so it needs no translation drain on another CPU. On main
+/// every committed fault published a cross-CPU shootdown rendezvous while a
+/// sibling ran the MM: the run's rendezvous count grew with the pages
+/// touched, and each fault cost about 0.9 ms against 0.5 us natively.
+/// Contract `x86.mm.first-touch-drain` (its affine `cross_cpu_shootdowns`
+/// budget, read from the registry): the count is bounded by a constant at
+/// every scale point. The run must also show the threads faulted on both
+/// CPUs with the other CPU inside the guest, so a run whose threads never
+/// overlapped cannot pass for the wrong reason.
+#[test]
+fn mounted_static_x86_threads_first_touch_publishes_no_shootdown_per_fault() {
+    if skip_without_kvm() {
+        return;
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let registry = carrick_conformance_contract::ContractRegistry::load(&root)
+        .expect("the conformance contract registry loads");
+    let contract = registry
+        .require("x86.mm.first-touch-drain")
+        .expect("contract x86.mm.first-touch-drain");
+    let (base, per_unit) = contract
+        .structural_budgets
+        .iter()
+        .find_map(|budget| match budget.budget {
+            carrick_conformance_contract::Budget::Affine {
+                metric: carrick_conformance_contract::WorkMetric::CrossCpuShootdowns,
+                base,
+                per_unit,
+            } => Some((base, per_unit)),
+            _ => None,
+        })
+        .expect("an affine cross_cpu_shootdowns budget");
+    let dir = tempfile::tempdir().unwrap();
+    let mut observed = Vec::new();
+    let mut peer_grants = 0;
+    let mut cpu_mask = 0;
+    for pages in [32u64, 128, 512] {
+        let elf = dir.path().join(format!("threads-first-touch-{pages}"));
+        let define = format!("-DPAGES={pages}");
+        compile_assembly_with_flags(
+            "x86_threads_first_touch.c",
+            &elf,
+            &[
+                "-fno-stack-protector",
+                "-fno-asynchronous-unwind-tables",
+                "-O1",
+                &define,
+            ],
+        );
+        let native = Command::new(&elf)
+            .timeout(Duration::from_secs(10))
+            .output()
+            .expect("run native threads-first-touch oracle");
+        assert_eq!(native.status.code(), Some(7), "native oracle");
+        assert_eq!(native.stdout, b"ok\n", "native oracle");
+
+        let guest = run_mounted_binary(&elf, &format!("threads-first-touch-{pages}"), true);
+        assert_eq!(
+            guest.status.code(),
+            Some(7),
+            "93 is a failed map (its errno is printed), 94 a thread that did not \
+             start, 99 a page that did not read back. Stdout: {} Stderr: {}",
+            String::from_utf8_lossy(&guest.stdout),
+            String::from_utf8_lossy(&guest.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(
+            guest
+                .stdout
+                .strip_prefix(b"ok\n".as_slice())
+                .expect("threads-first-touch stdout"),
+        )
+        .expect("run JSON receipt");
+        let witness = &report["report"]["execution_witness"];
+        let rendezvous = witness["shootdown_rendezvous"]
+            .as_u64()
+            .expect("the KVM run reports its shootdown rendezvous");
+        let private_pages = witness["anonymous_private_pages"]
+            .as_u64()
+            .expect("the KVM run reports its private pages");
+        // The touches happened: every fresh page became a private leaf.
+        assert!(
+            private_pages >= 4 * pages,
+            "{pages} pages per thread made only {private_pages} private pages"
+        );
+        peer_grants += witness["peer_active_private_grants"]
+            .as_u64()
+            .expect("the KVM run reports its peer-active grants");
+        for mm in witness["anonymous_private_mms"]
+            .as_array()
+            .expect("the KVM run reports its private MMs")
+        {
+            cpu_mask |= mm["cpu_mask"].as_u64().expect("an MM's CPU mask");
+        }
+        observed.push((pages, rendezvous));
+    }
+    println!(
+        "first-touch shootdown rendezvous (pages per thread, count): {observed:?} \
+         peer-active grants {peer_grants} cpu mask {cpu_mask:#x}"
+    );
+    // The threads overlapped: grants were settled on both CPUs, and at
+    // least one while the other CPU was inside the guest.
+    assert!(
+        cpu_mask == 0b11 && peer_grants > 0,
+        "the four threads never ran on both CPUs at once: cpu mask {cpu_mask:#x}, \
+         peer-active grants {peer_grants}"
+    );
+    assert!(
+        observed
+            .iter()
+            .all(|(pages, rendezvous)| *rendezvous <= base + per_unit * pages),
+        "a first touch published a cross-CPU shootdown: (pages per thread, \
+         rendezvous) {observed:?}, budget {base} + {per_unit} per page"
+    );
+}
+
 /// #2890: the Go runtime's `fork/exec` once it runs more than one P. A
 /// thread forks with `clone(CLONE_VM | CLONE_VFORK)` on its own stack and
 /// execs this image sixteen times (`x86_threads_vfork_exec.c`). `go build`
