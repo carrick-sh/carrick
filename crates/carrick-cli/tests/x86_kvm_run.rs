@@ -2316,6 +2316,69 @@ fn mounted_static_x86_mremap_grows_shrinks_and_moves_anonymous_rows_as_native() 
     );
 }
 
+/// A counted in-ring refusal appears in the run's compat report (#3152).
+/// The ring answers `tuxcall` (x86_64 184, never implemented by Linux)
+/// with ENOSYS, as Linux does, and counts it; before #3152 the report was built only from host
+/// dispatch and showed no gap for such a run.
+#[test]
+fn mounted_static_x86_ring_refusal_appears_in_the_compat_report() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("unrouted-syscall-counted");
+    compile_assembly_with_flags(
+        "x86_unrouted_syscall_counted.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native tuxcall oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+    assert_eq!(native.stdout, b"U\n", "native oracle");
+    let guest = run_mounted_binary(&elf, "unrouted-syscall-counted", true);
+    assert_eq!(
+        guest.status.code(),
+        Some(7),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&guest.stdout),
+        String::from_utf8_lossy(&guest.stderr)
+    );
+    let envelope = guest
+        .stdout
+        .strip_prefix(b"U\n")
+        .expect("guest tuxcall output");
+    let report: serde_json::Value = serde_json::from_slice(envelope).unwrap();
+    let rows = report["report"]["ring_refused_syscalls"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no ring refusals in the report: {}", report["report"]));
+    // `tuxcall` has no canonical syscall, so the ring counts it in its
+    // overflow bucket (native 512, "unknown"): one root refusal.
+    assert!(
+        rows.iter().any(|row| row["native"] == 512
+            && row["name"] == "unknown"
+            && row["caller"] == "root"
+            && row["count"] == 1),
+        "tuxcall is one root ring refusal: {rows:?}"
+    );
+    let summary = &report["report"]["summary"];
+    assert_eq!(
+        summary["distinct_ring_refused_syscalls"],
+        rows.len(),
+        "{summary}"
+    );
+    assert!(
+        summary["ring_refused_invocations"].as_u64() >= Some(1),
+        "{summary}"
+    );
+}
+
 #[test]
 fn mounted_static_x86_exec_refuses_before_replacement_identity() {
     if skip_without_kvm() {
