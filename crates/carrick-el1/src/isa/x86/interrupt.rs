@@ -575,59 +575,80 @@ pub fn send_resched(slot: carrick_sched_core::SlotId) -> Result<ReschedSend, Arc
 /// Owed reschedule IPIs this CPU resent, for the KVM witness's census.
 #[cfg(feature = "test-support")]
 static OWED_RESCHED_RESENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// Reschedule IPIs that found the ICR busy by injection, for the census.
+/// Sends that found the ICR busy by injection, for the census.
 #[cfg(feature = "test-support")]
 static RESCHED_BUSY_INJECTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// Waits for this CPU's own ICR to go idle at a last-chance delivery
-/// point, for the census.
+/// Idle-ICR waits that observed the ICR busy, for the census.
 #[cfg(feature = "test-support")]
 static RESCHED_ICR_WAITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// The CPU slot (plus one) whose next reschedule IPIs find the ICR busy.
+/// The [`UserReturn`] of the last resend at a return to user, for the census.
+#[cfg(feature = "test-support")]
+static RESCHED_RESEND_SITE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// The CPU slot (plus one) the busy injection applies to.
 #[cfg(feature = "test-support")]
 static RESCHED_BUSY_CPU: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-/// How many more of that CPU's reschedule IPIs find the ICR busy.
+/// How many more of that CPU's IPI sends find the ICR busy (`u32::MAX`:
+/// every one).
 #[cfg(feature = "test-support")]
-static RESCHED_BUSY_LEFT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static RESCHED_SEND_BUSY_LEFT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+/// How many more of that CPU's idle-ICR polls read the ICR busy.
+#[cfg(feature = "test-support")]
+static RESCHED_POLL_BUSY_LEFT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
 
-/// Make this CPU's next `times` reschedule IPI sends (first sends and
-/// resends alike) find its ICR busy (#3083 witness); another CPU's sends
-/// never consume them. False when some are still armed, or this CPU has no
+/// Make this CPU's next `sends` reschedule IPI sends (first sends and
+/// resends alike; `u32::MAX`: all of them) and its next `polls` idle-ICR
+/// polls find the ICR busy (#3083 witness). Another CPU's sends never
+/// consume them. False when some are still armed, or this CPU has no
 /// binding.
 #[cfg(feature = "test-support")]
-pub fn inject_resched_busy(times: u32) -> bool {
+pub fn inject_resched_busy(sends: u32, polls: u32) -> bool {
     let Some(binding) = super::context::current_cpu_binding() else {
         return false;
     };
-    if RESCHED_BUSY_LEFT.load(Ordering::Acquire) != 0 {
+    if RESCHED_SEND_BUSY_LEFT.load(Ordering::Acquire) != 0
+        || RESCHED_POLL_BUSY_LEFT.load(Ordering::Acquire) != 0
+    {
         return false;
     }
     RESCHED_BUSY_CPU.store(binding.cpu_slot + 1, Ordering::Release);
-    RESCHED_BUSY_LEFT
-        .compare_exchange(0, times, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok()
+    RESCHED_POLL_BUSY_LEFT.store(polls, Ordering::Release);
+    RESCHED_SEND_BUSY_LEFT.store(sends, Ordering::Release);
+    true
 }
 
-/// `(injected busy sends, owed IPIs resent, waits for an idle ICR)`, for
-/// the #3083 witness.
+/// `(sends found busy by injection, owed IPIs resent, idle-ICR waits that
+/// observed it busy, the last resend's UserReturn as u8)`, for the #3083
+/// witness.
 #[cfg(feature = "test-support")]
-pub fn resched_busy_census() -> (u64, u64, u64) {
+pub fn resched_busy_census() -> (u64, u64, u64, u8) {
     (
         RESCHED_BUSY_INJECTED.load(Ordering::Acquire),
         OWED_RESCHED_RESENT.load(Ordering::Acquire),
         RESCHED_ICR_WAITS.load(Ordering::Acquire),
+        RESCHED_RESEND_SITE.load(Ordering::Acquire),
     )
+}
+
+/// Take one injected busy result from `left` for this CPU.
+#[cfg(feature = "test-support")]
+fn injected_busy(left: &core::sync::atomic::AtomicU32) -> bool {
+    super::context::current_cpu_binding().is_some_and(|binding| {
+        RESCHED_BUSY_CPU.load(Ordering::Acquire) == binding.cpu_slot + 1
+            && left
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| match n {
+                    0 => None,
+                    u32::MAX => Some(u32::MAX),
+                    n => Some(n - 1),
+                })
+                .is_ok()
+    })
 }
 
 fn send_resched_ipi(apic: interrupts::ApicId) -> Result<(), interrupts::IpiBusy> {
     #[cfg(feature = "test-support")]
-    if let Some(binding) = super::context::current_cpu_binding()
-        && RESCHED_BUSY_CPU.load(Ordering::Acquire) == binding.cpu_slot + 1
-        && RESCHED_BUSY_LEFT
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
-                left.checked_sub(1)
-            })
-            .is_ok()
-    {
+    if injected_busy(&RESCHED_SEND_BUSY_LEFT) {
         RESCHED_BUSY_INJECTED.fetch_add(1, Ordering::AcqRel);
         return Err(interrupts::IpiBusy);
     }
@@ -635,6 +656,16 @@ fn send_resched_ipi(apic: interrupts::ApicId) -> Result<(), interrupts::IpiBusy>
     // IPI; the stopped bootstrap retains the destination APIC until
     // retirement.
     unsafe { interrupts::hardware::send_resched(apic) }
+}
+
+/// Whether this CPU's own ICR still reads busy, for the idle-ICR wait.
+fn icr_poll_busy() -> bool {
+    #[cfg(feature = "test-support")]
+    if injected_busy(&RESCHED_POLL_BUSY_LEFT) {
+        return true;
+    }
+    // SAFETY: CPL0 on this CPU, with its local APIC mapped.
+    unsafe { interrupts::hardware::icr_busy() }
 }
 
 fn owe_resched(binding: &super::context::native::CpuBinding, slot: carrick_sched_core::SlotId) {
@@ -655,10 +686,26 @@ fn owe_resched(binding: &super::context::native::CpuBinding, slot: carrick_sched
 /// ([`deliver_owed_resched_before_user`]).
 #[must_use]
 pub fn deliver_owed_resched() -> bool {
+    resend_owed().clear
+}
+
+/// What one resend pass over this CPU's owed IPIs did.
+struct Resent {
+    /// None is owed any more.
+    clear: bool,
+    /// At least one owed IPI was sent.
+    progress: bool,
+}
+
+fn resend_owed() -> Resent {
     let Some(binding) = super::context::current_cpu_binding() else {
-        return true;
+        return Resent {
+            clear: true,
+            progress: false,
+        };
     };
     let mut clear = true;
+    let mut progress = false;
     for (word_index, word) in binding.owed_resched.iter().enumerate() {
         let mut owed = word.swap(0, Ordering::AcqRel);
         while owed != 0 {
@@ -683,13 +730,14 @@ pub fn deliver_owed_resched() -> bool {
             }
             #[cfg(feature = "test-support")]
             OWED_RESCHED_RESENT.fetch_add(1, Ordering::AcqRel);
+            progress = true;
             owed &= owed - 1;
         }
         if !clear {
             break;
         }
     }
-    clear
+    Resent { clear, progress }
 }
 
 /// How long this CPU's own ICR may stay busy before its local APIC counts
@@ -708,22 +756,43 @@ const ICR_IDLE_BOUND_NS: u128 = 1_000_000;
 /// sends an IPI: no software holder to enrol on, and a timer retry would
 /// be polling) and is then sent. An ICR busy past [`ICR_IDLE_BOUND_NS`] is
 /// a broken local APIC: fatal.
-pub fn deliver_owed_resched_before_user() {
-    while !deliver_owed_resched() {
+pub fn deliver_owed_resched_before_user(site: UserReturn) {
+    loop {
+        let resent = resend_owed();
+        #[cfg(feature = "test-support")]
+        if resent.progress {
+            RESCHED_RESEND_SITE.store(site as u8, Ordering::Release);
+        }
+        if resent.clear {
+            return;
+        }
         wait_icr_idle();
     }
 }
 
+/// The return to user a last-chance delivery runs at.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum UserReturn {
+    /// A syscall's return (`carrier_validate_return`).
+    Syscall = 1,
+    /// The scheduler resuming a parked thread (`resume_parked`).
+    Resume = 2,
+    /// A resolved user page fault.
+    PageFault = 3,
+    /// An interrupt taken in user mode.
+    Interrupt = 4,
+}
+
 fn wait_icr_idle() {
-    #[cfg(feature = "test-support")]
-    RESCHED_ICR_WAITS.fetch_add(1, Ordering::AcqRel);
     let Some(hz) = tsc_frequency() else {
         super::fatal_entry_binding();
     };
     let bound = u128::from(hz.get()) * ICR_IDLE_BOUND_NS / 1_000_000_000;
     let start = read_tsc();
-    // SAFETY: CPL0 on this CPU, with its local APIC mapped.
-    while unsafe { interrupts::hardware::icr_busy() } {
+    while icr_poll_busy() {
+        #[cfg(feature = "test-support")]
+        RESCHED_ICR_WAITS.fetch_add(1, Ordering::AcqRel);
         if u128::from(read_tsc().wrapping_sub(start)) > bound {
             // A local APIC that never finishes its own send is broken.
             super::fatal_entry_binding();

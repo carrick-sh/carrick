@@ -194,12 +194,18 @@ mod test_support {
     /// (#3083): the send is owed by this CPU and resent at its next
     /// delivery point, never fatal.
     pub const INJECT_RESCHED_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe5d;
-    /// `injected busy sends | owed IPIs resent << 32 | idle-ICR waits << 48`.
+    /// `sends found busy | owed IPIs resent << 16 | idle-ICR waits that saw
+    /// it busy << 32 | the last resend's UserReturn << 48`.
     pub const INJECT_RESCHED_BUSY_CENSUS: u64 = 0xffff_ffff_ffff_fe5e;
-    /// The next two reschedule IPI sends of this CPU find its ICR busy: the
+    /// This CPU's next two reschedule IPI sends find its ICR busy (the
     /// first send and its resend at the return to user, the last delivery
-    /// point before a syscall-free user loop (#3083).
-    pub const INJECT_RESCHED_BUSY_TWICE: u64 = 0xffff_ffff_ffff_fe5f;
+    /// point before a syscall-free user loop), and its next idle-ICR poll
+    /// reads it busy once more (#3083).
+    pub const INJECT_RESCHED_BUSY_THROUGH_LAST_RETURN: u64 = 0xffff_ffff_ffff_fe5f;
+    /// Every reschedule IPI send of this CPU finds its ICR busy while every
+    /// idle-ICR poll reads it idle: a local APIC that never accepts its
+    /// send. The last-chance wait must end fatal, never loop (#3083).
+    pub const INJECT_RESCHED_ICR_FLAPPING: u64 = 0xffff_ffff_ffff_fe60;
     const ORDER_AFTER_READ: u8 = 1;
     const ORDER_BEFORE_HLT: u8 = 2;
     const ORDER_ARMED: u8 = 1;
@@ -1480,15 +1486,18 @@ mod test_support {
             )),
             INJECT_CURRENT_CPU => Some(u64::from(binding.cpu_slot)),
             INJECT_RESCHED_BUSY_ONCE => {
-                carrick_el1::isa::x86::interrupt::inject_resched_busy(1).then_some(0)
+                carrick_el1::isa::x86::interrupt::inject_resched_busy(1, 0).then_some(0)
             }
-            INJECT_RESCHED_BUSY_TWICE => {
-                carrick_el1::isa::x86::interrupt::inject_resched_busy(2).then_some(0)
+            INJECT_RESCHED_BUSY_THROUGH_LAST_RETURN => {
+                carrick_el1::isa::x86::interrupt::inject_resched_busy(2, 1).then_some(0)
+            }
+            INJECT_RESCHED_ICR_FLAPPING => {
+                carrick_el1::isa::x86::interrupt::inject_resched_busy(u32::MAX, 0).then_some(0)
             }
             INJECT_RESCHED_BUSY_CENSUS => {
-                let (injected, resent, waits) =
+                let (injected, resent, waits, site) =
                     carrick_el1::isa::x86::interrupt::resched_busy_census();
-                Some(injected | resent << 32 | waits << 48)
+                Some(injected | resent << 16 | waits << 32 | u64::from(site) << 48)
             }
             INJECT_EDITOR_RELEASED_BEFORE_PARK_ONCE => EARLY_RELEASE_TASK
                 .compare_exchange(0, binding.task_address, Ordering::AcqRel, Ordering::Acquire)

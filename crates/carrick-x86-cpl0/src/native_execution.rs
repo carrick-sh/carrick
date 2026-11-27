@@ -345,7 +345,9 @@ pub fn schedule(slot: SlotId) -> ! {
                     // The return to user is the last-chance delivery point
                     // (#3083): the migration's kicks above may have owed an
                     // IPI, and a still-busy ICR is waited out here.
-                    carrick_el1::isa::x86::interrupt::deliver_owed_resched_before_user();
+                    carrick_el1::isa::x86::interrupt::deliver_owed_resched_before_user(
+                        carrick_el1::isa::x86::interrupt::UserReturn::Resume,
+                    );
                 })
             } {
                 Ok(never) => match never {},

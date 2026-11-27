@@ -162,7 +162,7 @@ pub unsafe fn carrier_receive_irq<P: Personality>(
     // owes after a busy ICR (#3083), including any its handler just owed;
     // its return to user is the last-chance one, which waits out a busy ICR.
     if frame.cs & 3 == 3 {
-        interrupt::deliver_owed_resched_before_user();
+        interrupt::deliver_owed_resched_before_user(interrupt::UserReturn::Interrupt);
     } else {
         let _ = interrupt::deliver_owed_resched();
     }
