@@ -1727,6 +1727,84 @@ impl Cpl0Carrier {
         result
     }
 
+    /// Leave a stopped CPL3 fixture CPU exactly as KVM leaves one that exited
+    /// while delivering an accepted APIC vector: the vector is in service in
+    /// the local APIC (no longer requested), and the vCPU's event state holds
+    /// it as an injected interrupt that KVM delivers on the next KVM_RUN.
+    pub fn fixture_stop_delivering_interrupt(
+        &mut self,
+        index: usize,
+        vector: u8,
+    ) -> Result<(), TrapError> {
+        let cpu = self
+            .cpus
+            .get(index)
+            .ok_or_else(|| fail("unknown CPL0 CPU slot"))?;
+        let mut lapic = cpu.fd().get_lapic().map_err(|e| fail(e.to_string()))?;
+        let word = usize::from(vector >> 5) * 0x10;
+        let bit = 1u32 << (vector & 31);
+        let mut set = |base: usize, on: bool| {
+            let at = base + word;
+            let mut value = u32::from_le_bytes([
+                lapic.regs[at] as u8,
+                lapic.regs[at + 1] as u8,
+                lapic.regs[at + 2] as u8,
+                lapic.regs[at + 3] as u8,
+            ]);
+            if on {
+                value |= bit;
+            } else {
+                value &= !bit;
+            }
+            for (offset, byte) in value.to_le_bytes().into_iter().enumerate() {
+                lapic.regs[at + offset] = byte as _;
+            }
+        };
+        set(0x100, true); // ISR
+        set(0x200, false); // IRR
+        cpu.fd()
+            .set_lapic(&lapic)
+            .map_err(|e| fail(format!("KVM_SET_LAPIC: {e}")))?;
+        let mut events = cpu
+            .fd()
+            .get_vcpu_events()
+            .map_err(|e| fail(e.to_string()))?;
+        events.interrupt.injected = 1;
+        events.interrupt.nr = vector;
+        events.interrupt.soft = 0;
+        cpu.fd()
+            .set_vcpu_events(&events)
+            .map_err(|e| fail(format!("KVM_SET_VCPU_EVENTS: {e}")))
+    }
+
+    /// Leave a stopped CPL3 fixture CPU in a MOV SS interrupt shadow, as KVM
+    /// leaves one that exited right after a user `mov ss`.
+    pub fn fixture_stop_in_mov_ss_shadow(&mut self, index: usize) -> Result<(), TrapError> {
+        let cpu = self
+            .cpus
+            .get(index)
+            .ok_or_else(|| fail("unknown CPL0 CPU slot"))?;
+        let mut events = cpu
+            .fd()
+            .get_vcpu_events()
+            .map_err(|e| fail(e.to_string()))?;
+        events.interrupt.shadow = kvm_bindings::KVM_X86_SHADOW_INT_MOV_SS as u8;
+        events.flags |= kvm_bindings::KVM_VCPUEVENT_VALID_SHADOW;
+        cpu.fd()
+            .set_vcpu_events(&events)
+            .map_err(|e| fail(format!("KVM_SET_VCPU_EVENTS: {e}")))
+    }
+
+    /// Where a stopped fixture CPU resumes, as the production run admission
+    /// classifies it.
+    pub fn fixture_stopped_cpu(&self, index: usize) -> Result<StoppedCpu, TrapError> {
+        stopped_cpu(
+            self.cpus
+                .get(index)
+                .ok_or_else(|| fail("unknown CPL0 CPU slot"))?,
+        )
+    }
+
     /// Stop the resumed CPU as soon as its own native KICK gate published the
     /// pending mailbox bit, before another fixture operation changes state.
     pub fn fixture_run_until_pending_kick(&mut self, index: usize) -> Result<(), TrapError> {
