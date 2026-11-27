@@ -188,7 +188,13 @@ fn collect_object_wake<C: carrick_el1_abi::EntryContext>(
                 },
                 &passes,
             );
-            passes.deliver(crate::el1_zone::resched_slot);
+            // The owed passes go with the placements' kicks, through the
+            // venue `slots` is delivered by (this zone's carrier, or the
+            // global kicker), never the global kicker for a carrier zone.
+            passes.deliver(|slot| {
+                let index = usize::from(slot.raw());
+                slots[index / 64] |= 1 << (index % 64);
+            });
             owed
         }
         .map_err(|_| CollectFault::Ownership)?;
@@ -365,7 +371,11 @@ pub(crate) fn notify_host_ready(carrier: Option<&CarrierZone>, record: RecordRef
                 },
                 &passes,
             );
-            passes.deliver(crate::el1_zone::resched_slot);
+            // Delivered with the placements' kicks, by `delivery`'s venue.
+            passes.deliver(|slot| {
+                let index = usize::from(slot.raw());
+                slots[index / 64] |= 1 << (index % 64);
+            });
             owed
         };
         // A refused notification leaves the epoch unmoved and the member
