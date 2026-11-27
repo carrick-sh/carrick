@@ -1308,6 +1308,16 @@ pub struct SoftRetainedMetadata {
 unsafe impl Send for SoftRetainedMetadata {}
 unsafe impl Sync for SoftRetainedMetadata {}
 
+impl SoftRetainedMetadata {
+    /// How many stage-2 borrowers met another's borrow and waited for its
+    /// release ("not now"), over this carrier's life. No borrower waits
+    /// yet: a met borrow is refused `Busy`.
+    #[must_use]
+    pub fn contended_stage2_borrows(&self) -> u64 {
+        0
+    }
+}
+
 /// One retained mapping in its exact soft carrier, by its grant identity.
 pub struct SoftRetainedExtent {
     stage2: Weak<ExclusiveStage2>,

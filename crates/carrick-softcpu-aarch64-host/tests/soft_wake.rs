@@ -170,6 +170,14 @@ fn nop_elf() -> Vec<u8> {
 /// image (GIC-mode EL1 vectors, HVPatch stage-1 tables), with `wait` in
 /// place of the EL1 scheduler's idle entry.
 fn bring_up_with_idle_wait(wait: &[u32]) -> SoftAarch64Engine<TerminatorExecutor> {
+    bring_up_with_idle_wait_on(wait, TerminatorExecutor)
+}
+
+fn bring_up_with_idle_wait_on<X>(wait: &[u32], executor: X) -> SoftAarch64Engine<X>
+where
+    X: ExecuteBlock + Send + 'static,
+    X::Error: core::fmt::Debug,
+{
     let image = AddressSpace::load_elf_bytes_with_reader(&nop_elf(), &|_| None)
         .expect("load the witness ELF")
         .with_vdso_auxv(false)
@@ -186,7 +194,7 @@ fn bring_up_with_idle_wait(wait: &[u32]) -> SoftAarch64Engine<TerminatorExecutor
         .and_then(AddressSpace::with_syscall_mailbox_arena)
         .and_then(AddressSpace::with_hvpatch_stage1_page_tables)
         .expect("finalize the witness image");
-    let engine = SoftAarch64Vmm::bring_up_with_executor(&image, None, None, TerminatorExecutor)
+    let engine = SoftAarch64Vmm::bring_up_with_executor(&image, None, None, executor)
         .expect("soft carrier bring-up");
     let bytes: Vec<u8> = wait.iter().flat_map(|word| word.to_le_bytes()).collect();
     // The carrier maintenance root maps the EL1 kernel hole identically.
@@ -372,4 +380,202 @@ fn soft_wfi_park_ends_on_a_cross_thread_kick() {
         el1_idle_entry_va() + 12,
         "the WFI retired; re-entry resumes after it"
     );
+}
+
+/// `b .`: the guest spins in one block, so its vCPU's `run` keeps the
+/// stage-2 borrow until a kick.
+const A64_B_SELF: u32 = 0x1400_0000;
+
+/// A [`TerminatorExecutor`] that reports, once per arming, that the vCPU is
+/// executing guest code: inside `run`, holding the stage-2 borrow.
+struct EnteredExecutor {
+    armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    entered: std::sync::Arc<(Mutex<u32>, std::sync::Condvar)>,
+}
+
+impl ExecuteBlock for EnteredExecutor {
+    type Error = String;
+    type Code = ();
+
+    fn prepare(&mut self, block: &TranslatedBlock) -> Result<(), Self::Error> {
+        TerminatorExecutor.prepare(block)
+    }
+
+    fn execute(
+        &mut self,
+        block: &TranslatedBlock,
+        code: &(),
+        cpu: &mut CpuState,
+    ) -> Result<usize, Self::Error> {
+        if self.armed.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            let (count, cv) = &*self.entered;
+            *count.lock().unwrap() += 1;
+            cv.notify_all();
+        }
+        TerminatorExecutor.execute(block, code, cpu)
+    }
+}
+
+/// 16 KiB of MAP_SHARED anonymous ABI storage, as the reservation bank is.
+#[derive(Debug)]
+struct SharedBacking {
+    base: usize,
+    len: usize,
+}
+
+impl SharedBacking {
+    fn new(len: usize) -> Self {
+        // SAFETY: a fresh anonymous shared mapping.
+        let raw = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(raw, libc::MAP_FAILED, "map the retained backing");
+        Self {
+            base: raw as usize,
+            len,
+        }
+    }
+}
+
+impl Drop for SharedBacking {
+    fn drop(&mut self) {
+        // SAFETY: this owner's own mapping.
+        unsafe { libc::munmap(self.base as *mut libc::c_void, self.len) };
+    }
+}
+
+// SAFETY: a stable MAP_SHARED range until this owner drops, holding only
+// bytes the witness never reads concurrently.
+unsafe impl carrick_hal::retained_metadata::RetainedMetadataBacking for SharedBacking {
+    fn host_base(&self) -> carrick_guest_mem::HostVa {
+        carrick_guest_mem::HostVa::new(self.base)
+    }
+    fn mapped_len(&self) -> usize {
+        self.len
+    }
+}
+
+/// The reservation provider's metadata access on the soft carrier, against
+/// a vCPU whose `run` holds the stage-2 borrow while it executes guest code:
+/// - mapping a bank must edit stage 2, so it meets the running vCPU's borrow
+///   once ("not now"), kicks the vCPU out of `run`, and maps once the borrow
+///   is released, never refusing `Busy`;
+/// - a pin reads only the grant records, so it succeeds while the vCPU runs
+///   again, holding the borrow, with no wait;
+/// - retiring the bank must unmap its window, so it waits out the vCPU's
+///   borrow the same way, once.
+#[test]
+fn soft_retained_metadata_waits_out_the_running_vcpu_and_pins_beside_it() {
+    use carrick_el1_abi::{MetadataExtentResolver as _, PinnedMetadataExtent as _};
+    use carrick_hal::retained_metadata::{
+        RetainedMetadataExtent as _, RetainedMetadataMapper as _,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::{Arc, Condvar, mpsc};
+
+    let _carrier_lock = lock_soft_carrier_test();
+    let armed = Arc::new(AtomicBool::new(false));
+    let entered = Arc::new((Mutex::new(0u32), Condvar::new()));
+    let mut engine = bring_up_with_idle_wait_on(
+        &[A64_B_SELF],
+        EnteredExecutor {
+            armed: Arc::clone(&armed),
+            entered: Arc::clone(&entered),
+        },
+    );
+    let access = engine
+        .backend()
+        .retained_metadata()
+        .expect("the carrier's reservation access");
+    assert_eq!(access.contended_stage2_borrows(), 0);
+    let root = engine.backend().carrier_maintenance_root().unwrap();
+    let returned = Arc::new(AtomicU32::new(0));
+    let (mapped_tx, mapped_rx) = mpsc::channel::<()>();
+
+    let wait_entered = |runs: u32| {
+        let (count, cv) = &*entered;
+        let mut count = count.lock().unwrap();
+        while *count < runs {
+            count = cv.wait(count).unwrap();
+        }
+    };
+
+    let (exits, contended) = std::thread::scope(|scope| {
+        let mapper = scope.spawn(|| {
+            // Owned here, so a failed map ends the main thread's wait too.
+            let mapped_tx = mapped_tx;
+            // The vCPU is executing guest code: its run holds the borrow.
+            wait_entered(1);
+            let mapping = access
+                .map_retained(Arc::new(SharedBacking::new(0x4000)))
+                .expect("mapping a bank waits out the running vCPU's borrow, never Busy");
+            let after_map = engine_contended(&access);
+            mapped_tx.send(()).unwrap();
+            // The vCPU runs again, holding the borrow.
+            wait_entered(2);
+            let pin = mapping.pin().expect("pin beside the running vCPU");
+            let extent = pin.extent();
+            let resolved = access
+                .pin(extent)
+                .expect("resolve the bank beside the running vCPU");
+            assert_eq!(resolved.host_base(), pin.host_base());
+            assert_eq!(
+                returned.load(Ordering::Acquire),
+                1,
+                "the pins were taken while the second run still held the borrow"
+            );
+            let after_pins = engine_contended(&access);
+            drop((pin, resolved));
+            mapping
+                .try_retire()
+                .unwrap_or_else(|_| panic!("retiring the unpinned bank waits out the vCPU"));
+            (after_map, after_pins, engine_contended(&access))
+        });
+        let vcpu = engine.vcpu_mut();
+        vcpu.set_sys_reg(
+            carrick_hal::SysReg::Tcr,
+            carrick_mem::arch_sysregs::TCR_EL1_BOOTSTRAP | (1 << 36),
+        )
+        .unwrap();
+        vcpu.set_sys_reg(carrick_hal::SysReg::Ttbr0, root.raw())
+            .unwrap();
+        vcpu.set_sys_reg(carrick_hal::SysReg::Ttbr1, root.raw())
+            .unwrap();
+        vcpu.set_reg(Reg::Pc, el1_idle_entry_va()).unwrap();
+        vcpu.set_reg(Reg::Pstate, 0x3c5).unwrap();
+        let mut exits = Vec::new();
+        for run in 0..2 {
+            if run == 1 {
+                // Re-enter only once the bank is mapped.
+                mapped_rx.recv().unwrap();
+            }
+            armed.store(true, Ordering::Release);
+            exits.push(vcpu.run().map_err(|e| format!("{e:?}")));
+            returned.fetch_add(1, Ordering::AcqRel);
+        }
+        (exits, mapper.join().unwrap())
+    });
+    for exit in &exits {
+        assert!(
+            matches!(exit, Ok(Aarch64Exit::Kicked)),
+            "each wait kicked the running vCPU out of run: {exits:?}"
+        );
+    }
+    assert_eq!(
+        contended,
+        (1, 1, 2),
+        "(after the map, after the pins, after the retire): the map and the \
+         retire each met the running vCPU's borrow once; the pins never did"
+    );
+}
+
+fn engine_contended(access: &carrick_softcpu_aarch64_host::SoftRetainedMetadata) -> u64 {
+    access.contended_stage2_borrows()
 }
