@@ -558,6 +558,9 @@ pub struct ExecutionWitness {
     /// refusal reason, withdrawn lifecycle records, child retirement.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fork_stock_families: Vec<ExecutionFamilyCount>,
+    /// The most backend memslots the carrier held at once (KVM; #3099).
+    #[serde(default)]
+    pub peak_memslots: u64,
     /// Last refused fork admission, including quarantine at that boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_admission_refusal: Option<ForkAdmissionRefusal>,

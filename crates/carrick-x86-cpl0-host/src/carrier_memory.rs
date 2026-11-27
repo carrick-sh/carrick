@@ -635,6 +635,8 @@ pub struct CarrierMemory<M: CarrierMemoryIo> {
     /// aliases), so a retired MM's drain debt is dropped without a scan.
     drained_by: BTreeMap<NonZeroU64, BTreeSet<u32>>,
     limit: u32,
+    /// The most memslots this carrier held at once (#3099 witness).
+    peak_slots: usize,
     generation: u64,
     quarantined: bool,
 }
@@ -695,6 +697,7 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
             admitted: BTreeMap::new(),
             drained_by: BTreeMap::new(),
             limit,
+            peak_slots: 0,
             generation: 0,
             quarantined: false,
         })
@@ -765,6 +768,10 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
     }
     pub fn slot_count(&self) -> usize {
         self.slots.len()
+    }
+    /// The most memslots this carrier has held at once.
+    pub fn peak_slot_count(&self) -> usize {
+        self.peak_slots
     }
     /// Borrow the allocation retained by each installed slot, including
     /// bootstrap windows. Callers can clone the Arcs to retain storage
@@ -909,6 +916,7 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
             );
             self.by_gpa.insert(b.extent.base.raw(), slot);
             self.free.remove(&slot);
+            self.peak_slots = self.peak_slots.max(self.slots.len());
             installed.push(handle);
         }
         Ok(installed)
