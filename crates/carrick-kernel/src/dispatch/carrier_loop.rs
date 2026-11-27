@@ -656,7 +656,7 @@ pub fn wait_for_owner_memory_release(
                 },
                 &passes,
             );
-            (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
+            passes.deliver(crate::el1_zone::resched_slot);
             owed
         };
         zone.free_record(record);
@@ -993,10 +993,9 @@ pub fn run_guest<R>(
     if let Some((zone, slot)) = zone_slot {
         {
             let passes = carrick_sched_core::OwedPasses::new();
-            let owed = zone.leave_guest(slot, &crate::el1_zone::HostLockWait, &passes);
-            (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
-            owed
-        };
+            zone.leave_guest(slot, &crate::el1_zone::HostLockWait, &passes);
+            passes.deliver(crate::el1_zone::resched_slot);
+        }
     }
     result
 }
@@ -1034,7 +1033,7 @@ pub fn settle_zone_exit(zone: &ZoneTables, slot: SlotId) -> ZoneExitSettlement {
     {
         let passes = carrick_sched_core::OwedPasses::new();
         let owed = zone.sweep_cancelled(slot, &passes);
-        (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
+        passes.deliver(crate::el1_zone::resched_slot);
         owed
     };
     crate::el1_zone::hand_back_wanted(slot);
@@ -1044,12 +1043,10 @@ pub fn settle_zone_exit(zone: &ZoneTables, slot: SlotId) -> ZoneExitSettlement {
     if let (Some(switched), Some(own)) = (current, own)
         && switched == own
     {
-        return match {
-            let passes = carrick_sched_core::OwedPasses::new();
-            let owed = zone.release_current(slot, own, &crate::el1_zone::HostLockWait, &passes);
-            (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
-            owed
-        } {
+        let passes = carrick_sched_core::OwedPasses::new();
+        let owed = zone.release_current(slot, own, &crate::el1_zone::HostLockWait, &passes);
+        passes.deliver(crate::el1_zone::resched_slot);
+        return match owed {
             carrick_sched_core::CurrentRelease::Released => ZoneExitSettlement::Released,
             carrick_sched_core::CurrentRelease::Requeued => ZoneExitSettlement::Requeued { own },
         };
@@ -1156,12 +1153,9 @@ pub fn publish_stopped_zone_slot<B: StoppedSlotBackend>(
                 .set_sgi_target(carrick_sched_core::HOST_RESCHEDULE_TARGET);
             {
                 let passes = carrick_sched_core::OwedPasses::new();
-                let owed = zone.publish_slot_with_affinity(slot, 0, bound_cpu, affinity, &passes);
-                (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(
-                    passes,
-                );
-                owed
-            };
+                zone.publish_slot_with_affinity(slot, 0, bound_cpu, affinity, &passes);
+                passes.deliver(crate::el1_zone::resched_slot);
+            }
         }
         carrick_el1_abi::publish_zone_identity(slot.index(), 0, serial.raw());
         return Ok(());
@@ -1510,8 +1504,14 @@ mod tests {
             .unwrap();
         zone.publish_park(record, seq);
         // Another executor drives the slot and runs this address space.
-        zone.drive(slot, 3);
-        zone.publish_slot(slot, STOPPED_MM, None, 0);
+        zone.drive(slot, 3, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(
+            slot,
+            STOPPED_MM,
+            None,
+            0,
+            &carrick_sched_core::OwedPasses::new(),
+        );
         let here = carrick_sched_core::occupancy::ExecutionSlot::zone(slot);
         zone.occupancy.vacate_any(here);
         assert!(zone.occupancy.replace(here, 0, STOPPED_MM));
@@ -1532,7 +1532,10 @@ mod tests {
                 let _ = owned.into_parts();
             });
         }
-        assert_eq!(zone.switch_in(slot), Some(record));
+        assert_eq!(
+            zone.switch_in(slot, &carrick_sched_core::OwedPasses::new()),
+            Some(record)
+        );
         let mut backend = RecordingSlotBackend {
             target: Ok(0x55),
             targets: 0,
