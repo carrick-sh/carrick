@@ -33,6 +33,8 @@
 //!
 //! PR 1a adds the MMs (`own/mm.rs`), their editor (`own/editor.rs`) and
 //! their copy-on-write grants (`own/grant.rs`, invariants G1 to G3).
+//! `own/holds.rs` owns each backing slot's holders, so a slot is released
+//! exactly when its last holder lets go (#3127, invariants H1 to H3).
 //!
 //! The index structure is the step-1a table (#1236): records never overlap,
 //! so the only record that can hold an address is the one with the greatest
@@ -46,6 +48,7 @@ mod editor;
 #[cfg(test)]
 mod explore;
 mod grant;
+mod holds;
 mod mm;
 
 pub use editor::{ExcludedMm, HostEdit, MmEditor, NotNow};
@@ -53,6 +56,7 @@ pub use grant::{
     ChunkDemand, CowArenaGeometry, CowSupply, GrantId, GrantPayload, MmRefusal, SettleProof,
     Supplied, SupplyTicket,
 };
+pub use holds::{DrainContext, HoldError, HoldRetirement, SlotHolds};
 pub use mm::MmKey;
 #[cfg(all(test, feature = "loom"))]
 mod loom_models;

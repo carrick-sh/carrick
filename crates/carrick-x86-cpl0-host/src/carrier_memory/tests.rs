@@ -121,6 +121,12 @@ fn grandchild_inherits_a_slot_after_its_parent_retired() {
     });
 }
 #[test]
+fn an_owner_retired_slot_goes_with_the_retirement_that_drops_its_last_hold() {
+    test_support::an_owner_retired_slot_goes_with_the_retirement_that_drops_its_last_hold(|| {
+        test_support::MemoryTestIo::new(TestMemoryIo::default())
+    });
+}
+#[test]
 fn refused_retire_child_mutates_nothing_and_its_retry_completes() {
     test_support::refused_retire_child_mutates_nothing_and_its_retry_completes(|| {
         test_support::MemoryTestIo::new(TestMemoryIo::default())
