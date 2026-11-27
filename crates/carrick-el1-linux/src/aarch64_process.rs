@@ -1534,7 +1534,10 @@ impl<X: ForkStockCrossing> UserWriteVenue<Aarch64ParkedContext> for NativeWriteV
         }
     }
 
-    fn settle_completions(&mut self, _: &UserWriteRequest<'_>) -> Result<(), Self::Error> {
+    fn settle_completions(
+        &mut self,
+        _: &UserWriteRequest<'_>,
+    ) -> Result<(), carrick_core::mm::transaction::VenueRefusal<Self::Error>> {
         // Host settlement runs at the next exact-MM exclusion; provisioning
         // adds an unmapped inventory extent and does not inspect old mappings.
         Ok(())
@@ -1543,7 +1546,7 @@ impl<X: ForkStockCrossing> UserWriteVenue<Aarch64ParkedContext> for NativeWriteV
     fn supply_cow(
         &mut self,
         window: carrick_el1_abi::PortalGrantWindow,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), carrick_core::mm::transaction::VenueRefusal<Self::Error>> {
         let cpu = u64::from(self.slot.raw());
         // A supply the carrier refused is withdrawn before this returns; a
         // selection left published would be read by this CPU's next native
@@ -1555,28 +1558,29 @@ impl<X: ForkStockCrossing> UserWriteVenue<Aarch64ParkedContext> for NativeWriteV
                 self.crossing
                     .cross_cow_supply(UserVa::new(window.fault_page), cpu)
             })
-            .map_err(NativeProcessError::from_cow_supply)
+            .map_err(NativeProcessError::venue_cow_supply)
     }
 
     fn supply_backing(
         &mut self,
         window: carrick_el1_abi::PortalGrantWindow,
-    ) -> Option<Result<(), Self::Error>> {
+    ) -> Option<Result<(), carrick_core::mm::transaction::VenueRefusal<Self::Error>>> {
         if !self.allow_backing {
             return None;
         }
         let Some(slot) = self.slots.grant(usize::from(self.slot.raw())) else {
-            return Some(Err(NativeProcessError::Stale));
+            return Some(Err(NativeProcessError::Stale.into()));
         };
-        Some(
+        Some(Err(
             if slot.publish_fault_selection(window.operation.sequence.get(), window) {
                 // The existing native fault service owns physical supply. The
                 // caller retains its operation while that service releases CPU.
-                Err(NativeProcessError::SupplySelected)
+                NativeProcessError::SupplySelected
             } else {
-                Err(NativeProcessError::Busy)
-            },
-        )
+                NativeProcessError::Busy
+            }
+            .into(),
+        ))
     }
 
     fn copy(

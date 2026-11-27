@@ -255,8 +255,35 @@ mod test_support {
     /// 16..32: holds released with their fork parked on the editor;
     /// 0..16: fork settlement crossings that left the parent settled.
     pub const INJECT_FORK_COW_SETTLE_CENSUS: u64 = 0xffff_ffff_ffff_fe35;
+    /// The same hold at the next user-write settlement crossing that finds
+    /// the caller's MM with COW completions (#3082): a kernel copy into user
+    /// memory meets the editor held, settles nothing, and waits for the
+    /// editor's release. The fork's census counts it.
+    pub const INJECT_HOLD_EDITOR_AT_COPY_COW_SETTLE: u64 = 0xffff_ffff_ffff_fe37;
+    /// Settlement crossings of a user write that met the armed copy hold's
+    /// editor held. A copy that waits on the editor's release meets it once;
+    /// one that reran as bare carrier work meets it again (#3082).
+    pub const INJECT_COPY_COW_EDITOR_HELD_CENSUS: u64 = 0xffff_ffff_ffff_fe38;
+    static COPY_COW_EDITOR_HELD_CROSSINGS: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
+
+    /// A user write's settlement crossing met its MM's editor held: count
+    /// it while the copy hold holds the editor.
+    pub fn record_copy_cow_editor_held() {
+        if FORK_COW_EDITOR
+            .lock()
+            .as_ref()
+            .is_some_and(|held| held.editor_queue.is_some())
+        {
+            COPY_COW_EDITOR_HELD_CROSSINGS.fetch_add(1, Ordering::AcqRel);
+        }
+    }
     /// The armed member: the fork whose park releases the held editor.
     static FORK_COW_EDITOR_WAITER: carrick_el1::lock::SpinLock<
+        Option<carrick_sched_core::RecordRef>,
+    > = carrick_el1::lock::SpinLock::new(None);
+    /// The armed member: the copy whose park releases the held editor.
+    static COPY_COW_EDITOR_WAITER: carrick_el1::lock::SpinLock<
         Option<carrick_sched_core::RecordRef>,
     > = carrick_el1::lock::SpinLock::new(None);
     static FORK_COW_EDITOR_HOLDS: core::sync::atomic::AtomicU64 =
@@ -273,6 +300,10 @@ mod test_support {
             carrick_sched_core::ParkedContextWords,
         >,
         waiter: carrick_sched_core::RecordRef,
+        /// The MM's editor queue the waiter must be enrolled on before the
+        /// hold releases (the copy hold, #3082): a bare carrier-work rerun
+        /// parks nowhere, so the holder keeps the editor and the run hangs.
+        editor_queue: Option<u32>,
     }
     // SAFETY: the guard names the one static zone's space entry and its
     // release venue (a plain function delivery); it moves between this
@@ -290,7 +321,44 @@ mod test_support {
         slot: u32,
         mm: u64,
     ) {
-        let Some(waiter) = FORK_COW_EDITOR_WAITER.lock().take() else {
+        hold_editor_for_armed(&FORK_COW_EDITOR_WAITER, zone, slot, mm, None);
+    }
+
+    /// Called by a user-write settlement crossing that found its MM's COW
+    /// completions, before it rings the crossing, on the copying member's
+    /// CPU: when armed, take the MM's real editor for the copying record's
+    /// park to release.
+    pub fn hold_editor_for_copy_cow_settle(
+        zone: &'static carrick_sched_core::ZoneTables<carrick_sched_core::ParkedContextWords>,
+        slot: u32,
+        handle: carrick_el1_abi::El1MmHandle,
+    ) {
+        let mm = handle.mm().raw();
+        if COPY_COW_EDITOR_WAITER.lock().is_none() {
+            return;
+        }
+        let Some(queue) = core::num::NonZeroU64::new(mm)
+            .and_then(|key| zone.space_entry(key))
+            .and_then(|entry| entry.notifications(handle.incarnation()).ok())
+            .map(|lease| {
+                lease
+                    .key(carrick_sched_core::spaces::notification::SpaceWaitCause::Editor)
+                    .index()
+            })
+        else {
+            carrick_x86_carrier::entry::fatal_boot!();
+        };
+        hold_editor_for_armed(&COPY_COW_EDITOR_WAITER, zone, slot, mm, Some(queue));
+    }
+
+    fn hold_editor_for_armed(
+        armed: &carrick_el1::lock::SpinLock<Option<carrick_sched_core::RecordRef>>,
+        zone: &'static carrick_sched_core::ZoneTables<carrick_sched_core::ParkedContextWords>,
+        slot: u32,
+        mm: u64,
+        editor_queue: Option<u32>,
+    ) {
+        let Some(waiter) = armed.lock().take() else {
             return;
         };
         let (Some(slot), Some(index)) = (
@@ -305,7 +373,11 @@ mod test_support {
         else {
             carrick_x86_carrier::entry::fatal_boot!();
         };
-        *FORK_COW_EDITOR.lock() = Some(HeldForkEditor { editor, waiter });
+        *FORK_COW_EDITOR.lock() = Some(HeldForkEditor {
+            editor,
+            waiter,
+            editor_queue,
+        });
         FORK_COW_EDITOR_HOLDS.fetch_add(1, Ordering::AcqRel);
     }
 
@@ -320,13 +392,23 @@ mod test_support {
         source: carrick_el1_abi::BornInZoneSource<'static, carrick_sched_core::ParkedContextWords>,
     ) {
         let mut held = FORK_COW_EDITOR.lock();
-        let Some(waiter) = held.as_ref().map(|held| held.waiter) else {
+        let Some((waiter, editor_queue)) =
+            held.as_ref().map(|held| (held.waiter, held.editor_queue))
+        else {
             return;
         };
         if !matches!(
             source.zone.record(waiter.id).claim(),
             carrick_sched_core::Claim::Parked { .. }
         ) {
+            return;
+        }
+        if let Some(queue) = editor_queue
+            && source
+                .zone
+                .object_queue_census(queue)
+                .is_none_or(|census| census.waiters == 0)
+        {
             return;
         }
         let released = held.take();
@@ -1290,7 +1372,7 @@ mod test_support {
                     });
                 Some(0)
             }
-            INJECT_HOLD_EDITOR_AT_FORK_COW_SETTLE => {
+            INJECT_HOLD_EDITOR_AT_FORK_COW_SETTLE | INJECT_HOLD_EDITOR_AT_COPY_COW_SETTLE => {
                 // The caller is the member whose next fork the hold covers.
                 let slot = carrick_el1::isa::x86::context::native::checked_scheduler_slot(
                     carrick_guest_arch::CpuId::new(binding.cpu_slot),
@@ -1302,7 +1384,11 @@ mod test_support {
                     .current()
                     .or_else(|| zone.slot(slot).host_record())?;
                 let waiter = zone.record_ref(record);
-                let mut armed = FORK_COW_EDITOR_WAITER.lock();
+                let mut armed = if native == INJECT_HOLD_EDITOR_AT_FORK_COW_SETTLE {
+                    FORK_COW_EDITOR_WAITER.lock()
+                } else {
+                    COPY_COW_EDITOR_WAITER.lock()
+                };
                 if armed.is_some() || FORK_COW_EDITOR.lock().is_some() {
                     return None;
                 }
@@ -1314,6 +1400,9 @@ mod test_support {
                     | ((FORK_COW_EDITOR_PARKED_RELEASES.load(Ordering::Acquire) & 0xffff) << 16)
                     | (FORK_COW_SETTLED.load(Ordering::Acquire) & 0xffff),
             ),
+            INJECT_COPY_COW_EDITOR_HELD_CENSUS => {
+                Some(COPY_COW_EDITOR_HELD_CROSSINGS.load(Ordering::Acquire))
+            }
             INJECT_MISLABELLED_RESUME_CENSUS => Some(MISLABELLED_RESUMES.load(Ordering::Acquire)),
             INJECT_OWNED_COPY_CENSUS => Some(
                 (OWNED_COPY_REFUSALS.load(Ordering::Acquire) << 32)

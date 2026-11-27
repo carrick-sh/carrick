@@ -4776,6 +4776,54 @@ fn production_fork_parks_on_a_held_parent_editor_and_forks_once_the_carrier_sett
     );
 }
 
+/// #3082 (pre-review P0-1): a kernel copy into user memory that meets its
+/// MM's editor held at the COW settlement crossing parks on that editor's
+/// release through the shared native service, and the release wakes it:
+/// the shared user-write protocol observes the editor before the crossing
+/// and answers the venue's `EditorHeld` with that wait, where it reran a
+/// bare `Busy` as carrier work and spun while the holder kept the editor.
+/// The leader's `read(2)` into a copy-on-write page returns its eight bytes
+/// and leaves the page's other bytes alone. Two live processes and two live
+/// threads, ordered on the fixture image's holds: a sibling's COW is held
+/// before its settlement crossing, and the MM's real editor is held across
+/// the copy's first crossing and released only once the reader has parked.
+#[test]
+fn production_copyout_parks_on_a_held_editor_and_completes_once_the_carrier_settles() {
+    // The guest orders every step on events and its holds have no time
+    // bound, so a regression spins or parks the run forever. This reporting
+    // bound turns that hang into a failure with the step named. It changes
+    // no ordering.
+    const REPORT_HANG_AFTER: std::time::Duration = std::time::Duration::from_secs(300);
+    let elf = native_exit_fixture("native_copy_cow_settle_editor_wait.S");
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("copy-cow-settle-editor-wait".into())
+        .spawn(move || {
+            let _ = done_tx.send(
+                kvm_pool_fixture::try_run_instrumented_pool_fixture(&elf, 4096)
+                    .map_err(|failure| failure.error),
+            );
+        })
+        .expect("spawn the fixture run");
+    let outcome = match done_rx.recv_timeout(REPORT_HANG_AFTER) {
+        Ok(run) => run.expect("copy-out beside a held MM editor run"),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+            "the copy-out beside a held MM editor never finished in {REPORT_HANG_AFTER:?}: \
+             it did not park on the editor's release, or the release never woke it \
+             (see native_copy_cow_settle_editor_wait.S)"
+        ),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("the fixture run panicked before reporting an outcome")
+        }
+    };
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (7, None),
+        "see native_copy_cow_settle_editor_wait.S for the failed step: {:?}",
+        outcome.run
+    );
+}
+
 /// #2923: a sibling's copy-on-write that the carrier supplied before a fork
 /// selected its parent's frames resolves only after that fork commits. The
 /// fork selects the frame the sibling's leaf names, publishes the parent

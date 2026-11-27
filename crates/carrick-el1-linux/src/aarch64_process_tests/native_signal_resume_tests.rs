@@ -1242,10 +1242,13 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
         fn settle_completions(
             &mut self,
             _: &UserWriteRequest<'_>,
-        ) -> Result<(), NativeProcessError> {
+        ) -> Result<(), carrick_core::mm::transaction::VenueRefusal<NativeProcessError>> {
             Ok(())
         }
-        fn supply_cow(&mut self, _: PortalGrantWindow) -> Result<(), NativeProcessError> {
+        fn supply_cow(
+            &mut self,
+            _: PortalGrantWindow,
+        ) -> Result<(), carrick_core::mm::transaction::VenueRefusal<NativeProcessError>> {
             panic!("private stack pages must not request COW supply")
         }
         fn copy(&mut self, fence: &ValidatedChunk<'_, Aarch64ParkedContext>, src: &[u8]) -> bool {

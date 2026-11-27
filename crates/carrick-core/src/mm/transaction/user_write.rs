@@ -87,6 +87,29 @@ impl<E> From<crate::mm::transfer::TransferError> for UserWriteError<E> {
     }
 }
 
+/// Why a venue's physical crossing did nothing. `EditorHeld` is contention
+/// ("not now"): the carrier met this MM's editor held on another CPU. It
+/// names no wait of its own, because only the protocol observes the
+/// editor's release source, before the crossing that met the holder, so
+/// the caller enrols on that release instead of rerunning a bare `Busy`
+/// (#3082). `Failed` is the mechanics' own refusal, kept as it is.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
+pub enum VenueRefusal<E> {
+    EditorHeld,
+    Failed(E),
+}
+impl<E> From<E> for VenueRefusal<E> {
+    fn from(error: E) -> Self {
+        Self::Failed(error)
+    }
+}
+
 /// ISA copy mechanics and the existing physical supply crossing. This owns
 /// neither grants nor a pool. Supply must publish or return a refusal; it
 /// cannot report progress merely because the producer was notified.
@@ -96,12 +119,21 @@ pub trait UserWriteVenue<Context: Copy + Send + Sync + zerocopy::FromZeros> {
     type Error;
 
     fn selection_venues(&mut self) -> SelectionVenues<'_, Self::Prepared, Self::Cow>;
-    fn settle_completions(&mut self, request: &UserWriteRequest<'_>) -> Result<(), Self::Error>;
-    fn supply_cow(&mut self, window: PortalGrantWindow) -> Result<(), Self::Error>;
-    fn supply_backing(&mut self, _window: PortalGrantWindow) -> Option<Result<(), Self::Error>> {
+    fn settle_completions(
+        &mut self,
+        request: &UserWriteRequest<'_>,
+    ) -> Result<(), VenueRefusal<Self::Error>>;
+    fn supply_cow(&mut self, window: PortalGrantWindow) -> Result<(), VenueRefusal<Self::Error>>;
+    fn supply_backing(
+        &mut self,
+        _window: PortalGrantWindow,
+    ) -> Option<Result<(), VenueRefusal<Self::Error>>> {
         None
     }
-    fn settle_preparation(&mut self, _target: &UserWriteTarget) -> Result<(), Self::Error> {
+    fn settle_preparation(
+        &mut self,
+        _target: &UserWriteTarget,
+    ) -> Result<(), VenueRefusal<Self::Error>> {
         Ok(())
     }
 
@@ -193,20 +225,18 @@ impl<
             // The settlement follows every selection, a failed one included:
             // an earlier supply of this call may still be owed to the venue
             // (#2716). The selection's own error is the one reported.
-            let settled = match request.as_ref() {
+            let settled = self.cross(target.handle, || match request.as_ref() {
                 Some(request) => venue.settle_completions(request),
                 None => venue.settle_preparation(&target),
-            };
+            });
             let step = step?;
-            settled.map_err(UserWriteError::Mechanics)?;
+            settled?;
             match step {
                 TransferStep::CowSupply(window) => {
                     if awaiting_supply_progress {
                         return Err(UserWriteError::Busy);
                     }
-                    venue
-                        .supply_cow(window)
-                        .map_err(UserWriteError::Mechanics)?;
+                    self.cross(target.handle, || venue.supply_cow(window))?;
                     awaiting_supply_progress = true;
                 }
                 TransferStep::Selected(selected) => {
@@ -240,9 +270,15 @@ impl<
                     if awaiting_supply_progress {
                         return Err(UserWriteError::Busy);
                     }
-                    match venue.supply_backing(window) {
-                        Some(result) => result.map_err(UserWriteError::Mechanics)?,
-                        None => return Err(UserWriteError::UnsupportedSupply),
+                    let mut unsupported = false;
+                    self.cross(target.handle, || {
+                        venue.supply_backing(window).unwrap_or_else(|| {
+                            unsupported = true;
+                            Ok(())
+                        })
+                    })?;
+                    if unsupported {
+                        return Err(UserWriteError::UnsupportedSupply);
                     }
                     awaiting_supply_progress = true;
                 }
@@ -256,5 +292,28 @@ impl<
             }
         }
         Ok(())
+    }
+
+    /// The one reading of a venue crossing's contention, for every venue and
+    /// every caller of the protocol (#3082). The MM's editor release is
+    /// observed after the protocol's own selection released the editor and
+    /// before the crossing that may meet another holder, so a crossing that
+    /// met it returns that exact wait: a release in between moves the
+    /// revision, and the caller's enrolment reruns at once ("Busy once, then
+    /// success"); otherwise the holder's release wakes it. The observation
+    /// is `None` only for a source-free model fixture.
+    fn cross<E>(
+        &self,
+        handle: El1MmHandle,
+        crossing: impl FnOnce() -> Result<(), VenueRefusal<E>>,
+    ) -> Result<(), UserWriteError<E>> {
+        let editor = self.observe_wait(handle, carrick_core_abi::PortalWaitCause::Editor)?;
+        crossing().map_err(|refusal| match refusal {
+            VenueRefusal::EditorHeld => {
+                let _ = editor;
+                UserWriteError::Busy
+            }
+            VenueRefusal::Failed(error) => UserWriteError::Mechanics(error),
+        })
     }
 }
