@@ -69,7 +69,11 @@ fn terminal_close_with_retained_service_entry_for<
         .find(|slot| fixture.zone.slot(*slot).queued() != 0)
         .expect("the cancelled service wakes its exact member");
     assert_eq!(
-        fixture.zone.switch_in_full(slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         sibling.record.id
     );
     let saved = unsafe { fixture.runtime.record_binding(sibling.record) }
@@ -577,6 +581,7 @@ fn busy_service_notice_parks_and_reruns_once_for<
                 fixture.slot,
                 record.id,
                 &carrick_sched_core::ShortLockSpin,
+                &carrick_sched_core::OwedPasses::new(),
             );
             holder_resumed = true;
         } else {
@@ -761,6 +766,7 @@ fn busy_service_notice_releases_execution_capacity_for<
                         fixture.slot,
                         record.id,
                         &carrick_sched_core::ShortLockSpin,
+                        &carrick_sched_core::OwedPasses::new(),
                     );
                     completed += 1;
                 }
@@ -899,12 +905,19 @@ fn busy_service_notice_cancellation_wakes_and_retires_for<
     assert!(
         fixture
             .zone
-            .requeue_preempted(contender_slot, contender_record.id)
+            .requeue_preempted(
+                contender_slot,
+                contender_record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     fixture.zone.clear_current(contender_slot);
 
-    let selected_child = fixture.zone.switch_in_full(contender_slot).unwrap();
+    let selected_child = fixture
+        .zone
+        .switch_in_full(contender_slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     assert_ne!(selected_child.record, contender_record.id);
     let child_record = fixture.zone.record_ref(selected_child.record);
     let child_identity = fixture.zone.record(selected_child.record).identity();
@@ -980,7 +993,10 @@ fn busy_service_notice_cancellation_wakes_and_retires_for<
     }
 
     // Select the contender before the carrier takes the child's notice.
-    let selected_contender = fixture.zone.switch_in_full(contender_slot).unwrap();
+    let selected_contender = fixture
+        .zone
+        .switch_in_full(contender_slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     assert_eq!(selected_contender.record, contender_record.id);
     let contender_identity = fixture.zone.record(contender_record.id).identity();
     fixture
@@ -1143,7 +1159,11 @@ fn busy_service_notice_cancellation_wakes_and_retires_for<
             .find(|slot| fixture.zone.slot(*slot).queued() != 0)
             .expect("cancelling a contended notice wait must wake the parked member");
         assert_eq!(
-            fixture.zone.switch_in_full(woken_slot).unwrap().record,
+            fixture
+                .zone
+                .switch_in_full(woken_slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record,
             fixture.record.id
         );
         let leader_saved = unsafe { fixture.runtime.record_binding(fixture.record) }
@@ -1500,7 +1520,11 @@ fn terminal_close_with_retained_adapter_service_entry_for<
         .find(|slot| fixture.zone.slot(*slot).queued() != 0)
         .expect("the cancelled adapter service wakes its exact member");
     assert_eq!(
-        fixture.zone.switch_in_full(slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         sibling.record.id
     );
     let saved = unsafe { fixture.runtime.record_binding(sibling.record) }
@@ -1649,7 +1673,11 @@ fn terminal_close_with_retained_adapter_service_entry_for<
         .find(|candidate| fixture.zone.slot(*candidate).queued() != 0)
         .expect("retiring the sibling must wake the closing leader");
     assert_eq!(
-        fixture.zone.switch_in_full(leader_slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(leader_slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         fixture.record.id
     );
     let leader_saved = unsafe { fixture.runtime.record_binding(fixture.record) }
@@ -1805,7 +1833,11 @@ fn terminal_close_with_retained_service_propagates_lifecycle_run_failure_for<
         .find(|slot| fixture.zone.slot(*slot).queued() != 0)
         .unwrap();
     assert_eq!(
-        fixture.zone.switch_in_full(slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         sibling.record.id
     );
     let saved = unsafe { fixture.runtime.record_binding(sibling.record) }
@@ -1836,6 +1868,7 @@ fn terminal_close_with_retained_service_propagates_lifecycle_run_failure_for<
                 carrick_sched_core::Handback::Control,
                 &carrick_sched_core::ShortLockSpin,
                 &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+                &carrick_sched_core::OwedPasses::new(),
             ),
             carrick_sched_core::HostClaim::El1Held { slot }
         );
@@ -2073,7 +2106,11 @@ fn terminal_close_with_foreign_service_control_quarantines_at_member_guard_for<
         .find(|slot| fixture.zone.slot(*slot).queued() != 0)
         .unwrap();
     assert_eq!(
-        fixture.zone.switch_in_full(slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         sibling.record.id
     );
     let saved = unsafe { fixture.runtime.record_binding(sibling.record) }
@@ -2273,7 +2310,11 @@ fn closing_process_retires_object_parked_member_for<
         panic!("the close must place the interrupted object waiter in the ring, got {claim:?}");
     };
     assert_eq!(
-        fixture.zone.switch_in_full(slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         sibling.record.id
     );
     let saved = unsafe { fixture.runtime.record_binding(sibling.record) }
@@ -2337,7 +2378,11 @@ fn closing_process_retires_object_parked_member_for<
         .find(|candidate| fixture.zone.slot(*candidate).queued() != 0)
         .expect("retiring the sibling must wake the closing leader");
     assert_eq!(
-        fixture.zone.switch_in_full(leader_slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(leader_slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         fixture.record.id
     );
     let leader_saved = unsafe { fixture.runtime.record_binding(fixture.record) }
@@ -2680,7 +2725,11 @@ fn fatal_cancellation_during_signal_frame_supply_clears_retained_delivery_for<
         .find(|slot| fixture.zone.slot(*slot).queued() != 0)
         .expect("the completed supply wakes its exact member");
     assert_eq!(
-        fixture.zone.switch_in_full(resume_slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(resume_slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         sibling.record.id
     );
     // SAFETY: switch_in_full selected this exact record just above.

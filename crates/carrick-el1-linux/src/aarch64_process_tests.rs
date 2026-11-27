@@ -106,8 +106,12 @@ fn arm_native_wake_cross_slot_reaches_reschedule_transport() {
     use carrick_sched_core::WakeEffects;
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let other = SlotId::new(4);
-    fixture.zone.drive(other, 2);
-    fixture.zone.publish_slot(other, 1, Some(0), 1);
+    fixture
+        .zone
+        .drive(other, 2, &carrick_sched_core::OwedPasses::new());
+    fixture
+        .zone
+        .publish_slot(other, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
     fixture.zone.enter_guest(other);
     let target = 0x8000_0004;
     fixture.zone.slot(other).set_sgi_target(target);
@@ -659,6 +663,7 @@ impl ForkStockCrossing for TestStockCrossing {
             false,
             &mut |transfer| transfers.push(transfer),
             &mut |_| panic!("must hand back to host"),
+            &carrick_sched_core::OwedPasses::new(),
         );
         drop(guard);
         for transfer in transfers {
@@ -1003,8 +1008,16 @@ fn arm_unregistered_host_cancel_commits_terminal_intent_before_record_release() 
                 fixture.page.thread_born().unwrap();
                 let sibling_control = Box::leak(Box::new(ThreadControlSlot::new()));
                 let sibling_slot = SlotId::new(1);
-                fixture.zone.drive(sibling_slot, 1);
-                fixture.zone.publish_slot(sibling_slot, 1, Some(1), 1);
+                fixture
+                    .zone
+                    .drive(sibling_slot, 1, &carrick_sched_core::OwedPasses::new());
+                fixture.zone.publish_slot(
+                    sibling_slot,
+                    1,
+                    Some(1),
+                    1,
+                    &carrick_sched_core::OwedPasses::new(),
+                );
                 fixture.zone.enter_guest(sibling_slot);
                 fixture.zone.install_space(sibling_slot, 1).unwrap();
                 let sibling_record = fixture
@@ -1022,10 +1035,19 @@ fn arm_unregistered_host_cancel_commits_terminal_intent_before_record_release() 
                 assert!(
                     fixture
                         .zone
-                        .requeue_preempted(sibling_slot, sibling_record)
+                        .requeue_preempted(
+                            sibling_slot,
+                            sibling_record,
+                            &carrick_sched_core::OwedPasses::new()
+                        )
                         .is_queued()
                 );
-                assert_eq!(fixture.zone.switch_in(sibling_slot), Some(sibling_record));
+                assert_eq!(
+                    fixture
+                        .zone
+                        .switch_in(sibling_slot, &carrick_sched_core::OwedPasses::new()),
+                    Some(sibling_record)
+                );
                 fixture.zone.record_ref(sibling_record)
             });
             let record = fixture
@@ -1035,10 +1057,15 @@ fn arm_unregistered_host_cancel_commits_terminal_intent_before_record_release() 
             assert!(
                 fixture
                     .zone
-                    .requeue_preempted(fixture.slot, record)
+                    .requeue_preempted(fixture.slot, record, &carrick_sched_core::OwedPasses::new())
                     .is_queued()
             );
-            assert_eq!(fixture.zone.switch_in(fixture.slot), Some(record));
+            assert_eq!(
+                fixture
+                    .zone
+                    .switch_in(fixture.slot, &carrick_sched_core::OwedPasses::new()),
+                Some(record)
+            );
             let reference = fixture.zone.record_ref(record);
             fixture.control.bind_zone_record(reference);
             let birth = fixture.control.host_birth_identity().unwrap();
@@ -1069,7 +1096,8 @@ fn arm_unregistered_host_cancel_commits_terminal_intent_before_record_release() 
                         &|owned| crate::sched::object_wait::deliver_host_completion(
                             owned.zone(),
                             owned
-                        )
+                        ),
+                        &carrick_sched_core::OwedPasses::new()
                     ),
                     carrick_sched_core::HostClaim::El1Held { slot: fixture.slot }
                 ),
@@ -1110,7 +1138,9 @@ fn arm_unregistered_host_cancel_commits_terminal_intent_before_record_release() 
                     "{owner:?} must retain its record"
                 );
                 assert_eq!(
-                    fixture.zone.take_service_head(fixture.slot),
+                    fixture
+                        .zone
+                        .take_service_head(fixture.slot, &carrick_sched_core::OwedPasses::new()),
                     Some(reference)
                 );
                 assert_eq!(fixture.page.live(), 1);
@@ -1133,8 +1163,16 @@ fn arm_unregistered_host_cancel_commits_terminal_intent_before_record_release() 
                     let work = fixture.task.linux.take_host_work_doorbell().unwrap();
                     assert_eq!(work.native_terminal_slot(), None, "Busy did not release");
                     work.settled();
-                    fixture.zone.requeue_on(fixture.slot, record).unwrap();
-                    assert_eq!(fixture.zone.switch_in(fixture.slot), Some(record));
+                    fixture
+                        .zone
+                        .requeue_on(fixture.slot, record, &carrick_sched_core::OwedPasses::new())
+                        .unwrap();
+                    assert_eq!(
+                        fixture
+                            .zone
+                            .switch_in(fixture.slot, &carrick_sched_core::OwedPasses::new()),
+                        Some(record)
+                    );
                     assert_eq!(
                         crate::aarch64_process::resume_production_with_service(
                             fixture.zone,
@@ -1247,14 +1285,20 @@ fn arm_unregistered_cancel_requeues_adapter_operation_without_retirement() {
             1
         );
         drop(queue);
-        assert_eq!(fixture.zone.switch_in(fixture.slot), Some(record));
+        assert_eq!(
+            fixture
+                .zone
+                .switch_in(fixture.slot, &carrick_sched_core::OwedPasses::new()),
+            Some(record)
+        );
         assert_eq!(
             fixture.zone.claim_for_host(
                 reference,
                 None,
                 carrick_el1_abi::Handback::Cancelled,
                 &carrick_sched_core::ShortLockSpin,
-                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+                &carrick_sched_core::OwedPasses::new()
             ),
             carrick_sched_core::HostClaim::El1Held { slot: fixture.slot }
         );
@@ -1297,7 +1341,9 @@ fn arm_unregistered_cancel_requeues_adapter_operation_without_retirement() {
         );
         assert_eq!(fixture.zone.slot(fixture.slot).current(), None);
         assert_eq!(
-            fixture.zone.take_service_head(fixture.slot),
+            fixture
+                .zone
+                .take_service_head(fixture.slot, &carrick_sched_core::OwedPasses::new()),
             Some(reference),
             "{owner:?}: host takes the exact operation"
         );
@@ -1330,10 +1376,15 @@ fn arm_unregistered_cancel_without_lifecycle_retains_record_for_host() {
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, record)
+            .requeue_preempted(fixture.slot, record, &carrick_sched_core::OwedPasses::new())
             .is_queued()
     );
-    assert_eq!(fixture.zone.switch_in(fixture.slot), Some(record));
+    assert_eq!(
+        fixture
+            .zone
+            .switch_in(fixture.slot, &carrick_sched_core::OwedPasses::new()),
+        Some(record)
+    );
     let reference = fixture.zone.record_ref(record);
     assert_eq!(
         fixture.zone.claim_for_host(
@@ -1341,7 +1392,8 @@ fn arm_unregistered_cancel_without_lifecycle_retains_record_for_host() {
             None,
             carrick_el1_abi::Handback::Cancelled,
             &carrick_sched_core::ShortLockSpin,
-            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+            &carrick_sched_core::OwedPasses::new()
         ),
         carrick_sched_core::HostClaim::El1Held { slot: fixture.slot }
     );
@@ -1364,7 +1416,8 @@ fn arm_unregistered_cancel_without_lifecycle_retains_record_for_host() {
             None,
             carrick_el1_abi::Handback::Cancelled,
             &carrick_sched_core::ShortLockSpin,
-            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+            &carrick_sched_core::OwedPasses::new()
         ),
         carrick_sched_core::HostClaim::Claimed
     );
@@ -1381,19 +1434,33 @@ fn arm_unregistered_pool_cancel_reaps_entry_before_host_cleanup() {
         assert!(
             fixture
                 .zone
-                .requeue_preempted(fixture.slot, leader)
+                .requeue_preempted(fixture.slot, leader, &carrick_sched_core::OwedPasses::new())
                 .is_queued()
         );
-        assert_eq!(fixture.zone.switch_in(fixture.slot), Some(leader));
+        assert_eq!(
+            fixture
+                .zone
+                .switch_in(fixture.slot, &carrick_sched_core::OwedPasses::new()),
+            Some(leader)
+        );
         let slot = SlotId::new(1);
-        fixture.zone.drive(slot, 1);
-        fixture.zone.publish_slot(slot, 1, Some(1), 1);
+        fixture
+            .zone
+            .drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        fixture
+            .zone
+            .publish_slot(slot, 1, Some(1), 1, &carrick_sched_core::OwedPasses::new());
         fixture.zone.enter_guest(slot);
         fixture.zone.install_space(slot, 1).unwrap();
         let (control, record) =
             imported_thread_on_slot(fixture, slot, |identity| identity.affinity = 2);
         let entry = control.entry().unwrap();
-        assert_eq!(fixture.zone.switch_in(slot), Some(record.id));
+        assert_eq!(
+            fixture
+                .zone
+                .switch_in(slot, &carrick_sched_core::OwedPasses::new()),
+            Some(record.id)
+        );
         let task = Box::leak(Box::new(CurrentTask::new()));
         task.set(
             El1TaskId::from_linux_tid(42),
@@ -1430,7 +1497,12 @@ fn arm_unregistered_pool_cancel_reaps_entry_before_host_cleanup() {
         );
         if !closed {
             assert!(fixture.zone.live(record).is_some());
-            assert_eq!(fixture.zone.take_service_head(slot), Some(record));
+            assert_eq!(
+                fixture
+                    .zone
+                    .take_service_head(slot, &carrick_sched_core::OwedPasses::new()),
+                Some(record)
+            );
             assert_eq!(
                 fixture.page.live(),
                 2,
@@ -1732,8 +1804,14 @@ impl Fixture {
         let ttbr0 = (u64::from(asid.raw()) << 48) | root_gpa;
         let space = zone.spaces.publish_closed(leader.mm, ttbr0, ttbr0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, leader.mm);
-        zone.publish_slot(slot, leader.mm, Some(0), 1);
+        zone.drive(slot, leader.mm, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(
+            slot,
+            leader.mm,
+            Some(0),
+            1,
+            &carrick_sched_core::OwedPasses::new(),
+        );
         zone.enter_guest(slot);
         zone.install_space(slot, leader.mm).unwrap();
         zone.current_or_new(slot, leader).unwrap();
@@ -2493,7 +2571,11 @@ fn native_fork_child_time_result_with(
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, parent.record.id)
+            .requeue_preempted(
+                fixture.slot,
+                parent.record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     activate(source, &task, &child);
@@ -2874,7 +2956,11 @@ fn native_fork_child_cputime_and_times_account_user_system_and_children() {
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, parent.record.id)
+            .requeue_preempted(
+                fixture.slot,
+                parent.record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
 
@@ -2907,7 +2993,11 @@ fn native_fork_child_cputime_and_times_account_user_system_and_children() {
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, child.record.id)
+            .requeue_preempted(
+                fixture.slot,
+                child.record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
 
@@ -2933,14 +3023,21 @@ fn native_fork_child_cputime_and_times_account_user_system_and_children() {
         Aarch64ParkedContext,
     >| {
         loop {
-            let switched = fixture.zone.switch_in_full(fixture.slot).unwrap();
+            let switched = fixture
+                .zone
+                .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap();
             if switched.record == target.record.id {
                 break;
             }
             assert!(
                 fixture
                     .zone
-                    .requeue_preempted(fixture.slot, switched.record)
+                    .requeue_preempted(
+                        fixture.slot,
+                        switched.record,
+                        &carrick_sched_core::OwedPasses::new()
+                    )
                     .is_queued()
             );
         }
@@ -3465,7 +3562,9 @@ fn activate(
 ) {
     let zone = source.zone;
     assert_eq!(
-        zone.switch_in_full(source.slot).unwrap().record,
+        zone.switch_in_full(source.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         binding.record.id
     );
     zone.install_space(source.slot, binding.address.mm.raw().get())
@@ -3655,7 +3754,11 @@ fn wait4_consumes_zombie_once_with_exact_status(terminal: Wait4TerminalCase) {
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, parent_binding.record.id)
+            .requeue_preempted(
+                fixture.slot,
+                parent_binding.record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
 
@@ -4091,10 +4194,18 @@ fn arm_child_wait_wake_with_stock(in_ring: bool, sibling: bool, physical: bool) 
         // No guest slot may place the parent: its executor is in the host
         // continuation, and the child is the last execution on this slot.
         if !in_ring {
-            fixture.zone.publish_slot(fixture.slot, 0, Some(0), 1);
-            fixture
-                .zone
-                .leave_guest(fixture.slot, &carrick_sched_core::ShortLockSpin);
+            fixture.zone.publish_slot(
+                fixture.slot,
+                0,
+                Some(0),
+                1,
+                &carrick_sched_core::OwedPasses::new(),
+            );
+            fixture.zone.leave_guest(
+                fixture.slot,
+                &carrick_sched_core::ShortLockSpin,
+                &carrick_sched_core::OwedPasses::new(),
+            );
         }
         let exit_outcome = child_entry.exit_group(9);
         assert_eq!(child_entry.take_run_failure(), None);
@@ -4921,7 +5032,15 @@ fn terminal_retirement_cannot_retire_a_reused_record_or_slot_generation() {
     };
     let old = super::common_entry::execution_binding(&fixture.task);
     let record = fixture.zone.slot(fixture.slot).host_record().unwrap();
-    assert!(carrick_core::entry::retire_current(old, source, record).is_some());
+    assert!(
+        carrick_core::entry::retire_current(
+            old,
+            source,
+            record,
+            &carrick_sched_core::OwedPasses::new()
+        )
+        .is_some()
+    );
     let phase = carrick_sched_core::TerminalPhase::PendingRetirement;
     assert!(carrick_core::entry::terminal_matches(old, source, phase));
     // Global record storage can be reissued before the terminal crossing.
@@ -4943,7 +5062,15 @@ fn terminal_retirement_cannot_retire_a_reused_record_or_slot_generation() {
         .unwrap();
     assert_eq!(current, record);
     assert!(!carrick_core::entry::terminal_matches(old, source, phase));
-    assert!(carrick_core::entry::retire_current(old, source, current).is_none());
+    assert!(
+        carrick_core::entry::retire_current(
+            old,
+            source,
+            current,
+            &carrick_sched_core::OwedPasses::new()
+        )
+        .is_none()
+    );
     assert_eq!(fixture.zone.slot(fixture.slot).host_record(), Some(current));
     assert_eq!(fixture.zone.record(current).identity(), replacement);
     let next = carrick_el1_abi::ExecutionBinding {
@@ -4951,7 +5078,15 @@ fn terminal_retirement_cannot_retire_a_reused_record_or_slot_generation() {
         thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(replacement.serial),
         ..old
     };
-    assert!(carrick_core::entry::retire_current(next, source, current).is_some());
+    assert!(
+        carrick_core::entry::retire_current(
+            next,
+            source,
+            current,
+            &carrick_sched_core::OwedPasses::new()
+        )
+        .is_some()
+    );
     // Each stale control differs from the retained custody in exactly one
     // field, so no single comparison can be dropped without admitting it.
     for stale in [
@@ -5091,6 +5226,7 @@ pub fn with_native_terminal_host_handback(
             false,
             &mut |transfer| transfers.push(transfer),
             &mut |_| panic!("host handback requested"),
+            &carrick_sched_core::OwedPasses::new(),
         ),
         1
     );
@@ -5272,7 +5408,11 @@ pub fn with_native_file_fork(
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, parent.record.id)
+            .requeue_preempted(
+                fixture.slot,
+                parent.record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     activate(source, &child_task, &child);
@@ -5502,7 +5642,11 @@ fn native_fork_child_getrandom(flags: u64) {
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, parent_binding.record.id)
+            .requeue_preempted(
+                fixture.slot,
+                parent_binding.record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     activate(source, child_task, &child);
@@ -5623,17 +5767,28 @@ fn native_fork_child_getrandom(flags: u64) {
     drop(queue);
     // The still-live parent is also runnable; keep its queue custody while
     // selecting the completed child's service continuation.
-    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    let selected = fixture
+        .zone
+        .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     if selected.record != child.record.id {
         assert_eq!(selected.record, parent_binding.record.id);
         assert!(
             fixture
                 .zone
-                .requeue_preempted(fixture.slot, selected.record)
+                .requeue_preempted(
+                    fixture.slot,
+                    selected.record,
+                    &carrick_sched_core::OwedPasses::new()
+                )
                 .is_queued()
         );
         assert_eq!(
-            fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+            fixture
+                .zone
+                .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record,
             child.record.id
         );
     }
@@ -5852,7 +6007,7 @@ fn arm_returned_process_call_is_not_a_zone_park() {
             assert!(
                 fixture
                     .zone
-                    .requeue_preempted(fixture.slot, record)
+                    .requeue_preempted(fixture.slot, record, &carrick_sched_core::OwedPasses::new())
                     .is_queued()
             );
             fixture.zone.record_ref(record)
@@ -5984,7 +6139,12 @@ fn imported_thread_on_control_and_slot(
             },
         )
         .unwrap();
-    assert!(fixture.zone.requeue_preempted(slot, record).is_queued());
+    assert!(
+        fixture
+            .zone
+            .requeue_preempted(slot, record, &carrick_sched_core::OwedPasses::new())
+            .is_queued()
+    );
     (control, reference)
 }
 
@@ -6040,7 +6200,11 @@ fn arm_root_admission_imports_live_thread_membership_without_changing_census() {
             .task
             .publish_lifecycle(fixture.page as *const _ as u64, control);
         assert_eq!(
-            fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+            fixture
+                .zone
+                .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record,
             record.id
         );
         let control = unsafe { &*(control as *const ThreadControlSlot) };
@@ -6095,7 +6259,13 @@ fn arm_root_admission_imports_live_thread_membership_without_changing_census() {
                         .unwrap();
                 let terminal_entry = control.entry();
                 fixture.page.try_exit().unwrap();
-                carrick_core::entry::retire_current(process.binding(), source, record.id).unwrap();
+                carrick_core::entry::retire_current(
+                    process.binding(),
+                    source,
+                    record.id,
+                    &carrick_sched_core::OwedPasses::new(),
+                )
+                .unwrap();
                 admission.commit_with_member(control).unwrap();
                 if notified {
                     let identity = carrick_core::terminal::ThreadTerminalIdentity::from_exit(
@@ -6249,11 +6419,15 @@ fn arm_root_entry_refuses_wrong_binding_and_root_incarnation() {
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, record)
+            .requeue_preempted(fixture.slot, record, &carrick_sched_core::OwedPasses::new())
             .is_queued()
     );
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         record
     );
     let generation = fixture.task.execution.generation.load(Ordering::Acquire);
@@ -6354,7 +6528,11 @@ fn arm_born_thread_uses_native_owner_without_an_execution_generation() {
         .task
         .publish_lifecycle(fixture.page as *const _ as u64, control as *const _ as u64);
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         record.id
     );
     let mut frame = carrick_el1_abi::TrapFrame {
@@ -6419,8 +6597,12 @@ fn arm_born_thread_uses_native_owner_without_an_execution_generation() {
     fixture.zone.clear_current(fixture.slot);
     fixture.zone.free_record(record.id);
     let slot = SlotId::new(1);
-    fixture.zone.drive(slot, 2);
-    fixture.zone.publish_slot(slot, 1, Some(0), 1);
+    fixture
+        .zone
+        .drive(slot, 2, &carrick_sched_core::OwedPasses::new());
+    fixture
+        .zone
+        .publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
     fixture.zone.enter_guest(slot);
     fixture.zone.install_space(slot, 1).unwrap();
     fixture.task.execution.generation.store(
@@ -6470,7 +6652,11 @@ fn arm_owned_raw_exit_retires_only_one_of_two_live_threads() {
         .task
         .publish_lifecycle(fixture.page as *const _ as u64, control as *const _ as u64);
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         record.id
     );
     let mut frame = carrick_el1_abi::TrapFrame::default();
@@ -6975,9 +7161,13 @@ fn arm_permission_fault_keeps_signal_owner_after_admission_home_release() {
     // A previous home is still retained by another executor. Rehoming the
     // signal owner must refuse transiently, before publishing a forced signal.
     let other = SlotId::new(1);
-    fixture
-        .zone
-        .publish_slot(other, fixture.address.mm.raw().get(), Some(1), 1);
+    fixture.zone.publish_slot(
+        other,
+        fixture.address.mm.raw().get(),
+        Some(1),
+        1,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     fixture
         .zone
         .install_space(other, fixture.address.mm.raw().get())
@@ -7557,7 +7747,11 @@ fn native_child_sigsuspend_wakes_from_parent_signal() {
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, parent_binding.record.id)
+            .requeue_preempted(
+                fixture.slot,
+                parent_binding.record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     activate(source, &child_task, &child_binding);
@@ -7612,7 +7806,11 @@ fn native_child_sigsuspend_wakes_from_parent_signal() {
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, parent_binding.record.id)
+            .requeue_preempted(
+                fixture.slot,
+                parent_binding.record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     activate(source, &child_task, &child_binding);
@@ -7948,7 +8146,7 @@ fn arm_registered_sibling_switch_in_without_pending_owner_work() {
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, record)
+            .requeue_preempted(fixture.slot, record, &carrick_sched_core::OwedPasses::new())
             .is_queued()
     );
     let mut cpu = ResumeCpu {
@@ -8127,7 +8325,11 @@ fn arm_two_live_threads_robust_exit_retires_in_ring() {
         .unwrap();
     run_as(fixture, 42, 12, 102, control);
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         record.id
     );
     // Every glibc thread registers a robust list at start.
@@ -8177,7 +8379,11 @@ fn arm_raw_exit_refused_copy_after_membership_reservation_restores_live() {
         .unwrap();
     run_as(fixture, 42, 12, 102, control);
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         record.id
     );
     // A refused clear_child_tid copy is checked only after the nonfinal
@@ -8244,7 +8450,11 @@ fn arm_raw_exit_refused_clear_tid_copy_reruns_in_ring() {
         .unwrap();
     run_as(fixture, 42, 12, 102, control);
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         record.id
     );
     words.set::<u32>(0, 42);
@@ -8866,6 +9076,7 @@ fn arm_two_live_threads_exit_group_ends_group_with_status() {
                 carrick_el1_abi::Handback::Cancelled,
                 &carrick_sched_core::ShortLockSpin,
                 &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+                &carrick_sched_core::OwedPasses::new(),
             );
             assert!(fixture.zone.record(record.id).is_cancelled());
         }
@@ -9034,7 +9245,11 @@ fn arm_pool_raw_exit_closing_at_commit_boundary(
         .unwrap();
     run_as(fixture, 42, 12, 102, control);
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         record.id
     );
     let source = BornInZoneSource {
@@ -9631,6 +9846,7 @@ fn arm_graph_pool_host_retirement(unbound: bool) {
         carrick_el1_abi::Handback::Cancelled,
         &carrick_sched_core::ShortLockSpin,
         &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+        &carrick_sched_core::OwedPasses::new(),
     );
     assert!(fixture.zone.record(record.id).is_cancelled());
     let mut frame = carrick_el1_abi::TrapFrame::default();
@@ -9690,7 +9906,11 @@ fn arm_closing_during_raw_exit_admission_settles_after_commit() {
         .unwrap();
     run_as(fixture, 42, 12, 102, control);
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         record.id
     );
     let source = BornInZoneSource {
@@ -9753,7 +9973,10 @@ fn arm_closing_during_raw_exit_admission_settles_after_commit() {
         control.recorded_exit_kind(control.entry()),
         carrick_core::lifecycle::MemberExitKind::InZone
     );
-    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    let selected = fixture
+        .zone
+        .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     run_as_leader(fixture);
     let source = BornInZoneSource {
         zone: fixture.zone,
@@ -9793,7 +10016,11 @@ fn arm_unadopted_exit_wakes_closing_owner_without_process_venue() {
     let mut worker_service = fixture.process_service();
     run_as(fixture, 42, 0, 102, control);
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         record.id
     );
     let mut failed_frame = carrick_el1_abi::TrapFrame::default();
@@ -9814,7 +10041,11 @@ fn arm_unadopted_exit_wakes_closing_owner_without_process_venue() {
         ),
         "a Born sibling cannot register a group before its root owner exists"
     );
-    fixture.zone.unswitch(fixture.slot, record.id);
+    fixture.zone.unswitch(
+        fixture.slot,
+        record.id,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     run_as_leader(fixture);
     fixture
         .enter(
@@ -9826,7 +10057,11 @@ fn arm_unadopted_exit_wakes_closing_owner_without_process_venue() {
         .unwrap();
     run_as(fixture, 42, 0, 102, control);
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         record.id
     );
     let root_service: &'static mut Aarch64NativeProcessService<'static, TestStockCrossing> =
@@ -10016,8 +10251,12 @@ fn arm_host_birth_adoption_racing_closing_has_one_cancel_owner() {
     sibling_task.publish_lifecycle(fixture.page as *const _ as u64, control as *const _ as u64);
     sibling_task.publish_root_generation(fixture.address.generation);
     let slot = SlotId::new(1);
-    fixture.zone.drive(slot, 2);
-    fixture.zone.publish_slot(slot, 1, Some(1), 1);
+    fixture
+        .zone
+        .drive(slot, 2, &carrick_sched_core::OwedPasses::new());
+    fixture
+        .zone
+        .publish_slot(slot, 1, Some(1), 1, &carrick_sched_core::OwedPasses::new());
     fixture.zone.enter_guest(slot);
     fixture.zone.install_space(slot, 1).unwrap();
     let record = fixture
@@ -10124,8 +10363,12 @@ fn arm_rehomed_adopted_member_settles_on_its_birth_identity() {
     let birth_identity = control.host_birth_identity().unwrap();
     let sibling_task = Box::leak(Box::new(CurrentTask::new()));
     let slot = SlotId::new(1);
-    fixture.zone.drive(slot, 2);
-    fixture.zone.publish_slot(slot, 1, Some(1), 1);
+    fixture
+        .zone
+        .drive(slot, 2, &carrick_sched_core::OwedPasses::new());
+    fixture
+        .zone
+        .publish_slot(slot, 1, Some(1), 1, &carrick_sched_core::OwedPasses::new());
     fixture.zone.enter_guest(slot);
     fixture.zone.install_space(slot, 1).unwrap();
     let mm = fixture.task.mm.key.load(Ordering::Acquire);
@@ -10245,8 +10488,12 @@ fn arm_adopted_member_rejects_a_foreign_retirement_receipt() {
     sibling_task.publish_lifecycle(fixture.page as *const _ as u64, control as *const _ as u64);
     sibling_task.publish_root_generation(fixture.address.generation);
     let slot = SlotId::new(1);
-    fixture.zone.drive(slot, 2);
-    fixture.zone.publish_slot(slot, 1, Some(1), 1);
+    fixture
+        .zone
+        .drive(slot, 2, &carrick_sched_core::OwedPasses::new());
+    fixture
+        .zone
+        .publish_slot(slot, 1, Some(1), 1, &carrick_sched_core::OwedPasses::new());
     fixture.zone.enter_guest(slot);
     fixture.zone.install_space(slot, 1).unwrap();
     let record = fixture
@@ -10508,6 +10755,7 @@ fn wake_closing_root(
         true,
         &mut |transfer| transfers.push(transfer),
         &mut |_| {},
+        &carrick_sched_core::OwedPasses::new(),
     );
     drop(guard);
     assert_eq!(count, 1);
@@ -10520,7 +10768,10 @@ fn resume_closing_root(
     fixture: &'static Fixture,
     service: &mut Aarch64NativeProcessService<'static, TestStockCrossing>,
 ) -> crate::sched::ResumeAction {
-    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    let selected = fixture
+        .zone
+        .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     // The production scheduler installs the selected MM before resume_selected.
     // A sibling's terminal receipt now vacates this slot's old installation.
     if fixture.zone.installed_space(fixture.slot) != fixture.address.mm.raw().get() {
@@ -10789,6 +11040,7 @@ fn arm_exit_group_under_gate(state: carrick_el1_abi::GateState) {
             carrick_el1_abi::Handback::Cancelled,
             &carrick_sched_core::ShortLockSpin,
             &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+            &carrick_sched_core::OwedPasses::new(),
         );
         assert!(fixture.zone.record(sibling_record.id).is_cancelled());
         drop(admission);
@@ -11019,8 +11271,12 @@ fn arm_concurrent_exit_group_loser_retires_and_wakes_owner() {
 
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     let slot2 = SlotId::new(1);
-    fixture.zone.drive(slot2, 2);
-    fixture.zone.publish_slot(slot2, 1, Some(1), 1);
+    fixture
+        .zone
+        .drive(slot2, 2, &carrick_sched_core::OwedPasses::new());
+    fixture
+        .zone
+        .publish_slot(slot2, 1, Some(1), 1, &carrick_sched_core::OwedPasses::new());
     fixture.zone.enter_guest(slot2);
     fixture.zone.install_space(slot2, 1).unwrap();
     let (control2, record2) = imported_thread_on_slot(fixture, slot2, |id| id.affinity = u64::MAX);
@@ -11086,7 +11342,11 @@ fn arm_concurrent_exit_group_loser_retires_and_wakes_owner() {
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, record3)
+            .requeue_preempted(
+                fixture.slot,
+                record3,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
 
@@ -11114,7 +11374,11 @@ fn arm_concurrent_exit_group_loser_retires_and_wakes_owner() {
     // Admit and register sibling 2 (tid 42) on slot2, keeping it OnCpu on slot2
     // while leader initiates group exit on slot 0.
     assert_eq!(
-        fixture.zone.switch_in_full(slot2).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(slot2, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         record2.id
     );
     run_as(fixture, 42, 12, 102, control2);
@@ -11125,7 +11389,11 @@ fn arm_concurrent_exit_group_loser_retires_and_wakes_owner() {
     // Switch in unadopted sibling 3 (tid 43) on slot 0 to begin raw SYS_exit(0)
     // while the admission gate is open; pause it after begin_exit and before commit.
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         record3
     );
     run_as(fixture, 43, 0, 103, control3);
@@ -11349,7 +11617,11 @@ fn arm_unadopted_exit_wakes_unplaceable_closing_owner_without_process_venue() {
     let leader_record = fixture.control.zone_record().unwrap().id;
     run_as(fixture, 42, 0, 102, control);
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         record.id
     );
     let root_service: &'static mut Aarch64NativeProcessService<'static, TestStockCrossing> =
@@ -11378,7 +11650,13 @@ fn arm_unadopted_exit_wakes_unplaceable_closing_owner_without_process_venue() {
             // guest slot may run it when the unadopted sibling's
             // venue-absent terminal notification wakes it.
             fixture.zone.unhome(fixture.slot, leader_record, 1);
-            fixture.zone.publish_slot(fixture.slot, 0, Some(0), 1);
+            fixture.zone.publish_slot(
+                fixture.slot,
+                0,
+                Some(0),
+                1,
+                &carrick_sched_core::OwedPasses::new(),
+            );
             fixture.zone.release_space(fixture.slot);
             run_as(fixture, 42, 0, 102, control);
         }),
@@ -11640,11 +11918,15 @@ fn arm_caught_signal_returns_then_reexecutes_parked_anonymous_edit() {
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, record)
+            .requeue_preempted(fixture.slot, record, &carrick_sched_core::OwedPasses::new())
             .is_queued()
     );
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         record
     );
     assert!(fixture.zone.mark_native_owned(record));
@@ -12004,10 +12286,16 @@ fn arm_terminal_entries_release_parked_anonymous_edit() {
             zone: fixture.zone,
             slot: sibling_slot,
         };
-        fixture.zone.drive(sibling_slot, 2);
         fixture
             .zone
-            .publish_slot(sibling_slot, fixture.address.mm.raw().get(), Some(1), 1);
+            .drive(sibling_slot, 2, &carrick_sched_core::OwedPasses::new());
+        fixture.zone.publish_slot(
+            sibling_slot,
+            fixture.address.mm.raw().get(),
+            Some(1),
+            1,
+            &carrick_sched_core::OwedPasses::new(),
+        );
         fixture.zone.enter_guest(sibling_slot);
         fixture
             .zone
@@ -12037,7 +12325,11 @@ fn arm_terminal_entries_release_parked_anonymous_edit() {
         assert!(
             fixture
                 .zone
-                .requeue_preempted(sibling_slot, sibling_record.id)
+                .requeue_preempted(
+                    sibling_slot,
+                    sibling_record.id,
+                    &carrick_sched_core::OwedPasses::new()
+                )
                 .is_queued()
         );
         let idle_record = fixture
@@ -12062,11 +12354,19 @@ fn arm_terminal_entries_release_parked_anonymous_edit() {
         assert!(
             fixture
                 .zone
-                .requeue_preempted(sibling_slot, idle_record)
+                .requeue_preempted(
+                    sibling_slot,
+                    idle_record,
+                    &carrick_sched_core::OwedPasses::new()
+                )
                 .is_queued()
         );
         assert_eq!(
-            fixture.zone.switch_in_full(sibling_slot).unwrap().record,
+            fixture
+                .zone
+                .switch_in_full(sibling_slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record,
             sibling_record.id
         );
         assert!(fixture.zone.mark_native_owned(sibling_record.id));
@@ -12249,7 +12549,10 @@ fn arm_terminal_entries_release_parked_anonymous_edit() {
                 queue.notify_object(fixture.slot, &mut effects).unwrap();
                 drop(queue);
                 NativeProcessService::wake_effects(&mut service, effects);
-                let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+                let selected = fixture
+                    .zone
+                    .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+                    .unwrap();
                 // SAFETY: service completion selected this exact root record.
                 let saved =
                     unsafe { runtime.record_binding(fixture.zone.record_ref(selected.record)) }
@@ -12466,7 +12769,11 @@ fn arm_parked_wait4_signal_wake_case(restart: bool, replace: bool, check_member:
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, child_binding.record.id)
+            .requeue_preempted(
+                fixture.slot,
+                child_binding.record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
 
@@ -12536,8 +12843,16 @@ fn arm_parked_wait4_signal_wake_case(restart: bool, replace: bool, check_member:
         sibling_task.publish_lifecycle(fixture.page as *const _ as u64, control as *const _ as u64);
         sibling_task.publish_root_generation(fixture.address.generation);
         let sibling_slot = SlotId::new(1);
-        fixture.zone.drive(sibling_slot, 1);
-        fixture.zone.publish_slot(sibling_slot, 1, Some(1), 1);
+        fixture
+            .zone
+            .drive(sibling_slot, 1, &carrick_sched_core::OwedPasses::new());
+        fixture.zone.publish_slot(
+            sibling_slot,
+            1,
+            Some(1),
+            1,
+            &carrick_sched_core::OwedPasses::new(),
+        );
         fixture.zone.enter_guest(sibling_slot);
         fixture.zone.install_space(sibling_slot, 1).unwrap();
         let record = fixture
@@ -12609,6 +12924,7 @@ fn arm_parked_wait4_signal_wake_case(restart: bool, replace: bool, check_member:
                 fixture.slot,
                 parent_binding.record.id,
                 &carrick_sched_core::ShortLockSpin,
+                &carrick_sched_core::OwedPasses::new(),
             ),
             carrick_sched_core::CurrentRelease::Released
         );
@@ -13346,7 +13662,9 @@ fn activate_target(
 ) -> carrick_sched_core::SwitchedIn {
     let zone = source.zone;
     for _ in 0..8 {
-        let switched = zone.switch_in_full(source.slot).unwrap();
+        let switched = zone
+            .switch_in_full(source.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap();
         if switched.record == binding.record.id {
             zone.install_space(source.slot, binding.address.mm.raw().get())
                 .unwrap();
@@ -13367,8 +13685,12 @@ fn activate_target(
             return switched;
         }
         assert!(
-            zone.requeue_preempted(source.slot, switched.record)
-                .is_queued()
+            zone.requeue_preempted(
+                source.slot,
+                switched.record,
+                &carrick_sched_core::OwedPasses::new()
+            )
+            .is_queued()
         );
     }
     panic!("target record {:?} not runnable in slot", binding.record.id);
@@ -13537,7 +13859,11 @@ fn serial_host_native_children_close_descriptors_above_inherited_capacity() {
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, parent_binding.record.id)
+            .requeue_preempted(
+                fixture.slot,
+                parent_binding.record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
 
@@ -13610,7 +13936,11 @@ fn serial_host_native_children_close_descriptors_above_inherited_capacity() {
         assert!(
             fixture
                 .zone
-                .requeue_preempted(fixture.slot, child_bindings[idx].record.id)
+                .requeue_preempted(
+                    fixture.slot,
+                    child_bindings[idx].record.id,
+                    &carrick_sched_core::OwedPasses::new()
+                )
                 .is_queued()
         );
         (route, ret)
@@ -14319,7 +14649,11 @@ fn native_descriptor_argument_witness(
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, parent_binding.record.id)
+            .requeue_preempted(
+                fixture.slot,
+                parent_binding.record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
 
@@ -14648,7 +14982,11 @@ fn native_descriptor_argument_witness(
                 assert!(
                     fixture
                         .zone
-                        .requeue_preempted(fixture.slot, current)
+                        .requeue_preempted(
+                            fixture.slot,
+                            current,
+                            &carrick_sched_core::OwedPasses::new()
+                        )
                         .is_queued()
                 );
             }
@@ -15287,7 +15625,11 @@ fn native_descriptor_argument_witness(
             assert!(
                 fixture
                     .zone
-                    .requeue_preempted(fixture.slot, writer.record.id)
+                    .requeue_preempted(
+                        fixture.slot,
+                        writer.record.id,
+                        &carrick_sched_core::OwedPasses::new()
+                    )
                     .is_queued()
             );
             activate_target(source, &task, child);
@@ -15447,7 +15789,11 @@ fn native_descriptor_argument_witness(
         assert!(
             fixture
                 .zone
-                .requeue_preempted(fixture.slot, writer.record.id)
+                .requeue_preempted(
+                    fixture.slot,
+                    writer.record.id,
+                    &carrick_sched_core::OwedPasses::new()
+                )
                 .is_queued()
         );
         activate_target(source, &task, waiter);
@@ -15582,7 +15928,11 @@ fn native_descriptor_argument_witness(
             assert!(
                 fixture
                     .zone
-                    .requeue_preempted(fixture.slot, writer.record.id)
+                    .requeue_preempted(
+                        fixture.slot,
+                        writer.record.id,
+                        &carrick_sched_core::OwedPasses::new()
+                    )
                     .is_queued()
             );
             activate_target(source, &task, waiter);
@@ -15611,7 +15961,11 @@ fn native_descriptor_argument_witness(
         assert!(
             fixture
                 .zone
-                .requeue_preempted(fixture.slot, writer.record.id)
+                .requeue_preempted(
+                    fixture.slot,
+                    writer.record.id,
+                    &carrick_sched_core::OwedPasses::new()
+                )
                 .is_queued()
         );
         activate_target(source, &task, waiter);
@@ -15679,7 +16033,11 @@ fn native_descriptor_argument_witness(
         assert!(
             fixture
                 .zone
-                .requeue_preempted(fixture.slot, child_bindings[0].record.id)
+                .requeue_preempted(
+                    fixture.slot,
+                    child_bindings[0].record.id,
+                    &carrick_sched_core::OwedPasses::new()
+                )
                 .is_queued()
         );
         activate_target(source, &task, &child_bindings[1]);
@@ -15688,7 +16046,11 @@ fn native_descriptor_argument_witness(
         assert!(
             fixture
                 .zone
-                .requeue_preempted(fixture.slot, child_bindings[1].record.id)
+                .requeue_preempted(
+                    fixture.slot,
+                    child_bindings[1].record.id,
+                    &carrick_sched_core::OwedPasses::new()
+                )
                 .is_queued()
         );
         activate_target(source, &task, &child_bindings[0]);
@@ -15836,7 +16198,11 @@ fn native_descriptor_argument_witness(
                 assert!(
                     fixture
                         .zone
-                        .requeue_preempted(fixture.slot, child_bindings[idx - 1].record.id)
+                        .requeue_preempted(
+                            fixture.slot,
+                            child_bindings[idx - 1].record.id,
+                            &carrick_sched_core::OwedPasses::new()
+                        )
                         .is_queued()
                 );
                 activate_target(source, &task, &child_bindings[idx]);
@@ -16207,7 +16573,11 @@ fn native_descriptor_argument_witness(
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, child_bindings[0].record.id)
+            .requeue_preempted(
+                fixture.slot,
+                child_bindings[0].record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     activate_target(source, &task, &child_bindings[1]);
@@ -16259,7 +16629,11 @@ fn native_descriptor_argument_witness(
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, child_bindings[1].record.id)
+            .requeue_preempted(
+                fixture.slot,
+                child_bindings[1].record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     activate_target(source, &task, &child_bindings[0]);
@@ -16290,7 +16664,11 @@ fn native_descriptor_argument_witness(
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, child_bindings[0].record.id)
+            .requeue_preempted(
+                fixture.slot,
+                child_bindings[0].record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     activate_target(source, &task, &child_bindings[1]);
@@ -16444,7 +16822,11 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, parent_binding.record.id)
+            .requeue_preempted(
+                fixture.slot,
+                parent_binding.record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
 
@@ -16537,7 +16919,11 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, child_bindings[0].record.id)
+            .requeue_preempted(
+                fixture.slot,
+                child_bindings[0].record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     activate_target(source, &task, &child_bindings[1]);
@@ -16551,7 +16937,11 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, child_bindings[1].record.id)
+            .requeue_preempted(
+                fixture.slot,
+                child_bindings[1].record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     activate_target(source, &task, &child_bindings[0]);
@@ -16576,7 +16966,11 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, child_bindings[0].record.id)
+            .requeue_preempted(
+                fixture.slot,
+                child_bindings[0].record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     activate_target(source, &task, &child_bindings[1]);
@@ -16592,7 +16986,11 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, child_bindings[1].record.id)
+            .requeue_preempted(
+                fixture.slot,
+                child_bindings[1].record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     activate_target(source, &task, &child_bindings[0]);
@@ -16617,7 +17015,11 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, child_bindings[0].record.id)
+            .requeue_preempted(
+                fixture.slot,
+                child_bindings[0].record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     activate_target(source, &task, &child_bindings[1]);
@@ -16640,7 +17042,11 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, child_bindings[1].record.id)
+            .requeue_preempted(
+                fixture.slot,
+                child_bindings[1].record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     activate_target(source, &task, &child_bindings[0]);
@@ -16775,11 +17181,19 @@ fn arm_kill_nonleader_recipient(blocked: bool) {
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, waiter.id)
+            .requeue_preempted(
+                fixture.slot,
+                waiter.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         waiter.id
     );
     let mut service = fixture.process_service();
@@ -16821,8 +17235,16 @@ fn arm_kill_nonleader_recipient(blocked: bool) {
     sender_task.publish_root_generation(fixture.address.generation);
     sender_task.publish_lifecycle(fixture.page as *const _ as u64, control as *const _ as u64);
     let sender_slot = SlotId::new(1);
-    fixture.zone.drive(sender_slot, 2);
-    fixture.zone.publish_slot(sender_slot, 1, Some(0), 1);
+    fixture
+        .zone
+        .drive(sender_slot, 2, &carrick_sched_core::OwedPasses::new());
+    fixture.zone.publish_slot(
+        sender_slot,
+        1,
+        Some(0),
+        1,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     fixture.zone.enter_guest(sender_slot);
     fixture.zone.install_space(sender_slot, 1).unwrap();
     let sender_record = fixture
@@ -16859,11 +17281,19 @@ fn arm_kill_nonleader_recipient(blocked: bool) {
     assert!(
         fixture
             .zone
-            .requeue_preempted(sender_slot, sender_record)
+            .requeue_preempted(
+                sender_slot,
+                sender_record,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     assert_eq!(
-        fixture.zone.switch_in_full(sender_slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(sender_slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         sender_record
     );
     let live_members = carrick_el1_abi::Lifecycle::live(fixture.page);
@@ -16974,11 +17404,19 @@ fn tgkill_during_futex_enrollment_returns_eintr() {
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, waiter.id)
+            .requeue_preempted(
+                fixture.slot,
+                waiter.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         waiter.id
     );
     let mut service = fixture.process_service();
@@ -17020,8 +17458,16 @@ fn tgkill_during_futex_enrollment_returns_eintr() {
     sender_task.publish_root_generation(fixture.address.generation);
     sender_task.publish_lifecycle(fixture.page as *const _ as u64, control as *const _ as u64);
     let sender_slot = SlotId::new(1);
-    fixture.zone.drive(sender_slot, 2);
-    fixture.zone.publish_slot(sender_slot, 1, Some(0), 1);
+    fixture
+        .zone
+        .drive(sender_slot, 2, &carrick_sched_core::OwedPasses::new());
+    fixture.zone.publish_slot(
+        sender_slot,
+        1,
+        Some(0),
+        1,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     fixture.zone.enter_guest(sender_slot);
     fixture.zone.install_space(sender_slot, 1).unwrap();
     let sender_record = fixture
@@ -17058,11 +17504,19 @@ fn tgkill_during_futex_enrollment_returns_eintr() {
     assert!(
         fixture
             .zone
-            .requeue_preempted(sender_slot, sender_record)
+            .requeue_preempted(
+                sender_slot,
+                sender_record,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     assert_eq!(
-        fixture.zone.switch_in_full(sender_slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(sender_slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         sender_record
     );
     assert_eq!(carrick_el1_abi::Lifecycle::live(fixture.page), 2);
@@ -17205,11 +17659,15 @@ fn native_process_venue_survives_host_only_and_closed_admission() {
         assert!(
             fixture
                 .zone
-                .requeue_preempted(fixture.slot, record)
+                .requeue_preempted(fixture.slot, record, &carrick_sched_core::OwedPasses::new())
                 .is_queued()
         );
         assert_eq!(
-            fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+            fixture
+                .zone
+                .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record,
             record
         );
         assert_eq!(fixture.zone.slot(fixture.slot).current(), Some(record));
@@ -17760,7 +18218,11 @@ fn closed_gate_service_entry(retained_ipc: bool) {
     // The sibling runs and registers its member before the close.
     run_as(fixture, 42, 12, 102, control);
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         record.id
     );
     fixture
@@ -17808,7 +18270,11 @@ fn closed_gate_service_entry(retained_ipc: bool) {
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, record.id)
+            .requeue_preempted(
+                fixture.slot,
+                record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     fixture.zone.clear_current(fixture.slot);
@@ -17829,7 +18295,11 @@ fn closed_gate_service_entry(retained_ipc: bool) {
     // The sibling, still running, enters a host crossing.
     run_as(fixture, 42, 12, 102, control);
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         record.id
     );
     let source = BornInZoneSource {
@@ -18220,8 +18690,16 @@ fn futex_owner_wait_episode(
     let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
     if signal_during_owner {
         let sender_slot = SlotId::new(1);
-        fixture.zone.drive(sender_slot, 2);
-        fixture.zone.publish_slot(sender_slot, 1, Some(0), 1);
+        fixture
+            .zone
+            .drive(sender_slot, 2, &carrick_sched_core::OwedPasses::new());
+        fixture.zone.publish_slot(
+            sender_slot,
+            1,
+            Some(0),
+            1,
+            &carrick_sched_core::OwedPasses::new(),
+        );
         fixture.zone.enter_guest(sender_slot);
         fixture.zone.install_space(sender_slot, 1).unwrap();
     }
@@ -18445,11 +18923,19 @@ fn futex_owner_wait_episode(
         assert!(
             fixture
                 .zone
-                .requeue_preempted(sender_slot, sender_record)
+                .requeue_preempted(
+                    sender_slot,
+                    sender_record,
+                    &carrick_sched_core::OwedPasses::new()
+                )
                 .is_queued()
         );
         assert_eq!(
-            fixture.zone.switch_in_full(sender_slot).unwrap().record,
+            fixture
+                .zone
+                .switch_in_full(sender_slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record,
             sender_record
         );
         let mut sender = runtime
@@ -18475,7 +18961,10 @@ fn futex_owner_wait_episode(
     service.prepare_copy_error = None;
     access.lower(space.index());
     if !synchronous {
-        let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+        let selected = fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap();
         assert_eq!(selected.record, fixture.control.zone_record().unwrap().id);
         let mut entry = runtime
             .enter_registered(
@@ -18790,8 +19279,16 @@ fn futex_owner_wait_episode(
     wake.x[2] = 1;
     wake.x[5] = 0xffff_ffff;
     let waker_slot = SlotId::new(1);
-    fixture.zone.drive(waker_slot, 2);
-    fixture.zone.publish_slot(waker_slot, 1, Some(0), 1);
+    fixture
+        .zone
+        .drive(waker_slot, 2, &carrick_sched_core::OwedPasses::new());
+    fixture.zone.publish_slot(
+        waker_slot,
+        1,
+        Some(0),
+        1,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     fixture.zone.enter_guest(waker_slot);
     fixture.zone.install_space(waker_slot, 1).unwrap();
     let mut wake_cpu = crate::sched::FakeCpu::default();
@@ -18993,7 +19490,11 @@ fn native_fork_with_live_host_threads(sibling_tids: [u32; 2], scenario: Namespac
             assert!(
                 fixture
                     .zone
-                    .requeue_preempted(fixture.slot, parent_record)
+                    .requeue_preempted(
+                        fixture.slot,
+                        parent_record,
+                        &carrick_sched_core::OwedPasses::new()
+                    )
                     .is_queued()
             );
             (outcome, runtime)
@@ -19539,9 +20040,11 @@ fn with_arm_process_host_files_on<R>(
             let binding = runtime.task_binding(key).unwrap();
             // Only the selected caller is queued: a parked caller left on the
             // run queue would be the next dispatch's switch target.
-            let _ = fixture
-                .zone
-                .requeue_preempted(source.slot, binding.record.id);
+            let _ = fixture.zone.requeue_preempted(
+                source.slot,
+                binding.record.id,
+                &carrick_sched_core::OwedPasses::new(),
+            );
             let claim = fixture.zone.record(binding.record.id).claim();
             if nr == ARM_RESUME && !matches!(claim, carrick_sched_core::Claim::Queued { .. }) {
                 // Still parked: nothing woke it.
@@ -25067,7 +25570,11 @@ fn arm_two_live_processes_dup_and_close_isolate_tables() {
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, parent_binding.record.id)
+            .requeue_preempted(
+                fixture.slot,
+                parent_binding.record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     let mut cpu = crate::sched::FakeCpu::default();
@@ -25084,7 +25591,11 @@ fn arm_two_live_processes_dup_and_close_isolate_tables() {
                 assert!(
                     fixture
                         .zone
-                        .requeue_preempted(fixture.slot, current)
+                        .requeue_preempted(
+                            fixture.slot,
+                            current,
+                            &carrick_sched_core::OwedPasses::new()
+                        )
                         .is_queued()
                 );
             }

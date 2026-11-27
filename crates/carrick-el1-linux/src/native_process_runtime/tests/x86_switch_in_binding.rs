@@ -24,7 +24,10 @@ fn x86_switch_in_after_another_process_admits_under_the_selected_owner() {
     assert_eq!(current.visible_pid(), Some(root_pid));
     current.publish_root_generation(fixture.address.generation);
 
-    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    let selected = fixture
+        .zone
+        .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     let record = fixture.zone.record_ref(selected.record);
     assert_ne!(record, fixture.record, "the fork child is selected");
     let runtime = fixture

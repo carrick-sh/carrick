@@ -512,7 +512,11 @@ fn run_arm_fork_exec_child_socket_poll(become_ready: bool) {
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, child_binding.record.id)
+            .requeue_preempted(
+                fixture.slot,
+                child_binding.record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     let _ = crate::sched::leave_space(
@@ -520,7 +524,9 @@ fn run_arm_fork_exec_child_socket_poll(become_ready: bool) {
         fixture.slot,
         &mut crate::sched::FakeCpu::default(),
     );
-    fixture.zone.drive(fixture.slot, 1);
+    fixture
+        .zone
+        .drive(fixture.slot, 1, &carrick_sched_core::OwedPasses::new());
     if let Some(doorbell) = fixture.task.linux.take_host_work_doorbell() {
         doorbell.settled();
     }

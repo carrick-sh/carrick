@@ -529,15 +529,19 @@ pub fn native_owner_matrix(mut make: impl FnMut() -> Box<dyn PhysicalTransferFix
                 let record = zone.alloc_host_runnable(identity(n as u64 + 1)).unwrap();
                 let slot = carrick_sched_core::SlotId::from_index(n).unwrap();
                 let driver = n as u64 + 1;
-                zone.publish_slot(slot, 1, None, 0);
-                zone.drive(slot, driver);
+                zone.publish_slot(slot, 1, None, 0, &carrick_sched_core::OwedPasses::new());
+                zone.drive(slot, driver, &carrick_sched_core::OwedPasses::new());
                 assert!(zone.step_away(
                     slot,
                     driver,
                     &mut |_| panic!("unexpected take"),
-                    &mut |_| panic!("unexpected place")
+                    &mut |_| panic!("unexpected place"),
+                    &carrick_sched_core::OwedPasses::new()
                 ));
-                assert!(zone.requeue_on(slot, record).is_some());
+                assert!(
+                    zone.requeue_on(slot, record, &carrick_sched_core::OwedPasses::new())
+                        .is_some()
+                );
                 waiting.push((slot, record, driver));
             }
             let view = nodes(&region);
