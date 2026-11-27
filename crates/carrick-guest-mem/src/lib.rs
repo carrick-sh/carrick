@@ -94,8 +94,8 @@ pub use prepared::{
     GuestWriteRange, LegacyProtectionRead, MemoryPrepareError, MemoryReadSuspension,
     MemoryReadWait, MemorySupplyRequest, OwnedMemoryWait, OwnedReadContinuation,
     OwnerMemorySelection, OwnerMemorySelectionError, PhysicalMemoryWait, PreparedGuestWrite,
-    PreparedStreamRanges, PreparedWriteLimit, UserMemoryAdmissionError, UserMemoryAdmissionGuard,
-    UserMemoryAuthority, UserMemoryVenue,
+    PreparedStreamRanges, PreparedWriteLimit, PrivateFileVenue, UserMemoryAdmissionError,
+    UserMemoryAdmissionGuard, UserMemoryAuthority, UserMemoryVenue,
 };
 
 mod deferred_anonymous;
@@ -978,6 +978,13 @@ pub trait GuestMemory {
     /// fork, partial-unmap and first-write COW semantics before opting in.
     fn supports_lazy_private_file_mmap(&self) -> bool {
         false
+    }
+
+    /// Who serves an admitted root's private file pages
+    /// ([`PrivateFileVenue`]). Only a carrier that serves owner frame grants
+    /// answers `OwnerGrant`.
+    fn private_file_venue(&self) -> PrivateFileVenue {
+        PrivateFileVenue::HostEager
     }
 
     /// Whether this backend can safely publish executable protection changes

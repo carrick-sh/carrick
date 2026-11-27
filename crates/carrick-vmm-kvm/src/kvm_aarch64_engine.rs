@@ -272,6 +272,11 @@ impl GuestVmBackend for KvmAarch64Vmm {
 }
 
 impl Aarch64Vmm for KvmAarch64Vmm {
+    /// No owner file grants here: private file pages stay host-served.
+    fn private_file_venue(&self) -> carrick_guest_mem::PrivateFileVenue {
+        carrick_guest_mem::PrivateFileVenue::HostEager
+    }
+
     /// KVM AArch64 has no owner frame-grant custody: a lazy file grant
     /// reaching it fails the run, never a declined fault and a wrong signal.
     fn prepare_owner_frame_grant(
