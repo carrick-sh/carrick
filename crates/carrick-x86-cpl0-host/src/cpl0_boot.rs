@@ -9576,8 +9576,12 @@ pub trait ProductionMemberCpu {
     /// End a stopped CPL3 CPU's interrupt shadow, so a queued KICK is taken
     /// before the shadowed instruction. At CPL3 in long mode an interrupt
     /// switches to the CPL0 stack and IRET restores SS:RSP exactly, so the
-    /// shadow guards nothing the user program can observe beyond the timing
-    /// of a debug trap deferred by MOV SS.
+    /// interrupt blocking is invisible to the user program. MOV SS also
+    /// defers a single-step trap and suppresses an instruction breakpoint on
+    /// the shadowed instruction; with TF or DR7 armed, ending the shadow can
+    /// move that one debug event by an instruction (#3076 follow-up). Running
+    /// the shadowed instruction first would instead use a translation its
+    /// editor has already retired.
     fn end_user_interrupt_shadow(&mut self) -> Result<(), TrapError>;
     /// Queue `KICK_VECTOR` to this CPU's own local APIC, durable across the
     /// reentry that follows.
@@ -9630,8 +9634,12 @@ pub fn run_production_member<C: ProductionMemberCpu>(
             StoppedCpu::Kernel => {}
             // The KICK is taken ahead of the next user instruction.
             StoppedCpu::UserInterruptible => {}
-            // The event enters CPL0 first. The KICK waits in the local APIC
-            // behind it and is taken no later than the IRET to user mode.
+            // The event enters CPL0 first. An APIC vector in delivery is in
+            // service at priority class 0xe or above, so the KICK waits in the
+            // local APIC until the handler's EOI. Every event's return to user
+            // mode then reaches IF set, with the KICK pending, before any
+            // user instruction; the ring's user-return generation check also
+            // settles the debt on that path.
             StoppedCpu::UserEventPending { .. } => {}
             // The shadowed user instruction would otherwise run on the stale
             // translation; end the shadow so the KICK comes first.

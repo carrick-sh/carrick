@@ -2997,6 +2997,7 @@ fn stopped_cpl3_cpu_delivering_an_interrupt_settles_shootdown_debt_before_user_c
     use carrick_vmm_kvm::cpl0_boot::{PendingEvent, StoppedCpu};
     use carrick_x86::interrupts::RESCHED_VECTOR;
     let (mut carrier, generation, checks_before) = stopped_reader_owing_a_retirement();
+    assert_eq!(carrier.fixture_read_backing_byte(0x4_0000).unwrap(), 0);
     let pending_before = carrier.fixture_pending_irqs(1).unwrap();
     carrier
         .fixture_stop_delivering_interrupt(1, RESCHED_VECTOR)
@@ -3013,6 +3014,11 @@ fn stopped_cpl3_cpu_delivering_an_interrupt_settles_shootdown_debt_before_user_c
     carrier
         .fixture_run_until_user_fault(1, carrick_vmm_kvm::cpl0_boot::USER_CODE + 0x1000, 0x3_7000)
         .expect("reentry delivers the interrupt, then KICK, then the load faults");
+    assert_eq!(
+        carrier.fixture_read_backing_byte(0x4_0000).unwrap(),
+        0,
+        "no load of the retired page retired before the fault"
+    );
     let pending = carrier.fixture_pending_irqs(1).unwrap();
     assert_eq!(pending_before & 4, 0, "RESCHED was not pending before");
     assert_ne!(pending & 4, 0, "the in-flight RESCHED was delivered");
@@ -3023,6 +3029,44 @@ fn stopped_cpl3_cpu_delivering_an_interrupt_settles_shootdown_debt_before_user_c
         carrier.fixture_kick_generation_checks(1).unwrap(),
         checks_before + 1,
         "exactly one reentry KICK settled the debt"
+    );
+}
+
+/// #3076: the CPU stopped while delivering the KICK itself (two of the
+/// three Go refusals). The admission queues a second KICK behind the one in
+/// service; the debt is settled before the load, which faults, and both
+/// KICKs are taken.
+#[test]
+fn stopped_cpl3_cpu_delivering_a_kick_settles_shootdown_debt_before_user_code() {
+    use carrick_vmm_kvm::cpl0_boot::{PendingEvent, StoppedCpu};
+    use carrick_x86::interrupts::KICK_VECTOR;
+    let (mut carrier, generation, checks_before) = stopped_reader_owing_a_retirement();
+    carrier
+        .fixture_stop_delivering_interrupt(1, KICK_VECTOR)
+        .expect("reader stopped mid-delivery of KICK");
+    assert_eq!(
+        carrier.fixture_stopped_cpu(1).unwrap(),
+        StoppedCpu::UserEventPending {
+            event: PendingEvent::Interrupt {
+                vector: KICK_VECTOR
+            },
+            rip: carrick_vmm_kvm::cpl0_boot::USER_CODE + 0x1000,
+        }
+    );
+    carrier
+        .fixture_run_until_user_fault(1, carrick_vmm_kvm::cpl0_boot::USER_CODE + 0x1000, 0x3_7000)
+        .expect("reentry delivers both KICKs, then the load faults");
+    assert_eq!(
+        carrier.fixture_read_backing_byte(0x4_0000).unwrap(),
+        0,
+        "no load of the retired page retired before the fault"
+    );
+    assert_eq!(carrier.fixture_shootdown_served(0, 1).unwrap(), generation);
+    assert!(carrier.fixture_shootdown_state()[0].2[1] >= generation);
+    assert_eq!(
+        carrier.fixture_kick_generation_checks(1).unwrap(),
+        checks_before + 2,
+        "the KICK in delivery and the queued reentry KICK were both taken"
     );
 }
 
@@ -3048,6 +3092,11 @@ fn stopped_cpl3_cpu_in_an_interrupt_shadow_settles_shootdown_debt_before_user_co
     carrier
         .fixture_run_until_user_fault(1, carrick_vmm_kvm::cpl0_boot::USER_CODE + 0x1000, 0x3_7000)
         .expect("reentry takes KICK before the shadowed load, which faults");
+    assert_eq!(
+        carrier.fixture_read_backing_byte(0x4_0000).unwrap(),
+        0,
+        "the shadowed load did not run on the retired translation"
+    );
     assert_ne!(carrier.fixture_pending_irqs(1).unwrap() & 2, 0);
     assert_eq!(carrier.fixture_shootdown_served(0, 1).unwrap(), generation);
     assert!(carrier.fixture_shootdown_state()[0].2[1] >= generation);
