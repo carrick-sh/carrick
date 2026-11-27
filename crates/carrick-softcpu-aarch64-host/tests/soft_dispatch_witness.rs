@@ -683,6 +683,14 @@ fn soft_cpu_runs_root_lifecycle_and_portal_through_production_dispatch() {
         entry.ring_ready(),
         "the root's lifecycle and MM portal must be what the ring expects: {entry:?}"
     );
+    // One carrier identity: the portal is bound to the id the carrier's
+    // stage-2 core was minted with, never a second id from its host address.
+    assert_eq!(
+        entry.portal_carrier,
+        Some(entry.carrier),
+        "the MM portal must be bound to the carrier's one identity"
+    );
+    assert_eq!(entry.carrier, run.engine.vm().carrier().raw());
     // The mapped control slot names the task loaded on the slot.
     assert_eq!(
         entry.control_visible_tid.map(u64::from),
@@ -705,6 +713,61 @@ fn soft_cpu_runs_root_lifecycle_and_portal_through_production_dispatch() {
                 .host_ptr(entry.control_slot, 1)
                 .is_none(),
         "retired lifecycle mappings must leave stage 2"
+    );
+}
+
+/// The soft carrier maps file windows whole, so no lazy owner file grant is
+/// ever owed to it. One that reaches it fails the run loudly: a `Declined`
+/// would refuse the fault and hand the guest the fault's original `SIGSEGV`
+/// for a valid page (#1236).
+#[test]
+fn soft_owner_file_grant_fails_loudly_and_never_declines() {
+    use carrick_aarch64::Aarch64Vmm as _;
+    let _test_guard = lock_soft_carrier_test();
+    let elf = build_witness_elf(&[A64_SVC_0], &[]);
+    let mailbox_slot = Arc::new(AtomicPtr::new(null_mut()));
+    let executor = ScriptedHvc2Executor {
+        mailbox: Arc::clone(&mailbox_slot),
+        obs: Arc::new(Mutex::new(WitnessObservations::default())),
+        next_seq: 1,
+    };
+    let config = SoftSingleProcessConfig::new(&elf, "/grant");
+    let outcome = Arc::new(Mutex::new(None));
+    let outcome_in_setup = Arc::clone(&outcome);
+    let _ = run_single_process_with_executor_and_setup(&config, executor, move |engine| {
+        let mm = carrick_el1_abi::ReservationMm::new(41).expect("a nonzero mm");
+        // SAFETY: the handle is only offered to the backend under test, which
+        // must refuse it before using any owner authority.
+        let handle = unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                engine.vm().carrier().raw(),
+                mm,
+                std::num::NonZeroU64::MIN,
+            )
+        };
+        let target = carrick_aarch64::user_transfer::TransferTarget::from_handle(handle, 0x1000);
+        let window = carrick_el1_abi::PortalGrantWindow::decode([
+            1, 41, 1, 1, 1, 0x4000, 0x5000, 3, 0x4000, 0, 0, 0, 0,
+        ])
+        .ok_or("decode the grant window")?;
+        let answer = engine
+            .vm()
+            .prepare_owner_frame_grant(target, window)
+            .map(|preparation| {
+                matches!(
+                    preparation,
+                    carrick_aarch64::user_transfer::TransferPreparation::Declined
+                )
+            });
+        *outcome_in_setup.lock().unwrap() = Some(answer.map_err(|error| error.to_string()));
+        // End the run here: the grant answer is all this witness reads.
+        Err("grant answered".to_owned())
+    });
+    let answer = outcome.lock().unwrap().take().expect("setup ran");
+    let error = answer.expect_err("a lazy owner file grant on the soft carrier must fail loudly");
+    assert!(
+        error.contains("does not serve lazy owner file grants"),
+        "the refusal names the soft carrier's missing service: {error}"
     );
 }
 
