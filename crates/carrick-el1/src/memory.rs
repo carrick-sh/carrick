@@ -1031,24 +1031,25 @@ pub enum RangeBacking {
     /// node the caller named (#1338): host-mapped pages of the file (never
     /// `PRIVATE`) that an edit unlinks rather than retires.
     Window,
-    /// A host-owned terminal, a malformed one, a table outside the primary
-    /// arena, or more backed runs than one edit step takes.
+    /// A host-owned terminal, a malformed one, or a table outside the
+    /// primary arena.
     Foreign,
 }
 
-/// Backed runs one classification reports; more is [`RangeBacking::Foreign`].
-pub const MAX_BACKED_RUNS: usize = 8;
+/// Shared file window nodes one mprotect or unmap names to the classifier.
+pub const MAX_WINDOW_NODES: usize = 8;
 
-/// One range's classification and its maximal backed runs (`[start, end)`
-/// of EL1-private terminals, in address order): the spans an editor step
-/// must cover. Pages between runs have no terminal at all.
+/// One range's classification and the span its backed terminals cover:
+/// `[start, end)` from the first backed page to the end of the last. An
+/// editor step covers that span in one transaction, however many holes it
+/// holds: every descriptor planner skips a page with no terminal, which is a
+/// lazy reservation the root model's metadata alone describes (#3073).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stage1Backing {
     pub summary: RangeBacking,
     /// Why a `Foreign` summary is foreign (the leave EL1 counts).
     pub foreign: ForeignBacking,
-    runs: [(u64, u64); MAX_BACKED_RUNS],
-    count: usize,
+    backed: Option<(u64, u64)>,
 }
 
 /// Which [`RangeBacking::Foreign`] a range is.
@@ -1058,8 +1059,6 @@ pub enum ForeignBacking {
     HostOwnedLeaf,
     /// An L1/L2 block terminal.
     Block,
-    /// More backed runs than one classification reports.
-    TooManyRuns,
     /// A malformed terminal, a table outside the primary arena, or a range
     /// that wraps.
     Malformed,
@@ -1070,7 +1069,6 @@ impl ForeignBacking {
         match self {
             Self::HostOwnedLeaf => carrick_el1_abi::AnonymousLeave::BackingHostOwnedLeaf,
             Self::Block => carrick_el1_abi::AnonymousLeave::BackingBlock,
-            Self::TooManyRuns => carrick_el1_abi::AnonymousLeave::BackingMultiRun,
             Self::Malformed => carrick_el1_abi::AnonymousLeave::BackingMalformed,
         }
     }
@@ -1081,8 +1079,7 @@ impl Stage1Backing {
         Self {
             summary,
             foreign: ForeignBacking::Malformed,
-            runs: [(0, 0); MAX_BACKED_RUNS],
-            count: 0,
+            backed: None,
         }
     }
     /// A `Foreign` range, for `why`.
@@ -1091,7 +1088,7 @@ impl Stage1Backing {
         backing.foreign = why;
         backing
     }
-    /// `summary` over exactly these backed runs; `Foreign` if too many.
+    /// `summary` over these backed runs (`[start, end)`, in address order).
     pub fn with_runs(summary: RangeBacking, runs: &[(u64, u64)]) -> Self {
         let mut backing = Self::of(summary);
         for &(start, end) in runs {
@@ -1100,18 +1097,15 @@ impl Stage1Backing {
         backing
     }
     fn push(&mut self, start: u64, end: u64) {
-        if self.count > 0 && self.runs[self.count - 1].1 == start {
-            self.runs[self.count - 1].1 = end;
-        } else if self.count == MAX_BACKED_RUNS {
-            self.summary = RangeBacking::Foreign;
-            self.foreign = ForeignBacking::TooManyRuns;
-        } else {
-            self.runs[self.count] = (start, end);
-            self.count += 1;
-        }
+        self.backed = Some(match self.backed {
+            Some((first, _)) => (first, end),
+            None => (start, end),
+        });
     }
-    pub fn runs(&self) -> &[(u64, u64)] {
-        &self.runs[..self.count]
+    /// `[start, end)` from the first backed page to the end of the last;
+    /// `None` when no page has a terminal.
+    pub fn backed(&self) -> Option<(u64, u64)> {
+        self.backed
     }
 }
 
@@ -1252,9 +1246,6 @@ pub fn classify_window_range<A: AnonymousDescriptorDecode>(
                 return Stage1Backing::foreign(ForeignBacking::HostOwnedLeaf);
             }
             backing.push(cursor, next.min(end));
-            if backing.summary == RangeBacking::Foreign {
-                return Stage1Backing::foreign(ForeignBacking::TooManyRuns);
-            }
         }
         if next <= cursor {
             break;
@@ -2259,7 +2250,7 @@ fn serve_delegated_anonymous_attempt<
         && backing.foreign == ForeignBacking::HostOwnedLeaf
         && matches!(request.operation, Retire | Prepare | Protect)
     {
-        let mut windows = [(0u64, 0u64); MAX_BACKED_RUNS];
+        let mut windows = [(0u64, 0u64); MAX_WINDOW_NODES];
         let mut count = 0usize;
         let observed = model.observe_range(request.range, &mut |mapping| {
             use carrick_el1_abi::ReservationNodeFlags as F;
@@ -2285,18 +2276,11 @@ fn serve_delegated_anonymous_attempt<
     } else {
         backing
     };
-    // A discard can retire sparse residency in one descriptor transaction:
-    // the retirement planners skip absent entries and validate every
-    // populated terminal before publishing the edit. So do a window unlink
-    // and a window protect, which skip holes alike.
-    let run = match backing.runs() {
-        [] => None,
-        [(start, end)] => Some((*start, *end - *start)),
-        _ if request.operation == Discard || backing.summary == RangeBacking::Window => {
-            Some((va, len))
-        }
-        _ => return refuse(pending, &mut model, Leave::BackingMultiRun),
-    };
+    // One descriptor transaction covers the backed span, holes and all:
+    // every planner (retire, protect, window unlink and window protect)
+    // skips an absent entry and validates every populated terminal before
+    // its first store, so the edit applies to every run or to none (#3073).
+    let run = backing.backed().map(|(start, end)| (start, end - start));
     // A fresh mapping into a root hole over this MM's first-touch stock
     // adopts it: zero backing EL1 never exposed, re-permissioned for the
     // mapping and committed on first touch; any rest of the range has no
@@ -5295,8 +5279,8 @@ mod tests {
 
         /// A fresh mapping that straddles the end of this MM's stock adopts
         /// the stocked part and leaves the rest lazy, still without a host
-        /// crossing. Backing split into several runs is one step too many:
-        /// the host serves it.
+        /// crossing. Stock split into several runs is adopted as one span:
+        /// its holes stay lazy (#3073).
         #[test]
         fn delegated_mmap_straddling_first_touch_stock_adopts_the_stocked_part() {
             let (spaces, table, counters) = (AddressSpaces::new(), table(), Counters::default());
@@ -5345,8 +5329,121 @@ mod tests {
                 SYS_MMAP,
                 mmap_fixed(ARENA + 0x8000, 0x3000),
             );
-            assert_eq!(route, DelegatedAnonymous::Forward);
+            assert_eq!(route, DelegatedAnonymous::Served);
+            assert_eq!(
+                split.calls[1..],
+                [Call::Protect(
+                    task.ttbr0,
+                    GuestPermissionEdit {
+                        va: ARENA + 0x8000,
+                        len: 0x3000,
+                        readable: true,
+                        writable: true,
+                        executable: false,
+                        cow_ceiling: None,
+                    }
+                )]
+            );
             assert!(root(&spaces, &table, &task).pending().is_none());
+        }
+
+        /// #3073: an mprotect, or a munmap, over a private range resident in
+        /// separate runs (V8 frees a 256 KiB page with `mprotect(PROT_NONE)`)
+        /// is one descriptor step over the backed span, served in the ring,
+        /// however many runs the span holds. It never leaves the ring.
+        #[test]
+        fn delegated_edit_over_sparse_residency_is_one_step_over_the_backed_span() {
+            static TWO: [(u64, u64); 2] =
+                [(ARENA, ARENA + 0x1000), (ARENA + 0x2000, ARENA + 0x3000)];
+            static MANY: [(u64, u64); 32] = {
+                let mut runs = [(0, 0); 32];
+                let mut page = 0;
+                while page < 32 {
+                    let start = ARENA + page as u64 * 0x2000;
+                    runs[page] = (start, start + 0x1000);
+                    page += 1;
+                }
+                runs
+            };
+            for runs in [&TWO[..], &MANY[..]] {
+                let (spaces, table, counters) =
+                    (AddressSpaces::new(), table(), Counters::default());
+                let task = mm(&spaces, &table, 17, true);
+                let mut lazy = Editor::over(RangeBacking::Empty);
+                syscall(
+                    &task,
+                    &spaces,
+                    &table,
+                    &counters,
+                    &mut lazy,
+                    SYS_MMAP,
+                    mmap_fixed(ARENA, 0x40000),
+                );
+                let end = runs.last().unwrap().1;
+                let mut sparse = Editor::over(RangeBacking::Private);
+                sparse.runs = Some(runs);
+                let (route, result) = syscall(
+                    &task,
+                    &spaces,
+                    &table,
+                    &counters,
+                    &mut sparse,
+                    SYS_MPROTECT,
+                    [ARENA, 0x40000, 0, 0, 0, 0],
+                );
+                assert_eq!((route, result), (DelegatedAnonymous::Served, 0));
+                assert_eq!(
+                    sparse.calls[1..],
+                    [Call::Protect(
+                        task.ttbr0,
+                        GuestPermissionEdit {
+                            va: ARENA,
+                            len: end - ARENA,
+                            readable: false,
+                            writable: false,
+                            executable: false,
+                            cow_ceiling: Some(GuestPermissionCeiling {
+                                readable: true,
+                                writable: true,
+                                executable: true,
+                            }),
+                        }
+                    )]
+                );
+                let mut model = root(&spaces, &table, &task);
+                assert!(model.pending().is_none());
+                assert_eq!(
+                    model.mapping(ARENA + 0x1000).map(|m| m.protection.bits()),
+                    Some(0),
+                    "the hole takes the new protection from the root model"
+                );
+                drop(model);
+
+                let mut sparse = Editor::over(RangeBacking::Private);
+                sparse.runs = Some(runs);
+                let (route, result) = syscall(
+                    &task,
+                    &spaces,
+                    &table,
+                    &counters,
+                    &mut sparse,
+                    SYS_MUNMAP,
+                    [ARENA, 0x40000, 0, 0, 0, 0],
+                );
+                assert_eq!((route, result), (DelegatedAnonymous::Served, 0));
+                assert_eq!(
+                    sparse
+                        .calls
+                        .iter()
+                        .filter(|call| matches!(call, Call::Retire(..)))
+                        .count(),
+                    1
+                );
+            }
+            assert_eq!(
+                Counters::default().anonymous_leaves.len(),
+                carrick_el1_abi::AnonymousLeave::COUNT
+            );
         }
 
         #[test]
@@ -5374,12 +5471,12 @@ mod tests {
                 };
                 classify_stage1_range(&read, root, va, len).summary
             };
-            let runs = |words: &Vec<u64>, va: u64, len: u64| {
+            let backed = |words: &Vec<u64>, va: u64, len: u64| {
                 let read = |pa: u64| {
                     let offset = pa.checked_sub(root)?;
                     words.get((offset / 8) as usize).copied()
                 };
-                classify_stage1_range(&read, root, va, len).runs().to_vec()
+                classify_stage1_range(&read, root, va, len).backed()
             };
             assert_eq!(classify(&words, va, 0x2000), RangeBacking::Private);
             assert_eq!(
@@ -5387,12 +5484,12 @@ mod tests {
                 RangeBacking::Prepared
             );
             assert_eq!(classify(&words, va + 0x2000, 0x1000), RangeBacking::Empty);
-            // A hole beside backed pages: the backed run alone is the step.
+            // A hole beside backed pages: the backed span alone is the step.
             assert_eq!(classify(&words, va, 0x3000), RangeBacking::Private);
-            assert_eq!(runs(&words, va, 0x3000), vec![(va, va + 0x2000)]);
+            assert_eq!(backed(&words, va, 0x3000), Some((va, va + 0x2000)));
             assert_eq!(
-                runs(&words, va + 0x1000, 0x2000),
-                vec![(va + 0x1000, va + 0x2000)]
+                backed(&words, va + 0x1000, 0x2000),
+                Some((va + 0x1000, va + 0x2000))
             );
             assert_eq!(classify(&words, va + 0x3000, 0x1000), RangeBacking::Foreign);
             assert_eq!(classify(&words, va + 0x4000, 0x1000), RangeBacking::Retired);
@@ -5428,14 +5525,19 @@ mod tests {
             // An L2 block without EL1 tags.
             words[1024 + 2] = 0x9040_0000 | VALID;
             assert_eq!(cause(&words, va + (2 << 21), 0x1000), ForeignBacking::Block);
-            // Nine private runs separated by holes: more than one step takes.
+            // Nine private runs separated by holes: one private span, from
+            // the first run's start to the last one's end (#3073).
             for page in 0..9 {
                 words[leaf(16 + 2 * page)] =
                     (0x9001_0000 + page as u64 * 0x2000) | PRIVATE | VALID | TABLE;
             }
             assert_eq!(
-                cause(&words, va + 0x10000, 0x12000),
-                ForeignBacking::TooManyRuns
+                classify(&words, va + 0x10000, 0x12000),
+                RangeBacking::Private
+            );
+            assert_eq!(
+                backed(&words, va + 0x10000, 0x12000),
+                Some((va + 0x10000, va + 0x21000))
             );
         }
 

@@ -605,6 +605,67 @@ fn guest_protect_can_restore_write_within_private_grant_ceiling() {
     ));
 }
 
+/// #3073: mprotect(2) ignores residency. A range resident in two runs, with
+/// a lazy page (no entry) between them and lazy pages after, changes both
+/// terminals in one transaction and leaves every hole absent.
+#[test]
+fn guest_protect_skips_absent_entries_between_resident_runs() {
+    let words = Words::new();
+    let writable = Permissions {
+        writable: true,
+        executable: false,
+        user: true,
+    };
+    for (va, output, tables) in [
+        (
+            0x4000,
+            0x800000,
+            &[root(0x2000), root(0x3000), root(0x4000)][..],
+        ),
+        (0x6000, 0x802000, &[][..]),
+    ] {
+        assert!(matches!(
+            apply(
+                &words,
+                private_prepare(PageSpan::new(va, PAGE), output, writable),
+                tables
+            ),
+            DescriptorOutcome::Applied { .. }
+        ));
+    }
+    let readonly = Permissions {
+        writable: false,
+        ..writable
+    };
+    assert!(matches!(
+        apply(
+            &words,
+            DescriptorOp::Protect {
+                span: PageSpan::new(0x4000, 8 * PAGE),
+                permissions: readonly,
+                exec: ExecAuthority::Leaf,
+            },
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    for (va, output) in [(0x4000, 0x800000), (0x6000, 0x802000)] {
+        let (leaf, _) = read_terminal_descriptor(&words, root(0x1000), UserVa::new(va)).unwrap();
+        assert_eq!(leaf & WRITE, 0, "{va:#x} is read-only");
+        assert_ne!(leaf & PRESENT, 0, "{va:#x} stays resident");
+        assert_eq!(leaf & ADDRESS, output, "{va:#x} keeps its frame");
+    }
+    for page in [1, 3, 4, 5, 6, 7] {
+        let va = 0x4000 + page * PAGE;
+        assert!(
+            read_terminal_descriptor(&words, root(0x1000), UserVa::new(va))
+                .is_ok_and(|(leaf, _)| leaf == 0)
+                || read_terminal_descriptor(&words, root(0x1000), UserVa::new(va)).is_err(),
+            "hole {va:#x} stays absent"
+        );
+    }
+}
+
 #[test]
 fn guest_retire_refuses_host_map_leaf() {
     let words = Words::new();

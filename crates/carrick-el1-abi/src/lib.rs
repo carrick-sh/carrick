@@ -3154,8 +3154,6 @@ pub enum AnonymousLeave {
     BackingHostOwnedLeaf,
     /// The range's backing has an L1/L2 block terminal.
     BackingBlock,
-    /// The range's backing is split into more backed runs than one step.
-    BackingMultiRun,
     /// The range's backing has a malformed terminal, or a table outside
     /// the primary arena.
     BackingMalformed,
@@ -3180,7 +3178,7 @@ pub enum AnonymousLeave {
 }
 
 impl AnonymousLeave {
-    pub const COUNT: usize = 17;
+    pub const COUNT: usize = 16;
 
     /// Every variant, in ordinal order.
     pub const ALL: [AnonymousLeave; Self::COUNT] = [
@@ -3192,7 +3190,6 @@ impl AnonymousLeave {
         Self::EditorBusy,
         Self::BackingHostOwnedLeaf,
         Self::BackingBlock,
-        Self::BackingMultiRun,
         Self::BackingMalformed,
         Self::BackingRetired,
         Self::EditRefused,
@@ -3214,7 +3211,6 @@ impl AnonymousLeave {
             Self::EditorBusy => "editor_busy",
             Self::BackingHostOwnedLeaf => "backing_host_owned_leaf",
             Self::BackingBlock => "backing_block",
-            Self::BackingMultiRun => "backing_multi_run",
             Self::BackingMalformed => "backing_malformed",
             Self::BackingRetired => "backing_retired",
             Self::EditRefused => "edit_refused",
