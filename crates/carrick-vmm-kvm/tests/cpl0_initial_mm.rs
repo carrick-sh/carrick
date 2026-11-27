@@ -8996,6 +8996,39 @@ reservation_shape_witness!(
     "#2874: as the anonymous RW case, in a forked child while its parent waits."
 );
 reservation_shape_witness!(
+    production_mprotect_and_munmap_cover_a_sparse_resident_range,
+    14,
+    "#3073: the root writes pages 0 and 2 of a 256 KiB RW map (two resident runs with a hole), \
+     mprotects the whole range PROT_READ (the bytes and the hole read back), munmaps it, and its \
+     read of page 0 faults (ENOSYS before the fix)."
+);
+reservation_shape_witness!(
+    production_mprotect_and_munmap_cover_a_forked_childs_sparse_resident_range,
+    15,
+    "#3073: as the root's sparse range, in a forked child while its parent waits."
+);
+reservation_shape_witness!(
+    production_mprotect_and_munmap_cover_a_range_of_many_resident_runs,
+    16,
+    "#3073: as the root's sparse range with every other page written: 32 resident runs."
+);
+
+/// #3073, V8's `FreePages`: one `mprotect(PROT_NONE)` over the whole sparse
+/// range, then a read that must fault. The sparse range itself is served
+/// (cases 14 to 16); x86 has no leaf encoding for a resident page with no
+/// user access yet, so the descriptor step still refuses `PROT_NONE`.
+#[test]
+#[ignore = "x86 PROT_NONE over a resident private page, see #2875"]
+fn production_mprotect_none_covers_a_sparse_resident_range() {
+    let outcome = run_reservation_shape(17);
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (7, None),
+        "case 17 exit (7 = Linux; else the errno, +100 from mmap): {:?}",
+        outcome.run
+    );
+}
+reservation_shape_witness!(
     production_fork_child_runs_beside_a_parent_holding_a_4gib_reservation,
     9,
     "The root reserves 4 GiB, grows brk and the stack, then forks; both processes keep their own \

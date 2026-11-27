@@ -17,6 +17,16 @@
  *     last pages
  *   12 as 11, the range committed RW inside a 16 MiB PROT_NONE reserve
  *   13 as 11, in a forked child
+ *   14 (#3073) the root reserves 16 MiB PROT_NONE and commits pages 0 and
+ *     2 RW one at a time, writing each, so its resident pages form two runs
+ *     with a hole between. mprotect over the whole 256 KiB to PROT_READ
+ *     returns 0, and the written bytes and the hole's zero read back. munmap
+ *     of the whole range returns 0 and the read of page 0 then faults: its
+ *     SIGSEGV handler exits 7 (93 = no fault)
+ *   15 as 14, in a forked child
+ *   16 as 14 with every other page of the 256 KiB committed (32 runs)
+ *   17 V8's FreePages: as 14, but one mprotect(PROT_NONE) over the whole
+ *     range, then the read of page 0 must fault
  * The parent propagates the child's exit status. */
 
 /* rax = mmap(0, rsi, edx prot, r10 flags, -1, 0); r15 = base or exit errno */
@@ -59,11 +69,13 @@
 #endif
 /* #2874: V8's code-range length */
 #define CODE_LEN 0x1e0000
+/* #3073: V8's allocation page */
+#define SPARSE_LEN 0x40000
 
 .global _start
 .text
 _start:
-#if CASE == 8 || CASE == 11 || CASE == 12
+#if CASE == 8 || CASE == 11 || CASE == 12 || CASE == 14 || CASE == 16 || CASE == 17
     jmp child               /* the run root itself, no fork */
 #endif
 #if CASE == 9
@@ -125,6 +137,58 @@ child:
     movb $1, (%r15)
     cmpb $0x3c, (%r14)
     jne bad
+#elif CASE >= 14
+    /* V8's code range: a PROT_NONE reserve, committed RW a page at a time */
+    MMAP $0x1000000, $0, $0x4022
+    mov %r15, %rbx
+#if CASE == 16
+    lea SPARSE_LEN(%r15), %r13
+#else
+    lea 0x3000(%r15), %r13
+#endif
+1:  MPROTECT %rbx, $0x1000, $3
+    movb $0xa5, (%rbx)      /* every other page: runs with holes between */
+    add $8192, %rbx
+    cmp %r13, %rbx
+    jb 1b
+#if CASE == 17
+    MPROTECT %r15, $SPARSE_LEN, $0  /* V8's FreePages */
+#else
+    MPROTECT %r15, $SPARSE_LEN, $1
+    cmpb $0xa5, (%r15)
+    jne bad
+    cmpb $0xa5, 8192(%r15)
+    jne bad
+    cmpb $0, 4096(%r15)     /* the hole reads zero */
+    jne bad
+    mov %r15, %rdi          /* munmap(base, SPARSE_LEN) */
+    mov $SPARSE_LEN, %rsi
+    mov $11, %eax
+    syscall
+    test %rax, %rax
+    js fail
+#endif
+    lea segv(%rip), %rax
+    mov %rax, act(%rip)
+    movq $0x04000000, act+8(%rip)   /* SA_RESTORER */
+    lea restorer(%rip), %rax
+    mov %rax, act+16(%rip)
+    mov $11, %edi           /* rt_sigaction(SIGSEGV, &act, NULL, 8) */
+    lea act(%rip), %rsi
+    xor %edx, %edx
+    mov $8, %r10d
+    mov $13, %eax
+    syscall
+    test %rax, %rax
+    js harness
+    movb (%r15), %al        /* unmapped or PROT_NONE: must fault */
+    mov $93, %edi
+    jmp exit
+segv:
+    mov $7, %edi
+    jmp exit
+restorer:
+    ud2
 #elif CASE >= 11
 #if CASE == 12
     MMAP $0x1000000, $0, $0x4022
@@ -177,4 +241,6 @@ exit:
 .section .bss
 .balign 4
 status: .space 4
+.balign 8
+act: .space 32
 .section .note.GNU-stack,"",@progbits
