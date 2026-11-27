@@ -450,6 +450,10 @@ pub enum NativeProcessError {
     Invalid,
     Stale,
     Exhausted,
+    /// Kernel memory for the operation could not be allocated: Linux
+    /// `ENOMEM` (`fork(2)`: "failed to allocate the necessary kernel
+    /// structures"), distinct from `Exhausted`'s resource-limit `EAGAIN`.
+    NoMemory,
     Fault,
     OwnerWait(carrick_core_abi::PortalOwnerWait),
     ForkRefused(super::native_fork_refusal::NativeForkRefusal),
@@ -534,6 +538,7 @@ impl NativeProcessError {
             Self::Invalid => Ok(NativeFailure::Invalid),
             Self::Stale => Ok(NativeFailure::Stale),
             Self::Exhausted => Ok(NativeFailure::Exhausted),
+            Self::NoMemory => Ok(NativeFailure::NoMemory),
             Self::Fault => Ok(NativeFailure::Fault),
             Self::ForkRefused(refusal) => refusal.error().failure(),
             // A supply request that reaches a refusal answer has no owner
@@ -566,6 +571,7 @@ pub enum NativeFailure {
     Invalid,
     Stale,
     Exhausted,
+    NoMemory,
     Fault,
     Unsupported,
     GroupExitCustody,
@@ -580,6 +586,7 @@ impl NativeFailure {
             Self::Invalid => R::NativeInvalid,
             Self::Stale => R::NativeStale,
             Self::Exhausted => R::NativeExhausted,
+            Self::NoMemory => R::NativeNoMemory,
             Self::Fault => R::NativeFault,
             Self::Unsupported => R::NativeUnsupported,
             Self::Quarantined | Self::ServiceQuarantined(_) => R::NativeQuarantined,
@@ -591,6 +598,7 @@ impl NativeFailure {
         match self {
             Self::Invalid | Self::Stale => -22,
             Self::Exhausted => -11,
+            Self::NoMemory => -12,
             Self::Fault => -14,
             Self::Unsupported | Self::GroupExitCustody => -38,
             Self::Quarantined | Self::ServiceQuarantined(_) => -5,
@@ -604,6 +612,7 @@ impl From<NativeFailure> for NativeProcessError {
             NativeFailure::Invalid => Self::Invalid,
             NativeFailure::Stale => Self::Stale,
             NativeFailure::Exhausted => Self::Exhausted,
+            NativeFailure::NoMemory => Self::NoMemory,
             NativeFailure::Fault => Self::Fault,
             NativeFailure::Unsupported => Self::Unsupported,
             NativeFailure::GroupExitCustody => Self::GroupExitCustody,

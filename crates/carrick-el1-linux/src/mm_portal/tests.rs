@@ -4598,14 +4598,15 @@ fn anonymous_contention_then_metadata_provisions_without_park_serial_host() {
         fn allocate_with_extent(
             &self,
             layout: core::alloc::Layout,
-        ) -> Option<(*mut u8, carrick_core_abi::ExtentGrantReceipt)> {
+        ) -> Result<(*mut u8, carrick_core_abi::ExtentGrantReceipt), carrick_core_abi::MetadataMiss>
+        {
             // SAFETY: the allocation is retained in self until after the table drops.
             let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
             if ptr.is_null() {
-                return None;
+                return Err(carrick_core_abi::MetadataMiss::Exhausted);
             }
             self.0.lock().unwrap().push((ptr as usize, layout));
-            Some((
+            Ok((
                 ptr,
                 carrick_core_abi::ExtentGrantReceipt {
                     base_va: ptr as u64,

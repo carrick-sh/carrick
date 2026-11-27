@@ -12,6 +12,7 @@ pub(crate) const fn native_process_error_from_run_failure(
         R::NativeInvalid => E::Invalid,
         R::NativeStale => E::Stale,
         R::NativeExhausted => E::Exhausted,
+        R::NativeNoMemory => E::NoMemory,
         R::NativeFault => E::Fault,
         R::NativeUnsupported => E::Unsupported,
         R::NativeBusy => E::Busy,
