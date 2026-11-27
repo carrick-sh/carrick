@@ -670,14 +670,22 @@ mod ticket_tests {
             .unwrap();
         assert_eq!(
             guard
-                .notify_object_host(&mut |_| handed += 1, &mut |_| {})
+                .notify_object_host(
+                    &mut |_| handed += 1,
+                    &mut |_| {},
+                    &carrick_sched_core::OwedPasses::new()
+                )
                 .unwrap()
                 .visited,
             1
         );
         assert_eq!(
             guard
-                .notify_object_host(&mut |_| handed += 1, &mut |_| {})
+                .notify_object_host(
+                    &mut |_| handed += 1,
+                    &mut |_| {},
+                    &carrick_sched_core::OwedPasses::new()
+                )
                 .unwrap()
                 .visited,
             0

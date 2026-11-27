@@ -715,8 +715,8 @@ fn zone() -> Box<ZoneTables> {
         assert!(!pointer.is_null());
         Box::from_raw(pointer)
     };
-    zone.drive(SLOT, 1);
-    zone.publish_slot(SLOT, MM, None, 0);
+    zone.drive(SLOT, 1, &carrick_sched_core::OwedPasses::new());
+    zone.publish_slot(SLOT, MM, None, 0, &carrick_sched_core::OwedPasses::new());
     assert!(
         zone.occupancy
             .replace(carrick_sched_core::ExecutionSlot::zone(SLOT), 0, MM)
@@ -811,7 +811,11 @@ fn check_enroll_wake_interleaving_preserves_epoch() {
                             })
                             .unwrap();
                         let report = guard
-                            .notify_object_host(&mut |_| panic!("not enrolled yet"), &mut |_| {})
+                            .notify_object_host(
+                                &mut |_| panic!("not enrolled yet"),
+                                &mut |_| {},
+                                &carrick_sched_core::OwedPasses::new(),
+                            )
                             .unwrap();
                         assert_eq!(report.visited, 0);
                         drop(guard);
@@ -827,7 +831,13 @@ fn check_enroll_wake_interleaving_preserves_epoch() {
                 let _ = owned.into_parts();
             })
             .unwrap();
-        let report = guard.notify_object_host(&mut |_| {}, &mut |_| {}).unwrap();
+        let report = guard
+            .notify_object_host(
+                &mut |_| {},
+                &mut |_| {},
+                &carrick_sched_core::OwedPasses::new(),
+            )
+            .unwrap();
         assert_eq!(report.visited, 1);
         assert_eq!(report.queued + report.handed, 1);
     }
@@ -878,7 +888,8 @@ fn claim_reuse_removes_queue_entries_and_stale_completions() {
                                         &BoundedSpin(0),
                                         &|owned| {
                                             let _ = owned.into_parts();
-                                        }
+                                        },
+                                        &carrick_sched_core::OwedPasses::new()
                                     ),
                                     HostClaim::Claimed
                                 );
@@ -911,7 +922,8 @@ fn claim_reuse_removes_queue_entries_and_stale_completions() {
                                         &BoundedSpin(0),
                                         &|owned| {
                                             let _ = owned.into_parts();
-                                        }
+                                        },
+                                        &carrick_sched_core::OwedPasses::new()
                                     ),
                                     HostClaim::Stale
                                 );
@@ -921,8 +933,13 @@ fn claim_reuse_removes_queue_entries_and_stale_completions() {
                                     let _ = owned.into_parts();
                                 })
                                 .unwrap();
-                            let report =
-                                guard.notify_object_host(&mut |_| {}, &mut |_| {}).unwrap();
+                            let report = guard
+                                .notify_object_host(
+                                    &mut |_| {},
+                                    &mut |_| {},
+                                    &carrick_sched_core::OwedPasses::new(),
+                                )
+                                .unwrap();
                             assert_eq!(
                                 report.visited, scale as u32,
                                 "work touches affected waiters only"
@@ -945,7 +962,10 @@ fn claim_reuse_removes_queue_entries_and_stale_completions() {
                 zone.object_queue_census(unrelated.index()).unwrap().waiters,
                 32
             );
-            assert!(zone.switch_in_full(SLOT).is_some());
+            assert!(
+                zone.switch_in_full(SLOT, &carrick_sched_core::OwedPasses::new())
+                    .is_some()
+            );
         }
     }
 }

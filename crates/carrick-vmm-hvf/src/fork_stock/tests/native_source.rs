@@ -54,8 +54,8 @@ fn native_fork_reserve_retains_a_source_the_parent_acquired_after_birth() {
         let ttbr0 = (asid << 48) | root;
         let space = zone.spaces.publish_closed(mm, ttbr0, ttbr0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, mm);
-        zone.publish_slot(slot, mm, Some(0), 1);
+        zone.drive(slot, mm, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, mm, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, mm).unwrap();
         task.set(

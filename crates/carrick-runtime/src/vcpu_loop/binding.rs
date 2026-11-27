@@ -7748,10 +7748,10 @@ mod tests {
             let zone = carrick_el1_abi::zone_tables().unwrap();
             let slot = carrick_el1_abi::SlotId::new(0);
             let mm = root.shared().mm().id().raw();
-            zone.drive(slot, 1);
-            zone.publish_slot(slot, mm, Some(0), 1);
+            zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+            zone.publish_slot(slot, mm, Some(0), 1, &carrick_sched_core::OwedPasses::new());
             zone.enter_guest(slot);
-            zone.enter_idle(slot, true);
+            zone.enter_idle(slot, true, &carrick_sched_core::OwedPasses::new());
             let space = zone.spaces.publish_closed(mm, 0x10000, 0x10000).unwrap();
             zone.spaces.open(space);
             zone.install_space(slot, mm).unwrap();
@@ -7828,7 +7828,8 @@ mod tests {
                             &carrick_kernel::el1_zone::HostLockWait,
                             owned.zone(),
                             owned
-                        )
+                        ),
+                        &carrick_sched_core::OwedPasses::new()
                     ),
                     carrick_el1_abi::HostClaim::Claimed
                 );
@@ -7842,8 +7843,11 @@ mod tests {
                 else {
                     panic!("first-entry handback was not queued");
                 };
-                let Some(carrick_el1_abi::ServiceHead::FirstEntry(custody)) =
-                    zone.take_service_head_for_executor(activation_slot)
+                let Some(carrick_el1_abi::ServiceHead::FirstEntry(custody)) = zone
+                    .take_service_head_for_executor(
+                        activation_slot,
+                        &carrick_sched_core::OwedPasses::new(),
+                    )
                 else {
                     panic!("uninitialized service head did not yield activation custody");
                 };
@@ -7875,7 +7879,10 @@ mod tests {
                 assert!(zone.free_first_entry_activation(activation_custody.take().unwrap()));
                 assert!(zone.live(record).is_none());
                 assert_eq!(zone.runnable_head(slot), None);
-                assert_eq!(zone.take_service_head(slot), None);
+                assert_eq!(
+                    zone.take_service_head(slot, &carrick_sched_core::OwedPasses::new()),
+                    None
+                );
             } else {
                 let carrick_el1_abi::Claim::Queued {
                     slot: service_slot, ..
@@ -7884,7 +7891,10 @@ mod tests {
                     panic!("first-entry control handback was not queued");
                 };
                 assert_eq!(zone.runnable_head(service_slot), Some(record.id));
-                assert_eq!(zone.take_service_head(service_slot), Some(record));
+                assert_eq!(
+                    zone.take_service_head(service_slot, &carrick_sched_core::OwedPasses::new()),
+                    Some(record)
+                );
             }
             assert_eq!(kernel.wake_native_terminal_members(&root).unwrap(), 0);
             scheduler.close();

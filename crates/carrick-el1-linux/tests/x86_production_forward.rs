@@ -565,12 +565,18 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
     let peer_slot = SlotId::new(1);
     let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
     zone.spaces.open(space);
-    zone.drive(slot, 1);
-    zone.publish_slot(slot, 1, Some(0), 1);
+    zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+    zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
     zone.enter_guest(slot);
     zone.install_space(slot, 1).unwrap();
-    zone.drive(peer_slot, 2);
-    zone.publish_slot(peer_slot, 1, Some(1), 2);
+    zone.drive(peer_slot, 2, &carrick_sched_core::OwedPasses::new());
+    zone.publish_slot(
+        peer_slot,
+        1,
+        Some(1),
+        2,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     zone.enter_guest(peer_slot);
     zone.current_or_new(
         slot,
@@ -645,12 +651,14 @@ fn child_exit_releases_control_custody_before_retire_mm_reclaims_stock() {
         .unwrap();
     assert_eq!(child_control.affinity().words(), &[0]);
     assert_eq!(child_control.affinity_source().load(), Some(0));
-    assert!(zone.enter_idle(peer_slot, true));
+    assert!(zone.enter_idle(peer_slot, true, &carrick_sched_core::OwedPasses::new()));
     let mut effects = WakeEffects::default();
     assert_eq!(zone.migrate_queued(slot, &mut effects), 1);
     assert_eq!(effects.sgi_slots().collect::<Vec<_>>(), vec![peer_slot]);
     zone.leave_idle(peer_slot);
-    let selected = zone.switch_in_full(peer_slot).unwrap();
+    let selected = zone
+        .switch_in_full(peer_slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     let child_record = zone.record_ref(selected.record);
     let state = unsafe { runtime.record_binding(child_record) }.unwrap();
     let identity = zone.record(selected.record).identity();
@@ -1806,12 +1814,18 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
     let peer_slot = SlotId::new(1);
     let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
     zone.spaces.open(space);
-    zone.drive(slot, 1);
-    zone.publish_slot(slot, 1, Some(0), 1);
+    zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+    zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
     zone.enter_guest(slot);
     zone.install_space(slot, 1).unwrap();
-    zone.drive(peer_slot, 2);
-    zone.publish_slot(peer_slot, 1, Some(1), 2);
+    zone.drive(peer_slot, 2, &carrick_sched_core::OwedPasses::new());
+    zone.publish_slot(
+        peer_slot,
+        1,
+        Some(1),
+        2,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     zone.enter_guest(peer_slot);
     zone.current_or_new(
         slot,
@@ -2204,11 +2218,13 @@ fn x86_clone_child_serves_stdout_stat_write_and_own_redirect() {
     }
     let _ = task.linux.take_served_boundary();
 
-    assert!(zone.enter_idle(peer_slot, true));
+    assert!(zone.enter_idle(peer_slot, true, &carrick_sched_core::OwedPasses::new()));
     let mut effects = WakeEffects::default();
     assert_eq!(zone.migrate_queued(slot, &mut effects), 1);
     zone.leave_idle(peer_slot);
-    let selected = zone.switch_in_full(peer_slot).unwrap();
+    let selected = zone
+        .switch_in_full(peer_slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     let child_record = zone.record_ref(selected.record);
     let state = unsafe { runtime.record_binding(child_record) }.unwrap();
     let identity = zone.record(selected.record).identity();

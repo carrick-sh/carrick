@@ -8957,8 +8957,8 @@ fn serial_host_mixed_queue_progress(compute_in_zone: bool) {
     let zone = carrick_el1_abi::zone_tables().unwrap();
     zone.publish_carrier_cpu_count(1);
     let slot = SlotId::new(0);
-    zone.drive(slot, 1);
-    zone.publish_slot(slot, 3, Some(0), 0);
+    zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+    zone.publish_slot(slot, 3, Some(0), 0, &carrick_sched_core::OwedPasses::new());
 
     let (kernel, compute) = bootstrap(19_746);
     compute
@@ -9174,12 +9174,18 @@ fn serial_host_captured_service_after_self_affinity_and_futex_wakes_current_idle
     let zone = carrick_el1_abi::zone_tables().unwrap();
     zone.publish_carrier_cpu_count(2);
     let (donor, idle) = (SlotId::new(0), SlotId::new(12));
-    zone.drive(donor, 7);
-    zone.publish_slot(donor, 0, Some(0), 0);
+    zone.drive(donor, 7, &carrick_sched_core::OwedPasses::new());
+    zone.publish_slot(donor, 0, Some(0), 0, &carrick_sched_core::OwedPasses::new());
     // The idle vCPU has a new mailbox, unlike its creation-time hardware kick.
-    zone.drive(idle, 8);
-    zone.publish_slot(idle, 0, Some(0), 0);
-    zone.step_away(idle, 8, &mut |_| panic!("empty idle slot"), &mut |_| {});
+    zone.drive(idle, 8, &carrick_sched_core::OwedPasses::new());
+    zone.publish_slot(idle, 0, Some(0), 0, &carrick_sched_core::OwedPasses::new());
+    zone.step_away(
+        idle,
+        8,
+        &mut |_| panic!("empty idle slot"),
+        &mut |_| {},
+        &carrick_sched_core::OwedPasses::new(),
+    );
     let control = context.thread().control_slot();
     // SAFETY: this retained control is directly mapped in the VM-free fixture.
     unsafe {
@@ -9222,7 +9228,7 @@ fn serial_host_captured_service_after_self_affinity_and_futex_wakes_current_idle
         assert_eq!(zone.slot(donor).queued(), 0);
         assert_eq!(zone.slot(idle).queued(), 0);
         assert_eq!(wake_scheduler.queued_len(), 1);
-        zone.step_back(idle, 8);
+        zone.step_back(idle, 8, &carrick_sched_core::OwedPasses::new());
         // The actual EL1 idle owner must observe the durable host work. A
         // FakeCpu WFI without any pending event fails instead of hanging.
         // SAFETY: aligned, retained ABI storage for this exact mailbox slot.
@@ -9345,8 +9351,8 @@ fn serial_host_idle_vcpu_root_exit_hands_its_slot_and_terminal_to_the_exact_owne
         .settle_blocked(scheduler.take(&idle).unwrap(), BlockedReason::HostWait)
         .unwrap();
     let slot = carrick_el1_abi::SlotId::new(0);
-    zone.drive(slot, 1);
-    zone.publish_slot(slot, 0, Some(0), 0);
+    zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+    zone.publish_slot(slot, 0, Some(0), 0, &carrick_sched_core::OwedPasses::new());
     let mm_id = root.shared().mm().id();
     // EL1 installed the exiting space on the idle vCPU, then crossed.
     zone.occupancy
@@ -10013,8 +10019,8 @@ fn serial_host_zone_service_between_scan_and_idle_enrollment_is_claimed() {
         ));
     }
     let slot = carrick_el1_abi::SlotId::new(0);
-    zone.drive(slot, 1);
-    zone.publish_slot(slot, 0, Some(0), 0);
+    zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+    zone.publish_slot(slot, 0, Some(0), 0, &carrick_sched_core::OwedPasses::new());
     let factory = FakeFactory::default();
     let mut backend = factory.create(&destination).unwrap();
     backend.idle_slot = Some(slot);
@@ -10137,8 +10143,8 @@ fn serial_host_zone_handback_between_scan_and_idle_enrollment_is_claimed() {
         .settle_blocked_continuation(running, continuation, registration)
         .unwrap();
     let slot = carrick_el1_abi::SlotId::new(0);
-    zone.drive(slot, 1);
-    zone.publish_slot(slot, 0, Some(0), 0);
+    zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+    zone.publish_slot(slot, 0, Some(0), 0, &carrick_sched_core::OwedPasses::new());
     let factory = FakeFactory::default();
     let mut backend = factory.create(&destination).unwrap();
     backend.idle_slot = Some(slot);
@@ -10161,20 +10167,24 @@ fn serial_host_zone_handback_between_scan_and_idle_enrollment_is_claimed() {
             carrick_kernel::el1_zone::claim(reference, None, carrick_el1_abi::Handback::Woken),
             carrick_el1_abi::HostClaim::Claimed
         );
-        zone.publish_slot(slot, mm, Some(0), 0);
+        zone.publish_slot(slot, mm, Some(0), 0, &carrick_sched_core::OwedPasses::new());
         assert!(zone.occupancy.replace(here, 0, mm));
         zone.enter_guest(slot);
         assert_eq!(
-            zone.place_from_host(id),
+            zone.place_from_host(id, &carrick_sched_core::OwedPasses::new()),
             Some(carrick_el1_abi::HostPlacement {
                 slot,
                 resched: true,
             })
         );
-        zone.leave_guest(slot, &carrick_kernel::el1_zone::HostLockWait);
+        zone.leave_guest(
+            slot,
+            &carrick_kernel::el1_zone::HostLockWait,
+            &carrick_sched_core::OwedPasses::new(),
+        );
         zone.occupancy.vacate_any(here);
         let _ = zone.take_resched(slot);
-        zone.publish_slot(slot, 0, Some(0), 0);
+        zone.publish_slot(slot, 0, Some(0), 0, &carrick_sched_core::OwedPasses::new());
         assert_eq!(
             zone.slot(slot).queued(),
             1,
@@ -10685,8 +10695,8 @@ fn serial_host_missing_terminal_continuation_finishes_exit_owner() {
     let space = zone.spaces.publish_closed(mm, 0x10000, 0x10000).unwrap();
     zone.spaces.open(space);
     let slot = SlotId::new(0);
-    zone.drive(slot, mm);
-    zone.publish_slot(slot, mm, Some(1), 1);
+    zone.drive(slot, mm, &carrick_sched_core::OwedPasses::new());
+    zone.publish_slot(slot, mm, Some(1), 1, &carrick_sched_core::OwedPasses::new());
     zone.enter_guest(slot);
     zone.install_space(slot, sibling.shared().mm().id().raw())
         .unwrap();
@@ -10707,8 +10717,14 @@ fn serial_host_missing_terminal_continuation_finishes_exit_owner() {
             },
         )
         .unwrap();
-    assert!(zone.requeue_preempted(slot, id).is_queued());
-    assert_eq!(zone.switch_in(slot), Some(id));
+    assert!(
+        zone.requeue_preempted(slot, id, &carrick_sched_core::OwedPasses::new())
+            .is_queued()
+    );
+    assert_eq!(
+        zone.switch_in(slot, &carrick_sched_core::OwedPasses::new()),
+        Some(id)
+    );
     let record = zone.record_ref(id);
     member.bind_zone_record(record);
     binding.set_cpu_residency(super::residency::TaskCpuResidency::Zone {
@@ -10928,8 +10944,8 @@ fn claimed_abi_born_sibling_zone_reload(terminal: bool) {
     let generation = publish(&sibling, 17);
     let mm = sibling.shared().mm().id().raw();
     let slot = carrick_sched_core::SlotId::new(0);
-    zone.drive(slot, 1);
-    zone.publish_slot(slot, mm, None, 0);
+    zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+    zone.publish_slot(slot, mm, None, 0, &carrick_sched_core::OwedPasses::new());
     zone.enter_guest(slot);
     let space = zone.spaces.publish_closed(mm, 0x1000, 0x1000).unwrap();
     zone.spaces.open(space);
@@ -10947,8 +10963,14 @@ fn claimed_abi_born_sibling_zone_reload(terminal: bool) {
             control_slot: 0,
         })
         .unwrap();
-    assert!(zone.requeue_preempted(slot, id).is_queued());
-    assert_eq!(zone.switch_in(slot), Some(id));
+    assert!(
+        zone.requeue_preempted(slot, id, &carrick_sched_core::OwedPasses::new())
+            .is_queued()
+    );
+    assert_eq!(
+        zone.switch_in(slot, &carrick_sched_core::OwedPasses::new()),
+        Some(id)
+    );
     let record = zone.record_ref(id);
     let control = sibling.thread().control_slot();
     control.bind_zone_record(record);
@@ -10996,6 +11018,7 @@ fn claimed_abi_born_sibling_zone_reload(terminal: bool) {
                 entry_binding,
                 carrick_core_abi::BornInZoneSource { zone, slot },
                 id,
+                &carrick_sched_core::OwedPasses::new(),
             )
             .unwrap();
         carrick_core::lifecycle::retire_cancelled_pool_member(&*page, entry, control, membership)
@@ -11004,7 +11027,12 @@ fn claimed_abi_born_sibling_zone_reload(terminal: bool) {
         // Failure cleanup can release the same record but has no terminal
         // provenance. Process close and absence alone must still fail closed.
         assert_eq!(
-            zone.release_current(slot, id, &carrick_sched_core::ShortLockSpin),
+            zone.release_current(
+                slot,
+                id,
+                &carrick_sched_core::ShortLockSpin,
+                &carrick_sched_core::OwedPasses::new()
+            ),
             carrick_sched_core::CurrentRelease::Released,
         );
     }
@@ -11143,8 +11171,14 @@ fn first_entry_order(
             record
         }
         FirstEntryArm::ServiceHead => {
-            zone.drive(slot, 1);
-            zone.publish_slot(slot, identity.mm, None, 0);
+            zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+            zone.publish_slot(
+                slot,
+                identity.mm,
+                None,
+                0,
+                &carrick_sched_core::OwedPasses::new(),
+            );
             zone.enter_guest(slot);
             let space = zone
                 .spaces
@@ -11153,7 +11187,10 @@ fn first_entry_order(
             zone.spaces.open(space);
             zone.install_space(slot, identity.mm).unwrap();
             let id = zone.alloc_record(identity).unwrap();
-            assert!(zone.requeue_preempted(slot, id).is_queued());
+            assert!(
+                zone.requeue_preempted(slot, id, &carrick_sched_core::OwedPasses::new())
+                    .is_queued()
+            );
             zone.record_ref(id)
         }
     };

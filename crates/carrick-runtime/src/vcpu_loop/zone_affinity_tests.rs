@@ -207,8 +207,14 @@ fn publish_current(
         &*page as *const _ as u64,
         thread.control_slot() as *const _ as u64,
     );
-    zone.drive(slot, 1);
-    zone.publish_slot(slot, address.mm.raw().get(), Some(slot.raw() as u32), 3);
+    zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+    zone.publish_slot(
+        slot,
+        address.mm.raw().get(),
+        Some(slot.raw() as u32),
+        3,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     zone.enter_guest(slot);
     zone.install_space(slot, address.mm.raw().get()).unwrap();
     let record = zone
@@ -419,7 +425,8 @@ fn production_venue_affinity_survives_host_affinity_round_trip() {
         let mut memory = carrick_kernel::dispatch::LinearMemory::new(0x8000, vec![0; 8]);
         for (index, context, before, after) in [(0, p.root, 1, 2u64), (1, p.sibling, 2, 1u64)] {
             let slot = SlotId::new(index);
-            p.zone.leave_guest(slot, &HostLockWait);
+            p.zone
+                .leave_guest(slot, &HostLockWait, &carrick_sched_core::OwedPasses::new());
             let captured = context
                 .task_binding()
                 .capture(context.thread().key().tid)
@@ -770,21 +777,38 @@ fn switched_self_affinity(exclude: bool) {
         cpu.save(&frame, saved);
         assert!(
             p.zone
-                .requeue_preempted(previous_slot, sibling.id)
+                .requeue_preempted(
+                    previous_slot,
+                    sibling.id,
+                    &carrick_sched_core::OwedPasses::new()
+                )
                 .is_queued()
         );
-        p.zone.leave_guest(previous_slot, &HostLockWait);
+        p.zone.leave_guest(
+            previous_slot,
+            &HostLockWait,
+            &carrick_sched_core::OwedPasses::new(),
+        );
         let mut handed_back = Vec::new();
-        p.zone.drain_slot(previous_slot, &mut |record, discarded| {
-            assert!(!discarded);
-            handed_back.push(record);
-        });
+        p.zone.drain_slot(
+            previous_slot,
+            &mut |record, discarded| {
+                assert!(!discarded);
+                handed_back.push(record);
+            },
+            &carrick_sched_core::OwedPasses::new(),
+        );
         assert_eq!(handed_back, [sibling]);
         p.zone.unhome(previous_slot, sibling.id, 3);
-        assert!(p.zone.requeue_on(slot, sibling.id).is_some());
+        assert!(
+            p.zone
+                .requeue_on(slot, sibling.id, &carrick_sched_core::OwedPasses::new())
+                .is_some()
+        );
         if exclude {
             p.zone.enter_guest(previous_slot);
-            p.zone.enter_idle(previous_slot, false);
+            p.zone
+                .enter_idle(previous_slot, false, &carrick_sched_core::OwedPasses::new());
         }
 
         run_guest(Some(p.root.thread()), Some((p.zone, slot)), || {
@@ -919,6 +943,7 @@ fn affinity_reentry_preserves_retired_terminal_custody() {
         7,
         Some(1),
         context.thread().control_slot().affinity_source(),
+        &carrick_sched_core::OwedPasses::new(),
     );
     let identity = ThreadIdentity {
         tid: 1,
@@ -948,8 +973,18 @@ fn production_venue_remote_set_prompts_a_record_without_host_residency() {
     with_pair(|p| {
         let slot = SlotId::new(1);
         let record = p.sibling.thread().control_slot().zone_record().unwrap().id;
-        assert!(p.zone.requeue_preempted(slot, record).is_queued());
-        assert_eq!(p.zone.switch_in_full(slot).unwrap().record, record);
+        assert!(
+            p.zone
+                .requeue_preempted(slot, record, &carrick_sched_core::OwedPasses::new())
+                .is_queued()
+        );
+        assert_eq!(
+            p.zone
+                .switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record,
+            record
+        );
         let mut physical = NoPhysicalCrossings::default();
         let mut entry = enter_native(&p, 0, &mut physical);
         let mut mask = 1;

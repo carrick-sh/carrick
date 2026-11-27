@@ -4537,8 +4537,12 @@ mod tests {
             let word = std::sync::atomic::AtomicU32::new(0);
             let uaddr = word.as_ptr() as u64;
             let other = park(202, uaddr);
-            zone.drive(SLOT, u64::from(SLOT.raw()) + 1);
-            zone.publish_slot(SLOT, MM, None, 0);
+            zone.drive(
+                SLOT,
+                u64::from(SLOT.raw()) + 1,
+                &carrick_sched_core::OwedPasses::new(),
+            );
+            zone.publish_slot(SLOT, MM, None, 0, &carrick_sched_core::OwedPasses::new());
             let here = carrick_sched_core::ExecutionSlot::zone(SLOT);
             zone.occupancy.vacate_any(here);
             assert!(zone.occupancy.replace(here, 0, MM));

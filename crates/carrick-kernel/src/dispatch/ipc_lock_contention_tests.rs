@@ -373,6 +373,7 @@ fn pipe2_cancel_while_parked_leaks_no_object_or_binding() {
                     carrick_el1_abi::Handback::Cancelled,
                     &crate::el1_zone::HostLockWait,
                     &complete,
+                    &carrick_sched_core::OwedPasses::new(),
                 ),
                 carrick_el1_abi::HostClaim::Deferred
             ));
