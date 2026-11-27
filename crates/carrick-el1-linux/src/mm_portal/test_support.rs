@@ -140,7 +140,11 @@ impl Region {
             layout,
         });
         self.table()
-            .provision_metadata(&NoPin(bank.clone()), self.table().storage_generation())
+            .provision_metadata(
+                &NoPin(bank.clone()),
+                self.table().storage_generation(),
+                &carrick_core_abi::NO_METADATA_WAITERS,
+            )
             .unwrap();
         self.bank = Some(bank);
     }

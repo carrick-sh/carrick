@@ -916,9 +916,10 @@ impl AdmittedCustodyToken {
     ) -> Result<Box<Self>, NativeProcessError> {
         let boxed = FallibleBox::try_reserve()?;
         let mut custody = Vec::new();
+        // Kernel memory, not an admission limit: ENOMEM (#3085).
         custody
             .try_reserve_exact(rows.len())
-            .map_err(|_| NativeProcessError::Exhausted)?;
+            .map_err(|_| NativeProcessError::NoMemory)?;
         custody.extend(rows.iter().copied().map(PortalForkCustody::words));
         let mut reserve = ForkStockSettlement::reserve(
             loan,
@@ -2520,6 +2521,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             }
         };
         let mut custody = Vec::new();
+        // Kernel memory, not an admission limit: ENOMEM (#3085).
         if custody.try_reserve_exact(plan.custody().len()).is_err() {
             child_space.release();
             return Err(abandon_loan(
@@ -2527,7 +2529,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                 self.worker(),
                 &loan,
                 None,
-                NativeProcessError::Exhausted,
+                NativeProcessError::NoMemory,
             ));
         }
         custody.extend_from_slice(plan.custody());
@@ -2560,7 +2562,22 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                         NativeProcessError::Busy,
                     ) {
                         NativeProcessError::Busy => {
-                            demand.supply(owner.roots, &carrick_el1::alloc::GLOBAL_ALLOCATOR)
+                            // Observed before the supply: the wake for a
+                            // grant or a held window it meets (#3085).
+                            let metadata = owner.fork_metadata_wait(
+                                loan.request.operation.mm,
+                                loan.request.operation.incarnation,
+                                self.worker(),
+                            );
+                            match owner.metadata_waiters(self.worker()) {
+                                Ok(waiters) => demand.supply(
+                                    owner.roots,
+                                    &carrick_el1::alloc::GLOBAL_ALLOCATOR,
+                                    metadata,
+                                    &waiters,
+                                ),
+                                Err(_) => NativeProcessError::Stale,
+                            }
                         }
                         unreturned => unreturned,
                     },

@@ -1560,15 +1560,25 @@ fn mounted_static_x86_fork_supplies_node_banks_for_a_large_tree() {
     assert_eq!(native.status.code(), Some(7), "native oracle");
     assert_eq!(native.stdout, b"ok=2\n", "native oracle");
 
-    let guest = run_mounted_binary(&elf, "fork-supplies-node-banks", false);
+    let guest = run_mounted_binary(&elf, "fork-supplies-node-banks", true);
     assert_eq!(
-        (guest.status.code(), guest.stdout.as_slice()),
-        (native.status.code(), native.stdout.as_slice()),
+        (
+            guest.status.code(),
+            guest.stdout.starts_with(native.stdout.as_slice())
+        ),
+        (native.status.code(), true),
         "114 is a fork refused EFAULT, 100 + errno another refusal, 96 a \
          refused mapping, 95 a child that did not exit 0. Stdout: {} Stderr: {}",
         String::from_utf8_lossy(&guest.stdout),
         String::from_utf8_lossy(&guest.stderr)
     );
+    let report: serde_json::Value =
+        serde_json::from_slice(&guest.stdout[native.stdout.len()..]).expect("run JSON receipt");
+    // The path ran: the pool grew by a bank for each fork's tree.
+    let banks = report["report"]["execution_witness"]["reservation_node_banks"]
+        .as_u64()
+        .expect("the KVM run reports its node banks");
+    assert!(banks >= 2, "node banks supplied: {banks}");
 }
 
 /// #2851: seven threads of an exec'd fork child map, protect, advise and

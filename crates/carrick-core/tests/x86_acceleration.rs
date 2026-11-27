@@ -2555,7 +2555,7 @@ fn private_file_4k_grants_scale_past_initial_residency<
     if provision_extensions {
         for index in 0..expected_extensions {
             table
-                .grow(&allocator, index)
+                .grow(&allocator, index, &carrick_core_abi::NO_METADATA_WAITERS)
                 .expect("allocate residency segment");
         }
         assert_eq!(table.extension_count(), expected_extensions);

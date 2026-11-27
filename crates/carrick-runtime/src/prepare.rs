@@ -1085,6 +1085,7 @@ fn run_prepared_kvm_pool_with_debug(
             .and_then(|stats| stats.totals().ok())
             .and_then(|totals| totals.get("pf_taken")),
         large_page_windows: physical.large_page_windows()?,
+        reservation_node_banks: physical.reservation_node_banks()?,
         physical_crossing_families,
         host_forward_families: count_family(forward_families),
         guest_refusal_families: count_family(refusal_families),

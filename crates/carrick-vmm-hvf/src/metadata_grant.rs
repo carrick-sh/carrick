@@ -1644,7 +1644,7 @@ fn retain_fork_custody_rows(
     }
     let mut retained = Vec::new();
     if retained.try_reserve_exact(count).is_err() {
-        return Err(ForkStockRefusal::Capacity);
+        return Err(ForkStockRefusal::NoMemory);
     }
     // The exact live root owns the dispatcher byte-source handles. Frame
     // inventory IDs describe resident mappings and cannot authenticate them.
