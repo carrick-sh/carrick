@@ -38,6 +38,10 @@ impl CarrierMemoryIo for KvmVm {
         unsafe { self.carrier_set_region(kvm_region) }
     }
 
+    fn discovery_prefault(&self, gpa: FrameGpa, len: usize) -> Result<(), OsError> {
+        KvmVm::discovery_prefault(self, gpa.raw(), len as u64)
+    }
+
     fn signal_msi(&self, address_lo: u32, data: u32) -> Result<(), OsError> {
         let sent = self
             .vm

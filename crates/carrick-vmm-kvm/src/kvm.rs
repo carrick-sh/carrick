@@ -1521,6 +1521,59 @@ impl KvmVm {
         })
     }
 
+    /// DISCOVERY (#3105, never lands): `KVM_PRE_FAULT_MEMORY` over
+    /// `gpa..gpa+len` on a side vCPU that never runs.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn discovery_prefault(&self, gpa: u64, len: u64) -> Result<(), OsError> {
+        use std::collections::HashMap;
+        use std::os::fd::AsRawFd;
+        static SIDE: OnceLock<Mutex<HashMap<usize, VcpuFd>>> = OnceLock::new();
+        #[repr(C)]
+        struct PreFault {
+            gpa: u64,
+            size: u64,
+            flags: u64,
+            padding: [u64; 5],
+        }
+        const KVM_PRE_FAULT_MEMORY: libc::c_ulong = 0xC040_AED5;
+        let key = Arc::as_ptr(&self.vm) as usize;
+        let mut map = SIDE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !map.contains_key(&key) {
+            let id = self.next_vcpu_id.fetch_add(1, Ordering::SeqCst);
+            let fd = self
+                .vm
+                .create_vcpu(id)
+                .map_err(|e| os_err("KVM_CREATE_VCPU(prefault)", e))?;
+            self.install_x86_cpuid(&fd, id)?;
+            map.insert(key, fd);
+        }
+        let fd = map.get(&key).expect("inserted").as_raw_fd();
+        let mut arg = PreFault {
+            gpa,
+            size: len,
+            flags: 0,
+            padding: [0; 5],
+        };
+        while arg.size > 0 {
+            // SAFETY: a live vCPU fd and a correctly sized argument.
+            let rc = unsafe { libc::ioctl(fd, KVM_PRE_FAULT_MEMORY as _, &mut arg) };
+            if rc < 0 {
+                let e = std::io::Error::last_os_error();
+                if matches!(e.raw_os_error(), Some(libc::EINTR) | Some(libc::EAGAIN)) {
+                    continue;
+                }
+                return Err(OsError {
+                    context: format!("KVM_PRE_FAULT_MEMORY 0x{:x}+0x{:x}: {e}", arg.gpa, arg.size),
+                    errno: e.raw_os_error().unwrap_or(0),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Dedicated carrier slot namespace; the legacy map_memory allocator is
     /// never used on this privately retained VM.
     #[cfg(target_arch = "x86_64")]

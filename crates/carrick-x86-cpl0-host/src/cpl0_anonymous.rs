@@ -3334,8 +3334,14 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             // normal backing-fault signal; EOF is not a carrier invariant.
             return Ok(Ok(BackingPreparation::FilePastEnd));
         }
-        let gpa = self.anonymous_next_gpa;
         let len = publication_len.next_multiple_of(4096);
+        let mode = crate::carrier_memory::discovery_mode();
+        let gpa = if (mode == "align" || mode == "both") && len >= 2 << 20 {
+            FrameGpa::new(self.anonymous_next_gpa.raw().next_multiple_of(2 << 20))
+        } else {
+            self.anonymous_next_gpa
+        };
+        crate::carrier_memory::discovery_count(len);
         self.anonymous_next_gpa = FrameGpa::new(
             gpa.raw()
                 .checked_add(len)
@@ -3372,6 +3378,11 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             )
             .map_err(|error| fail(error.to_string()))?;
         let handle = handles[0];
+        if mode == "prefault" || mode == "both" {
+            self._vm
+                .discovery_prefault(gpa, len as usize)
+                .map_err(|error| fail(error.to_string()))?;
+        }
         let grant = grants[0];
         let op = WireOp::Prepare {
             publication: GuestLeafPublication {

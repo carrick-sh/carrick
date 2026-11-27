@@ -46,6 +46,40 @@ pub trait CarrierMemoryIo: Send + Sync + 'static {
     /// Report a successful host write to retained RAM before the stopped
     /// carrier may reenter. Hardware carriers need no software cache update.
     fn host_wrote_ram(&self, _start: FrameGpa, _len: usize) {}
+
+    /// DISCOVERY (#3105, never lands).
+    fn discovery_prefault(&self, _gpa: FrameGpa, _len: usize) -> Result<(), carrick_hal::OsError> {
+        Ok(())
+    }
+}
+
+/// DISCOVERY (#3105, never lands): `CARRICK_DISC_3105` = `prefault`,
+/// `align`, `both`, `populate` or unset.
+pub fn discovery_mode() -> &'static str {
+    static MODE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    MODE.get_or_init(|| {
+        extern "C" fn report() {
+            let line = format!(
+                "disc3105 mode={} grants={} grants_2m={}\n",
+                discovery_mode(),
+                DISC_GRANTS.load(Ordering::Relaxed),
+                DISC_GRANTS_2M.load(Ordering::Relaxed)
+            );
+            // SAFETY: a plain write of an owned buffer to fd 2.
+            unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
+        }
+        // SAFETY: registering a plain extern "C" fn.
+        unsafe { libc::atexit(report) };
+        std::env::var("CARRICK_DISC_3105").unwrap_or_default()
+    })
+}
+static DISC_GRANTS: AtomicU64 = AtomicU64::new(0);
+static DISC_GRANTS_2M: AtomicU64 = AtomicU64::new(0);
+pub fn discovery_count(len: u64) {
+    DISC_GRANTS.fetch_add(1, Ordering::Relaxed);
+    if len >= 2 << 20 {
+        DISC_GRANTS_2M.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::cmp::PartialEq, ::core::cmp::Eq)]
@@ -213,7 +247,15 @@ impl BackingExtent {
         let host = extent
             .ptr(base.raw(), len)
             .ok_or_else(|| error("populated extent host mapping"))?;
-        populate_write(host, len)?;
+        let mode = discovery_mode();
+        #[cfg(target_os = "linux")]
+        if mode == "align" || mode == "both" {
+            // SAFETY: the extent's own live mapping.
+            unsafe { libc::madvise(host.cast(), len, libc::MADV_HUGEPAGE) };
+        }
+        if mode == "populate" || mode == "prefault" || mode == "both" {
+            populate_write(host, len)?;
+        }
         Ok(extent)
     }
     /// Retain the original IPC allocation without copying it or assuming
@@ -682,6 +724,13 @@ pub struct CarrierMemory<M: CarrierMemoryIo> {
 impl<M: CarrierMemoryIo> CarrierMemory<M> {
     pub fn vm(&self) -> &M {
         &self.vm
+    }
+
+    /// DISCOVERY (#3105, never lands).
+    pub fn discovery_prefault(&self, gpa: FrameGpa, len: usize) -> Result<(), MemoryError> {
+        self.vm
+            .discovery_prefault(gpa, len)
+            .map_err(|e| error(e.to_string()))
     }
 
     pub fn with_unique_vm_mut<R>(&mut self, f: impl FnOnce(&mut M) -> R) -> Option<R> {
