@@ -487,6 +487,10 @@ struct Slot {
     backing: PreparedBacking,
     frame_identities: BTreeMap<u64, BackingIdentity>,
     inherited_identities: BTreeMap<(NonZeroU64, u64), BackingIdentity>,
+    /// A chunk of one MM's copy-on-write replacement arena (#3099): its
+    /// pages authenticate only through `frame_identities`, one grant at a
+    /// time, never through the slot's own backing identity.
+    arena: bool,
     bootstrap: bool,
     alias_count: usize,
     allowed: Vec<NonZeroU64>,
@@ -896,6 +900,7 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
                     backing: b.clone(),
                     frame_identities: BTreeMap::new(),
                     inherited_identities: BTreeMap::new(),
+                    arena: false,
                     bootstrap: false,
                     alias_count: 0,
                     allowed: Vec::new(),
@@ -1012,9 +1017,18 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
             if slot.drains.iter().any(|drained| drained.mm.raw() != mm) {
                 return Err(error("retired child slot owes a live context drain"));
             }
-            let mapping =
-                carrick_hal::MappingId::from_kernel_allocation(slot.backing.identity.mapping_id);
-            if authority.live_mapping_row(mapping).is_some() {
+            // An arena chunk holds one frame per grant, each retired with
+            // the MM; none may still be mapped.
+            if core::iter::once(&slot.backing.identity)
+                .chain(slot.frame_identities.values())
+                .any(|identity| {
+                    authority
+                        .live_mapping_row(carrick_hal::MappingId::from_kernel_allocation(
+                            identity.mapping_id,
+                        ))
+                        .is_some()
+                })
+            {
                 return Err(error("retired child memslot frame is still mapped"));
             }
             private.push(slot.handle);
@@ -1070,7 +1084,11 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
     ) -> Result<(), MemoryError> {
         self.admit()?;
         let slot = self.record(handle)?;
-        if slot.bootstrap || slot.alias_count != 0 || !slot.frame_identities.is_empty() {
+        if slot.bootstrap
+            || slot.arena
+            || slot.alias_count != 0
+            || !slot.frame_identities.is_empty()
+        {
             return Err(error(
                 "frame identities require an unpublished private extent",
             ));
@@ -1093,9 +1111,118 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
             .frame_identities = map;
         Ok(())
     }
+    /// Install one chunk of `mm`'s copy-on-write replacement arena (#3099):
+    /// one memslot, admitted to `mm` alone, so it retires with `mm`
+    /// (`retire_child`) exactly as a per-grant slot did. No page of it
+    /// authenticates until [`Self::adopt_frames`] binds a grant's frame.
+    /// `backing.identity` is the first grant's, never used to authenticate.
+    pub fn install_arena_chunk(
+        &mut self,
+        mm: NonZeroU64,
+        backing: PreparedBacking,
+    ) -> Result<BackingHandle, MemoryError> {
+        self.admit()?;
+        if !self.roots.contains_key(&mm) || backing.extent.is_host_file_window() {
+            return Err(error("arena chunk for an unrooted MM or a window"));
+        }
+        let handle = *self
+            .install_inner(core::slice::from_ref(&backing))?
+            .first()
+            .ok_or_else(|| error("arena chunk install"))?;
+        let slot = self
+            .slots
+            .get_mut(&handle.slot)
+            .ok_or_else(|| error("missing arena chunk slot"))?;
+        slot.arena = true;
+        slot.allowed.push(mm);
+        self.admitted.entry(mm).or_default().insert(handle.slot);
+        Ok(handle)
+    }
+
+    /// Bind one inventoried grant `[gpa, gpa + len)` inside an arena chunk
+    /// of `mm`, then publish its inventory: a supply with no memslot change
+    /// and no host mapping call. A failure unbinds it and rolls the
+    /// inventory back.
+    pub fn adopt_frames<I: InventoryTransaction>(
+        &mut self,
+        mm: NonZeroU64,
+        gpa: FrameGpa,
+        len: u64,
+        identity: BackingIdentity,
+        inventory: &mut I,
+    ) -> Result<BackingHandle, MemoryError> {
+        self.admit()?;
+        let slot = usize::try_from(len)
+            .ok()
+            .and_then(|len| self.locate(gpa, len))
+            .ok_or_else(|| error("grant outside every arena chunk"))?;
+        let pages = (0..len / PAGE).map(|page| gpa.raw() + page * PAGE);
+        if !slot.arena
+            || slot.allowed != [mm]
+            || len == 0
+            || !gpa.raw().is_multiple_of(PAGE)
+            || !len.is_multiple_of(PAGE)
+            || pages
+                .clone()
+                .any(|page| slot.frame_identities.contains_key(&page))
+        {
+            return Err(error("grant is not a free range of its MM's arena chunk"));
+        }
+        let index = slot.handle.slot;
+        let handle = slot.handle;
+        let frames = &mut self
+            .slots
+            .get_mut(&index)
+            .ok_or_else(|| error("missing arena chunk slot"))?
+            .frame_identities;
+        frames.extend(pages.clone().map(|page| (page, identity)));
+        if let Err(reason) = inventory.publish() {
+            if let Some(slot) = self.slots.get_mut(&index) {
+                for page in pages {
+                    slot.frame_identities.remove(&page);
+                }
+            }
+            self.rollback_inventory(inventory)?;
+            return Err(reason);
+        }
+        Ok(handle)
+    }
+
+    /// Undo an adoption that never reached a guest edit.
+    ///
+    /// # Safety
+    /// The caller holds exact-MM entry exclusion and proves that no guest
+    /// descriptor has named any page of this grant.
+    pub unsafe fn cancel_adopted<I: InventoryTransaction>(
+        &mut self,
+        handle: BackingHandle,
+        gpa: FrameGpa,
+        len: u64,
+        identity: BackingIdentity,
+        inventory: &mut I,
+    ) -> Result<(), MemoryError> {
+        self.admit()?;
+        let slot = self.record(handle)?;
+        let pages = (0..len / PAGE).map(|page| gpa.raw() + page * PAGE);
+        if !slot.arena
+            || pages
+                .clone()
+                .any(|page| slot.frame_identities.get(&page) != Some(&identity))
+        {
+            return Err(error("cancelled grant is not adopted in its chunk"));
+        }
+        self.rollback_inventory(inventory)?;
+        if let Some(slot) = self.slots.get_mut(&handle.slot) {
+            for page in pages {
+                slot.frame_identities.remove(&page);
+            }
+        }
+        Ok(())
+    }
+
     pub fn share(&self, handle: BackingHandle) -> Result<SharedFrameEdge, MemoryError> {
         let slot = self.record(handle)?;
-        if slot.bootstrap || !slot.frame_identities.is_empty() {
+        if slot.bootstrap || slot.arena || !slot.frame_identities.is_empty() {
             return Err(error("bootstrap backing cannot be shared as guest data"));
         }
         Ok(SharedFrameEdge {
@@ -1223,9 +1350,7 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
             .copied()
             .or_else(|| slot.frame_identities.get(&gpa.raw()).copied())
             .or_else(|| {
-                slot.frame_identities
-                    .is_empty()
-                    .then_some(slot.backing.identity)
+                (slot.frame_identities.is_empty() && !slot.arena).then_some(slot.backing.identity)
             })
             .ok_or_else(|| error("missing inherited frame identity"))?;
         let op = DescriptorOp::Map {
@@ -1550,7 +1675,7 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
             .flatten();
         let expected = if let Some(identity) = inherited {
             *identity
-        } else if slot.frame_identities.is_empty() {
+        } else if slot.frame_identities.is_empty() && !slot.arena {
             slot.backing.identity
         } else {
             if op.span().len != PAGE {
