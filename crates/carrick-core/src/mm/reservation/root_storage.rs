@@ -7,6 +7,13 @@ use super::*;
 pub(super) const BANK_NODES: usize = 4096;
 pub(super) const BANKS: usize = 256;
 
+/// The shared node pool's capacity, as an operation observed it before a
+/// `MetadataRequired` refusal ([`SharedReservations::node_capacity`]). Only
+/// the table mints it, so a bank supply always names the capacity it found
+/// too small.
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug, PartialEq, Eq)]
+pub struct NodeCapacity(u32);
+
 #[derive(::core::clone::Clone, ::core::marker::Copy)]
 #[repr(C)]
 struct Bank {
@@ -216,6 +223,28 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
     /// after this changes. The generation is monotonic for this table lifetime.
     pub fn storage_generation(&self) -> u32 {
         self.storage.bank_count()
+    }
+
+    /// The shared pool's node capacity now. An operation samples it before
+    /// it locks a root, so a later [`Self::supply_node_bank`] for the same
+    /// refusal adds nothing when another supplier grew the pool meanwhile.
+    pub fn node_capacity(&self) -> NodeCapacity {
+        NodeCapacity(self.storage.capacity())
+    }
+
+    /// Supply one node bank for an operation that was refused
+    /// `MetadataRequired` against the `observed` capacity, holding no MM
+    /// guard, editor or loan. `Ok` means the pool now holds more than
+    /// `observed` (this bank, or a concurrent one): rerun the operation.
+    /// `Busy` is a concurrent bank publication in its short append window.
+    /// `MetadataRequired` means no bank can be added: the `BANKS` table is
+    /// full, or the allocator has no extent to give.
+    pub fn supply_node_bank(
+        &self,
+        allocator: &impl ReservationMetadataAllocator,
+        observed: NodeCapacity,
+    ) -> Result<(), Refusal> {
+        self.provision_nodes(allocator, observed.0)
     }
 
     /// Supply one bank through GLOBAL_ALLOCATOR (or the same allocator in a
@@ -699,5 +728,44 @@ mod tests {
         assert_eq!(table.storage.capacity(), (NODES + BANK_NODES) as u32);
         // The consumed MM lock was released before provisioning.
         table.lock_identity_for_test(0, a).unwrap();
+    }
+
+    /// #3085: a refused operation supplies one bank against the capacity it
+    /// observed, holding no MM guard; a capacity another supplier already
+    /// raised adds nothing, and a full `BANKS` table refuses for good.
+    #[test]
+    fn node_bank_supply_adds_one_bank_against_the_observed_capacity() {
+        let table = table();
+        let mut backing = vec![0u8; 2 * 1024 * 1024];
+        let allocator = MetadataStorage::new();
+        allocator
+            .admit_bootstrap_region(backing.as_mut_ptr() as u64, backing.len())
+            .unwrap();
+        let observed = table.node_capacity();
+        assert_eq!(observed, NodeCapacity(NODES as u32));
+        table.supply_node_bank(&allocator, observed).unwrap();
+        assert_eq!(table.storage.bank_count(), 1);
+        assert_eq!(
+            table.node_capacity(),
+            NodeCapacity((NODES + BANK_NODES) as u32)
+        );
+        // The same stale observation (a concurrent supplier's) adds nothing,
+        // even with an allocator that has nothing to give.
+        table
+            .supply_node_bank(&MetadataStorage::new(), observed)
+            .unwrap();
+        assert_eq!(table.storage.bank_count(), 1);
+        // An allocator with no extent cannot add a bank.
+        assert_eq!(
+            table.supply_node_bank(&MetadataStorage::new(), table.node_capacity()),
+            Err(Refusal::MetadataRequired)
+        );
+        // A full table refuses before it allocates.
+        table.storage.count.store(BANKS as u32, Ordering::Release);
+        assert_eq!(
+            table.supply_node_bank(&allocator, table.node_capacity()),
+            Err(Refusal::MetadataRequired)
+        );
+        table.storage.count.store(1, Ordering::Release);
     }
 }
