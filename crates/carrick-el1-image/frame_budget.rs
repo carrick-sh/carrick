@@ -182,11 +182,19 @@ impl Frames {
         let entry = vector_size
             + self.required("carrick_el1_syscall")?
             + self.required("::dispatch::dispatch_entry::")?;
+        // The native syscall entry reaches the personality dispatcher (a
+        // never-inlined frame) through the process entry's closure, or
+        // through the refused-call fallback: both stay live beneath every
+        // family the dispatcher serves (#3106 pre-review).
         let native = entry
             + self
                 .required("::dispatch::dispatch_syscall::")?
                 .max(self.required("::dispatch::arm_signal_user_return::")?)
-            + self.required("::aarch64_process::with_process_entry::")?;
+            + self.required("::aarch64_process::with_process_entry::")?
+            + self
+                .maximum("::dispatch_arm_syscall_with_native_process::_$u7b$$u7b$closure")
+                .max(self.maximum("::dispatch::fallback_or_refuse_arm_process_call::"))
+            + self.required("::dispatch::dispatch_syscall_with_native::")?;
         // A park's owed switch runs from `dispatch_entry` (#3093), beside
         // the interrupt and idle entries.
         let resume_entry = entry
@@ -601,6 +609,10 @@ impl Frames {
                 native
                     + self.qualified("El1PendingFamilies", "::poll::")
                     + self.required("::gather_poll::")?
+                    // A fresh readiness set, or a replayed one, beneath it.
+                    + self
+                        .maximum("::readiness_set::serve::")
+                        .max(self.maximum("::readiness_set::resume::"))
                     + self.sum(&[
                         "::resolve_poll::",
                         "::resolve_poll_with_host_readiness::",
@@ -1065,6 +1077,7 @@ mod tests {
             "x::fork_child_context_boxed::h0",
             "x::wait_query::h0",
             "x::gather_poll::h0",
+            "x::dispatch::dispatch_syscall_with_native::h0",
             "x::dispatch::arm_native_service_exit::h0",
             "x::park_service::h0",
             "x::begin_service_inner::h0",
@@ -1180,6 +1193,34 @@ mod tests {
         let error = frames.check(16384, 288).unwrap_err();
         assert!(error.contains("ring poll readiness"), "{error}");
         assert!(!error.contains("ring completed copyout"), "{error}");
+    }
+
+    /// #3106 pre-review: the personality dispatcher, the closure that
+    /// reaches it and a readiness set's serve stay live beneath a ring poll,
+    /// so each is charged to the chains that run beneath them.
+    #[test]
+    fn ring_poll_chains_charge_the_dispatcher_and_the_readiness_set() {
+        for (frame, chains) in [
+            (
+                "x::dispatch::dispatch_syscall_with_native::h1",
+                &["ring completed copyout", "ring poll readiness"][..],
+            ),
+            (
+                "x::dispatch::dispatch_arm_syscall_with_native_process::_$u7b$$u7b$closure$u7d$$u7d$::h1",
+                &["ring completed copyout", "ring poll readiness"][..],
+            ),
+            (
+                "x::ipc::readiness_set::serve::h1",
+                &["ring poll readiness"][..],
+            ),
+        ] {
+            let mut frames = small_frames();
+            frames.0.insert(frame.to_owned(), 12000);
+            let error = frames.check(16384, 288).unwrap_err();
+            for chain in chains {
+                assert!(error.contains(chain), "{frame}: {chain}: {error}");
+            }
+        }
     }
 
     #[test]
