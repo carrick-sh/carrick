@@ -1534,9 +1534,9 @@ mod test_support {
                     .then_some(0)
             }
             INJECT_RESCHED_BUSY_CENSUS => {
-                let (injected, resent, waits, site) =
+                let (injected, resent, waits, site, stalls) =
                     carrick_el1::isa::x86::interrupt::resched_busy_census();
-                Some(injected | resent << 16 | waits << 32 | u64::from(site) << 48)
+                Some(injected | resent << 16 | waits << 32 | u64::from(site) << 48 | stalls << 56)
             }
             INJECT_EDITOR_RELEASED_BEFORE_PARK_ONCE => EARLY_RELEASE_TASK
                 .compare_exchange(0, binding.task_address, Ordering::AcqRel, Ordering::Acquire)

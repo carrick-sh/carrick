@@ -63,7 +63,9 @@ pub fn schedule(slot: SlotId) -> ! {
         }
         // Each pass is a delivery point for the reschedule IPIs this CPU
         // owes after a busy ICR (#3083); the HLT below never sleeps owing one.
-        let _ = carrick_el1::isa::x86::interrupt::deliver_owed_resched();
+        let _ = carrick_el1::isa::x86::interrupt::deliver_owed_resched(
+            carrick_el1::isa::x86::interrupt::DeliveryPoint::Idle,
+        );
         #[cfg(feature = "test-support")]
         crate::test_support::hold_idle_scan(slot);
         #[cfg(feature = "test-support")]
@@ -378,7 +380,9 @@ pub fn schedule(slot: SlotId) -> ! {
             // busy, #3083) is resent here; one still busy keeps this CPU
             // awake for another pass, so it never sleeps owing a wake.
             if !carrick_el1::substrate::sched::idle_wake_owed(current, source.zone, slot)
-                && carrick_el1::isa::x86::interrupt::deliver_owed_resched()
+                && carrick_el1::isa::x86::interrupt::deliver_owed_resched(
+                    carrick_el1::isa::x86::interrupt::DeliveryPoint::Idle,
+                )
             {
                 unsafe {
                     core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));

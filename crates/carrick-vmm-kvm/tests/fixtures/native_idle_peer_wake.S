@@ -60,7 +60,7 @@
  * at the bounded wait, never loop; the fixture never reaches its exit.
  *
  * Exit 7: the peer took the publication, and the ordered pass ran once.
- * 81: arming failed; 82: the peer never reached its stop; 83: the
+ * 81: arming failed; 83: the
  * publication failed; 84: releasing the peer failed; 90: the ordered pass
  * ran once and the peer slept past the publication; 91: the peer took the
  * publication but the ordered pass did not run exactly once; 92: the peer
@@ -81,7 +81,9 @@
 
 /* Census: sends found busy | resent << 16 | busy-to-idle transitions a
  * wait saw << 32 | the last resend's return to user << 48 (1: the
- * syscall's own). */
+ * syscall's own) | injected stalls that ran << 56. The bound runs on the
+ * witness clock under injection (one tick per ICR operation, twice the
+ * bound per stall), so host load never moves a verdict. */
 #ifdef ICR_FLAPPING
 #define LAST_RETURN 1
 #define BUSY_INJECT     INJECT_RESCHED_ICR_FLAPPING
@@ -101,12 +103,16 @@
 #endif
 #if defined(LAST_RETURN_STALLED_AFTER_SEND)
 #define BUSY_RESCHED 1
-#define BUSY_AFTER_HOLD 0x0001000000010003
-#define BUSY_AT_END     0x0001000000010003
+#define BUSY_AFTER_HOLD 0x0101000000010003
+#define BUSY_AT_END     0x0101000000010003
+#elif defined(LAST_RETURN_STALLED_AFTER_POLL)
+#define BUSY_RESCHED 1
+#define BUSY_AFTER_HOLD 0x0101000100010002
+#define BUSY_AT_END     0x0101000100010002
 #elif defined(LAST_RETURN_STALLED)
 #define BUSY_RESCHED 1
-#define BUSY_AFTER_HOLD 0x0001000000010002
-#define BUSY_AT_END     0x0001000000010002
+#define BUSY_AFTER_HOLD 0x0101000000010002
+#define BUSY_AT_END     0x0101000000010002
 #elif defined(LAST_RETURN)
 #define BUSY_RESCHED 1
 #define BUSY_AFTER_HOLD 0x0001000100010002
@@ -137,14 +143,14 @@ _start:
     test %rax, %rax
     jnz fail_arm
 
-    mov $POLL_LIMIT, %r13
+    /* Wait for the peer's own stop, the event itself (#3136): a count of
+     * polls ran out under load while the peer vCPU was unscheduled. The
+     * bounded child is the hang bound. */
 reach_loop:
     mov $INJECT_ORDER_PEER_REACHED, %rax
     syscall
     cmp $1, %rax
     je reached
-    dec %r13
-    jz fail_reach
     pause
     jmp reach_loop
 reached:
@@ -232,9 +238,6 @@ taken:
 
 fail_arm:
     mov $81, %edi
-    jmp die
-fail_reach:
-    mov $82, %edi
     jmp die
 fail_publish:
     mov $83, %edi
