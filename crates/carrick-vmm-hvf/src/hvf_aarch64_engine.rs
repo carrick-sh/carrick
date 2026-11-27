@@ -3169,11 +3169,6 @@ impl Aarch64Vmm for HvfAarch64Vmm {
         ))
     }
 
-    /// HVF's transfer custody serves owner file grants.
-    fn private_file_venue(&self) -> carrick_guest_mem::PrivateFileVenue {
-        carrick_guest_mem::PrivateFileVenue::OwnerGrant
-    }
-
     fn prepare_owner_frame_grant(
         &self,
         target: carrick_aarch64::user_transfer::TransferTarget,

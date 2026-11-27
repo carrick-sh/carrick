@@ -33,6 +33,11 @@ pub trait CarrierReservationAccess:
 
     /// The carrier's guest COW grant settlement, if it settles any.
     fn guest_cow_settlement(&self) -> Option<Arc<dyn carrick_el1_abi::CowGrantSettlement>>;
+
+    /// Who serves this carrier's delegated private file pages
+    /// ([`HostReservationProvider::private_file_venue`]): `OwnerGrant` only
+    /// if its owner frame grant serves them.
+    fn private_file_venue(&self) -> carrick_guest_mem::PrivateFileVenue;
 }
 
 /// The reservation provider of one carrier generation.
@@ -93,6 +98,10 @@ fn table<A: CarrierReservationAccess>(access: &A) -> Result<&SharedReservations,
 }
 
 impl<A: CarrierReservationAccess> HostReservationProvider for CarrierReservations<A> {
+    fn private_file_venue(&self) -> carrick_guest_mem::PrivateFileVenue {
+        self.access.private_file_venue()
+    }
+
     fn address_space_backing(&self) -> Option<Arc<dyn AddressSpaceBacking>> {
         self.access.region().ok()?;
         Some(Arc::new(CarrierPublicationBacking(Arc::clone(

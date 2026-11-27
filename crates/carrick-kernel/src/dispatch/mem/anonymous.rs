@@ -1263,6 +1263,26 @@ impl MemState {
         )
     }
 
+    /// The retained private file source the root takes with the row
+    /// `[start, end)`, if any: the one rule for every import of a private
+    /// file row into the root (admission and the host-row mirror; mmap asks
+    /// the same [`DelegatedRoot::takes_private_files`]). A root whose carrier
+    /// answered `HostEager` takes none, so the row stays a host-owned node
+    /// that keeps its host VMA, file map and protection.
+    pub(in crate::dispatch) fn root_file_source(
+        &self,
+        root: &DelegatedRoot,
+        start: u64,
+        end: u64,
+    ) -> Option<&super::PrivateFileMapEntry> {
+        if !root.takes_private_files() {
+            return None;
+        }
+        self.private_file_maps
+            .iter()
+            .find(|source| source.start <= start && source.end >= end)
+    }
+
     /// Mirror the host rows of `[start, end)` into the root as opaque nodes,
     /// replacing whatever the root held there. No-op in host setup and for a
     /// range the pending host proposal owns.
@@ -1343,9 +1363,7 @@ impl MemState {
                 boundaries.dedup();
                 for span in boundaries.windows(2) {
                     let backing = self
-                        .private_file_maps
-                        .iter()
-                        .find(|source| source.start <= span[0] && source.end >= span[1])
+                        .root_file_source(&root, span[0], span[1])
                         .map(|source| {
                             let lease = self
                                 .host_backing_custody

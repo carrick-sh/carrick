@@ -1353,6 +1353,9 @@ fn host_root_returns_stay_owed_until_its_frames_are_released() {
 
 struct RetainedTestProvider(Arc<RetainedPublicationFixture>);
 impl crate::dispatch::mem::el1_reservations::HostReservationProvider for RetainedTestProvider {
+    fn private_file_venue(&self) -> carrick_guest_mem::PrivateFileVenue {
+        carrick_guest_mem::PrivateFileVenue::OwnerGrant
+    }
     fn address_space_backing(&self) -> Option<Arc<dyn AddressSpaceBacking>> {
         Some(self.0.clone())
     }

@@ -1532,6 +1532,9 @@ mod reservation_provider_tests {
 
     struct Provider(Arc<AtomicUsize>);
     impl HostReservationProvider for Provider {
+        fn private_file_venue(&self) -> carrick_guest_mem::PrivateFileVenue {
+            carrick_guest_mem::PrivateFileVenue::OwnerGrant
+        }
         fn prepare(&self) -> Result<Box<dyn PreparedHostReservations>, Refusal> {
             self.0.fetch_add(1, Ordering::Relaxed);
             Err(Refusal::MetadataRequired)

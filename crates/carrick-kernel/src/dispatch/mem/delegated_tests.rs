@@ -226,13 +226,18 @@ impl PreparedHostReservations for View {
         result
     }
 }
-struct Provider(Carrier);
+/// The reference carrier provider, answering the private file venue its
+/// test names.
+struct Provider(Carrier, carrick_guest_mem::PrivateFileVenue);
 /// Carrier backing unavailable, rather than a Linux map-count limit.
 struct UnavailableProvider {
     carrier: Carrier,
     requests: Arc<std::sync::atomic::AtomicUsize>,
 }
 impl HostReservationProvider for UnavailableProvider {
+    fn private_file_venue(&self) -> carrick_guest_mem::PrivateFileVenue {
+        carrick_guest_mem::PrivateFileVenue::OwnerGrant
+    }
     fn address_space_backing(
         &self,
     ) -> Option<Arc<dyn crate::kernel::mm_occupancy::AddressSpaceBacking>> {
@@ -252,6 +257,9 @@ impl HostReservationProvider for UnavailableProvider {
     }
 }
 impl HostReservationProvider for Provider {
+    fn private_file_venue(&self) -> carrick_guest_mem::PrivateFileVenue {
+        self.1
+    }
     fn address_space_backing(
         &self,
     ) -> Option<Arc<dyn crate::kernel::mm_occupancy::AddressSpaceBacking>> {
@@ -381,13 +389,33 @@ impl Root {
         root
     }
 
+    /// [`Self::admit`] under a carrier whose provider answers `venue`.
+    pub(in crate::dispatch) fn admit_with_venue(
+        dispatcher: &SyscallDispatcher,
+        venue: carrick_guest_mem::PrivateFileVenue,
+    ) -> Self {
+        let root = Self::publish_with_venue(dispatcher, venue);
+        assert_eq!(
+            admit(dispatcher, El1AdmissionOrigin::Bind, true),
+            Ok(El1Admission::Delegated)
+        );
+        root
+    }
+
     /// Publish this dispatcher MM's root and install the carrier provider,
     /// leaving the MM in host setup.
     fn publish(dispatcher: &SyscallDispatcher) -> Self {
+        Self::publish_with_venue(dispatcher, carrick_guest_mem::PrivateFileVenue::OwnerGrant)
+    }
+
+    fn publish_with_venue(
+        dispatcher: &SyscallDispatcher,
+        venue: carrick_guest_mem::PrivateFileVenue,
+    ) -> Self {
         let carrier = Carrier::new();
         let mm = carrier.publish(dispatcher);
         dispatcher
-            .install_reservation_provider(Arc::new(Provider(carrier.clone())))
+            .install_reservation_provider(Arc::new(Provider(carrier.clone(), venue)))
             .unwrap();
         Self { carrier, mm }
     }
@@ -1316,6 +1344,177 @@ fn admitted_private_file_mmap_publishes_owner_backing_before_fork() {
         root.lock().mapping(file).unwrap().host_backing.is_some(),
         "post-admission private mmap loses its retained source in the owner tree"
     );
+}
+
+/// Whether `[start, end)` is a host-owned private file row: the host keeps
+/// its VMA, and no root node over it holds a retained file source (the
+/// root would then own it, and only an owner frame grant could serve it).
+fn host_owned_file_row(dispatcher: &SyscallDispatcher, root: &Root, start: u64, end: u64) -> bool {
+    let host_row = {
+        let authority = dispatcher.mem();
+        let mem = authority.lock();
+        (start..end).step_by(PAGE as usize).all(|page| {
+            mem.semantic_vmas.iter().any(|vma| {
+                vma.start <= page
+                    && page < vma.end
+                    && vma.provenance == super::vma::VmaBackingProvenance::PrivateFile
+            })
+        })
+    };
+    let mut retained = false;
+    root.lock()
+        .observe_mappings(&mut |mapping| {
+            if mapping.range.start() < end && start < mapping.range.end() {
+                retained |= mapping.host_backing.is_some();
+            }
+        })
+        .unwrap();
+    host_row && !retained
+}
+
+/// A carrier whose provider answers `HostEager` (the soft carrier, which
+/// serves no owner frame grant) keeps every private file row on the host,
+/// through admission, mmap and each later edit of the row: `madvise(DONTNEED)`,
+/// `mprotect` from `PROT_NONE`, `mremap` growth, `MAP_FIXED` over it and
+/// `munmap`. Each step is answered by the host and leaves the row host-owned
+/// with the file's bytes; none hands it to the root. One row is imported at
+/// admission and one mapped after it, through the production dispatch.
+#[test]
+fn host_eager_root_keeps_private_file_rows_host_owned_through_their_lifecycle() {
+    const MADV_DONTNEED: u64 = 4;
+    let mut dispatcher = SyscallDispatcher::new();
+    let file: Vec<u8> = (0..4u8)
+        .flat_map(|page| std::iter::repeat_n(0x10 + page, PAGE as usize))
+        .collect();
+    install_host_file_fd(&dispatcher, FILE_FD, &file);
+    let mut memory = arena_memory();
+    let page_of = |index: u8| vec![0x10 + index; 8];
+    let imported = returned(host_mmap(
+        &mut dispatcher,
+        &mut memory,
+        0,
+        2 * PAGE,
+        RW,
+        LINUX_MAP_PRIVATE,
+        FILE_FD,
+    )) as u64;
+    let root = Root::admit_with_venue(&dispatcher, carrick_guest_mem::PrivateFileVenue::HostEager);
+    assert!(
+        host_owned_file_row(&dispatcher, &root, imported, imported + 2 * PAGE),
+        "admission handed a HostEager carrier's private file row to the root"
+    );
+    let mapped = returned(host_mmap(
+        &mut dispatcher,
+        &mut memory,
+        0,
+        2 * PAGE,
+        RW,
+        LINUX_MAP_PRIVATE,
+        FILE_FD,
+    )) as u64;
+    assert!(
+        host_owned_file_row(&dispatcher, &root, mapped, mapped + 2 * PAGE),
+        "mmap handed a HostEager carrier's private file row to the root"
+    );
+    for row in [imported, mapped] {
+        assert_eq!(memory.read_bytes(row, 8).unwrap(), page_of(0));
+        assert_eq!(memory.read_bytes(row + PAGE, 8).unwrap(), page_of(1));
+    }
+
+    // madvise(MADV_DONTNEED) drops a dirtied private page; the next read
+    // sees the file's bytes again.
+    memory.write_bytes(mapped, b"dirty!!!").unwrap();
+    assert_eq!(
+        returned(call(
+            &mut dispatcher,
+            &mut memory,
+            SYS_MADVISE,
+            [mapped, PAGE, MADV_DONTNEED, 0, 0, 0]
+        )),
+        0
+    );
+    assert!(host_owned_file_row(
+        &dispatcher,
+        &root,
+        mapped,
+        mapped + 2 * PAGE
+    ));
+    assert_eq!(memory.read_bytes(mapped, 8).unwrap(), page_of(0));
+
+    // mprotect to PROT_NONE, then back to PROT_READ: the row keeps its bytes.
+    for prot in [0, LINUX_PROT_READ] {
+        assert_eq!(
+            returned(call(
+                &mut dispatcher,
+                &mut memory,
+                SYS_MPROTECT,
+                [mapped + PAGE, PAGE, prot, 0, 0, 0]
+            )),
+            0
+        );
+        assert!(host_owned_file_row(
+            &dispatcher,
+            &root,
+            mapped,
+            mapped + 2 * PAGE
+        ));
+    }
+    let row = proc_row_at(&dispatcher, mapped + PAGE).unwrap();
+    assert!(row.read && !row.write, "{row:?}");
+    assert_eq!(memory.read_bytes(mapped + PAGE, 8).unwrap(), page_of(1));
+
+    // mremap growth: the grown row stays host-owned with its bytes.
+    let grown = returned(mremap(
+        &mut dispatcher,
+        &mut memory,
+        [imported, 2 * PAGE, 3 * PAGE, MREMAP_MAYMOVE, 0],
+    )) as u64;
+    assert!(host_owned_file_row(
+        &dispatcher,
+        &root,
+        grown,
+        grown + 3 * PAGE
+    ));
+    assert_eq!(memory.read_bytes(grown, 8).unwrap(), page_of(0));
+    assert_eq!(memory.read_bytes(grown + PAGE, 8).unwrap(), page_of(1));
+
+    // MAP_FIXED anonymous memory over the middle page replaces only it.
+    assert_eq!(
+        returned(host_mmap(
+            &mut dispatcher,
+            &mut memory,
+            grown + PAGE,
+            PAGE,
+            RW,
+            ANON | LINUX_MAP_FIXED,
+            -1,
+        )) as u64,
+        grown + PAGE
+    );
+    assert_eq!(memory.read_bytes(grown + PAGE, 8).unwrap(), vec![0; 8]);
+    assert!(host_owned_file_row(&dispatcher, &root, grown, grown + PAGE));
+    assert!(host_owned_file_row(
+        &dispatcher,
+        &root,
+        grown + 2 * PAGE,
+        grown + 3 * PAGE
+    ));
+    assert_eq!(memory.read_bytes(grown, 8).unwrap(), page_of(0));
+
+    // munmap retires the rows, with no row left on the host or in the root.
+    for (start, len) in [(grown, 3 * PAGE), (mapped, 2 * PAGE)] {
+        assert_eq!(
+            returned(call(
+                &mut dispatcher,
+                &mut memory,
+                SYS_MUNMAP,
+                [start, len, 0, 0, 0, 0]
+            )),
+            0
+        );
+        assert_eq!(proc_row_at(&dispatcher, start), None);
+        assert_eq!(root.node(start), None);
+    }
 }
 
 /// A read-only `MAP_SHARED` file mapping the ring serves is held in private
@@ -3872,7 +4071,10 @@ fn delegated_initial_reserve_refusal_leaves_the_mm_unadmitted() {
     let child = SyscallDispatcher::new();
     let child_mm = root.carrier.publish(&child);
     child
-        .install_reservation_provider(Arc::new(Provider(root.carrier.clone())))
+        .install_reservation_provider(Arc::new(Provider(
+            root.carrier.clone(),
+            carrick_guest_mem::PrivateFileVenue::OwnerGrant,
+        )))
         .unwrap();
     let before = proc_rows(&child);
     assert_eq!(
@@ -9405,7 +9607,10 @@ mod private_file_owner {
         // A second process of the same carrier: its own MM slot and provider.
         let second_root = first_root.publish_child(&second);
         second
-            .install_reservation_provider(Arc::new(Provider(first_root.carrier.clone())))
+            .install_reservation_provider(Arc::new(Provider(
+                first_root.carrier.clone(),
+                carrick_guest_mem::PrivateFileVenue::OwnerGrant,
+            )))
             .unwrap();
         assert_eq!(
             admit(&second, El1AdmissionOrigin::Bind, true),
