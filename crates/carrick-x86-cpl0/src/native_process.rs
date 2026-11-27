@@ -959,13 +959,17 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
                 }
             };
             match result {
-                Ok(carrick_core::mm::frames::GrantServeOutcome::Completed(receipt)) => Some(
-                    matches!(receipt.outcome,
-                    carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(_)
-                    | carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Refused(
-                        carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::Occupied
-                        | carrick_mmu_core::aarch64::descriptor_txn::DescriptorRefusal::StaleRoot)),
-                ),
+                Ok(carrick_core::mm::frames::GrantServeOutcome::Completed(receipt)) => {
+                    Some(match receipt.outcome {
+                        carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Applied(
+                            _,
+                        ) => true,
+                        carrick_mmu_core::aarch64::descriptor_txn::DescriptorOutcome::Refused(
+                            reason,
+                        ) => carrick_core::mm::frames::refusal_is_stale_selection(reason),
+                        _ => false,
+                    })
+                }
                 Ok(carrick_core::mm::frames::GrantServeOutcome::Empty) => Some(false),
                 Ok(carrick_core::mm::frames::GrantServeOutcome::NotNow(continuation)) => {
                     return Err(MmError::Wait(
