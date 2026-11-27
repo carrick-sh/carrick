@@ -71,7 +71,8 @@ impl OwnerForkMmu for X86Mmu {
         word & RETIRED != 0 && word & (PRESENT | PREPARED) == 0
     }
     fn is_absent_unowned(word: u64) -> bool {
-        word & (PRESENT | PREPARED | RETIRED) == 0
+        // A no-access leaf is not present yet still owns its frame (#2875).
+        word & (PRESENT | PREPARED | RETIRED | NO_ACCESS) == 0
     }
     fn is_owned_resident(word: u64) -> bool {
         word & (PRESENT | PREPARED | MAY_WRITE) == PRESENT | MAY_WRITE

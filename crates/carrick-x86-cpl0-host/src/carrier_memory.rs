@@ -1945,6 +1945,11 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
                         && (!permissions.executable || entry & MAY_EXEC != 0)
                         && Self::matches_permissions(entry, permissions)
                 }
+                // A PROT_NONE leaf keeps its frame, not present (#2875).
+                DescriptorOp::ProtectNone { .. } => {
+                    entry & (PRESENT | PRIVATE | NO_ACCESS) == PRIVATE | NO_ACCESS
+                        && entry & ADDRESS != 0
+                }
                 // Every armed leaf keeps its frame and has no hardware
                 // write; MAY_WRITE is its write intent (#3121).
                 DescriptorOp::ArmCow(_) => {
