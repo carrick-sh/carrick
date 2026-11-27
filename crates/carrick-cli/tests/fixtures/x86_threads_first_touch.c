@@ -15,6 +15,13 @@
 #ifndef PAGES
 #define PAGES 256
 #endif
+// -DLARGE_ALIGN: each thread touches PAGES pages from a 2 MiB boundary of a
+// mapping 2 MiB longer, as a 2 MiB-aligned heap arena is laid out.
+#ifdef LARGE_ALIGN
+#define ALIGN_SLACK (2L << 20)
+#else
+#define ALIGN_SLACK 0L
+#endif
 #define THREADS 4
 #define PAGE 4096L
 
@@ -71,7 +78,9 @@ static void futex_wake(int *word) {
 
 static void worker(long index) {
     while (!LOAD(go)) futex_wait(&go, 0);
-    long *map = (long *)sc(9, 0, PAGES * PAGE, PROT_RW, MAP_FLAGS, -1, 0);
+    long *map = (long *)sc(9, 0, PAGES * PAGE + ALIGN_SLACK, PROT_RW, MAP_FLAGS, -1, 0);
+    if ((unsigned long)map <= -4096UL && ALIGN_SLACK)
+        map = (long *)(((unsigned long)map + ALIGN_SLACK - 1) & ~(unsigned long)(ALIGN_SLACK - 1));
     if ((unsigned long)map > -4096UL) {
         long none = 0;
         __atomic_compare_exchange_n(&map_errno, &none, -(long)map, 0, __ATOMIC_RELEASE, __ATOMIC_RELAXED);

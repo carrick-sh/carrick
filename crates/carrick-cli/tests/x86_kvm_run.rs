@@ -1866,6 +1866,107 @@ fn mounted_static_x86_threads_first_touch_publishes_no_shootdown_per_fault() {
     );
 }
 
+/// #3105: four threads first-touch fresh pages of 2 MiB-aligned heaps, as
+/// Go's arenas are laid out. Each fresh guest-physical page used to cost the
+/// hypervisor one stage-2 page fault, a nested exit of about 7.6 us on KVM,
+/// because every owner-grant window was a page-aligned host mapping at a
+/// page-aligned GPA and KVM filled its EPT/NPT one 4 KiB entry at a time.
+/// A window of whole 2 MiB pages is now placed on a 2 MiB GPA boundary with
+/// a 2 MiB-aligned, huge-page-advised host mapping, so the hypervisor maps
+/// it with one large entry. Contract `x86.mm.first-touch-stage2-fill` (its
+/// affine `host_stage2_faults` budget, read from the registry): the run's
+/// stage-2 faults, from the carrier's own `KVM_GET_STATS_FD`, stay bounded
+/// as the pages touched grow from 4 x 512 to 4 x 2048.
+#[test]
+fn mounted_static_x86_threads_first_touch_of_large_windows_takes_no_stage2_fault_per_page() {
+    if skip_without_kvm() {
+        return;
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let registry = carrick_conformance_contract::ContractRegistry::load(&root)
+        .expect("the conformance contract registry loads");
+    let contract = registry
+        .require("x86.mm.first-touch-stage2-fill")
+        .expect("contract x86.mm.first-touch-stage2-fill");
+    let (base, per_unit) = contract
+        .structural_budgets
+        .iter()
+        .find_map(|budget| match budget.budget {
+            carrick_conformance_contract::Budget::Affine {
+                metric: carrick_conformance_contract::WorkMetric::HostStage2Faults,
+                base,
+                per_unit,
+            } => Some((base, per_unit)),
+            _ => None,
+        })
+        .expect("an affine host_stage2_faults budget");
+    let dir = tempfile::tempdir().unwrap();
+    let mut observed = Vec::new();
+    for pages in [512u64, 1024, 2048] {
+        let elf = dir
+            .path()
+            .join(format!("threads-first-touch-large-{pages}"));
+        let define = format!("-DPAGES={pages}");
+        compile_assembly_with_flags(
+            "x86_threads_first_touch.c",
+            &elf,
+            &[
+                "-fno-stack-protector",
+                "-fno-asynchronous-unwind-tables",
+                "-O1",
+                "-DLARGE_ALIGN",
+                &define,
+            ],
+        );
+        let native = Command::new(&elf)
+            .timeout(Duration::from_secs(10))
+            .output()
+            .expect("run native threads-first-touch oracle");
+        assert_eq!(native.status.code(), Some(7), "native oracle");
+        assert_eq!(native.stdout, b"ok\n", "native oracle");
+
+        let guest = run_mounted_binary(&elf, &format!("threads-first-touch-large-{pages}"), true);
+        assert_eq!(
+            guest.status.code(),
+            Some(7),
+            "93 is a failed map (its errno is printed), 94 a thread that did not \
+             start, 99 a page that did not read back. Stdout: {} Stderr: {}",
+            String::from_utf8_lossy(&guest.stdout),
+            String::from_utf8_lossy(&guest.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(
+            guest
+                .stdout
+                .strip_prefix(b"ok\n".as_slice())
+                .expect("threads-first-touch stdout"),
+        )
+        .expect("run JSON receipt");
+        let witness = &report["report"]["execution_witness"];
+        let faults = witness["host_stage2_faults"].as_u64().expect(
+            "IncompleteMeasurement: the KVM run reports no host_stage2_faults \
+             (KVM_GET_STATS_FD pf_taken)",
+        );
+        let private_pages = witness["anonymous_private_pages"]
+            .as_u64()
+            .expect("the KVM run reports its private pages");
+        // The touches happened: every fresh page became a private leaf, so
+        // a run that faulted nothing cannot pass for the wrong reason.
+        assert!(
+            private_pages >= 4 * pages,
+            "{pages} pages per thread made only {private_pages} private pages"
+        );
+        observed.push((pages, faults));
+    }
+    println!("first-touch stage-2 faults (pages per thread, count): {observed:?}");
+    assert!(
+        observed
+            .iter()
+            .all(|(pages, faults)| *faults <= base + per_unit * pages),
+        "a first touch of a large-page window took a stage-2 fault per page: \
+         (pages per thread, faults) {observed:?}, budget {base} + {per_unit} per page"
+    );
+}
+
 /// #2890: the Go runtime's `fork/exec` once it runs more than one P. A
 /// thread forks with `clone(CLONE_VM | CLONE_VFORK)` on its own stack and
 /// execs this image sixteen times (`x86_threads_vfork_exec.c`). `go build`

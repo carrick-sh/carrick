@@ -940,6 +940,8 @@ fn run_prepared_kvm_pool_with_debug(
             })?;
     }
     let census_scope = dispatcher.container().launch().carrier_scope_id.clone();
+    // Opened before the carrier is consumed; read after the run settles.
+    let kernel_stats = machine.kernel_stats().ok();
     let KvmRootPool {
         physical,
         reporter,
@@ -1078,6 +1080,10 @@ fn run_prepared_kvm_pool_with_debug(
         cross_mm_private_aliases: physical.cross_mm_private_aliases()?,
         peer_active_private_grants: physical.peer_active_private_grants()?,
         shootdown_rendezvous: physical.shootdown_rendezvous()?,
+        host_stage2_faults: kernel_stats
+            .as_ref()
+            .and_then(|stats| stats.totals().ok())
+            .and_then(|totals| totals.get("pf_taken")),
         physical_crossing_families,
         host_forward_families: count_family(forward_families),
         guest_refusal_families: count_family(refusal_families),
