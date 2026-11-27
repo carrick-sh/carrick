@@ -302,6 +302,9 @@ struct Words {
     /// successive compare-exchange on one: a sibling CPU's page walker
     /// (`ACCESSED`/`DIRTY`), or any other change (#3133).
     interleaved: RefCell<VecDeque<u64>>,
+    /// `(pa, n, bits)`: the walker ORs `bits` into the present entry at `pa`
+    /// just before its `n`th load (#3133, an update during planning).
+    load_walker: Cell<Option<(u64, usize, u64)>>,
 }
 impl Words {
     fn new() -> Self {
@@ -313,12 +316,23 @@ impl Words {
             fail: Cell::new(usize::MAX),
             invalidations: Cell::new(0),
             interleaved: RefCell::new(VecDeque::new()),
+            load_walker: Cell::new(None),
         }
     }
 }
 impl LiveDescriptorWords for Words {
     fn load(&self, pa: u64) -> Result<u64, DescriptorRefusal> {
         self.reads.set(self.reads.get() + 1);
+        if let Some((at, n, bits)) = self.load_walker.get()
+            && at == pa
+        {
+            self.load_walker.set((n > 1).then_some((at, n - 1, bits)));
+            if let (1, Some(entry)) = (n, self.words.borrow_mut().get_mut(&pa))
+                && *entry & PRESENT != 0
+            {
+                *entry |= bits;
+            }
+        }
         self.words
             .borrow()
             .get(&pa)
@@ -2315,4 +2329,33 @@ fn walker_bits_are_only_added_accessed_or_dirty_on_a_present_entry() {
         walker_set_bits(leaf & !PRESENT, leaf & !PRESENT | ACCESSED),
         None
     );
+}
+
+/// #3133: the walker may also set `DIRTY` between the plan's first read of
+/// a leaf (which derives the new word) and its read of the word it replaces.
+/// The edit must not store a word that clears it.
+#[test]
+fn a_walker_update_during_planning_is_kept() {
+    let words = Words::new();
+    let span = two_private_rw_pages(&words);
+    let leaf = leaf_at(&words, span.va);
+    let pa = words
+        .words
+        .borrow()
+        .iter()
+        .find(|(_, word)| **word == leaf)
+        .map(|(pa, _)| *pa)
+        .unwrap();
+    words.load_walker.set(Some((pa, 2, DIRTY)));
+    assert!(matches!(
+        apply(&words, protect_read_only(span), &[]),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert_eq!(
+        words.load_walker.get(),
+        None,
+        "the planner read the leaf twice"
+    );
+    let first = leaf_at(&words, span.va);
+    assert_eq!(first & (WRITE | DIRTY), DIRTY);
 }
