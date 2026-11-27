@@ -1096,6 +1096,7 @@ dependencies = [
  "carrick-aarch64",
  "carrick-abi",
  "carrick-core",
+ "carrick-core-abi",
  "carrick-el1-abi",
  "carrick-fatal",
  "carrick-guest-arch",

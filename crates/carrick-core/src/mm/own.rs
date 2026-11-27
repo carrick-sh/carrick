@@ -141,6 +141,15 @@ pub struct ExtentId {
     raw: u64,
 }
 
+impl ExtentId {
+    /// The extent's record number within its carrier: never zero, never
+    /// reused by the same core.
+    pub fn record(self) -> NonZeroU64 {
+        // Ids are allocated from 1 and only ever incremented.
+        NonZeroU64::new(self.raw).unwrap_or(NonZeroU64::MIN)
+    }
+}
+
 /// A read-only view of one installed backend mapping.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InstalledView<'a, M> {
@@ -439,6 +448,14 @@ impl<V: CoreVenue, M, B> CarrierCore<V, M, B> {
     /// an address allocator must not hand out again.
     pub fn reserved_extents(&self) -> impl Iterator<Item = GpaExtent> + '_ {
         self.mappings.values().map(|mapping| mapping.spec.extent)
+    }
+
+    /// The live frame extent whose base is exactly `ipa`.
+    pub fn live_extent_at(&self, ipa: u64) -> Option<ExtentId> {
+        self.extents
+            .get(&ipa)
+            .filter(|extent| extent.state == ExtentState::Live)
+            .map(|extent| extent.id)
     }
 
     fn in_flight(&self) -> bool {
