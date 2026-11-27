@@ -346,6 +346,7 @@ mod tests {
 #[cfg(test)]
 mod queue_witnesses {
     use super::*;
+    use crate::OwedPasses;
     use crate::object_wait::{OperationToken, OwnedObjectWakeEffects};
     use crate::spaces::notification::{SpaceReleaseVenue, SpaceWakeDelivery};
     use crate::{ShortLockSpin, ThreadIdentity, Waker};
@@ -522,10 +523,10 @@ mod queue_witnesses {
             .unwrap();
         let mut handed = 0;
         let first = queue
-            .notify_object_host(&mut |_| handed += 1, &mut |_| {})
+            .notify_object_host(&mut |_| handed += 1, &mut |_| {}, &OwedPasses::new())
             .unwrap();
         let second = queue
-            .notify_object_host(&mut |_| handed += 1, &mut |_| {})
+            .notify_object_host(&mut |_| handed += 1, &mut |_| {}, &OwedPasses::new())
             .unwrap();
         assert_eq!(first.visited, 1);
         assert_eq!(second.visited, 0);

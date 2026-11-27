@@ -1594,36 +1594,42 @@ const SLOT_LOCK_SCAN_OWED: u32 = 2;
 /// is a broken invariant (a debug assertion): a scan would sleep past work.
 #[must_use = "an owed idle-scan pass must be delivered: fold it into the sent WakeEffects or deliver it"]
 pub struct OwedPasses {
-    slots: core::cell::Cell<[u64; ZONE_SLOT_WORDS]>,
+    // Plain atomics, never loom's: the sink is the caller's own, and a held
+    // guard (which borrows it) may move between threads.
+    slots: [core::sync::atomic::AtomicU64; ZONE_SLOT_WORDS],
 }
 
 impl OwedPasses {
     /// A sink that owes nothing yet.
     pub const fn new() -> Self {
         Self {
-            slots: core::cell::Cell::new([0; ZONE_SLOT_WORDS]),
+            slots: [const { core::sync::atomic::AtomicU64::new(0) }; ZONE_SLOT_WORDS],
         }
     }
 
     fn owe(&self, slot: SlotId) {
-        let mut slots = self.slots.get();
-        slots[slot.index() / 64] |= 1 << (slot.index() % 64);
-        self.slots.set(slots);
+        self.slots[slot.index() / 64].fetch_or(1 << (slot.index() % 64), Ordering::Relaxed);
     }
 
     /// Whether `slot` is owed a pass.
     pub fn owes(&self, slot: SlotId) -> bool {
-        self.slots.get()[slot.index() / 64] & (1 << (slot.index() % 64)) != 0
+        self.slots[slot.index() / 64].load(Ordering::Relaxed) & (1 << (slot.index() % 64)) != 0
     }
 
     /// Whether no pass is owed.
     pub fn is_empty(&self) -> bool {
-        self.slots.get().iter().all(|word| *word == 0)
+        self.slots
+            .iter()
+            .all(|word| word.load(Ordering::Relaxed) == 0)
+    }
+
+    fn take(&self) -> [u64; ZONE_SLOT_WORDS] {
+        core::array::from_fn(|index| self.slots[index].swap(0, Ordering::Relaxed))
     }
 
     /// Fold the owed passes into the SGIs `effects` sends.
     pub fn fold_into(self, effects: &mut WakeEffects) {
-        for (word, owed) in effects.sgi.iter_mut().zip(self.slots.take()) {
+        for (word, owed) in effects.sgi.iter_mut().zip(self.take()) {
             *word |= owed;
         }
     }
@@ -1631,7 +1637,7 @@ impl OwedPasses {
     /// Deliver each owed pass to `send` (a venue with no [`WakeEffects`],
     /// such as the host's reschedule kick).
     pub fn deliver(self, mut send: impl FnMut(SlotId)) {
-        for (word_index, word) in self.slots.take().into_iter().enumerate() {
+        for (word_index, word) in self.take().into_iter().enumerate() {
             let mut bits = word;
             while bits != 0 {
                 let bit = bits.trailing_zeros() as usize;
@@ -1655,7 +1661,7 @@ impl Drop for OwedPasses {
         debug_assert!(
             self.is_empty(),
             "an owed idle-scan pass was dropped undelivered: {:?}",
-            self.slots.get()
+            self.slots
         );
     }
 }

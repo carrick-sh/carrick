@@ -24,8 +24,8 @@ impl LockWait for HostWait {
 /// the slot's occupancy word.
 fn host_publish(zone: &ZoneTables, slot: SlotId, mm: u64, cpu: Option<u32>, affinity: u64) {
     // The executor that loads it drives the slot (one executor per slot).
-    zone.drive(slot, u64::from(slot.raw()) + 1);
-    zone.publish_slot(slot, mm, cpu, affinity);
+    zone.drive(slot, u64::from(slot.raw()) + 1, &OwedPasses::new());
+    zone.publish_slot(slot, mm, cpu, affinity, &OwedPasses::new());
     let here = ExecutionSlot::zone(slot);
     zone.occupancy.vacate_any(here);
     if mm != 0 {
@@ -155,7 +155,7 @@ fn parked_census_names_wait_key_resume_owner_and_saved_pc() {
         census.contains("zone maps: idle_slots=[] queued_slots=[] held_records=[]"),
         "{census}"
     );
-    zone.enter_idle(SLOT, false);
+    zone.enter_idle(SLOT, false, &OwedPasses::new());
     let mut idle = std::string::String::new();
     zone.write_census(&mut idle).unwrap();
     assert!(
@@ -221,13 +221,17 @@ fn wake(zone: &ZoneTables, uaddr: u64, count: u32, waker: Waker) -> Vec<RecordId
 fn drain(zone: &ZoneTables, slot: SlotId) -> (Vec<RecordId>, Vec<RecordId>, SlotDrain) {
     let mut woken = Vec::new();
     let mut discarded = Vec::new();
-    let drain = zone.drain_slot(slot, &mut |record, discard| {
-        if discard {
-            discarded.push(record.id);
-        } else {
-            woken.push(record.id);
-        }
-    });
+    let drain = zone.drain_slot(
+        slot,
+        &mut |record, discard| {
+            if discard {
+                discarded.push(record.id);
+            } else {
+                woken.push(record.id);
+            }
+        },
+        &OwedPasses::new(),
+    );
     (woken, discarded, drain)
 }
 
@@ -464,7 +468,7 @@ fn first_entry_mint_witness(concurrent: bool) {
     let zone = zone();
     host_publish(&zone, SLOT, MM, Some(0), 1);
     zone.enter_guest(SLOT);
-    zone.enter_idle(SLOT, true);
+    zone.enter_idle(SLOT, true, &OwedPasses::new());
     let record = zone
         .alloc_host_runnable(ThreadIdentity {
             generation: 0,
@@ -474,15 +478,21 @@ fn first_entry_mint_witness(concurrent: bool) {
         })
         .unwrap();
     let record = zone.record_ref(record);
-    assert!(zone.place_from_host(record.id).is_some());
+    assert!(
+        zone.place_from_host(record.id, &OwedPasses::new())
+            .is_some()
+    );
     assert_eq!(
-        zone.first_entry_links_clear_for_test(record, &HostWait),
+        zone.first_entry_links_clear_for_test(record, &HostWait, &OwedPasses::new()),
         Some(false)
     );
     // Deliver through the real service queue before minting current-record
     // custody. Retirement must leave that previously linked queue empty.
-    assert_eq!(zone.take_service_head(SLOT), Some(record));
-    assert_eq!(zone.take_service_head(SLOT), None);
+    assert_eq!(
+        zone.take_service_head(SLOT, &OwedPasses::new()),
+        Some(record)
+    );
+    assert_eq!(zone.take_service_head(SLOT, &OwedPasses::new()), None);
     assert_eq!(zone.counters.service_adoptions.load(Ordering::Relaxed), 1);
     let custody = if concurrent {
         let pause = Arc::new(MintPause {
@@ -529,13 +539,20 @@ fn first_entry_mint_witness(concurrent: bool) {
         );
     }
     assert_eq!(
-        zone.claim_for_host(record, None, Handback::Control, &HostWait, &|owned| {
-            let _ = owned.into_parts();
-        }),
+        zone.claim_for_host(
+            record,
+            None,
+            Handback::Control,
+            &HostWait,
+            &|owned| {
+                let _ = owned.into_parts();
+            },
+            &OwedPasses::new()
+        ),
         HostClaim::Deferred
     );
     assert_eq!(
-        zone.first_entry_links_clear_for_test(record, &HostWait),
+        zone.first_entry_links_clear_for_test(record, &HostWait, &OwedPasses::new()),
         Some(true)
     );
     assert!(zone.free_first_entry_activation(custody));
@@ -546,7 +563,10 @@ fn first_entry_mint_witness(concurrent: bool) {
         let slot = SlotId::new(raw as u8);
         assert_eq!(zone.runnable_head(slot), None);
         assert_eq!(zone.slot(slot).tail.load(Ordering::Acquire), NIL);
-        assert!(zone.take_service_head_for_executor(slot).is_none());
+        assert!(
+            zone.take_service_head_for_executor(slot, &OwedPasses::new())
+                .is_none()
+        );
     }
     assert_eq!(zone.record(record.id).next.load(Ordering::Acquire), NIL);
 }
@@ -565,9 +585,16 @@ fn closing_request_preempts_admitted_first_entry_placement() {
     let record = zone.record_ref(record);
     let placement = zone.claim_first_entry_placement(record).unwrap();
     assert_eq!(
-        zone.claim_for_host(record, None, Handback::Control, &HostWait, &|owned| {
-            let _ = owned.into_parts();
-        }),
+        zone.claim_for_host(
+            record,
+            None,
+            Handback::Control,
+            &HostWait,
+            &|owned| {
+                let _ = owned.into_parts();
+            },
+            &OwedPasses::new()
+        ),
         HostClaim::Deferred
     );
     assert!(matches!(
@@ -577,7 +604,7 @@ fn closing_request_preempts_admitted_first_entry_placement() {
             ..
         }
     ));
-    let placement = match zone.place_first_entry(placement) {
+    let placement = match zone.place_first_entry(placement, &OwedPasses::new()) {
         Ok(_) => panic!("requested placement was published"),
         Err(placement) => placement,
     };
@@ -646,11 +673,11 @@ fn el1_wake_queues_on_the_slot_and_switch_in_takes_it() {
     assert_eq!(woken, [a]);
     assert_eq!(zone.record(a).claim(), Claim::Queued { slot: SLOT, seq: 1 });
     assert_eq!(zone.slot(SLOT).queued(), 1);
-    assert_eq!(zone.switch_in(SLOT), Some(a));
+    assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), Some(a));
     assert_eq!(zone.record(a).claim(), Claim::OnCpu { slot: SLOT, seq: 1 });
     assert_eq!(zone.slot(SLOT).current(), Some(a));
     assert_eq!(zone.slot(SLOT).queued(), 0);
-    assert_eq!(zone.switch_in(SLOT), None);
+    assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), None);
 }
 
 /// #1941: an EL1 wake of a `futex_waitv` park (a host park on several
@@ -747,7 +774,11 @@ fn el1_wakes_any_count_and_exactly_that_many() {
     assert_eq!(zone.slot(SLOT).queued(), 9);
     // FIFO: the first nine parked are queued, in order.
     for (index, record) in parked.iter().take(9).enumerate() {
-        assert_eq!(zone.switch_in(SLOT), Some(*record), "position {index}");
+        assert_eq!(
+            zone.switch_in(SLOT, &OwedPasses::new()),
+            Some(*record),
+            "position {index}"
+        );
     }
     // The host takes batches of its buffer and its caller loops.
     let mut small = [const { WakeRecord::Empty }; 1];
@@ -771,9 +802,16 @@ fn host_claims_parked_but_is_refused_by_el1_held() {
     let a = park(&zone, 1, 0x1000);
     let r = zone.record_ref(a);
     assert_eq!(
-        zone.claim_for_host(r, None, Handback::Signal, &HostWait, &|owned| {
-            let _ = owned.into_parts();
-        }),
+        zone.claim_for_host(
+            r,
+            None,
+            Handback::Signal,
+            &HostWait,
+            &|owned| {
+                let _ = owned.into_parts();
+            },
+            &OwedPasses::new()
+        ),
         HostClaim::Claimed
     );
     assert_eq!(zone.record(a).handback(), Some(Handback::Signal));
@@ -781,9 +819,16 @@ fn host_claims_parked_but_is_refused_by_el1_held() {
     // Claimed records are no longer wakeable.
     assert!(wake(&zone, 0x1000, 1, Waker::Host).is_empty());
     assert_eq!(
-        zone.claim_for_host(r, None, Handback::Control, &HostWait, &|owned| {
-            let _ = owned.into_parts();
-        }),
+        zone.claim_for_host(
+            r,
+            None,
+            Handback::Control,
+            &HostWait,
+            &|owned| {
+                let _ = owned.into_parts();
+            },
+            &OwedPasses::new()
+        ),
         HostClaim::AlreadyHost
     );
 
@@ -799,18 +844,19 @@ fn host_claims_parked_but_is_refused_by_el1_held() {
             &HostWait,
             &|owned| {
                 let _ = owned.into_parts();
-            }
+            },
+            &OwedPasses::new()
         ),
         HostClaim::Claimed
     );
     assert_eq!(zone.record(b).handback(), Some(Handback::Woken));
     assert_eq!(zone.runnable_head(SLOT), None);
-    assert_eq!(zone.switch_in(SLOT), None);
+    assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), None);
 
     // Running on a vCPU: refused, the slot is kicked.
     let c = park(&zone, 3, 0x1000);
     let _ = wake(&zone, 0x1000, 1, Waker::El1 { slot: SLOT });
-    assert_eq!(zone.switch_in(SLOT), Some(c));
+    assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), Some(c));
     assert_eq!(
         zone.claim_for_host(
             zone.record_ref(c),
@@ -819,7 +865,8 @@ fn host_claims_parked_but_is_refused_by_el1_held() {
             &HostWait,
             &|owned| {
                 let _ = owned.into_parts();
-            }
+            },
+            &OwedPasses::new()
         ),
         HostClaim::El1Held { slot: SLOT }
     );
@@ -833,7 +880,7 @@ fn a_timeout_claims_only_the_park_that_armed_it() {
     let armed = zone.record(a).claim().seq();
     // EL1 wakes it, runs it, and it parks again (a later park, untimed).
     let _ = wake(&zone, 0x1000, 1, Waker::El1 { slot: SLOT });
-    assert_eq!(zone.switch_in(SLOT), Some(a));
+    assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), Some(a));
     let guard = zone
         .lock(ZoneTables::bucket_of(MM, 0x1000), &HostWait)
         .unwrap();
@@ -845,15 +892,29 @@ fn a_timeout_claims_only_the_park_that_armed_it() {
     zone.clear_current(SLOT);
     assert_ne!(seq, armed);
     assert_eq!(
-        zone.claim_for_host(r, Some(armed), Handback::Timeout, &HostWait, &|owned| {
-            let _ = owned.into_parts();
-        }),
+        zone.claim_for_host(
+            r,
+            Some(armed),
+            Handback::Timeout,
+            &HostWait,
+            &|owned| {
+                let _ = owned.into_parts();
+            },
+            &OwedPasses::new()
+        ),
         HostClaim::Stale
     );
     assert_eq!(
-        zone.claim_for_host(r, None, Handback::Signal, &HostWait, &|owned| {
-            let _ = owned.into_parts();
-        }),
+        zone.claim_for_host(
+            r,
+            None,
+            Handback::Signal,
+            &HostWait,
+            &|owned| {
+                let _ = owned.into_parts();
+            },
+            &OwedPasses::new()
+        ),
         HostClaim::Claimed
     );
 }
@@ -864,7 +925,7 @@ fn drain_slot_hands_back_queued_and_reports_the_switched_in_record() {
     let a = park(&zone, 1, 0x1000);
     let b = park(&zone, 2, 0x1000);
     let _ = wake(&zone, 0x1000, 2, Waker::El1 { slot: SLOT });
-    assert_eq!(zone.switch_in(SLOT), Some(a));
+    assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), Some(a));
     let (woken, discarded, drain) = drain(&zone, SLOT);
     assert_eq!(woken, [b]);
     assert!(discarded.is_empty());
@@ -909,23 +970,34 @@ fn drain_handback_identity_survives_reuse_before_the_consumer_runs() {
     let expected = zone.record_ref(record);
     let _ = wake(&zone, 0x1000, 1, Waker::El1 { slot: SLOT });
     let mut observed = None;
-    zone.drain_slot(SLOT, &mut |handed, discard| {
-        assert!(!discard);
-        // Model cancellation and reuse while the consumer is descheduled.
-        assert_eq!(
-            zone.claim_for_host(expected, None, Handback::Cancelled, &HostWait, &|owned| {
-                let _ = owned.into_parts();
-            }),
-            HostClaim::AlreadyHost,
-        );
-        zone.free_record(record);
-        let replacement = zone.alloc_record(identity(2)).unwrap();
-        assert_eq!(replacement, record);
-        let seq = zone.next_seq(replacement);
-        zone.publish_park(replacement, seq);
-        assert_ne!(zone.record_ref(replacement), expected);
-        observed = Some(handed);
-    });
+    zone.drain_slot(
+        SLOT,
+        &mut |handed, discard| {
+            assert!(!discard);
+            // Model cancellation and reuse while the consumer is descheduled.
+            assert_eq!(
+                zone.claim_for_host(
+                    expected,
+                    None,
+                    Handback::Cancelled,
+                    &HostWait,
+                    &|owned| {
+                        let _ = owned.into_parts();
+                    },
+                    &OwedPasses::new()
+                ),
+                HostClaim::AlreadyHost,
+            );
+            zone.free_record(record);
+            let replacement = zone.alloc_record(identity(2)).unwrap();
+            assert_eq!(replacement, record);
+            let seq = zone.next_seq(replacement);
+            zone.publish_park(replacement, seq);
+            assert_ne!(zone.record_ref(replacement), expected);
+            observed = Some(handed);
+        },
+        &OwedPasses::new(),
+    );
     assert_eq!(
         observed,
         Some(expected),
@@ -968,8 +1040,8 @@ fn service_take_keeps_identity_after_return_and_reuse() {
     let zone = zone();
     let record = service_record(&zone, 1);
     let expected = zone.record_ref(record);
-    assert!(zone.requeue_on(SLOT, record).is_some());
-    let taken = zone.take_service_head(SLOT).unwrap();
+    assert!(zone.requeue_on(SLOT, record, &OwedPasses::new()).is_some());
+    let taken = zone.take_service_head(SLOT, &OwedPasses::new()).unwrap();
     zone.free_record(record);
     assert_eq!(zone.alloc_record(identity(2)).unwrap(), record);
     let seq = zone.next_seq(record);
@@ -986,9 +1058,16 @@ fn records_are_reused_with_a_new_incarnation() {
     let a = park(&zone, 1, 0x1000);
     let r = zone.record_ref(a);
     assert_eq!(
-        zone.claim_for_host(r, None, Handback::Cancelled, &HostWait, &|owned| {
-            let _ = owned.into_parts();
-        }),
+        zone.claim_for_host(
+            r,
+            None,
+            Handback::Cancelled,
+            &HostWait,
+            &|owned| {
+                let _ = owned.into_parts();
+            },
+            &OwedPasses::new()
+        ),
         HostClaim::Claimed
     );
     zone.free_record(a);
@@ -997,9 +1076,16 @@ fn records_are_reused_with_a_new_incarnation() {
     assert_eq!(again, a, "the freed index is reused");
     assert!(zone.live(r).is_none(), "the old reference stays dead");
     assert_eq!(
-        zone.claim_for_host(r, None, Handback::Signal, &HostWait, &|owned| {
-            let _ = owned.into_parts();
-        }),
+        zone.claim_for_host(
+            r,
+            None,
+            Handback::Signal,
+            &HostWait,
+            &|owned| {
+                let _ = owned.into_parts();
+            },
+            &OwedPasses::new()
+        ),
         HostClaim::Stale
     );
 }
@@ -1033,9 +1119,16 @@ fn concurrent_el1_wakes_and_host_claims_give_each_record_one_owner() {
                 while !go.load(Ordering::Acquire) {}
                 refs.iter()
                     .filter(|r| {
-                        zone.claim_for_host(**r, None, Handback::Signal, &HostWait, &|owned| {
-                            let _ = owned.into_parts();
-                        }) == HostClaim::Claimed
+                        zone.claim_for_host(
+                            **r,
+                            None,
+                            Handback::Signal,
+                            &HostWait,
+                            &|owned| {
+                                let _ = owned.into_parts();
+                            },
+                            &OwedPasses::new(),
+                        ) == HostClaim::Claimed
                     })
                     .count()
             })
@@ -1178,7 +1271,7 @@ fn el1_wake_places_a_floating_thread_on_an_idle_slot() {
     enter(&zone, OTHER, 1);
     zone.slot(OTHER).set_sgi_target(0x5_0001);
     let a = park(&zone, 1, 0x1000);
-    assert!(!zone.enter_idle(OTHER, false));
+    assert!(!zone.enter_idle(OTHER, false, &OwedPasses::new()));
     let (woken, effects) = wake_effects(&zone, 0x1000, 1, SLOT);
     assert_eq!(woken, [a]);
     assert_eq!(
@@ -1198,7 +1291,7 @@ fn el1_wake_places_a_floating_thread_on_an_idle_slot() {
     assert!(!effects.queued_own && !effects.misplaced);
     assert_eq!(zone.counters.el1_cross_wakes.load(Ordering::Relaxed), 1);
     // The idle slot runs it.
-    let switched = zone.switch_in_full(OTHER).unwrap();
+    let switched = zone.switch_in_full(OTHER, &OwedPasses::new()).unwrap();
     assert_eq!(switched.record, a);
     assert_eq!(switched.result, Some(0));
     assert!(!switched.home);
@@ -1207,8 +1300,8 @@ fn el1_wake_places_a_floating_thread_on_an_idle_slot() {
     // Parked in WFI: the waker must send the SGI.
     let b = park(&zone, 2, 0x2000);
     zone.leave_idle(OTHER);
-    assert!(!zone.enter_idle(OTHER, false));
-    assert!(zone.enter_idle(OTHER, true));
+    assert!(!zone.enter_idle(OTHER, false, &OwedPasses::new()));
+    assert!(zone.enter_idle(OTHER, true, &OwedPasses::new()));
     let (woken, effects) = wake_effects(&zone, 0x2000, 1, SLOT);
     assert_eq!(woken, [b]);
     assert_eq!(effects.sgi_slots().collect::<Vec<_>>(), [OTHER]);
@@ -1222,11 +1315,11 @@ fn enter_idle_refuses_wfi_with_a_queued_thread() {
     enter(&zone, SLOT, 0);
     enter(&zone, OTHER, 1);
     let a = park(&zone, 1, 0x1000);
-    assert!(!zone.enter_idle(OTHER, false));
+    assert!(!zone.enter_idle(OTHER, false, &OwedPasses::new()));
     let (woken, _) = wake_effects(&zone, 0x1000, 1, SLOT);
     assert_eq!(woken, [a]);
     assert!(
-        !zone.enter_idle(OTHER, true),
+        !zone.enter_idle(OTHER, true, &OwedPasses::new()),
         "a queued thread must run first"
     );
     assert_eq!(zone.slot(OTHER).state(), SlotState::IdleSpin);
@@ -1257,7 +1350,7 @@ fn a_home_record_runs_only_on_its_home_slot() {
         }
     );
     assert_eq!(effects.sgi_slots().collect::<Vec<_>>(), [OTHER]);
-    let switched = zone.switch_in_full(OTHER).unwrap();
+    let switched = zone.switch_in_full(OTHER, &OwedPasses::new()).unwrap();
     assert!(switched.home);
     assert_eq!(
         zone.slot(OTHER).current(),
@@ -1270,7 +1363,7 @@ fn a_home_record_runs_only_on_its_home_slot() {
     // back to the guest. Never on the waker's slot, which would run it on
     // the wrong vCPU and which no host boundary relocates (#1961 review).
     let home = el1_park(&zone, OTHER, 9, 0x3000, 0);
-    zone.leave_guest(OTHER, &HostWait);
+    zone.leave_guest(OTHER, &HostWait, &OwedPasses::new());
     let (woken, effects) = wake_effects(&zone, 0x3000, 1, SLOT);
     assert_eq!(woken, [home]);
     assert_eq!(
@@ -1288,8 +1381,12 @@ fn a_home_record_runs_only_on_its_home_slot() {
     );
     assert_eq!(zone.counters.el1_misplaced.load(Ordering::Relaxed), 0);
     zone.enter_guest(OTHER);
-    assert_eq!(zone.switch_in_full(SLOT), None, "never run on the waker");
-    let switched = zone.switch_in_full(OTHER).unwrap();
+    assert_eq!(
+        zone.switch_in_full(SLOT, &OwedPasses::new()),
+        None,
+        "never run on the waker"
+    );
+    let switched = zone.switch_in_full(OTHER, &OwedPasses::new()).unwrap();
     assert_eq!(switched.record, home);
     assert!(switched.home);
 }
@@ -1345,7 +1442,7 @@ fn el1_honours_affinity_for_floating_threads() {
     enter(&zone, SLOT, 0);
     enter(&zone, OTHER, 1);
     // CPU 1's slot is stopped at a host exit.
-    zone.leave_guest(OTHER, &HostWait);
+    zone.leave_guest(OTHER, &HostWait, &OwedPasses::new());
     let (pinned, seq) = park_pinned(&zone, 3, 0x4000, 1 << 1);
     assert_eq!(zone.placement(pinned, SLOT), None);
     let (woken, effects) = wake_effects(&zone, 0x4000, 1, SLOT);
@@ -1355,17 +1452,26 @@ fn el1_honours_affinity_for_floating_threads() {
         Claim::Queued { slot: OTHER, seq }
     );
     assert!(!effects.queued_own && !effects.owes_host_boundary());
-    assert_eq!(zone.switch_in_full(SLOT), None, "never run on the waker");
+    assert_eq!(
+        zone.switch_in_full(SLOT, &OwedPasses::new()),
+        None,
+        "never run on the waker"
+    );
     // No slot of CPU 2 exists: the host takes it, never the waker's queue.
     let (unrunnable, seq) = park_pinned(&zone, 5, 0x4200, 1 << 2);
     let (woken, effects) = wake_effects(&zone, 0x4200, 1, SLOT);
     assert_eq!(woken, [unrunnable]);
     assert_handed_to_host(&zone, unrunnable, seq, effects);
     // CPU 1's slot returns and idles: it takes the next pinned thread.
-    assert_eq!(zone.switch_in_full(OTHER).unwrap().record, pinned);
+    assert_eq!(
+        zone.switch_in_full(OTHER, &OwedPasses::new())
+            .unwrap()
+            .record,
+        pinned
+    );
     zone.clear_current(OTHER);
     zone.enter_guest(OTHER);
-    assert!(!zone.enter_idle(OTHER, false));
+    assert!(!zone.enter_idle(OTHER, false, &OwedPasses::new()));
     let (pinned, seq) = park_pinned(&zone, 4, 0x4100, 1 << 1);
     assert_eq!(zone.placement(pinned, SLOT), Some(OTHER));
     let (woken, effects) = wake_effects(&zone, 0x4100, 1, SLOT);
@@ -1412,8 +1518,14 @@ fn an_excluded_waiter_no_driven_slot_may_run_goes_to_the_host() {
     enter(&zone, SLOT, 0);
     // CPU 1's slot ran the waiter last, and its driver left it since.
     enter(&zone, OTHER, 1);
-    zone.leave_guest(OTHER, &HostWait);
-    assert!(zone.leave_slot(OTHER, u64::from(OTHER.raw()) + 1, &mut |_| {}, &mut |_| {}));
+    zone.leave_guest(OTHER, &HostWait, &OwedPasses::new());
+    assert!(zone.leave_slot(
+        OTHER,
+        u64::from(OTHER.raw()) + 1,
+        &mut |_| {},
+        &mut |_| {},
+        &OwedPasses::new()
+    ));
     for last in [SLOT, OTHER] {
         let (pinned, seq) = park_pinned(&zone, 3, 0x4000, 1 << 1);
         zone.record(pinned)
@@ -1486,8 +1598,14 @@ fn an_excluded_waiter_queued_on_an_away_slot_kicks_live_peers_of_its_cpu() {
     let zone = zone();
     enter(&zone, SLOT, 0);
     enter(&zone, OTHER, 1);
-    zone.leave_guest(OTHER, &HostWait);
-    assert!(zone.step_away(OTHER, u64::from(OTHER.raw()) + 1, &mut |_| {}, &mut |_| {}));
+    zone.leave_guest(OTHER, &HostWait, &OwedPasses::new());
+    assert!(zone.step_away(
+        OTHER,
+        u64::from(OTHER.raw()) + 1,
+        &mut |_| {},
+        &mut |_| {},
+        &OwedPasses::new()
+    ));
     // THIRD runs on CPU 1 too, an address space the waiter's is not.
     host_publish(&zone, THIRD, MM + 1, Some(1), 0);
     zone.enter_guest(THIRD);
@@ -1519,13 +1637,14 @@ fn a_slot_left_between_choice_and_lock_never_strands_the_waiter() {
     let zone = zone();
     enter(&zone, SLOT, 0);
     enter(&zone, OTHER, 1);
-    zone.leave_guest(OTHER, &HostWait);
+    zone.leave_guest(OTHER, &HostWait, &OwedPasses::new());
     let (pinned, seq) = park_pinned(&zone, 3, 0x4000, 1 << 1);
     zone.record(pinned)
         .last_slot
         .store(OTHER.plus_one(), Ordering::Relaxed);
     let bucket = ZoneTables::bucket_of(MM, 0x4000);
-    let held = zone.slot_lock(OTHER, &HostWait).unwrap();
+    let held_passes = OwedPasses::new();
+    let held = zone.slot_lock(OTHER, &HostWait, &held_passes).unwrap();
     let (woken, effects) = std::thread::scope(|scope| {
         let waker = scope.spawn(|| wake_effects(&zone, 0x4000, 1, SLOT));
         // The waker holds the bucket lock and spins on OTHER's lock: it
@@ -1569,9 +1688,16 @@ fn native_readiness_handback_preserves_the_execution_owner() {
             let exact = zone.record_ref(record);
             zone.publish_park(record, zone.next_seq(record));
             assert_eq!(
-                zone.claim_for_host(exact, None, kind, &HostWait, &|owned| {
-                    let _ = owned.into_parts();
-                }),
+                zone.claim_for_host(
+                    exact,
+                    None,
+                    kind,
+                    &HostWait,
+                    &|owned| {
+                        let _ = owned.into_parts();
+                    },
+                    &OwedPasses::new()
+                ),
                 HostClaim::Claimed
             );
             let native_ready = native
@@ -1584,9 +1710,12 @@ fn native_readiness_handback_preserves_the_execution_owner() {
                 incarnation: exact.incarnation + 1,
                 ..exact
             };
-            assert!(zone.place_native_handback(stale).is_none());
+            assert!(
+                zone.place_native_handback(stale, &OwedPasses::new())
+                    .is_none()
+            );
             assert!(matches!(zone.record(record).claim(), Claim::Host { .. }));
-            let placed = zone.place_native_handback(exact);
+            let placed = zone.place_native_handback(exact, &OwedPasses::new());
             assert_eq!(placed.is_some(), native_ready);
             if native_ready {
                 assert_eq!(
@@ -1598,7 +1727,8 @@ fn native_readiness_handback_preserves_the_execution_owner() {
                 );
                 assert_eq!(zone.slot(SLOT).queued(), 1);
                 assert!(
-                    zone.place_native_handback(exact).is_none(),
+                    zone.place_native_handback(exact, &OwedPasses::new())
+                        .is_none(),
                     "one queue entry"
                 );
                 assert_eq!(zone.slot(SLOT).queued(), 1);
@@ -1615,7 +1745,7 @@ fn native_readiness_handback_preserves_the_execution_owner() {
 fn host_places_a_native_owned_wake_on_a_stopped_live_slot() {
     let zone = zone();
     enter(&zone, SLOT, 0);
-    zone.leave_guest(SLOT, &HostWait);
+    zone.leave_guest(SLOT, &HostWait, &OwedPasses::new());
     let record = zone.alloc_record(identity(3)).unwrap();
     assert!(zone.mark_native_owned(record));
     let guard = zone
@@ -1640,7 +1770,12 @@ fn host_places_a_native_owned_wake_on_a_stopped_live_slot() {
         Some(record)
     );
     assert!(matches!(zone.record(record).claim(), Claim::Host { .. }));
-    assert_eq!(zone.place_from_host(record).unwrap().slot, SLOT);
+    assert_eq!(
+        zone.place_from_host(record, &OwedPasses::new())
+            .unwrap()
+            .slot,
+        SLOT
+    );
     assert_eq!(
         zone.record(record).claim(),
         Claim::Queued { slot: SLOT, seq }
@@ -1657,33 +1792,51 @@ fn the_slot_timer_ends_a_timed_park_once() {
     let a = el1_park(&zone, SLOT, 1, 0x1000, 500);
     assert_eq!(zone.timer_deadline(SLOT), Some(500));
     assert_eq!(
-        zone.expire_timer(SLOT, 499, 0xdead_beef, &|owned| {
-            let _ = owned.into_parts();
-        }),
+        zone.expire_timer(
+            SLOT,
+            499,
+            0xdead_beef,
+            &|owned| {
+                let _ = owned.into_parts();
+            },
+            &OwedPasses::new()
+        ),
         Ok(false)
     );
     assert_eq!(
-        zone.expire_timer(SLOT, 500, 0xdead_beef, &|owned| {
-            let _ = owned.into_parts();
-        }),
+        zone.expire_timer(
+            SLOT,
+            500,
+            0xdead_beef,
+            &|owned| {
+                let _ = owned.into_parts();
+            },
+            &OwedPasses::new()
+        ),
         Ok(true)
     );
     assert_eq!(zone.record(a).claim(), Claim::Queued { slot: SLOT, seq: 1 });
     assert_eq!(zone.record(a).entry_count(), 0);
     assert_eq!(zone.timer_deadline(SLOT), None);
     assert_eq!(
-        zone.expire_timer(SLOT, 900, 0xdead_beef, &|owned| {
-            let _ = owned.into_parts();
-        }),
+        zone.expire_timer(
+            SLOT,
+            900,
+            0xdead_beef,
+            &|owned| {
+                let _ = owned.into_parts();
+            },
+            &OwedPasses::new()
+        ),
         Ok(false)
     );
-    let switched = zone.switch_in_full(SLOT).unwrap();
+    let switched = zone.switch_in_full(SLOT, &OwedPasses::new()).unwrap();
     assert_eq!(switched.result, Some(0xdead_beef));
     assert!(switched.home);
     // Woken before the deadline: the timer finds the park over.
     let b = el1_park(&zone, SLOT, 1, 0x1000, 500);
     assert_eq!(b, a, "the loaded thread parks into its record again");
-    assert!(!zone.enter_idle(SLOT, false));
+    assert!(!zone.enter_idle(SLOT, false, &OwedPasses::new()));
     let guard = zone
         .lock(ZoneTables::bucket_of(MM, 0x1000), &HostWait)
         .unwrap();
@@ -1703,9 +1856,15 @@ fn the_slot_timer_ends_a_timed_park_once() {
     );
     assert!(matches!(zone.record(b).claim(), Claim::Host { .. }));
     assert_eq!(
-        zone.expire_timer(SLOT, 900, 0xdead_beef, &|owned| {
-            let _ = owned.into_parts();
-        }),
+        zone.expire_timer(
+            SLOT,
+            900,
+            0xdead_beef,
+            &|owned| {
+                let _ = owned.into_parts();
+            },
+            &OwedPasses::new()
+        ),
         Ok(false)
     );
     assert_eq!(zone.counters.el1_timeouts.load(Ordering::Relaxed), 1);
@@ -1721,13 +1880,21 @@ fn arbitrary_non_linux_caller_result_propagates_on_timer_expiration() {
     let a = el1_park(&zone, SLOT, 1, 0x2000, 1000);
     assert_eq!(zone.timer_deadline(SLOT), Some(1000));
     assert_eq!(
-        zone.expire_timer(SLOT, 1000, arbitrary_result, &|owned| {
-            let _ = owned.into_parts();
-        }),
+        zone.expire_timer(
+            SLOT,
+            1000,
+            arbitrary_result,
+            &|owned| {
+                let _ = owned.into_parts();
+            },
+            &OwedPasses::new()
+        ),
         Ok(true)
     );
     assert_eq!(zone.record(a).claim(), Claim::Queued { slot: SLOT, seq: 1 });
-    let switched = zone.switch_in_full(SLOT).expect("switched in");
+    let switched = zone
+        .switch_in_full(SLOT, &OwedPasses::new())
+        .expect("switched in");
     assert_eq!(switched.result, Some(arbitrary_result));
 }
 
@@ -1745,22 +1912,28 @@ fn a_preempted_thread_resumes_without_a_result() {
     assert!(effects.queued_own);
     // Tick: preempt the host-loaded thread, switch B in.
     let a = zone.current_or_new(SLOT, identity(1)).unwrap();
-    let switched = zone.switch_in_full(SLOT).unwrap();
+    let switched = zone.switch_in_full(SLOT, &OwedPasses::new()).unwrap();
     assert_eq!(switched.record, b);
-    assert!(zone.requeue_preempted(SLOT, a).is_queued());
+    assert!(
+        zone.requeue_preempted(SLOT, a, &OwedPasses::new())
+            .is_queued()
+    );
     assert_eq!(zone.record(a).claim(), Claim::Queued { slot: SLOT, seq: 1 });
     assert_eq!(zone.slot(SLOT).current(), Some(b));
     // Next tick: B is preempted, A (home) comes back without a result.
     let prev = zone.current_or_new(SLOT, identity(2)).unwrap();
     assert_eq!(prev, b);
-    let switched = zone.switch_in_full(SLOT).unwrap();
+    let switched = zone.switch_in_full(SLOT, &OwedPasses::new()).unwrap();
     assert_eq!(switched.record, a);
     assert_eq!(switched.result, None);
     assert!(switched.home);
-    assert!(zone.requeue_preempted(SLOT, b).is_queued());
+    assert!(
+        zone.requeue_preempted(SLOT, b, &OwedPasses::new())
+            .is_queued()
+    );
     assert_eq!(zone.counters.el1_preemptions.load(Ordering::Relaxed), 2);
     // An exit now hands B back as preempted.
-    zone.leave_guest(SLOT, &HostWait);
+    zone.leave_guest(SLOT, &HostWait, &OwedPasses::new());
     let (woken, _, _) = drain(&zone, SLOT);
     assert_eq!(woken, [b]);
     assert_eq!(zone.record(b).handback(), Some(Handback::Resumed));
@@ -1780,8 +1953,11 @@ fn a_yield_hands_the_slot_to_a_queued_sibling_and_back() {
     let _ = wake(&zone, 0x1000, 1, Waker::El1 { slot: SLOT });
     for (yielder, next) in [(a, b), (b, a), (a, b)] {
         assert_eq!(zone.yield_turn(SLOT), YieldTurn::Rotate);
-        assert!(zone.requeue_preempted(SLOT, yielder).is_queued());
-        assert_eq!(zone.switch_in(SLOT), Some(next));
+        assert!(
+            zone.requeue_preempted(SLOT, yielder, &OwedPasses::new())
+                .is_queued()
+        );
+        assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), Some(next));
         assert_eq!(zone.slot(SLOT).current(), Some(next));
         assert_eq!(zone.runnable_head(SLOT), Some(yielder));
     }
@@ -1800,8 +1976,8 @@ fn a_tick_migrates_queued_threads_to_idle_slots() {
     let (woken, _) = wake_effects(&zone, 0x1000, 1, SLOT);
     assert_eq!(woken, [b]);
     assert_eq!(zone.slot(SLOT).queued(), 1);
-    assert!(!zone.enter_idle(OTHER, false));
-    assert!(zone.enter_idle(OTHER, true));
+    assert!(!zone.enter_idle(OTHER, false, &OwedPasses::new()));
+    assert!(zone.enter_idle(OTHER, true, &OwedPasses::new()));
     let mut effects = WakeEffects::default();
     assert_eq!(zone.migrate_queued(SLOT, &mut effects), 1);
     assert_eq!(zone.slot(SLOT).queued(), 0);
@@ -1826,7 +2002,7 @@ fn cross_slot_wakes_never_strand_a_thread_on_a_stopped_slot() {
     for round in 0..ROUNDS {
         enter(&zone, SLOT, 0);
         enter(&zone, OTHER, 1);
-        assert!(!zone.enter_idle(OTHER, false));
+        assert!(!zone.enter_idle(OTHER, false, &OwedPasses::new()));
         let uaddr = 0x1000 + (round as u64 % 5) * 4;
         let records: Vec<_> = (0..4).map(|t| park(&zone, t + 1, uaddr)).collect();
         let go = Arc::new(AtomicBool::new(false));
@@ -1848,7 +2024,7 @@ fn cross_slot_wakes_never_strand_a_thread_on_a_stopped_slot() {
             let go = Arc::clone(&go);
             std::thread::spawn(move || {
                 while !go.load(Ordering::Acquire) {}
-                zone.leave_guest(OTHER, &HostWait);
+                zone.leave_guest(OTHER, &HostWait, &OwedPasses::new());
                 drain(&zone, OTHER).2.woken
             })
         };
@@ -1868,7 +2044,7 @@ fn cross_slot_wakes_never_strand_a_thread_on_a_stopped_slot() {
         }
         assert_eq!(zone.slot(OTHER).queued(), 0, "round {round}");
         assert_eq!(own + drained, woken, "round {round}");
-        zone.leave_guest(SLOT, &HostWait);
+        zone.leave_guest(SLOT, &HostWait, &OwedPasses::new());
         let _ = drain(&zone, SLOT);
         for record in &records {
             zone.unlink_all(*record, &HostWait, &|owned| {
@@ -1899,7 +2075,8 @@ fn service_record(zone: &ZoneTables, tid: u64) -> RecordId {
             &HostWait,
             &|owned| {
                 let _ = owned.into_parts();
-            }
+            },
+            &OwedPasses::new()
         ),
         HostClaim::Claimed
     );
@@ -1918,15 +2095,15 @@ fn run_queue_is_unbounded_fifo_and_survives_removal_from_the_middle() {
     assert_eq!(zone.slot(SLOT).queued(), 40);
     // An idle thief of the same address space takes the head (the oldest).
     enter(&zone, OTHER, 1);
-    assert!(!zone.enter_idle(OTHER, false));
-    let stolen = zone.steal(OTHER).unwrap();
+    assert!(!zone.enter_idle(OTHER, false, &OwedPasses::new()));
+    let stolen = zone.steal(OTHER, &OwedPasses::new()).unwrap();
     assert_eq!(stolen.record, parked[0]);
     assert_eq!(zone.slot(SLOT).queued(), 39);
     for record in &parked[1..] {
-        assert_eq!(zone.switch_in(SLOT), Some(*record));
+        assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), Some(*record));
     }
     assert_eq!(zone.slot(SLOT).queued(), 0);
-    assert_eq!(zone.switch_in(SLOT), None);
+    assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), None);
 }
 
 /// A thread that needs its executor is never switched in at EL0: the slot
@@ -1936,13 +2113,13 @@ fn a_service_record_is_never_switched_in() {
     let zone = zone();
     enter(&zone, SLOT, 0);
     let service = service_record(&zone, 1);
-    let placed = zone.place_from_host(service).unwrap();
+    let placed = zone.place_from_host(service, &OwedPasses::new()).unwrap();
     assert_eq!(placed.slot, SLOT);
     assert!(zone.head_needs_host(SLOT));
-    assert_eq!(zone.switch_in_full(SLOT), None);
+    assert_eq!(zone.switch_in_full(SLOT, &OwedPasses::new()), None);
     assert_eq!(zone.slot(SLOT).queued(), 1);
     // Its executor takes it at the exit, still a service record.
-    zone.leave_guest(SLOT, &HostWait);
+    zone.leave_guest(SLOT, &HostWait, &OwedPasses::new());
     let (woken, _, _) = drain(&zone, SLOT);
     assert_eq!(woken, [service]);
     assert_eq!(zone.record(service).handback(), Some(Handback::Service));
@@ -1962,11 +2139,14 @@ fn idle_native_mm_does_not_license_a_host_owned_successor() {
         zone.spaces.open(space);
         let first = zone.alloc_record(identity(1)).unwrap();
         assert!(zone.mark_native_owned(first));
-        assert!(zone.requeue_preempted(SLOT, first).is_queued());
-        assert_eq!(zone.switch_in(SLOT), Some(first));
+        assert!(
+            zone.requeue_preempted(SLOT, first, &OwedPasses::new())
+                .is_queued()
+        );
+        assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), Some(first));
         assert!(zone.install_space(SLOT, MM).is_some());
         assert_eq!(
-            zone.release_current(SLOT, first, &HostWait),
+            zone.release_current(SLOT, first, &HostWait, &OwedPasses::new()),
             CurrentRelease::Released
         );
 
@@ -1974,22 +2154,34 @@ fn idle_native_mm_does_not_license_a_host_owned_successor() {
         if native_successor {
             assert!(zone.mark_native_owned(next));
         }
-        assert!(zone.requeue_preempted(SLOT, next).is_queued());
+        assert!(
+            zone.requeue_preempted(SLOT, next, &OwedPasses::new())
+                .is_queued()
+        );
         assert!(!zone.executor_has_task(SLOT));
         assert_eq!(zone.installed_space(SLOT), MM);
         if native_successor {
             assert!(!zone.head_needs_host(SLOT));
-            assert_eq!(zone.switch_in(SLOT), Some(next));
+            assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), Some(next));
         } else {
             assert!(
                 zone.head_needs_host(SLOT),
                 "same MM cannot supply host custody"
             );
-            assert_eq!(zone.switch_in(SLOT), None);
+            assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), None);
             assert_eq!(zone.slot(SLOT).current(), None);
-            zone.leave_guest(SLOT, &HostWait);
-            assert_eq!(zone.take_service_head(SLOT).unwrap().id, next);
-            assert!(zone.leave_slot(SLOT, u64::from(SLOT.raw()) + 1, &mut |_| {}, &mut |_| {}));
+            zone.leave_guest(SLOT, &HostWait, &OwedPasses::new());
+            assert_eq!(
+                zone.take_service_head(SLOT, &OwedPasses::new()).unwrap().id,
+                next
+            );
+            assert!(zone.leave_slot(
+                SLOT,
+                u64::from(SLOT.raw()) + 1,
+                &mut |_| {},
+                &mut |_| {},
+                &OwedPasses::new()
+            ));
         }
     }
 }
@@ -2006,18 +2198,30 @@ fn idle_native_mm_steals_host_work_without_switching_it_in() {
     let record = zone.alloc_record(identity(2)).unwrap();
     // SAFETY: this record is freshly allocated and unpublished.
     unsafe { zone.record(record).ctx_mut().x[0] = 0xabcdef };
-    assert!(zone.requeue_preempted(OTHER, record).is_queued());
-    zone.leave_guest(OTHER, &HostWait);
+    assert!(
+        zone.requeue_preempted(OTHER, record, &OwedPasses::new())
+            .is_queued()
+    );
+    zone.leave_guest(OTHER, &HostWait, &OwedPasses::new());
 
-    assert_eq!(zone.steal(SLOT), None);
+    assert_eq!(zone.steal(SLOT, &OwedPasses::new()), None);
     assert_eq!(zone.slot(SLOT).current(), None);
     assert!(zone.head_needs_host(SLOT));
     assert_eq!(zone.runnable_head(OTHER), None);
-    zone.leave_guest(SLOT, &HostWait);
-    assert_eq!(zone.take_service_head(SLOT).unwrap().id, record);
+    zone.leave_guest(SLOT, &HostWait, &OwedPasses::new());
+    assert_eq!(
+        zone.take_service_head(SLOT, &OwedPasses::new()).unwrap().id,
+        record
+    );
     // SAFETY: taking the service head gave this executor exclusive custody.
     assert_eq!(unsafe { zone.record(record).ctx_mut().x[0] }, 0xabcdef);
-    assert!(zone.leave_slot(SLOT, u64::from(SLOT.raw()) + 1, &mut |_| {}, &mut |_| {}));
+    assert!(zone.leave_slot(
+        SLOT,
+        u64::from(SLOT.raw()) + 1,
+        &mut |_| {},
+        &mut |_| {},
+        &OwedPasses::new()
+    ));
 }
 
 /// Host placement: a service thread goes to an idle slot of any address
@@ -2033,14 +2237,14 @@ fn host_placement_respects_address_spaces_and_owes_resched_sgis() {
     assert!(zone.reset_slot(OTHER));
     host_publish(&zone, OTHER, 0, Some(1), 0);
     zone.enter_guest(OTHER);
-    assert!(!zone.enter_idle(OTHER, false));
-    assert!(zone.enter_idle(OTHER, true));
+    assert!(!zone.enter_idle(OTHER, false, &OwedPasses::new()));
+    assert!(zone.enter_idle(OTHER, true, &OwedPasses::new()));
     assert!(zone.reset_slot(THIRD));
     host_publish(&zone, THIRD, MM + 1, Some(2), 0);
     zone.enter_guest(THIRD);
 
     let service = service_record(&zone, 1);
-    let placed = zone.place_from_host(service).unwrap();
+    let placed = zone.place_from_host(service, &OwedPasses::new()).unwrap();
     assert_eq!(placed.slot, OTHER, "the idle slot takes a service thread");
     assert!(placed.resched, "a WFI slot needs its SGI");
     assert!(zone.take_resched(OTHER));
@@ -2050,7 +2254,7 @@ fn host_placement_respects_address_spaces_and_owes_resched_sgis() {
     // SLOT (running MM) can.
     let ready = park(&zone, 2, 0x7000);
     assert_eq!(wake(&zone, 0x7000, 1, Waker::Host), [ready]);
-    let placed = zone.place_from_host(ready).unwrap();
+    let placed = zone.place_from_host(ready, &OwedPasses::new()).unwrap();
     assert_eq!(placed.slot, SLOT);
     assert!(
         placed.resched,
@@ -2062,18 +2266,18 @@ fn host_placement_respects_address_spaces_and_owes_resched_sgis() {
     );
 
     // With SLOT stopped at an exit, nothing runs MM: the host keeps it.
-    zone.leave_guest(SLOT, &HostWait);
+    zone.leave_guest(SLOT, &HostWait, &OwedPasses::new());
     let stranded = park(&zone, 3, 0x7004);
     assert_eq!(wake(&zone, 0x7004, 1, Waker::Host), [stranded]);
-    assert_eq!(zone.place_from_host(stranded), None);
+    assert_eq!(zone.place_from_host(stranded, &OwedPasses::new()), None);
     assert_eq!(zone.record(stranded).claim(), Claim::Host { seq: 1 });
 
     // A service thread with every slot stopped still goes to a slot: its
     // executor serves it before it runs the vCPU again.
-    zone.leave_guest(OTHER, &HostWait);
-    zone.leave_guest(THIRD, &HostWait);
+    zone.leave_guest(OTHER, &HostWait, &OwedPasses::new());
+    zone.leave_guest(THIRD, &HostWait, &OwedPasses::new());
     let late = service_record(&zone, 4);
-    let placed = zone.place_from_host(late).unwrap();
+    let placed = zone.place_from_host(late, &OwedPasses::new()).unwrap();
     assert!(!placed.resched, "a stopped slot needs no SGI");
     assert_eq!(
         zone.counters
@@ -2098,9 +2302,19 @@ fn a_slice_ends_only_while_a_thread_waits_behind_the_running_one() {
     assert_eq!(zone.slice_end(SLOT, 1_000, 50), None);
     let running = zone.alloc_record(identity(40)).unwrap();
     let waiting = zone.alloc_record(identity(41)).unwrap();
-    assert!(zone.requeue_preempted(SLOT, running).is_queued());
-    assert!(zone.requeue_preempted(SLOT, waiting).is_queued());
-    assert_eq!(zone.switch_in_full(SLOT).map(|s| s.record), Some(running));
+    assert!(
+        zone.requeue_preempted(SLOT, running, &OwedPasses::new())
+            .is_queued()
+    );
+    assert!(
+        zone.requeue_preempted(SLOT, waiting, &OwedPasses::new())
+            .is_queued()
+    );
+    assert_eq!(
+        zone.switch_in_full(SLOT, &OwedPasses::new())
+            .map(|s| s.record),
+        Some(running)
+    );
     assert_eq!(zone.slot(SLOT).queued_since(), 0);
     assert_eq!(zone.slice_end(SLOT, 1_000, 50), Some(1_050));
     assert_eq!(zone.slot(SLOT).queued_since(), 1_000);
@@ -2109,7 +2323,11 @@ fn a_slice_ends_only_while_a_thread_waits_behind_the_running_one() {
         Some(1_050),
         "a stamped wait keeps its start"
     );
-    assert_eq!(zone.switch_in_full(SLOT).map(|s| s.record), Some(waiting));
+    assert_eq!(
+        zone.switch_in_full(SLOT, &OwedPasses::new())
+            .map(|s| s.record),
+        Some(waiting)
+    );
     assert_eq!(zone.slice_end(SLOT, 2_000, 50), None);
 }
 
@@ -2125,15 +2343,29 @@ fn an_idle_scan_takes_a_thread_its_peers_migration_left_queued() {
     enter(&zone, OTHER, 1);
     let running = zone.alloc_record(identity(40)).unwrap();
     let stranded = zone.alloc_record(identity(41)).unwrap();
-    assert!(zone.requeue_preempted(SLOT, running).is_queued());
-    assert!(zone.requeue_preempted(SLOT, stranded).is_queued());
-    assert_eq!(zone.switch_in_full(SLOT).map(|s| s.record), Some(running));
+    assert!(
+        zone.requeue_preempted(SLOT, running, &OwedPasses::new())
+            .is_queued()
+    );
+    assert!(
+        zone.requeue_preempted(SLOT, stranded, &OwedPasses::new())
+            .is_queued()
+    );
+    assert_eq!(
+        zone.switch_in_full(SLOT, &OwedPasses::new())
+            .map(|s| s.record),
+        Some(running)
+    );
     // OTHER is in the guest but not idle (woken, not yet scanning).
     let mut effects = WakeEffects::default();
     assert_eq!(zone.migrate_queued(SLOT, &mut effects), 0);
     assert_eq!(effects, WakeEffects::default());
-    assert_eq!(zone.switch_in_full(OTHER), None, "its own queue is empty");
-    let taken = zone.take_idle_work(OTHER).unwrap();
+    assert_eq!(
+        zone.switch_in_full(OTHER, &OwedPasses::new()),
+        None,
+        "its own queue is empty"
+    );
+    let taken = zone.take_idle_work(OTHER, &OwedPasses::new()).unwrap();
     assert_eq!(taken.record, stranded);
     assert_eq!(
         zone.record(stranded).claim(),
@@ -2155,18 +2387,36 @@ fn a_migration_after_an_idle_scan_published_places_the_thread_there() {
     enter(&zone, SLOT, 0);
     enter(&zone, OTHER, 1);
     let running = zone.alloc_record(identity(40)).unwrap();
-    assert!(zone.requeue_preempted(SLOT, running).is_queued());
-    assert_eq!(zone.switch_in_full(SLOT).map(|s| s.record), Some(running));
-    assert_eq!(zone.take_idle_work(OTHER), None, "nothing to take yet");
+    assert!(
+        zone.requeue_preempted(SLOT, running, &OwedPasses::new())
+            .is_queued()
+    );
+    assert_eq!(
+        zone.switch_in_full(SLOT, &OwedPasses::new())
+            .map(|s| s.record),
+        Some(running)
+    );
+    assert_eq!(
+        zone.take_idle_work(OTHER, &OwedPasses::new()),
+        None,
+        "nothing to take yet"
+    );
     let late = zone.alloc_record(identity(42)).unwrap();
-    assert!(zone.requeue_preempted(SLOT, late).is_queued());
+    assert!(
+        zone.requeue_preempted(SLOT, late, &OwedPasses::new())
+            .is_queued()
+    );
     let mut effects = WakeEffects::default();
     assert_eq!(zone.migrate_queued(SLOT, &mut effects), 1);
     assert!(
-        !zone.enter_idle(OTHER, true),
+        !zone.enter_idle(OTHER, true, &OwedPasses::new()),
         "a queued thread refuses sleep"
     );
-    assert_eq!(zone.take_idle_work(OTHER).map(|s| s.record), Some(late));
+    assert_eq!(
+        zone.take_idle_work(OTHER, &OwedPasses::new())
+            .map(|s| s.record),
+        Some(late)
+    );
     assert_eq!(zone.counters.el1_steals.load(Ordering::Relaxed), 0);
 }
 
@@ -2181,12 +2431,23 @@ fn a_migration_put_back_kicks_an_idle_slot_it_could_not_place_on() {
     enter(&zone, SLOT, 0);
     enter(&zone, OTHER, 1);
     let running = zone.alloc_record(identity(40)).unwrap();
-    assert!(zone.requeue_preempted(SLOT, running).is_queued());
-    assert_eq!(zone.switch_in_full(SLOT).map(|s| s.record), Some(running));
+    assert!(
+        zone.requeue_preempted(SLOT, running, &OwedPasses::new())
+            .is_queued()
+    );
+    assert_eq!(
+        zone.switch_in_full(SLOT, &OwedPasses::new())
+            .map(|s| s.record),
+        Some(running)
+    );
     let stranded = zone.alloc_record(identity(41)).unwrap();
-    assert!(zone.requeue_preempted(SLOT, stranded).is_queued());
-    assert!(!zone.enter_idle(OTHER, false));
-    let held = zone.slot_lock(OTHER, &SpinForever).unwrap();
+    assert!(
+        zone.requeue_preempted(SLOT, stranded, &OwedPasses::new())
+            .is_queued()
+    );
+    assert!(!zone.enter_idle(OTHER, false, &OwedPasses::new()));
+    let held_passes = OwedPasses::new();
+    let held = zone.slot_lock(OTHER, &SpinForever, &held_passes).unwrap();
     let mut effects = WakeEffects::default();
     assert_eq!(zone.migrate_queued(SLOT, &mut effects), 0);
     drop(held);
@@ -2216,12 +2477,16 @@ fn stealing_takes_only_what_the_thief_may_run() {
     assert!(zone.reset_slot(THIRD));
     host_publish(&zone, THIRD, MM, Some(2), 0);
     zone.enter_guest(THIRD);
-    assert!(!zone.enter_idle(THIRD, false));
-    assert_eq!(zone.steal(THIRD), None, "a home record is not stolen");
+    assert!(!zone.enter_idle(THIRD, false, &OwedPasses::new()));
+    assert_eq!(
+        zone.steal(THIRD, &OwedPasses::new()),
+        None,
+        "a home record is not stolen"
+    );
     // A service thread on OTHER moves to the idle thief's queue.
     let service = service_record(&zone, 5);
-    zone.leave_guest(OTHER, &HostWait);
-    let placed = zone.place_from_host(service).unwrap();
+    zone.leave_guest(OTHER, &HostWait, &OwedPasses::new());
+    let placed = zone.place_from_host(service, &OwedPasses::new()).unwrap();
     assert_eq!(placed.slot, THIRD, "the idle slot is chosen first");
     assert!(zone.head_needs_host(THIRD));
     // An idle slot of another address space leaves both records on THIRD:
@@ -2230,14 +2495,14 @@ fn stealing_takes_only_what_the_thief_may_run() {
     assert!(zone.reset_slot(foreign));
     host_publish(&zone, foreign, MM + 7, Some(3), 0);
     zone.enter_guest(foreign);
-    assert!(!zone.enter_idle(foreign, false));
+    assert!(!zone.enter_idle(foreign, false, &OwedPasses::new()));
     let ready = park(&zone, 6, 0x8004);
     let (woken, _) = wake_effects(&zone, 0x8004, 1, SLOT);
     assert_eq!(woken, [ready]);
     assert!(matches!(zone.record(ready).claim(), Claim::Queued { .. }));
-    assert_eq!(zone.steal(foreign), None);
+    assert_eq!(zone.steal(foreign, &OwedPasses::new()), None);
     assert!(!zone.head_needs_host(foreign));
-    assert_eq!(zone.steal(foreign), None);
+    assert_eq!(zone.steal(foreign, &OwedPasses::new()), None);
     assert_eq!(
         zone.record(ready).claim(),
         Claim::Queued {
@@ -2249,8 +2514,12 @@ fn stealing_takes_only_what_the_thief_may_run() {
     assert_eq!(zone.counters.el1_steals.load(Ordering::Relaxed), 0);
     assert_eq!(zone.runnable_head(THIRD), Some(service));
     // THIRD's executor retains its service record.
-    zone.leave_guest(THIRD, &HostWait);
-    assert_eq!(zone.take_service_head(THIRD).map(|r| r.id), Some(service));
+    zone.leave_guest(THIRD, &HostWait, &OwedPasses::new());
+    assert_eq!(
+        zone.take_service_head(THIRD, &OwedPasses::new())
+            .map(|r| r.id),
+        Some(service)
+    );
     assert_eq!(zone.counters.foreign_adoptions.load(Ordering::Relaxed), 0);
 }
 
@@ -2274,12 +2543,15 @@ fn idle_executors_adopt_born_records_from_two_live_process_queues() {
                 ..identity(tid)
             })
             .unwrap();
-        assert!(zone.requeue_preempted(victim, born).is_queued());
+        assert!(
+            zone.requeue_preempted(victim, born, &OwedPasses::new())
+                .is_queued()
+        );
         host_publish(&zone, thief, 0, Some(cpu + 2), 0);
         zone.enter_guest(thief);
-        assert!(!zone.enter_idle(thief, false));
+        assert!(!zone.enter_idle(thief, false, &OwedPasses::new()));
         assert_eq!(
-            zone.steal(thief),
+            zone.steal(thief, &OwedPasses::new()),
             None,
             "cold adoption belongs to the executor"
         );
@@ -2288,7 +2560,12 @@ fn idle_executors_adopt_born_records_from_two_live_process_queues() {
             Some(born),
             "pre-reserved birth must reach idle execution capacity"
         );
-        assert_eq!(zone.take_service_head(thief).unwrap().id, born);
+        assert_eq!(
+            zone.take_service_head(thief, &OwedPasses::new())
+                .unwrap()
+                .id,
+            born
+        );
         assert_eq!(zone.record(born).identity().mm, mm);
         assert_eq!(zone.record(born).identity().generation, 0);
         assert_eq!(zone.runnable_head(victim), None);
@@ -2315,10 +2592,13 @@ fn queued_births_wake_cold_executors_for_both_live_processes() {
                 ..identity(tid)
             })
             .unwrap();
-        assert!(zone.requeue_preempted(victim, born).is_queued());
+        assert!(
+            zone.requeue_preempted(victim, born, &OwedPasses::new())
+                .is_queued()
+        );
         host_publish(&zone, thief, 0, Some(cpu), 0);
         zone.enter_guest(thief);
-        zone.enter_idle(thief, true);
+        zone.enter_idle(thief, true, &OwedPasses::new());
         let mut effects = WakeEffects::default();
         assert_eq!(
             zone.migrate_queued(victim, &mut effects),
@@ -2326,10 +2606,15 @@ fn queued_births_wake_cold_executors_for_both_live_processes() {
             "a born thread must wake pre-reserved cold execution capacity"
         );
         assert!(effects.sgi_slots().any(|slot| slot == thief));
-        assert_eq!(zone.take_service_head(thief).unwrap().id, born);
+        assert_eq!(
+            zone.take_service_head(thief, &OwedPasses::new())
+                .unwrap()
+                .id,
+            born
+        );
         assert_eq!(zone.record(born).identity().mm, mm);
         assert_eq!(zone.runnable_head(victim), None);
-        zone.leave_guest(thief, &HostWait);
+        zone.leave_guest(thief, &HostWait, &OwedPasses::new());
     }
 }
 
@@ -2343,14 +2628,18 @@ fn queued_births_wake_cold_executors_for_both_live_processes() {
 fn an_idle_vcpu_rescues_service_work_from_a_stopped_slot() {
     let zone = zone();
     enter(&zone, SLOT, 0);
-    zone.leave_guest(SLOT, &HostWait);
+    zone.leave_guest(SLOT, &HostWait, &OwedPasses::new());
     let service = service_record(&zone, 5);
-    let placed = zone.place_from_host(service).unwrap();
+    let placed = zone.place_from_host(service, &OwedPasses::new()).unwrap();
     assert_eq!(placed.slot, SLOT, "the only live slot is stopped");
     assert!(!placed.resched);
     enter(&zone, OTHER, 1);
-    assert!(!zone.enter_idle(OTHER, false));
-    assert_eq!(zone.steal(OTHER), None, "EL1 never runs a service thread");
+    assert!(!zone.enter_idle(OTHER, false, &OwedPasses::new()));
+    assert_eq!(
+        zone.steal(OTHER, &OwedPasses::new()),
+        None,
+        "EL1 never runs a service thread"
+    );
     assert_eq!(zone.runnable_head(SLOT), None);
     assert_eq!(zone.runnable_head(OTHER), Some(service));
     assert!(zone.head_needs_host(OTHER));
@@ -2368,16 +2657,25 @@ fn an_executor_sweeps_cancelled_records_and_takes_its_service_head() {
     zone.record(a)
         .request_cancel(zone.record_ref(a).incarnation);
     let service = zone.alloc_host_runnable(identity(2)).unwrap();
-    assert_eq!(zone.place_from_host(service).map(|p| p.slot), Some(SLOT));
-    zone.leave_guest(SLOT, &HostWait);
     assert_eq!(
-        zone.take_service_head(SLOT).map(|r| r.id),
+        zone.place_from_host(service, &OwedPasses::new())
+            .map(|p| p.slot),
+        Some(SLOT)
+    );
+    zone.leave_guest(SLOT, &HostWait, &OwedPasses::new());
+    assert_eq!(
+        zone.take_service_head(SLOT, &OwedPasses::new())
+            .map(|r| r.id),
         None,
         "a cancelled record is first"
     );
-    assert_eq!(zone.sweep_cancelled(SLOT), 1);
+    assert_eq!(zone.sweep_cancelled(SLOT, &OwedPasses::new()), 1);
     assert_eq!(zone.record(a).claim(), Claim::Free);
-    assert_eq!(zone.take_service_head(SLOT).map(|r| r.id), Some(service));
+    assert_eq!(
+        zone.take_service_head(SLOT, &OwedPasses::new())
+            .map(|r| r.id),
+        Some(service)
+    );
     assert_eq!(zone.record(service).claim(), Claim::Host { seq: 1 });
     assert_eq!(zone.slot(SLOT).queued(), 0);
 }
@@ -2390,11 +2688,22 @@ fn group_stop_preserves_queued_service_custody() {
     enter(&zone, SLOT, 0);
     let service = zone.alloc_host_runnable(identity(2)).unwrap();
     let record = zone.record_ref(service);
-    assert_eq!(zone.place_from_host(service).map(|p| p.slot), Some(SLOT));
     assert_eq!(
-        zone.claim_for_host(record, None, Handback::GroupStop, &HostWait, &|owned| {
-            let _ = owned.into_parts();
-        }),
+        zone.place_from_host(service, &OwedPasses::new())
+            .map(|p| p.slot),
+        Some(SLOT)
+    );
+    assert_eq!(
+        zone.claim_for_host(
+            record,
+            None,
+            Handback::GroupStop,
+            &HostWait,
+            &|owned| {
+                let _ = owned.into_parts();
+            },
+            &OwedPasses::new()
+        ),
         HostClaim::Claimed
     );
     let rec = zone.live(record).unwrap();
@@ -2433,6 +2742,7 @@ fn host_wake(
         place,
         &mut |record| handed.push(record),
         &mut |placement| placed.push(placement),
+        &OwedPasses::new(),
     );
     drop(guard);
     let handed = handed
@@ -2465,7 +2775,7 @@ fn a_host_wake_queues_the_waiter_in_the_guest_directly() {
 
     // No slot in the guest runs its address space: host owned, handed back.
     let b = park(&zone, 2, 0x2000);
-    zone.leave_guest(OTHER, &HostWait);
+    zone.leave_guest(OTHER, &HostWait, &OwedPasses::new());
     let (n, handed, placed) = host_wake(&zone, 0x2000, 1, true);
     assert_eq!((n, handed.as_slice(), placed.len()), (1, [b].as_slice(), 0));
     assert!(matches!(zone.record(b).claim(), Claim::Host { .. }));
@@ -2485,7 +2795,7 @@ fn relocation_moves_queued_threads_between_run_queues_without_host_ownership() {
     let a = park(&zone, 1, 0x1000);
     let b = park(&zone, 2, 0x1000);
     let _ = wake(&zone, 0x1000, 2, Waker::El1 { slot: SLOT });
-    zone.leave_guest(SLOT, &HostWait);
+    zone.leave_guest(SLOT, &HostWait, &OwedPasses::new());
     let mut handed = Vec::new();
     let mut placed = Vec::new();
     let moved = zone.relocate(
@@ -2493,6 +2803,7 @@ fn relocation_moves_queued_threads_between_run_queues_without_host_ownership() {
         None,
         &mut |record, discard| handed.push((record.id, discard)),
         &mut |placement| placed.push(placement),
+        &OwedPasses::new(),
     );
     assert_eq!(moved, 2);
     assert!(handed.is_empty());
@@ -2504,7 +2815,7 @@ fn relocation_moves_queued_threads_between_run_queues_without_host_ownership() {
     assert_eq!(zone.runnable_head(OTHER), Some(a));
 
     // Nowhere to go: host owned and handed back, a retired thread discarded.
-    zone.leave_guest(OTHER, &HostWait);
+    zone.leave_guest(OTHER, &HostWait, &OwedPasses::new());
     zone.record(b)
         .request_cancel(zone.record_ref(b).incarnation);
     let moved = zone.relocate(
@@ -2512,6 +2823,7 @@ fn relocation_moves_queued_threads_between_run_queues_without_host_ownership() {
         None,
         &mut |record, discard| handed.push((record.id, discard)),
         &mut |placement| placed.push(placement),
+        &OwedPasses::new(),
     );
     assert_eq!(moved, 2);
     assert_eq!(handed, [(a, false), (b, true)]);
@@ -2528,7 +2840,7 @@ fn a_host_load_starts_a_fresh_slice() {
     let zone = zone();
     enter(&zone, SLOT, 0);
     zone.slot(SLOT).restart_slice(1_000);
-    zone.leave_guest(SLOT, &HostWait);
+    zone.leave_guest(SLOT, &HostWait, &OwedPasses::new());
     assert!(zone.reset_slot(SLOT));
     assert_eq!(zone.slot(SLOT).queued_since(), 0);
 }
@@ -2540,15 +2852,21 @@ fn a_host_load_starts_a_fresh_slice() {
 fn a_driver_cannot_leave_while_a_switched_record_is_current() {
     let zone = zone();
     enter(&zone, SLOT, 0);
-    zone.drive(SLOT, 7);
+    zone.drive(SLOT, 7, &OwedPasses::new());
     let record = park(&zone, 1, 0x1000);
     wake(&zone, 0x1000, 1, Waker::El1 { slot: SLOT });
-    assert_eq!(zone.switch_in(SLOT), Some(record));
-    zone.leave_guest(SLOT, &HostWait);
+    assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), Some(record));
+    zone.leave_guest(SLOT, &HostWait, &OwedPasses::new());
     let mut taken = Vec::new();
     let mut placed = Vec::new();
 
-    assert!(!zone.leave_slot(SLOT, 7, &mut |r| taken.push(r.id), &mut |p| placed.push(p)));
+    assert!(!zone.leave_slot(
+        SLOT,
+        7,
+        &mut |r| taken.push(r.id),
+        &mut |p| placed.push(p),
+        &OwedPasses::new()
+    ));
     assert_eq!(zone.slot(SLOT).driver(), Some(7));
     assert_eq!(zone.slot(SLOT).current(), Some(record));
     assert!(matches!(
@@ -2567,26 +2885,42 @@ fn only_the_executor_still_driving_a_slot_vacates_it() {
     let zone = zone();
     enter(&zone, OTHER, 1);
     enter(&zone, SLOT, 0);
-    zone.drive(SLOT, 7);
+    zone.drive(SLOT, 7, &OwedPasses::new());
     let service = service_record(&zone, 5);
-    zone.leave_guest(SLOT, &HostWait);
-    zone.leave_guest(OTHER, &HostWait);
+    zone.leave_guest(SLOT, &HostWait, &OwedPasses::new());
+    zone.leave_guest(OTHER, &HostWait, &OwedPasses::new());
     zone.enter_guest(OTHER);
     // Queue a service thread on SLOT directly (its executor was about to take
     // it when its lease moved away).
-    assert!(zone.requeue_on(SLOT, service).is_some());
+    assert!(zone.requeue_on(SLOT, service, &OwedPasses::new()).is_some());
     let mut taken = Vec::new();
     let mut placed = Vec::new();
     // Another executor drives the slot now: nothing happens.
-    zone.drive(SLOT, 9);
-    assert!(!zone.leave_slot(SLOT, 7, &mut |r| taken.push(r.id), &mut |p| placed.push(p)));
+    zone.drive(SLOT, 9, &OwedPasses::new());
+    assert!(!zone.leave_slot(
+        SLOT,
+        7,
+        &mut |r| taken.push(r.id),
+        &mut |p| placed.push(p),
+        &OwedPasses::new()
+    ));
     assert_eq!(zone.runnable_head(SLOT), Some(service));
     // The executor still driving it leaves: the queue goes, the slot is
     // no longer live for placements.
-    assert!(zone.leave_slot(SLOT, 9, &mut |r| taken.push(r.id), &mut |p| placed.push(p)));
+    assert!(zone.leave_slot(
+        SLOT,
+        9,
+        &mut |r| taken.push(r.id),
+        &mut |p| placed.push(p),
+        &OwedPasses::new()
+    ));
     assert_eq!(taken, [service]);
     assert_eq!(zone.runnable_head(SLOT), None);
-    assert_eq!(zone.place_from_host(service).map(|p| p.slot), Some(OTHER));
+    assert_eq!(
+        zone.place_from_host(service, &OwedPasses::new())
+            .map(|p| p.slot),
+        Some(OTHER)
+    );
 }
 
 /// Contract kernel.el1.slot-liveness: a slot takes work that needs an
@@ -2598,20 +2932,24 @@ fn only_the_executor_still_driving_a_slot_vacates_it() {
 fn only_a_drive_makes_a_slot_live() {
     let zone = zone();
     assert!(zone.reset_slot(SLOT));
-    zone.publish_slot(SLOT, MM, Some(0), 0);
+    zone.publish_slot(SLOT, MM, Some(0), 0, &OwedPasses::new());
     zone.enter_guest(SLOT);
-    zone.leave_guest(SLOT, &HostWait);
+    zone.leave_guest(SLOT, &HostWait, &OwedPasses::new());
     assert!(!zone.slot(SLOT).is_live());
     let service = service_record(&zone, 5);
     assert_eq!(
-        zone.place_from_host(service),
+        zone.place_from_host(service, &OwedPasses::new()),
         None,
         "nobody drives the slot"
     );
-    zone.drive(SLOT, 7);
+    zone.drive(SLOT, 7, &OwedPasses::new());
     assert!(zone.slot(SLOT).is_live());
     assert_eq!(zone.slot(SLOT).driver(), Some(7));
-    assert_eq!(zone.place_from_host(service).map(|p| p.slot), Some(SLOT));
+    assert_eq!(
+        zone.place_from_host(service, &OwedPasses::new())
+            .map(|p| p.slot),
+        Some(SLOT)
+    );
 }
 
 /// Contract kernel.el1.slot-liveness: an executor that steps away for a
@@ -2623,32 +2961,54 @@ fn only_a_drive_makes_a_slot_live() {
 fn only_its_driver_steps_away_from_and_back_to_a_slot() {
     let zone = zone();
     enter(&zone, SLOT, 0);
-    zone.drive(SLOT, 7);
-    zone.leave_guest(SLOT, &HostWait);
+    zone.drive(SLOT, 7, &OwedPasses::new());
+    zone.leave_guest(SLOT, &HostWait, &OwedPasses::new());
     let mut taken = Vec::new();
     let mut placed = Vec::new();
-    assert!(!zone.step_away(SLOT, 9, &mut |r| taken.push(r.id), &mut |p| placed.push(p)));
+    assert!(!zone.step_away(
+        SLOT,
+        9,
+        &mut |r| taken.push(r.id),
+        &mut |p| placed.push(p),
+        &OwedPasses::new()
+    ));
     assert!(zone.slot(SLOT).is_live());
-    assert!(zone.step_away(SLOT, 7, &mut |r| taken.push(r.id), &mut |p| placed.push(p)));
+    assert!(zone.step_away(
+        SLOT,
+        7,
+        &mut |r| taken.push(r.id),
+        &mut |p| placed.push(p),
+        &OwedPasses::new()
+    ));
     assert!(!zone.slot(SLOT).is_live());
     assert_eq!(zone.slot(SLOT).driver(), Some(7), "away, not gone");
     let service = service_record(&zone, 5);
-    assert_eq!(zone.place_from_host(service), None);
+    assert_eq!(zone.place_from_host(service, &OwedPasses::new()), None);
     assert!(
-        zone.requeue_on(SLOT, service).is_some(),
+        zone.requeue_on(SLOT, service, &OwedPasses::new()).is_some(),
         "it waits for its driver"
     );
-    zone.step_back(SLOT, 9);
+    zone.step_back(SLOT, 9, &OwedPasses::new());
     assert!(!zone.slot(SLOT).is_live());
-    zone.step_back(SLOT, 7);
+    zone.step_back(SLOT, 7, &OwedPasses::new());
     assert!(zone.slot(SLOT).is_live());
-    assert_eq!(zone.take_service_head(SLOT).map(|r| r.id), Some(service));
+    assert_eq!(
+        zone.take_service_head(SLOT, &OwedPasses::new())
+            .map(|r| r.id),
+        Some(service)
+    );
 
     // Another executor drives the slot, then leaves it: the first one's
     // late return finds nothing to come back to.
-    zone.drive(SLOT, 9);
-    assert!(zone.leave_slot(SLOT, 9, &mut |r| taken.push(r.id), &mut |p| placed.push(p)));
-    zone.step_back(SLOT, 7);
+    zone.drive(SLOT, 9, &OwedPasses::new());
+    assert!(zone.leave_slot(
+        SLOT,
+        9,
+        &mut |r| taken.push(r.id),
+        &mut |p| placed.push(p),
+        &OwedPasses::new()
+    ));
+    zone.step_back(SLOT, 7, &OwedPasses::new());
     assert!(!zone.slot(SLOT).is_live());
     assert_eq!(zone.slot(SLOT).driver(), None);
 }
@@ -2978,9 +3338,10 @@ fn guest_wake_publication_has_no_remaining_futex_entry() {
             &mut |placement| {
                 // This is the real consumer boundary, after the target's
                 // lock was released. Take the waiter like a target vCPU.
-                let record = zone.switch_in(placement.slot).unwrap();
+                let record = zone.switch_in(placement.slot, &OwedPasses::new()).unwrap();
                 remaining_entries.push(zone.record(record).entry_count());
             },
+            &OwedPasses::new(),
         );
         drop(guard);
         assert_eq!(count, population as u32);
@@ -3026,6 +3387,7 @@ fn host_claim_is_not_published_before_queue_cleanup() {
                 &|owned| {
                     let _ = owned.into_parts();
                 },
+                &OwedPasses::new(),
             )
         });
         // Observe the real unlink lock boundary, without sleeps or a guest
@@ -3083,6 +3445,7 @@ fn host_claim_cleanup_does_not_unlink_a_replacement_waiter() {
                 &|owned| {
                     let _ = owned.into_parts();
                 },
+                &OwedPasses::new(),
             )
         });
         let reached = rx.recv_timeout(std::time::Duration::from_secs(5));
@@ -3093,10 +3456,16 @@ fn host_claim_cleanup_does_not_unlink_a_replacement_waiter() {
         }
         // Same cancellation decision as el1_zone::cancel: AlreadyHost
         // permits free, although this producer is still in unlink_all.
-        let cancellation =
-            zone.claim_for_host(original, None, Handback::Cancelled, &HostWait, &|owned| {
+        let cancellation = zone.claim_for_host(
+            original,
+            None,
+            Handback::Cancelled,
+            &HostWait,
+            &|owned| {
                 let _ = owned.into_parts();
-            });
+            },
+            &OwedPasses::new(),
+        );
         let replacement = if matches!(cancellation, HostClaim::Claimed | HostClaim::AlreadyHost) {
             zone.free_record(id);
             Some(park(zone, 2, replacement_address))
@@ -3181,7 +3550,8 @@ fn host_wake_transfer_owns_waitv_cleanup_until_completion() {
                 1,
                 false,
                 &mut |transfer| pending.push(transfer),
-                &mut |_| panic!("host-only wake placed in guest")
+                &mut |_| panic!("host-only wake placed in guest"),
+                &OwedPasses::new()
             ),
             1
         );
@@ -3203,7 +3573,8 @@ fn host_wake_transfer_owns_waitv_cleanup_until_completion() {
                 &HostWait,
                 &|owned| {
                     let _ = owned.into_parts();
-                }
+                },
+                &OwedPasses::new()
             ),
             HostClaim::Deferred
         );
@@ -3242,19 +3613,27 @@ fn a_host_request_during_transfer_prevents_guest_relocation() {
     let Claim::Queued { slot, .. } = zone.record(record).claim() else {
         panic!("not queued")
     };
-    let guard = zone.slot_lock(slot, &HostWait).unwrap();
+    let held_passes = OwedPasses::new();
+    let guard = zone.slot_lock(slot, &HostWait, &held_passes).unwrap();
     let transfer = zone
         .begin_host_transfer(original, zone.record(record).claim())
         .unwrap();
     assert!(zone.remove_locked(&guard, record));
     drop(guard);
     assert_eq!(
-        zone.claim_for_host(original, None, Handback::Control, &HostWait, &|owned| {
-            let _ = owned.into_parts();
-        }),
+        zone.claim_for_host(
+            original,
+            None,
+            Handback::Control,
+            &HostWait,
+            &|owned| {
+                let _ = owned.into_parts();
+            },
+            &OwedPasses::new()
+        ),
         HostClaim::Deferred
     );
-    let transfer = match transfer.place_in_guest(slot) {
+    let transfer = match transfer.place_in_guest(slot, &OwedPasses::new()) {
         Err(transfer) => transfer,
         Ok(_) => panic!("pending host request lost to guest placement"),
     };
@@ -3272,12 +3651,19 @@ fn cancelled_on_cpu_claim_is_retired_by_the_next_handback() {
     let zone = zone();
     let record = park(&zone, 1, 0x1000);
     let _ = wake(&zone, 0x1000, 1, Waker::El1 { slot: SLOT });
-    assert_eq!(zone.switch_in(SLOT), Some(record));
+    assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), Some(record));
     let original = zone.record_ref(record);
     assert_eq!(
-        zone.claim_for_host(original, None, Handback::Cancelled, &HostWait, &|owned| {
-            let _ = owned.into_parts();
-        }),
+        zone.claim_for_host(
+            original,
+            None,
+            Handback::Cancelled,
+            &HostWait,
+            &|owned| {
+                let _ = owned.into_parts();
+            },
+            &OwedPasses::new()
+        ),
         HostClaim::El1Held { slot: SLOT }
     );
     // The vCPU can hand it back before the host handles El1Held. The
@@ -3330,9 +3716,16 @@ fn late_host_requests_neither_target_nor_mask_a_new_incarnation() {
     let original = zone.record_ref(record);
     let admitted = zone.live(original).unwrap();
     assert_eq!(
-        zone.claim_for_host(original, None, Handback::Control, &HostWait, &|owned| {
-            let _ = owned.into_parts();
-        }),
+        zone.claim_for_host(
+            original,
+            None,
+            Handback::Control,
+            &HostWait,
+            &|owned| {
+                let _ = owned.into_parts();
+            },
+            &OwedPasses::new()
+        ),
         HostClaim::Claimed
     );
     zone.free_record(record);
@@ -3366,7 +3759,7 @@ fn host_request_wins_against_enrolled_guest_park() {
         let zone = zone();
         let record = park(&zone, 1, 0x1000);
         wake(&zone, 0x1000, 1, Waker::El1 { slot: SLOT });
-        assert_eq!(zone.switch_in(SLOT), Some(record));
+        assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), Some(record));
         let original = zone.record_ref(record);
         let guard = zone
             .lock(ZoneTables::bucket_of(MM, 0x2000), &HostWait)
@@ -3377,9 +3770,16 @@ fn host_request_wins_against_enrolled_guest_park() {
         zone.set_deadline(record, 100);
         zone.arm_timer(SLOT, record, seq).unwrap();
         assert_eq!(
-            zone.claim_for_host(original, None, kind, &HostWait, &|owned| {
-                let _ = owned.into_parts();
-            }),
+            zone.claim_for_host(
+                original,
+                None,
+                kind,
+                &HostWait,
+                &|owned| {
+                    let _ = owned.into_parts();
+                },
+                &OwedPasses::new()
+            ),
             HostClaim::El1Held { slot: SLOT }
         );
         assert!(!zone.publish_guest_park(&guard, SLOT, record, seq));
@@ -3408,15 +3808,22 @@ fn host_request_after_observation_refuses_the_object_park() {
         let zone = zone();
         let record = park(&zone, 1, 0x1000);
         wake(&zone, 0x1000, 1, Waker::El1 { slot: SLOT });
-        assert_eq!(zone.switch_in(SLOT), Some(record));
+        assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), Some(record));
         let original = zone.record_ref(record);
         let observed = zone.record(record).claim();
         assert!(matches!(observed, Claim::OnCpu { .. }));
         let seq = zone.next_seq(record);
         assert_eq!(
-            zone.claim_for_host(original, None, kind, &HostWait, &|owned| {
-                let _ = owned.into_parts();
-            }),
+            zone.claim_for_host(
+                original,
+                None,
+                kind,
+                &HostWait,
+                &|owned| {
+                    let _ = owned.into_parts();
+                },
+                &OwedPasses::new()
+            ),
             HostClaim::El1Held { slot: SLOT }
         );
         assert!(!zone.publish_object_park(record, seq, observed));
@@ -3439,7 +3846,7 @@ fn host_request_after_observation_refuses_the_object_park() {
     let zone = zone();
     let record = park(&zone, 1, 0x1000);
     wake(&zone, 0x1000, 1, Waker::El1 { slot: SLOT });
-    assert_eq!(zone.switch_in(SLOT), Some(record));
+    assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), Some(record));
     let observed = zone.record(record).claim();
     let seq = zone.next_seq(record);
     assert!(zone.publish_object_park(record, seq, observed));
@@ -3452,7 +3859,7 @@ fn host_request_after_guest_park_claims_the_published_wait() {
     let zone = zone();
     let record = park(&zone, 1, 0x1000);
     wake(&zone, 0x1000, 1, Waker::El1 { slot: SLOT });
-    assert_eq!(zone.switch_in(SLOT), Some(record));
+    assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), Some(record));
     let original = zone.record_ref(record);
     let guard = zone
         .lock(ZoneTables::bucket_of(MM, 0x2000), &HostWait)
@@ -3464,9 +3871,16 @@ fn host_request_after_guest_park_claims_the_published_wait() {
     drop(guard);
     zone.clear_current(SLOT);
     assert_eq!(
-        zone.claim_for_host(original, None, Handback::Signal, &HostWait, &|owned| {
-            let _ = owned.into_parts();
-        }),
+        zone.claim_for_host(
+            original,
+            None,
+            Handback::Signal,
+            &HostWait,
+            &|owned| {
+                let _ = owned.into_parts();
+            },
+            &OwedPasses::new()
+        ),
         HostClaim::Claimed
     );
     assert_eq!(zone.record(record).entry_count(), 0);
@@ -3479,24 +3893,34 @@ fn requested_running_records_survive_preemption_and_unswitch() {
         let zone = zone();
         let record = park(&zone, 1, 0x1000);
         wake(&zone, 0x1000, 1, Waker::El1 { slot: SLOT });
-        assert_eq!(zone.switch_in(SLOT), Some(record));
+        assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), Some(record));
         let original = zone.record_ref(record);
         assert_eq!(
-            zone.claim_for_host(original, None, Handback::Signal, &HostWait, &|owned| {
-                let _ = owned.into_parts();
-            }),
+            zone.claim_for_host(
+                original,
+                None,
+                Handback::Signal,
+                &HostWait,
+                &|owned| {
+                    let _ = owned.into_parts();
+                },
+                &OwedPasses::new()
+            ),
             HostClaim::El1Held { slot: SLOT }
         );
         if preempt {
-            assert!(zone.requeue_preempted(SLOT, record).is_queued());
+            assert!(
+                zone.requeue_preempted(SLOT, record, &OwedPasses::new())
+                    .is_queued()
+            );
         } else {
-            zone.unswitch(SLOT, record);
+            zone.unswitch(SLOT, record, &OwedPasses::new());
         }
         assert_eq!(zone.slot(SLOT).current(), None);
         assert_eq!(zone.slot(SLOT).queued(), 1);
         let mut handed = Vec::new();
         assert_eq!(
-            zone.take_host_wanted(SLOT, &mut |ready| handed.push(ready)),
+            zone.take_host_wanted(SLOT, &mut |ready| handed.push(ready), &OwedPasses::new()),
             1
         );
         assert_eq!(handed, [original]);
@@ -3557,7 +3981,7 @@ mod ipc_wait {
         .unwrap();
         let record = object_park(&zone, key, 17);
         assert_eq!(notify(&zone, key).0.queued, 1);
-        let switched = zone.switch_in_full(SLOT).unwrap();
+        let switched = zone.switch_in_full(SLOT, &OwedPasses::new()).unwrap();
         assert_eq!(switched.record, record);
         assert_eq!(
             switched.result, None,
@@ -3625,9 +4049,16 @@ mod ipc_wait {
             Err(ObjectWaitError::Occupied)
         );
         assert_eq!(
-            zone.claim_for_host(stale, None, Handback::Cancelled, &HostWait, &|owned| {
-                let _ = owned.into_parts();
-            }),
+            zone.claim_for_host(
+                stale,
+                None,
+                Handback::Cancelled,
+                &HostWait,
+                &|owned| {
+                    let _ = owned.into_parts();
+                },
+                &OwedPasses::new()
+            ),
             HostClaim::Claimed
         );
         zone.free_record(record);
@@ -3660,9 +4091,16 @@ mod ipc_wait {
         );
         let replacement = object_park(&zone, new, 2);
         assert_eq!(
-            zone.claim_for_host(stale, None, Handback::Control, &HostWait, &|owned| {
-                let _ = owned.into_parts();
-            }),
+            zone.claim_for_host(
+                stale,
+                None,
+                Handback::Control,
+                &HostWait,
+                &|owned| {
+                    let _ = owned.into_parts();
+                },
+                &OwedPasses::new()
+            ),
             HostClaim::Stale
         );
         assert!(matches!(
@@ -3688,14 +4126,21 @@ mod ipc_wait {
                     assert_eq!(notify(&zone, key).0.queued, 1);
                 }
                 assert_eq!(
-                    zone.claim_for_host(zone.record_ref(record), None, kind, &HostWait, &|owned| {
-                        let _ = owned.into_parts();
-                    }),
+                    zone.claim_for_host(
+                        zone.record_ref(record),
+                        None,
+                        kind,
+                        &HostWait,
+                        &|owned| {
+                            let _ = owned.into_parts();
+                        },
+                        &OwedPasses::new()
+                    ),
                     HostClaim::Claimed
                 );
                 assert_eq!(notify(&zone, key).0.queued, 0);
                 assert_eq!(zone.record(record).handback(), Some(kind));
-                assert!(zone.switch_in_full(SLOT).is_none());
+                assert!(zone.switch_in_full(SLOT, &OwedPasses::new()).is_none());
                 // SAFETY: host owns it; both wait/run queues detached it.
                 unsafe {
                     assert_eq!(zone.record(record).take_object_operation(), Some(token(1)));
@@ -3752,13 +4197,13 @@ mod ipc_wait {
             );
             assert_eq!(zone.counters.host_wakes.load(Ordering::Relaxed), 0);
             for _ in 0..n {
-                let switched = zone.switch_in_full(SLOT).unwrap();
+                let switched = zone.switch_in_full(SLOT, &OwedPasses::new()).unwrap();
                 assert_eq!(switched.result, None);
                 let rec = zone.record(switched.record);
                 // SAFETY: this slot owns this OnCpu record.
                 assert!(unsafe { rec.take_object_operation() }.is_some());
                 assert_eq!(
-                    zone.release_current(SLOT, switched.record, &HostWait),
+                    zone.release_current(SLOT, switched.record, &HostWait, &OwedPasses::new()),
                     CurrentRelease::Released
                 );
             }
@@ -3793,7 +4238,8 @@ mod ipc_wait {
                         &HostWait,
                         &|owned| {
                             let _ = owned.into_parts();
-                        }
+                        },
+                        &OwedPasses::new()
                     ),
                     HostClaim::Claimed
                 );
@@ -3838,9 +4284,16 @@ mod ipc_wait {
             .unwrap();
             let record = object_park(&zone, key, 1);
             assert_eq!(
-                zone.claim_for_host(zone.record_ref(record), None, kind, &HostWait, &|owned| {
-                    let _ = owned.into_parts();
-                }),
+                zone.claim_for_host(
+                    zone.record_ref(record),
+                    None,
+                    kind,
+                    &HostWait,
+                    &|owned| {
+                        let _ = owned.into_parts();
+                    },
+                    &OwedPasses::new()
+                ),
                 HostClaim::Claimed
             );
             assert!(
@@ -3864,11 +4317,14 @@ mod ipc_wait {
         notify(&zone, key);
         zone.record(record)
             .request_cancel(zone.record_ref(record).incarnation);
-        assert_eq!(zone.sweep_cancelled(SLOT), 0);
+        assert_eq!(zone.sweep_cancelled(SLOT, &OwedPasses::new()), 0);
         assert!(zone.head_needs_host(SLOT));
-        assert!(zone.switch_in_full(SLOT).is_none());
+        assert!(zone.switch_in_full(SLOT, &OwedPasses::new()).is_none());
         let mut taken = Vec::new();
-        assert_eq!(zone.take_host_wanted(SLOT, &mut |r| taken.push(r)), 1);
+        assert_eq!(
+            zone.take_host_wanted(SLOT, &mut |r| taken.push(r), &OwedPasses::new()),
+            1
+        );
         assert_eq!(taken, [zone.record_ref(record)]);
         assert_eq!(zone.record(record).handback(), Some(Handback::Cancelled));
         // SAFETY: host took the detached record.
@@ -3908,14 +4364,14 @@ mod ipc_wait {
         }
         zone.clear_current(SLOT);
         assert_eq!(notify(&zone, key).0.queued, 1);
-        let switched = zone.switch_in_full(SLOT).unwrap();
+        let switched = zone.switch_in_full(SLOT, &OwedPasses::new()).unwrap();
         assert_eq!(switched.record, record);
         assert!(switched.home);
-        zone.leave_guest(SLOT, &HostWait);
+        zone.leave_guest(SLOT, &HostWait, &OwedPasses::new());
         assert_eq!(zone.slot(SLOT).current(), Some(record));
         assert_eq!(zone.slot(SLOT).host_record(), Some(record));
         assert_eq!(
-            zone.release_current(SLOT, record, &HostWait),
+            zone.release_current(SLOT, record, &HostWait, &OwedPasses::new()),
             CurrentRelease::Requeued,
             "an operation EL1 never re-entered must not be retired"
         );
@@ -3970,9 +4426,12 @@ mod ipc_wait {
         .unwrap();
         let record = object_park(&zone, key, 71);
         notify(&zone, key);
-        assert_eq!(zone.switch_in(SLOT), Some(record));
+        assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), Some(record));
         let peer = zone.alloc_record(identity(72)).unwrap();
-        assert!(zone.requeue_preempted(SlotId::new(4), peer).is_queued());
+        assert!(
+            zone.requeue_preempted(SlotId::new(4), peer, &OwedPasses::new())
+                .is_queued()
+        );
         let commits = AtomicU32::new(0);
         let rollbacks = AtomicU32::new(0);
         let (published, observe) = std::sync::mpsc::sync_channel(1);
@@ -3984,7 +4443,10 @@ mod ipc_wait {
                 observe
                     .recv_timeout(std::time::Duration::from_secs(5))
                     .unwrap();
-                let guard = reader_zone.slot_lock(SLOT, &HostWait).unwrap();
+                let held_passes = OwedPasses::new();
+                let guard = reader_zone
+                    .slot_lock(SLOT, &HostWait, &held_passes)
+                    .unwrap();
                 assert_eq!(reader_zone.slot(SLOT).queued(), 1);
                 assert_eq!(observed_rollbacks.load(Ordering::Acquire), 1);
                 assert_eq!(observed_commits.load(Ordering::Acquire), 0);
@@ -4000,7 +4462,8 @@ mod ipc_wait {
                         record,
                         commits: &commits,
                         rollbacks: &rollbacks
-                    }
+                    },
+                    &OwedPasses::new()
                 ),
                 Some(CurrentRelease::Requeued)
             );
@@ -4043,9 +4506,12 @@ mod ipc_wait {
         .unwrap();
         let record = object_park(&zone, key, 81);
         notify(&zone, key);
-        assert_eq!(zone.switch_in(SLOT), Some(record));
+        assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), Some(record));
         let peer = zone.alloc_record(identity(82)).unwrap();
-        assert!(zone.requeue_preempted(SlotId::new(4), peer).is_queued());
+        assert!(
+            zone.requeue_preempted(SlotId::new(4), peer, &OwedPasses::new())
+                .is_queued()
+        );
         let commits = AtomicU32::new(0);
         let rollbacks = AtomicU32::new(0);
         let (reached, blocked) = std::sync::mpsc::sync_channel(1);
@@ -4056,7 +4522,8 @@ mod ipc_wait {
             once: AtomicBool::new(false),
         };
         std::thread::scope(|scope| {
-            let guard = zone.slot_lock(SLOT, &HostWait).unwrap();
+            let held_passes = OwedPasses::new();
+            let guard = zone.slot_lock(SLOT, &HostWait, &held_passes).unwrap();
             let writer = scope.spawn(|| {
                 zone.release_current_with(
                     SLOT,
@@ -4068,6 +4535,7 @@ mod ipc_wait {
                         commits: &commits,
                         rollbacks: &rollbacks,
                     },
+                    &OwedPasses::new(),
                 )
             });
             blocked
@@ -4103,7 +4571,7 @@ mod ipc_wait {
         .unwrap();
         let record = object_park(&zone, key, 71);
         assert_eq!(notify(&zone, key).0.queued, 1);
-        assert_eq!(zone.switch_in(SLOT), Some(record));
+        assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), Some(record));
         let identity = zone.record_ref(record);
         zone.record(record).request_cancel(identity.incarnation);
         assert_eq!(
@@ -4129,21 +4597,40 @@ fn contended_timer_expiry_rearms_without_consuming_the_park() {
         .lock(ZoneTables::bucket_of(MM, 0x1000), &HostWait)
         .unwrap();
     assert_eq!(
-        zone.expire_timer_and_rearm(SLOT, 500, 123, 10, &|owned| {
-            let _ = owned.into_parts();
-        }),
+        zone.expire_timer_and_rearm(
+            SLOT,
+            500,
+            123,
+            10,
+            &|owned| {
+                let _ = owned.into_parts();
+            },
+            &OwedPasses::new()
+        ),
         Some(510)
     );
     assert_eq!(zone.timer_deadline(SLOT), Some(500));
     assert_eq!(zone.record(record).claim(), Claim::Parked { seq: 1 });
     drop(guard);
     assert_eq!(
-        zone.expire_timer_and_rearm(SLOT, 510, 123, 10, &|owned| {
-            let _ = owned.into_parts();
-        }),
+        zone.expire_timer_and_rearm(
+            SLOT,
+            510,
+            123,
+            10,
+            &|owned| {
+                let _ = owned.into_parts();
+            },
+            &OwedPasses::new()
+        ),
         None
     );
-    assert_eq!(zone.switch_in_full(SLOT).unwrap().result, Some(123));
+    assert_eq!(
+        zone.switch_in_full(SLOT, &OwedPasses::new())
+            .unwrap()
+            .result,
+        Some(123)
+    );
 }
 
 /// A parent no guest slot may run (the waker's slot runs another address
@@ -4214,9 +4701,9 @@ fn carrier_cpu_policy_survives_slot_churn() {
     assert_eq!(zone.carrier_affinity_mask(), Some(15));
     assert_eq!(zone.carrier_cpu_count(), Some(4));
     let slot = SlotId::new(0);
-    zone.publish_slot(slot, MM, Some(1), 2);
+    zone.publish_slot(slot, MM, Some(1), 2, &OwedPasses::new());
     assert_eq!(zone.slot(slot).bound_cpu(), Some(1));
-    zone.publish_slot(slot, 0, None, 0);
+    zone.publish_slot(slot, 0, None, 0, &OwedPasses::new());
     assert_eq!(zone.slot(slot).bound_cpu(), None);
     assert_eq!(zone.carrier_affinity_mask(), Some(15));
     assert_eq!(zone.carrier_cpu_count(), Some(4));
@@ -4230,8 +4717,8 @@ fn unpublished_carrier_topology_cannot_invent_cpu_zero() {
     let zone = zone();
     assert_eq!(zone.carrier_affinity_mask(), None);
     assert_eq!(zone.carrier_cpu_count(), None);
-    zone.drive(SLOT, 1);
-    zone.publish_slot(SLOT, MM, Some(3), 1 << 3);
+    zone.drive(SLOT, 1, &OwedPasses::new());
+    zone.publish_slot(SLOT, MM, Some(3), 1 << 3, &OwedPasses::new());
     assert_eq!(zone.carrier_affinity_mask(), None);
     assert_eq!(zone.carrier_cpu_count(), None);
 }
@@ -4299,7 +4786,7 @@ fn live_affinity_sources_control_record_placement_and_the_host_loaded_slot() {
     // records and slot bindings below are retired.
     let source = unsafe { AffinitySource::from_authority(&authority) };
     let zone = zone();
-    zone.publish_slot_with_affinity(SLOT, MM, Some(1), source);
+    zone.publish_slot_with_affinity(SLOT, MM, Some(1), source, &OwedPasses::new());
     let record = zone
         .alloc_record(ThreadIdentity {
             affinity: 3,
@@ -4323,7 +4810,7 @@ fn live_affinity_sources_control_record_placement_and_the_host_loaded_slot() {
     assert_eq!(zone.record(record).identity().affinity, 2);
     assert!(!zone.slot(SLOT).affinity_excludes_cpu());
     zone.free_record(record);
-    zone.publish_slot_with_affinity(SLOT, 0, None, AffinitySource::UNBOUND);
+    zone.publish_slot_with_affinity(SLOT, 0, None, AffinitySource::UNBOUND, &OwedPasses::new());
 }
 
 #[test]
@@ -4342,7 +4829,7 @@ fn switched_sibling_mask_cannot_replace_the_host_loaded_affinity_source() {
     let loaded_source = unsafe { AffinitySource::from_authority(&loaded) };
     let sibling_source = unsafe { AffinitySource::from_authority(&sibling) };
     let zone = zone();
-    zone.publish_slot_with_affinity(SLOT, MM, Some(1), loaded_source);
+    zone.publish_slot_with_affinity(SLOT, MM, Some(1), loaded_source, &OwedPasses::new());
     let record = zone
         .alloc_record(ThreadIdentity {
             affinity_source: sibling_source,
@@ -4359,7 +4846,7 @@ fn switched_sibling_mask_cannot_replace_the_host_loaded_affinity_source() {
     assert_eq!(zone.slot(SLOT).affinity(), 2);
     assert_eq!(zone.record(record).identity().affinity, 1);
     zone.free_record(record);
-    zone.publish_slot_with_affinity(SLOT, 0, None, AffinitySource::UNBOUND);
+    zone.publish_slot_with_affinity(SLOT, 0, None, AffinitySource::UNBOUND, &OwedPasses::new());
 }
 
 #[test]
@@ -4374,7 +4861,7 @@ fn host_only_affinity_is_not_an_el1_residency() {
             0,
         )
     };
-    zone.publish_slot_with_affinity(SLOT, MM, Some(1), source);
+    zone.publish_slot_with_affinity(SLOT, MM, Some(1), source, &OwedPasses::new());
     assert!(
         !zone.slot(SLOT).affinity_excludes_cpu(),
         "host-only placement must not force an EL1 exit on every interrupt"
@@ -4387,8 +4874,11 @@ fn switched_affinity_change_prompts_only_the_exact_excluded_owner() {
     host_publish(&zone, SLOT, MM, Some(1), 3);
     zone.enter_guest(SLOT);
     let record = zone.alloc_record(identity(703)).unwrap();
-    assert!(zone.requeue_preempted(SLOT, record).is_queued());
-    zone.switch_in_full(SLOT).unwrap();
+    assert!(
+        zone.requeue_preempted(SLOT, record, &OwedPasses::new())
+            .is_queued()
+    );
+    zone.switch_in_full(SLOT, &OwedPasses::new()).unwrap();
     let reference = zone.record_ref(record);
     zone.record(record).set_affinity(1);
     let mut effects = WakeEffects::default();
@@ -4398,7 +4888,7 @@ fn switched_affinity_change_prompts_only_the_exact_excluded_owner() {
     let mut effects = WakeEffects::default();
     zone.affinity_change_effects(reference, &mut effects);
     assert_eq!(effects, WakeEffects::default());
-    zone.unswitch(SLOT, record);
+    zone.unswitch(SLOT, record, &OwedPasses::new());
     zone.record(record).set_affinity(1);
     zone.affinity_change_effects(reference, &mut effects);
     assert_eq!(effects, WakeEffects::default());
@@ -4456,7 +4946,11 @@ fn first_entry_operation_retirement(metadata: bool) {
         .unwrap();
     let mut handed = Vec::new();
     queue
-        .notify_object_host(&mut |record| handed.push(record), &mut |_| {})
+        .notify_object_host(
+            &mut |record| handed.push(record),
+            &mut |_| {},
+            &OwedPasses::new(),
+        )
         .unwrap();
     drop(queue);
     assert_eq!(handed, [record]);
@@ -4519,22 +5013,43 @@ fn cancelled_metadata_wait(deferred: bool) {
             Claim::Transferring { .. }
         ));
         assert_eq!(
-            zone.claim_for_host(record, None, Handback::Control, &HostWait, &|owned| {
-                let _ = owned.into_parts();
-            }),
+            zone.claim_for_host(
+                record,
+                None,
+                Handback::Control,
+                &HostWait,
+                &|owned| {
+                    let _ = owned.into_parts();
+                },
+                &OwedPasses::new()
+            ),
             HostClaim::Deferred
         );
     } else {
         assert_eq!(
-            zone.claim_for_host(record, None, Handback::Control, &HostWait, &|owned| {
-                let _ = owned.into_parts();
-            }),
+            zone.claim_for_host(
+                record,
+                None,
+                Handback::Control,
+                &HostWait,
+                &|owned| {
+                    let _ = owned.into_parts();
+                },
+                &OwedPasses::new()
+            ),
             HostClaim::Claimed
         );
     }
-    match zone.claim_for_host(record, None, Handback::Cancelled, &HostWait, &|owned| {
-        let _ = owned.into_parts();
-    }) {
+    match zone.claim_for_host(
+        record,
+        None,
+        Handback::Cancelled,
+        &HostWait,
+        &|owned| {
+            let _ = owned.into_parts();
+        },
+        &OwedPasses::new(),
+    ) {
         HostClaim::Claimed | HostClaim::AlreadyHost => zone.free_record(id),
         HostClaim::Deferred | HostClaim::Stale => {}
         other => panic!("unexpected cancellation: {other:?}"),
@@ -4568,16 +5083,30 @@ fn cancelled_metadata_wait(deferred: bool) {
             .unwrap();
     }
     assert_eq!(
-        zone.claim_for_host(record, None, Handback::Cancelled, &HostWait, &|owned| {
-            let _ = owned.into_parts();
-        }),
+        zone.claim_for_host(
+            record,
+            None,
+            Handback::Cancelled,
+            &HostWait,
+            &|owned| {
+                let _ = owned.into_parts();
+            },
+            &OwedPasses::new()
+        ),
         HostClaim::Stale
     );
     assert!(!zone.record(replacement).is_cancelled());
     assert!(zone.record(replacement).has_object_operation());
-    match zone.claim_for_host(live, None, Handback::Cancelled, &HostWait, &|owned| {
-        let _ = owned.into_parts();
-    }) {
+    match zone.claim_for_host(
+        live,
+        None,
+        Handback::Cancelled,
+        &HostWait,
+        &|owned| {
+            let _ = owned.into_parts();
+        },
+        &OwedPasses::new(),
+    ) {
         HostClaim::Claimed | HostClaim::AlreadyHost => zone.free_record(replacement),
         other => panic!("unexpected replacement cancellation: {other:?}"),
     }
@@ -4616,7 +5145,7 @@ fn interrupt_parked_futex_wakes_single_entry_user_return_with_eintr() {
         "signal futex interruption must record a Signal claim"
     );
     let selected = zone
-        .switch_in_full(SLOT)
+        .switch_in_full(SLOT, &OwedPasses::new())
         .expect("interrupted futex waiter must become runnable");
     assert_eq!(selected.record, record);
     assert_eq!(selected.result.map(|value| value as i64), Some(-4));
@@ -4635,7 +5164,7 @@ fn interrupt_parked_futex_preserves_a_resumed_waiters_new_timer() {
         *probe.borrow_mut() = Some(Box::new(move || {
             // A queue consumer may run as soon as publication exposes it.
             // Exercise an actual switch and timed re-park at that boundary.
-            if let Some(selected) = consumer.switch_in_full(SLOT) {
+            if let Some(selected) = consumer.switch_in_full(SLOT, &OwedPasses::new()) {
                 assert_eq!(selected.record, record);
                 assert_eq!(selected.result, Some((-4i64) as u64));
                 assert_eq!(el1_park(&consumer, SLOT, 41, 0x8000, 900), record);
@@ -4651,19 +5180,25 @@ fn interrupt_parked_futex_preserves_a_resumed_waiters_new_timer() {
         &mut WakeEffects::default(),
     ));
     if !reparked.load(Ordering::Acquire) {
-        let selected = zone.switch_in_full(SLOT).unwrap();
+        let selected = zone.switch_in_full(SLOT, &OwedPasses::new()).unwrap();
         assert_eq!(selected.record, record);
         assert_eq!(selected.result, Some((-4i64) as u64));
         assert_eq!(el1_park(&zone, SLOT, 41, 0x8000, 900), record);
     }
     assert_eq!(zone.timer_deadline(SLOT), Some(900));
     assert_eq!(
-        zone.expire_timer(SLOT, 900, 0xbeef, &|owned| {
-            let _ = owned.into_parts();
-        }),
+        zone.expire_timer(
+            SLOT,
+            900,
+            0xbeef,
+            &|owned| {
+                let _ = owned.into_parts();
+            },
+            &OwedPasses::new()
+        ),
         Ok(true)
     );
-    let selected = zone.switch_in_full(SLOT).unwrap();
+    let selected = zone.switch_in_full(SLOT, &OwedPasses::new()).unwrap();
     assert_eq!(selected.record, record);
     assert_eq!(selected.result, Some(0xbeef));
 }
@@ -4687,8 +5222,16 @@ fn interrupt_parked_futex_rechecks_claim_after_futex_enrollment() {
     let zone: Arc<ZoneTables> = Arc::from(zone());
     enter(&zone, SLOT, 0);
     let record = zone.current_or_new(SLOT, identity(41)).unwrap();
-    assert!(zone.requeue_preempted(SLOT, record).is_queued());
-    assert_eq!(zone.switch_in_full(SLOT).unwrap().record, record);
+    assert!(
+        zone.requeue_preempted(SLOT, record, &OwedPasses::new())
+            .is_queued()
+    );
+    assert_eq!(
+        zone.switch_in_full(SLOT, &OwedPasses::new())
+            .unwrap()
+            .record,
+        record
+    );
     let guard = zone.short_lock(ZoneTables::bucket_of(MM, 0x7000), &ShortLockSpin);
     let seq = zone.next_seq(record);
     zone.enqueue(&guard, record, seq, MM, 0x7000, u32::MAX, 0)
@@ -4725,7 +5268,7 @@ fn interrupt_parked_futex_rechecks_claim_after_futex_enrollment() {
         "sender must observe park publication under the bucket lock"
     );
     assert_eq!(zone.record(record).entry_count(), 0);
-    let selected = zone.switch_in_full(SLOT).unwrap();
+    let selected = zone.switch_in_full(SLOT, &OwedPasses::new()).unwrap();
     assert_eq!(selected.record, record);
     assert_eq!(selected.result.map(|value| value as i64), Some(-4));
 }
@@ -4774,7 +5317,10 @@ fn native_birth_issuer_refuses_issued_or_published_records() {
             ..identity(6)
         })
         .unwrap();
-    assert!(zone.requeue_preempted(SLOT, born).is_queued());
+    assert!(
+        zone.requeue_preempted(SLOT, born, &OwedPasses::new())
+            .is_queued()
+    );
     assert!(!zone.issue_native_birth(born), "already published");
     assert!(zone.record(born).is_unadopted_birth());
     assert!(!zone.record(born).is_native_owned());
@@ -4793,14 +5339,20 @@ fn native_birth_first_entry_stays_with_the_ring() {
     zone.spaces.open(space);
     let born = native_birth(&zone, 7);
     // EL1 `enqueue_born`.
-    assert!(zone.requeue_preempted(SLOT, born).is_queued());
+    assert!(
+        zone.requeue_preempted(SLOT, born, &OwedPasses::new())
+            .is_queued()
+    );
     assert!(!zone.record(born).needs_host_first_entry());
     assert!(
         !zone.head_needs_host(SLOT),
         "a native birth at the head must not send the vCPU to an executor"
     );
-    assert!(zone.take_service_head_for_executor(SLOT).is_none());
-    assert_eq!(zone.switch_in(SLOT), Some(born));
+    assert!(
+        zone.take_service_head_for_executor(SLOT, &OwedPasses::new())
+            .is_none()
+    );
+    assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), Some(born));
     assert!(matches!(zone.record(born).claim(), Claim::OnCpu { slot, .. } if slot == SLOT));
 }
 
@@ -4818,12 +5370,15 @@ fn native_birth_taken_by_an_executor_returns_to_the_ring_then_runs() {
     zone.enter_guest(SLOT);
     let space = zone.spaces.publish_closed(MM, 0x1000, 0x1000).unwrap();
     let born = native_birth(&zone, 8);
-    assert!(zone.requeue_preempted(SLOT, born).is_queued());
+    assert!(
+        zone.requeue_preempted(SLOT, born, &OwedPasses::new())
+            .is_queued()
+    );
     assert!(
         zone.head_needs_host(SLOT),
         "a closed MM is not runnable now"
     );
-    let record = match zone.take_service_head_for_executor(SLOT) {
+    let record = match zone.take_service_head_for_executor(SLOT, &OwedPasses::new()) {
         Some(ServiceHead::Record(record)) => record,
         Some(ServiceHead::FirstEntry(_)) => {
             panic!("a native birth must not become host first-entry custody")
@@ -4834,11 +5389,14 @@ fn native_birth_taken_by_an_executor_returns_to_the_ring_then_runs() {
     assert!(matches!(zone.record(born).claim(), Claim::Host { .. }));
     assert!(zone.record(born).needs_native_handback());
     // The executor's ring route (`el1_zone::route_native_handback`).
-    assert!(zone.place_native_handback(record).is_some());
+    assert!(
+        zone.place_native_handback(record, &OwedPasses::new())
+            .is_some()
+    );
     assert!(matches!(zone.record(born).claim(), Claim::Queued { .. }));
     zone.spaces.open(space);
     assert!(!zone.head_needs_host(SLOT));
-    assert_eq!(zone.switch_in(SLOT), Some(born));
+    assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), Some(born));
 }
 
 /// A refused requeue is returned with the claim it observed, and leaves the
@@ -4852,7 +5410,7 @@ fn requeue_refusal_reports_the_observed_claim() {
     let claim = zone.record(parked).claim();
     assert!(matches!(claim, Claim::Parked { .. }));
     assert_eq!(
-        zone.requeue_preempted(SLOT, parked),
+        zone.requeue_preempted(SLOT, parked, &OwedPasses::new()),
         Requeue::Refused(claim)
     );
     assert_eq!(zone.runnable_head(SLOT), None);
@@ -4874,16 +5432,19 @@ fn requeue_checkpoint_head_clears_woken_handback_and_preserves_head_order() {
     let peer = park(&zone, 12, 0x2000);
     assert_eq!(wake(&zone, 0x2000, 1, Waker::El1 { slot: SLOT }), [peer]);
 
-    let switched = zone.switch_in_full(SLOT).unwrap();
+    let switched = zone.switch_in_full(SLOT, &OwedPasses::new()).unwrap();
     assert_eq!(switched.record, first);
     assert_eq!(switched.result, Some(0));
 
-    assert!(zone.requeue_checkpoint_head(SLOT, first).is_queued());
+    assert!(
+        zone.requeue_checkpoint_head(SLOT, first, &OwedPasses::new())
+            .is_queued()
+    );
     assert_eq!(zone.record(first).handback(), Some(Handback::Resumed));
     assert_eq!(zone.runnable_head(SLOT), Some(first));
 
     // Next selection pops `first` ahead of `peer` with no stale wake result.
-    let resumed = zone.switch_in_full(SLOT).unwrap();
+    let resumed = zone.switch_in_full(SLOT, &OwedPasses::new()).unwrap();
     assert_eq!(resumed.record, first);
     assert_eq!(resumed.result, None);
     assert_eq!(zone.runnable_head(SLOT), Some(peer));
@@ -4898,16 +5459,20 @@ fn requeue_checkpoint_head_clears_woken_handback_and_preserves_head_order() {
             &HostWait,
             &|owned| {
                 let _ = owned.into_parts();
-            }
+            },
+            &OwedPasses::new()
         ),
         HostClaim::El1Held { slot: SLOT }
     );
-    assert!(zone.requeue_checkpoint_head(SLOT, first).is_queued());
+    assert!(
+        zone.requeue_checkpoint_head(SLOT, first, &OwedPasses::new())
+            .is_queued()
+    );
     assert_eq!(zone.record(first).handback(), Some(Handback::Resumed));
     assert_eq!(zone.runnable_head(SLOT), Some(first));
     let mut wanted = Vec::new();
     assert_eq!(
-        zone.take_host_wanted(SLOT, &mut |record| wanted.push(record)),
+        zone.take_host_wanted(SLOT, &mut |record| wanted.push(record), &OwedPasses::new()),
         1
     );
     assert_eq!(wanted, [zone.record_ref(first)]);
@@ -4957,7 +5522,7 @@ fn host_owned_syscall_memory_wait_requires_ring_resume() {
     let report = queue.notify_object(SLOT, &mut effects).unwrap();
     assert_eq!(report.visited, 1);
     drop(queue);
-    assert_eq!(zone.switch_in(SLOT), Some(record));
+    assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), Some(record));
     assert_eq!(
         zone.record(record).resume_disposition(),
         ResumeDisposition::OwnerContinuation(OwnerEntry::Syscall)
@@ -5060,7 +5625,7 @@ fn native_deadline_transfer_survives_all_slots_departing_and_record_reuse() {
     let zone = zone();
     host_publish(&zone, SLOT, MM, Some(0), 1);
     let exact = native_timer_park(&zone, 51, 100);
-    zone.leave_guest(SLOT, &HostWait);
+    zone.leave_guest(SLOT, &HostWait, &OwedPasses::new());
     let taken = zone.take_foreign_timer(SLOT).unwrap();
     assert!(taken.native);
     assert_eq!(taken.record, exact);
@@ -5107,9 +5672,16 @@ fn native_deadline_transfer_survives_all_slots_departing_and_record_reuse() {
         None
     );
     assert_eq!(
-        zone.claim_for_host(next, None, Handback::Cancelled, &HostWait, &|owned| {
-            let _ = owned.into_parts();
-        }),
+        zone.claim_for_host(
+            next,
+            None,
+            Handback::Cancelled,
+            &HostWait,
+            &|owned| {
+                let _ = owned.into_parts();
+            },
+            &OwedPasses::new()
+        ),
         HostClaim::Claimed
     );
     zone.free_record(next.id);
@@ -5124,7 +5696,7 @@ fn native_deadline_wake_transfer_and_expiry_resolve_once() {
         let zone = zone();
         host_publish(&zone, SLOT, MM, Some(0), 1);
         let exact = native_timer_park(&zone, 51, 100);
-        zone.leave_guest(SLOT, &HostWait);
+        zone.leave_guest(SLOT, &HostWait, &OwedPasses::new());
         let (woke, expired) = std::thread::scope(|scope| {
             let waker = scope.spawn(|| {
                 let guard = zone
@@ -5225,7 +5797,7 @@ fn unhoming_a_native_root_cannot_cancel_carrier_deadline_custody() {
     let record = zone.current_or_new(SLOT, identity(51)).unwrap();
     let exact = publish_native_timer_park(&zone, record, 100);
     zone.clear_current(SLOT);
-    zone.leave_guest(SLOT, &HostWait);
+    zone.leave_guest(SLOT, &HostWait, &OwedPasses::new());
     assert!(zone.take_foreign_timer(SLOT).unwrap().native);
     assert_eq!(zone.unhome(SLOT, record, 1), None);
     assert_eq!(zone.timer_node_count(), 1);
@@ -5245,8 +5817,14 @@ fn native_handback_without_an_allowed_driver_is_held() {
     let zone = zone();
     enter(&zone, SLOT, 0);
     enter(&zone, OTHER, 1);
-    zone.leave_guest(OTHER, &HostWait);
-    assert!(zone.leave_slot(OTHER, u64::from(OTHER.raw()) + 1, &mut |_| {}, &mut |_| {}));
+    zone.leave_guest(OTHER, &HostWait, &OwedPasses::new());
+    assert!(zone.leave_slot(
+        OTHER,
+        u64::from(OTHER.raw()) + 1,
+        &mut |_| {},
+        &mut |_| {},
+        &OwedPasses::new()
+    ));
     for last in [None, Some(SLOT), Some(OTHER)] {
         let (record, seq) = park_pinned(&zone, 3, 0x4000, 1 << 1);
         let reference = zone.record_ref(record);
@@ -5257,7 +5835,7 @@ fn native_handback_without_an_allowed_driver_is_held() {
         wake_effects(&zone, 0x4000, 1, SLOT);
         zone.take_completion_handbacks(&HostWait, &mut |_| {});
         assert_eq!(
-            zone.place_native_handback(reference),
+            zone.place_native_handback(reference, &OwedPasses::new()),
             Some(NativePlacement::Held),
             "no admitted native slot"
         );
@@ -5274,7 +5852,8 @@ fn claim_for_el1_busy_once_then_success() {
     enter(&zone, SLOT, 0);
     enter(&zone, OTHER, 1);
     let (record, seq) = park_pinned(&zone, 3, 0x4000, 1 << 1);
-    let held = zone.slot_lock(OTHER, &HostWait).unwrap();
+    let held_passes = OwedPasses::new();
+    let held = zone.slot_lock(OTHER, &HostWait, &held_passes).unwrap();
     let mut effects = WakeEffects::default();
     assert!(!zone.claim_for_el1_with_wait((record, seq, 0), SLOT, &mut effects, || {}, true));
     assert_eq!(zone.record(record).claim(), Claim::Parked { seq });
@@ -5292,13 +5871,14 @@ fn a_left_first_candidate_falls_back_to_a_driven_peer() {
     enter(&zone, SLOT, 0);
     enter(&zone, OTHER, 1);
     enter(&zone, THIRD, 1);
-    zone.leave_guest(OTHER, &HostWait);
-    zone.leave_guest(THIRD, &HostWait);
+    zone.leave_guest(OTHER, &HostWait, &OwedPasses::new());
+    zone.leave_guest(THIRD, &HostWait, &OwedPasses::new());
     let (record, seq) = park_pinned(&zone, 3, 0x4000, 1 << 1);
     zone.record(record)
         .last_slot
         .store(OTHER.plus_one(), Ordering::Relaxed);
-    let held = zone.slot_lock(OTHER, &HostWait).unwrap();
+    let held_passes = OwedPasses::new();
+    let held = zone.slot_lock(OTHER, &HostWait, &held_passes).unwrap();
     let (attempted, probe) = std::sync::mpsc::sync_channel(1);
     let (woken, _) = std::thread::scope(|scope| {
         let waker = scope.spawn(|| {
@@ -5355,7 +5935,8 @@ fn claim_for_el1_probes_a_busy_candidate_only_once() {
     enter(&zone, SLOT, 0);
     enter(&zone, OTHER, 1);
     let (record, seq) = park_pinned(&zone, 3, 0x4000, 1 << 1);
-    let held = zone.slot_lock(OTHER, &HostWait).unwrap();
+    let held_passes = OwedPasses::new();
+    let held = zone.slot_lock(OTHER, &HostWait, &held_passes).unwrap();
     SLOT_LOCK_PROBES.with_borrow_mut(|probes| *probes = Some(Vec::new()));
     let result = zone.claim_for_el1_with_wait(
         (record, seq, 0),
@@ -5386,7 +5967,13 @@ fn native_handback_admits_a_stepped_away_allowed_driver() {
     let zone = zone();
     enter(&zone, SLOT, 0);
     enter(&zone, OTHER, 1);
-    assert!(zone.step_away(OTHER, u64::from(OTHER.raw()) + 1, &mut |_| {}, &mut |_| {}));
+    assert!(zone.step_away(
+        OTHER,
+        u64::from(OTHER.raw()) + 1,
+        &mut |_| {},
+        &mut |_| {},
+        &OwedPasses::new()
+    ));
     for last in [None, Some(SLOT)] {
         let (record, _) = park_pinned(&zone, 3, 0x4000, 1 << 1);
         let reference = zone.record_ref(record);
@@ -5395,13 +5982,20 @@ fn native_handback_admits_a_stepped_away_allowed_driver() {
             .last_slot
             .store(last.map_or(0, SlotId::plus_one), Ordering::Relaxed);
         assert_eq!(
-            zone.claim_for_host(reference, None, Handback::Woken, &HostWait, &|owned| {
-                let _ = owned.into_parts();
-            }),
+            zone.claim_for_host(
+                reference,
+                None,
+                Handback::Woken,
+                &HostWait,
+                &|owned| {
+                    let _ = owned.into_parts();
+                },
+                &OwedPasses::new()
+            ),
             HostClaim::Claimed
         );
         let NativePlacement::Placed(placement) = zone
-            .place_native_handback(reference)
+            .place_native_handback(reference, &OwedPasses::new())
             .expect("retained completion")
         else {
             panic!("expected driven placement")
@@ -5409,9 +6003,16 @@ fn native_handback_admits_a_stepped_away_allowed_driver() {
         assert_eq!(placement.slot, OTHER);
         assert_eq!(zone.slot(SLOT).queued(), 0);
         assert_eq!(
-            zone.claim_for_host(reference, None, Handback::Cancelled, &HostWait, &|owned| {
-                let _ = owned.into_parts();
-            }),
+            zone.claim_for_host(
+                reference,
+                None,
+                Handback::Cancelled,
+                &HostWait,
+                &|owned| {
+                    let _ = owned.into_parts();
+                },
+                &OwedPasses::new()
+            ),
             HostClaim::Claimed
         );
         zone.free_record(record);
@@ -5423,13 +6024,20 @@ fn held_completion(zone: &ZoneTables) -> (RecordRef, u32) {
     zone.record(record).native_owned.store(1, Ordering::Release);
     let reference = zone.record_ref(record);
     assert_eq!(
-        zone.claim_for_host(reference, None, Handback::Woken, &HostWait, &|owned| {
-            let _ = owned.into_parts();
-        }),
+        zone.claim_for_host(
+            reference,
+            None,
+            Handback::Woken,
+            &HostWait,
+            &|owned| {
+                let _ = owned.into_parts();
+            },
+            &OwedPasses::new()
+        ),
         HostClaim::Claimed
     );
     assert_eq!(
-        zone.place_native_handback(reference),
+        zone.place_native_handback(reference, &OwedPasses::new()),
         Some(NativePlacement::Held)
     );
     (reference, seq)
@@ -5440,13 +6048,13 @@ fn a_published_driver_places_a_held_completion_exactly_once() {
     let zone = zone();
     enter(&zone, SLOT, 0);
     let (record, seq) = held_completion(&zone);
-    zone.drive(OTHER, 8);
-    zone.publish_slot(OTHER, MM, Some(1), 0);
+    zone.drive(OTHER, 8, &OwedPasses::new());
+    zone.publish_slot(OTHER, MM, Some(1), 0, &OwedPasses::new());
     assert_eq!(
         zone.record(record.id).claim(),
         Claim::Queued { slot: OTHER, seq }
     );
-    zone.publish_slot(OTHER, MM, Some(1), 0);
+    zone.publish_slot(OTHER, MM, Some(1), 0, &OwedPasses::new());
     assert_eq!(zone.slot(OTHER).queued(), 1);
 }
 
@@ -5456,9 +6064,16 @@ fn a_held_completion_can_be_cancelled_and_reused_before_a_trigger() {
     enter(&zone, SLOT, 0);
     let (record, _) = held_completion(&zone);
     assert_eq!(
-        zone.claim_for_host(record, None, Handback::Cancelled, &HostWait, &|owned| {
-            let _ = owned.into_parts();
-        }),
+        zone.claim_for_host(
+            record,
+            None,
+            Handback::Cancelled,
+            &HostWait,
+            &|owned| {
+                let _ = owned.into_parts();
+            },
+            &OwedPasses::new()
+        ),
         HostClaim::Claimed
     );
     zone.free_record(record.id);
@@ -5466,8 +6081,8 @@ fn a_held_completion_can_be_cancelled_and_reused_before_a_trigger() {
     assert_eq!(reused, record.id);
     assert_ne!(zone.record_ref(reused).incarnation, record.incarnation);
     let before = zone.record(reused).claim();
-    zone.drive(OTHER, 8);
-    zone.publish_slot(OTHER, MM, Some(1), 0);
+    zone.drive(OTHER, 8, &OwedPasses::new());
+    zone.publish_slot(OTHER, MM, Some(1), 0, &OwedPasses::new());
     assert_eq!(zone.record(reused).claim(), before);
     assert_eq!(zone.slot(OTHER).queued(), 0);
 }
@@ -5494,15 +6109,22 @@ fn a_signal_claims_held_custody_without_overwriting_the_wake_result() {
     enter(&zone, SLOT, 0);
     let (record, seq) = held_completion(&zone);
     assert_eq!(
-        zone.claim_for_host(record, Some(seq), Handback::Signal, &HostWait, &|owned| {
-            let _ = owned.into_parts();
-        }),
+        zone.claim_for_host(
+            record,
+            Some(seq),
+            Handback::Signal,
+            &HostWait,
+            &|owned| {
+                let _ = owned.into_parts();
+            },
+            &OwedPasses::new()
+        ),
         HostClaim::Claimed
     );
     assert_eq!(zone.record(record.id).handback(), Some(Handback::Woken));
     assert_eq!(zone.record(record.id).result(), 0);
     assert_eq!(
-        zone.place_native_handback(record),
+        zone.place_native_handback(record, &OwedPasses::new()),
         Some(NativePlacement::Held)
     );
 }
@@ -5513,7 +6135,8 @@ fn held_affinity_probe_busy_once_then_success() {
     enter(&zone, SLOT, 0);
     let (record, seq) = held_completion(&zone);
     zone.record(record.id).set_affinity(1);
-    let lock = zone.slot_lock(SLOT, &HostWait).unwrap();
+    let held_passes = OwedPasses::new();
+    let lock = zone.slot_lock(SLOT, &HostWait, &held_passes).unwrap();
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     std::thread::scope(|scope| {
         let probe = scope.spawn(|| {
@@ -5545,19 +6168,32 @@ fn held_affinity_placement_on_an_away_owner_kicks_live_peers() {
     enter(&zone, SLOT, 0);
     enter(&zone, OTHER, 1);
     enter(&zone, THIRD, 1);
-    assert!(zone.step_away(OTHER, u64::from(OTHER.raw()) + 1, &mut |_| {}, &mut |_| {}));
+    assert!(zone.step_away(
+        OTHER,
+        u64::from(OTHER.raw()) + 1,
+        &mut |_| {},
+        &mut |_| {},
+        &OwedPasses::new()
+    ));
     host_publish(&zone, THIRD, MM + 1, Some(1), 0);
     let (id, seq) = park_pinned(&zone, 75, 0x4000, 1 << 2);
     zone.record(id).native_owned.store(1, Ordering::Release);
     let record = zone.record_ref(id);
     assert_eq!(
-        zone.claim_for_host(record, None, Handback::Woken, &HostWait, &|owned| {
-            let _ = owned.into_parts();
-        }),
+        zone.claim_for_host(
+            record,
+            None,
+            Handback::Woken,
+            &HostWait,
+            &|owned| {
+                let _ = owned.into_parts();
+            },
+            &OwedPasses::new()
+        ),
         HostClaim::Claimed
     );
     assert_eq!(
-        zone.place_native_handback(record),
+        zone.place_native_handback(record, &OwedPasses::new()),
         Some(NativePlacement::Held)
     );
     zone.record(id).set_affinity(1 << 1);
@@ -5620,29 +6256,42 @@ fn two_slots_never_leave_a_queued_record_off_its_run_queue() {
                 let mut held: Vec<RecordId> = Vec::new();
                 for _ in 0..STEPS {
                     let tick = now.fetch_add(1, Ordering::SeqCst);
-                    let _ = zone.expire_timer_and_rearm(slot, tick, 110, 1, &|owned| {
-                        let _ = owned.into_parts();
+                    let _ = zone.expire_timer_and_rearm(
+                        slot,
+                        tick,
+                        110,
+                        1,
+                        &|owned| {
+                            let _ = owned.into_parts();
+                        },
+                        &OwedPasses::new(),
+                    );
+                    held.retain(|record| {
+                        zone.place_from_host(*record, &OwedPasses::new()).is_none()
                     });
-                    held.retain(|record| zone.place_from_host(*record).is_none());
                     if next() % 64 == 0 {
                         // An exit: the executor holds the stopped vCPU and
                         // moves its EL0-ready queue to slots in the guest.
-                        zone.leave_guest(slot, &HostWait);
+                        zone.leave_guest(slot, &HostWait, &OwedPasses::new());
                         zone.relocate(
                             slot,
                             None,
                             &mut |record, discard| {
                                 assert!(!discard);
-                                if zone.place_from_host(record.id).is_none() {
+                                if zone
+                                    .place_from_host(record.id, &OwedPasses::new())
+                                    .is_none()
+                                {
                                     held.push(record.id);
                                 }
                             },
                             &mut |_| {},
+                            &OwedPasses::new(),
                         );
                         zone.enter_guest(slot);
                     }
-                    let Some(switched) = zone.take_idle_work(slot) else {
-                        if zone.enter_idle(slot, true) {
+                    let Some(switched) = zone.take_idle_work(slot, &OwedPasses::new()) else {
+                        if zone.enter_idle(slot, true, &OwedPasses::new()) {
                             for _ in 0..16 {
                                 core::hint::spin_loop();
                             }
@@ -5675,7 +6324,7 @@ fn two_slots_never_leave_a_queued_record_off_its_run_queue() {
                             if let Some(ready) = woken.take_ready(&HostWait, &|owned| {
                                 let _ = owned.into_parts();
                             }) && matches!(zone.record(ready.id).claim(), Claim::Host { .. })
-                                && zone.place_from_host(ready.id).is_none()
+                                && zone.place_from_host(ready.id, &OwedPasses::new()).is_none()
                             {
                                 held.push(ready.id);
                             }
@@ -5684,7 +6333,10 @@ fn two_slots_never_leave_a_queued_record_off_its_run_queue() {
                     // x86 migrates queued work before every resume.
                     zone.migrate_queued(slot, &mut WakeEffects::default());
                     if roll % 3 == 0 && zone.runnable_head(slot).is_some() {
-                        assert!(zone.requeue_preempted(slot, record).is_queued());
+                        assert!(
+                            zone.requeue_preempted(slot, record, &OwedPasses::new())
+                                .is_queued()
+                        );
                         continue;
                     }
                     let uaddr = ADDRESSES[(roll >> 16) as usize % ADDRESSES.len()];
@@ -5697,7 +6349,10 @@ fn two_slots_never_leave_a_queued_record_off_its_run_queue() {
                     // thread runnable instead.
                     if zone.arm_timer(slot, record, seq).is_err() {
                         drop(guard);
-                        assert!(zone.requeue_preempted(slot, record).is_queued());
+                        assert!(
+                            zone.requeue_preempted(slot, record, &OwedPasses::new())
+                                .is_queued()
+                        );
                         continue;
                     }
                     zone.enqueue(&guard, record, seq, MM, uaddr, u32::MAX, 0)
@@ -5711,7 +6366,7 @@ fn two_slots_never_leave_a_queued_record_off_its_run_queue() {
                             zone.handback_current(slot, record),
                             CurrentHandback::HandedBack
                         );
-                        if zone.place_from_host(record).is_none() {
+                        if zone.place_from_host(record, &OwedPasses::new()).is_none() {
                             held.push(record);
                         }
                         continue;
@@ -5733,7 +6388,7 @@ fn two_slots_never_leave_a_queued_record_off_its_run_queue() {
                 rng ^= rng << 13;
                 rng ^= rng >> 7;
                 rng ^= rng << 17;
-                held.retain(|record| zone.place_from_host(*record).is_none());
+                held.retain(|record| zone.place_from_host(*record, &OwedPasses::new()).is_none());
                 let record = records[rng as usize % records.len()];
                 if rng.is_multiple_of(4) {
                     // A host futex wake that places in the guest.
@@ -5751,12 +6406,13 @@ fn two_slots_never_leave_a_queued_record_off_its_run_queue() {
                         true,
                         &mut |transfer| handed.push(transfer),
                         &mut |_| {},
+                        &OwedPasses::new(),
                     );
                     drop(guard);
                     for transfer in handed {
                         if let Some(ready) = transfer.finish(&HostWait, &|owned| {
                             let _ = owned.into_parts();
-                        }) && zone.place_from_host(ready.id).is_none()
+                        }) && zone.place_from_host(ready.id, &OwedPasses::new()).is_none()
                         {
                             held.push(ready.id);
                         }
@@ -5764,10 +6420,17 @@ fn two_slots_never_leave_a_queued_record_off_its_run_queue() {
                 } else if rng % 4 == 1 {
                     // A signal for a thread in the guest.
                     let reference = zone.record_ref(record);
-                    if zone.claim_for_host(reference, None, Handback::Signal, &HostWait, &|owned| {
-                        let _ = owned.into_parts();
-                    }) == HostClaim::Claimed
-                        && zone.place_from_host(record).is_none()
+                    if zone.claim_for_host(
+                        reference,
+                        None,
+                        Handback::Signal,
+                        &HostWait,
+                        &|owned| {
+                            let _ = owned.into_parts();
+                        },
+                        &OwedPasses::new(),
+                    ) == HostClaim::Claimed
+                        && zone.place_from_host(record, &OwedPasses::new()).is_none()
                     {
                         held.push(record);
                     }
