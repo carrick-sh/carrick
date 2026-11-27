@@ -2147,12 +2147,14 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                             mms: &mut mms.borrow_mut(),
                         },
                     )
-                    .is_ok()
                 },
             );
-            anonymous_owner::fatal_if_quarantined(&self._vm)?;
-            if settled.is_err() {
-                self.exec_predecessors.release_permitted.push(receipt);
+            match settled {
+                Ok(()) => {}
+                Err(carrick_hal::fork_stock::ForkStockServiceError::BrokenRelease(broken)) => {
+                    return Err(anonymous_owner::broken_release_fatal(broken));
+                }
+                Err(_) => self.exec_predecessors.release_permitted.push(receipt),
             }
         }
         Ok(())

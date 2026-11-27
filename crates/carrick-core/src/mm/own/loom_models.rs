@@ -229,3 +229,71 @@ fn a_cow_supply_is_busy_once_then_supplied_after_the_guest_editor_releases() {
         assert!(core.teardown().is_ok());
     });
 }
+
+/// PR 1b: the MM's last guest edit races its exit and two-phase release.
+/// The exit is "not now" while the guest holds the editor and reruns after
+/// its release; the release runs its I/O unlocked, a "not now" outcome
+/// leaves the MM releasable, and the grant comes back exactly once.
+#[test]
+fn an_exit_waits_for_the_guest_editor_and_a_not_now_release_reruns() {
+    loom::model(|| {
+        let mm = MmKey::new(NonZeroU64::MIN);
+        let mut core = GrantCore::new(carrier());
+        let excluded = ExcludedMm::claimed(mm);
+        let Ok(CowSupply::NeedsChunk(demand)) = core.supply_cow(&excluded, 0x1000) else {
+            panic!("the MM has no chunk yet");
+        };
+        let chunk = extent(0x200_000, demand.chunk_len());
+        let ticket = core.admit_chunk(demand, chunk).unwrap();
+        core.finish_supply_cow(ticket, Supplied::Published(7))
+            .unwrap();
+        assert!(core.guest_editor(mm, true));
+        let shell = Arc::new(GrantShell {
+            core: Mutex::new(core),
+        });
+        let guest = {
+            let shell = Arc::clone(&shell);
+            thread::spawn(move || shell.with(|core| assert!(core.guest_editor(mm, false))))
+        };
+        let releaser = {
+            let shell = Arc::clone(&shell);
+            thread::spawn(move || {
+                loop {
+                    match shell.with(|core| core.exit_mm(mm)) {
+                        Ok(()) => break,
+                        // A real shell enrols on the editor's release and
+                        // probes once; the model yields to the guest.
+                        Err(MmRefusal::NotNow(NotNow::EditorRelease(key))) => {
+                            assert_eq!(key, mm);
+                            thread::yield_now();
+                        }
+                        Err(other) => panic!("exit refused: {other:?}"),
+                    }
+                }
+                let mut returned = Vec::new();
+                for outcome in [
+                    ReleaseOutcome::NotNow(ReleaseWait::OwedReturns),
+                    ReleaseOutcome::Done,
+                ] {
+                    let (ticket, grants) = shell.with(|core| core.begin_release(mm).unwrap());
+                    returned.extend(grants);
+                    // The shell's release I/O runs unlocked.
+                    let verdict = shell.with(|core| core.finish_release(ticket, outcome).unwrap());
+                    assert_eq!(verdict, outcome);
+                }
+                returned
+            })
+        };
+        guest.join().unwrap();
+        assert_eq!(releaser.join().unwrap(), [7], "the grant comes back once");
+        let core = Arc::try_unwrap(shell)
+            .ok()
+            .unwrap()
+            .core
+            .into_inner()
+            .unwrap();
+        assert_eq!(core.mm_life(mm), None);
+        assert_eq!(core.chunk_count(), 0);
+        assert!(core.teardown().is_ok());
+    });
+}

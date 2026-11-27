@@ -422,6 +422,14 @@ struct GrantWorld {
     /// A supply was carved from a chunk an earlier supply mapped.
     carved_from_chunk: bool,
     refused_busy: [bool; 2],
+    /// Release tickets the shell holds (PR 1b).
+    releases: Vec<ReleaseTicket>,
+    /// A release came back `Broken`: the venue ends the carrier, so the
+    /// world stops here.
+    ended: bool,
+    /// Each MM had a release answered "not now", and was released since.
+    not_now_then_released: [bool; 2],
+    deferred: [bool; 2],
 }
 
 impl Drop for GrantWorld {
@@ -441,7 +449,11 @@ enum GrantOp {
     BeginSettle(usize),
     Settle(u8),
     FinishSettle,
-    Retire(usize),
+    Exit(usize),
+    BeginRelease(usize),
+    /// Finish the ticket at the index with outcome 0 `Done`, 1 `NotNow`
+    /// or 2 `Broken`.
+    FinishRelease(usize, u8),
     RetireAll,
 }
 
@@ -452,15 +464,22 @@ fn mm_key(index: usize) -> MmKey {
 }
 
 fn grant_ops(world: &GrantWorld) -> Vec<GrantOp> {
+    if world.ended {
+        return Vec::new();
+    }
     let mut ops = vec![GrantOp::FinishSettle, GrantOp::RetireAll];
     for mm in 0..2 {
         ops.extend([
             GrantOp::GuestHold(mm),
             GrantOp::GuestRelease(mm),
             GrantOp::BeginSettle(mm),
-            GrantOp::Retire(mm),
+            GrantOp::Exit(mm),
+            GrantOp::BeginRelease(mm),
             GrantOp::Supply(mm),
         ]);
+    }
+    for index in 0..world.releases.len() {
+        ops.extend((0..3).map(|outcome| GrantOp::FinishRelease(index, outcome)));
     }
     for index in 0..world.chunk_demands.len() {
         ops.extend((0..CHUNK_EXTENTS.len()).map(|chunk| GrantOp::AdmitChunk(index, chunk)));
@@ -495,12 +514,17 @@ fn grant_step(world: &mut GrantWorld, op: GrantOp) -> Result<(), String> {
     let before = Snapshot(world.core.clone());
     match op {
         GrantOp::GuestHold(mm) => {
-            // The guest takes its editor only while no host edit holds it:
-            // the guest try-lock is the same word.
+            // The guest takes its editor only while no host edit holds it
+            // (the guest try-lock is the same word), and only while the MM
+            // has members: an exited MM has none.
             if world
                 .core
                 .editor(mm_key(mm))
                 .is_none_or(|e| e == MmEditor::Free)
+                && world
+                    .core
+                    .mm_life(mm_key(mm))
+                    .is_none_or(|life| life == MmLife::Live)
             {
                 world.core.guest_editor(mm_key(mm), true);
             }
@@ -629,9 +653,91 @@ fn grant_step(world: &mut GrantWorld, op: GrantOp) -> Result<(), String> {
                 world.settle = Some(refused.offered);
             }
         }
-        GrantOp::Retire(mm) => {
-            if let Ok(returned) = world.core.retire_mm(mm_key(mm)) {
+        GrantOp::Exit(mm) => match world.core.exit_mm(mm_key(mm)) {
+            Ok(()) => {
+                if world.core.mm_life(mm_key(mm)) != Some(MmLife::Exiting) {
+                    return Err("an exited MM is not exiting".into());
+                }
+            }
+            Err(MmRefusal::NotNow(NotNow::EditorRelease(key))) => {
+                if key != mm_key(mm) || before.0.editor(key) != Some(MmEditor::Guest) {
+                    return Err("an exit's not now named the wrong editor".into());
+                }
+                if world.core != before {
+                    return Err("a not-now exit changed the core".into());
+                }
+            }
+            Err(MmRefusal::Refused(_)) => {
+                if world.core != before {
+                    return Err("a refused exit changed the core".into());
+                }
+            }
+        },
+        GrantOp::BeginRelease(mm) => match world.core.begin_release(mm_key(mm)) {
+            Ok((ticket, returned)) => {
+                if before
+                    .0
+                    .mm_life(mm_key(mm))
+                    .is_some_and(|life| life != MmLife::Exiting)
+                {
+                    return Err("released an MM that was not exiting".into());
+                }
+                if ticket.mm() != mm_key(mm) {
+                    return Err("a release ticket names another MM".into());
+                }
                 take_returned(world, &returned, Some(mm_key(mm)))?;
+                world.releases.push(ticket);
+            }
+            Err(_) => {
+                if world.core != before {
+                    return Err("a refused release changed the core".into());
+                }
+            }
+        },
+        GrantOp::FinishRelease(index, outcome) => {
+            let ticket = world.releases.remove(index);
+            let mm = ticket.mm();
+            let at = (0..2).find(|&i| mm_key(i) == mm).ok_or("universe MM")?;
+            let offered = match outcome {
+                0 => ReleaseOutcome::Done,
+                1 => ReleaseOutcome::NotNow(ReleaseWait::NextDrain),
+                _ => ReleaseOutcome::Broken(BrokenRelease::at("explorer")),
+            };
+            match world.core.finish_release(ticket, offered) {
+                Ok(verdict) => {
+                    if verdict != offered {
+                        return Err(format!(
+                            "release outcome {offered:?} came back as {verdict:?}"
+                        ));
+                    }
+                    let life = world.core.mm_life(mm);
+                    match offered {
+                        ReleaseOutcome::Done => {
+                            if life.is_some() {
+                                return Err("a done release left the MM's record".into());
+                            }
+                            world.not_now_then_released[at] |= world.deferred[at];
+                        }
+                        ReleaseOutcome::NotNow(_) => {
+                            if life != Some(MmLife::Exiting) {
+                                return Err("a not-now release did not leave the MM exiting".into());
+                            }
+                            world.deferred[at] = true;
+                        }
+                        ReleaseOutcome::Broken(_) => {
+                            if life != Some(MmLife::Releasing) {
+                                return Err("a broken release did not keep the MM releasing".into());
+                            }
+                            world.ended = true;
+                        }
+                    }
+                }
+                Err(refused) => {
+                    if world.core != before {
+                        return Err("a refused release report changed the core".into());
+                    }
+                    world.releases.insert(index, refused.offered);
+                }
             }
         }
         GrantOp::RetireAll => match world.core.retire_all_mms() {
@@ -716,6 +822,15 @@ fn reconcile_grants(world: &GrantWorld) -> Result<(), String> {
     if settling != usize::from(world.settle.is_some()) {
         return Err("a settle proof and the core disagree".into());
     }
+    // L3: one ticket per releasing MM (a broken one ended the world).
+    let releasing = core
+        .mms
+        .values()
+        .filter(|m| m.life == MmLife::Releasing)
+        .count();
+    if releasing != world.releases.len() + usize::from(world.ended) {
+        return Err("an outstanding release ticket and the core disagree".into());
+    }
     Ok(())
 }
 
@@ -726,6 +841,8 @@ struct GrantsReached {
     busy_then_supplied: bool,
     settled_while_other_supplies: bool,
     carved_from_chunk: bool,
+    not_now_then_released: bool,
+    released_with_a_grant: bool,
 }
 
 fn explore_grants(depth: usize) -> Result<(usize, GrantsReached), String> {
@@ -744,6 +861,10 @@ fn explore_grants(depth: usize) -> Result<(usize, GrantsReached), String> {
         next_payload: 1,
         busy_then_supplied: [false; 2],
         refused_busy: [false; 2],
+        releases: Vec::new(),
+        ended: false,
+        not_now_then_released: [false; 2],
+        deferred: [false; 2],
     };
     let mut seen = HashSet::new();
     let mut reached = GrantsReached::default();
@@ -773,6 +894,9 @@ fn explore_grants(depth: usize) -> Result<(usize, GrantsReached), String> {
             reached.settled_while_other_supplies |=
                 next.settle.is_some() && !next.supplies.is_empty();
             reached.carved_from_chunk |= next.carved_from_chunk;
+            reached.not_now_then_released |= next.not_now_then_released.iter().any(|&b| b);
+            reached.released_with_a_grant |=
+                matches!(op, GrantOp::BeginRelease(_)) && next.in_core.len() < world.in_core.len();
             if seen.insert(next.clone()) {
                 queue.push_back((next, next_trace));
             }
@@ -796,8 +920,38 @@ fn every_bounded_grant_sequence_keeps_the_mm_and_grant_invariants() {
             && reached.two_provisioned_one_mm
             && reached.busy_then_supplied
             && reached.settled_while_other_supplies
-            && reached.carved_from_chunk,
+            && reached.carved_from_chunk
+            && reached.not_now_then_released
+            && reached.released_with_a_grant,
         "depth {GRANT_DEPTH} ({states} states) missed a shape: {reached:?}"
     );
     std::println!("explored {states} distinct grant states to depth {GRANT_DEPTH}: {reached:?}");
 }
+
+/// Each seeded mutant of the release (#3061 PR 1b) breaks one rule, and the
+/// explorer finds it within a shallow depth: a lifecycle invariant is only
+/// as good as the checks that catch its violation.
+#[test]
+fn every_seeded_release_mutant_is_found() {
+    use super::release::mutant::{self, Mutant};
+    for which in [
+        Mutant::NotNowRetires,
+        Mutant::ReleasesLive,
+        Mutant::EditsAfterExit,
+        Mutant::BrokenDefers,
+    ] {
+        let found = mutant::with(which, || explore_grants(RELEASE_MUTANT_DEPTH));
+        match found {
+            Err(counterexample) => {
+                std::println!("mutant {which:?} found: {counterexample}");
+            }
+            Ok((states, _)) => {
+                panic!("mutant {which:?} survived {states} states to depth {RELEASE_MUTANT_DEPTH}")
+            }
+        }
+    }
+}
+
+/// Exit, begin, a "not now" finish, begin again: four transitions reach
+/// every mutant's rule.
+const RELEASE_MUTANT_DEPTH: usize = 4;

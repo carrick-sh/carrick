@@ -9,6 +9,11 @@ use carrick_el1_abi::{
 use carrick_guest_arch::{ContextGeneration, FrameGpa, KernelVa, MmGeneration};
 use std::cell::RefCell;
 
+/// A test release step: `true` is done, `false` is "not now".
+fn done(finished: bool) -> ReleaseOutcome {
+    ReleaseOutcome::done_or(finished, ReleaseWait::NextDrain)
+}
+
 #[test]
 fn committed_child_retains_physical_custody_through_quarantine() {
     use std::sync::Arc;
@@ -109,7 +114,7 @@ fn committed_child_retains_physical_custody_through_quarantine() {
             absent,
             |_| true,
             |_| true,
-            |_| true,
+            |_| done(true),
         )
         .unwrap();
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
@@ -220,7 +225,7 @@ fn exec_replacement_moves_child_owner_and_settles_predecessor_once() {
             receipt,
             wrong,
             |_| true,
-            |physical, absence| physical.id == 1 && absence.mm() == loan.request.child_mm,
+            |physical, absence| done(physical.id == 1 && absence.mm() == loan.request.child_mm),
         ),
         Err(ForkStockServiceError::StaleExecution)
     );
@@ -231,7 +236,7 @@ fn exec_replacement_moves_child_owner_and_settles_predecessor_once() {
             receipt,
             predecessor_absent,
             |_| true,
-            |physical, absence| physical.id == 1 && absence.mm() == loan.request.child_mm,
+            |physical, absence| done(physical.id == 1 && absence.mm() == loan.request.child_mm),
         )
         .unwrap();
     assert_eq!(drops.load(Ordering::SeqCst), 1);
@@ -241,7 +246,7 @@ fn exec_replacement_moves_child_owner_and_settles_predecessor_once() {
             receipt,
             absent(loan.request.child_mm).unwrap(),
             |_| true,
-            |_, _| true,
+            |_, _| done(true),
         ),
         Err(ForkStockServiceError::StaleExecution),
         "the consuming predecessor receipt must reject duplicates"
@@ -279,7 +284,7 @@ fn root_exec_enters_shared_stock_and_reclaims_without_child_capacity() {
             |_| true,
             |_, _| {
                 child_releases += 1;
-                false
+                done(false)
             },
         )
         .unwrap();
@@ -293,7 +298,7 @@ fn root_exec_enters_shared_stock_and_reclaims_without_child_capacity() {
                 absent,
                 |_| true,
                 |_| false,
-                |_| true,
+                |_| done(true),
             )
             .unwrap(),
         1
@@ -352,7 +357,7 @@ fn exec_replacement_absorbs_pending_descriptor_tables_with_peer_live() {
             |_| false,
             |_, _| {
                 releases += 1;
-                true
+                done(true)
             },
         ),
         Err(ForkStockServiceError::ExposedDirtyTable)
@@ -368,7 +373,7 @@ fn exec_replacement_absorbs_pending_descriptor_tables_with_peer_live() {
             },
             |_, _| {
                 releases += 1;
-                true
+                done(true)
             },
         )
         .unwrap();
@@ -827,7 +832,7 @@ fn reclaim<T: ChildAddressTags, C>(
                 true
             },
             |_| true,
-            |_| true,
+            |_| done(true),
         )
         .unwrap()
 }
@@ -940,7 +945,7 @@ fn quarantined_stock_is_never_reissued_while_its_mm_is_live() {
                 absent,
                 |_| true,
                 |_| true,
-                |_| true
+                |_| done(true)
             )
             .unwrap(),
         0
@@ -1303,7 +1308,7 @@ fn kvm_lifecycle_window_cycles_exceed_stock_with_cleared_records() {
                     true
                 },
                 |life| window.clear(life),
-                |_| true,
+                |_| done(true),
             )
             .unwrap();
         assert_eq!(returned, 1);
@@ -1351,7 +1356,7 @@ fn lifecycle_window_clear_refuses_graph_referenced_control_and_defers_reclaim() 
             absent,
             |_| true,
             |life| window.clear(life),
-            |_| true,
+            |_| done(true),
         )
         .unwrap();
     assert_eq!(deferred, 0);
@@ -1370,7 +1375,7 @@ fn lifecycle_window_clear_refuses_graph_referenced_control_and_defers_reclaim() 
             absent,
             |_| true,
             |life| window.clear(life),
-            |_| true,
+            |_| done(true),
         )
         .unwrap();
     assert_eq!(returned, 1);
@@ -1406,7 +1411,7 @@ fn kvm_unclearable_lifecycle_record_is_never_reissued_dirty() {
             absent,
             |_| true,
             |_| true,
-            |_| true,
+            |_| done(true),
         )
         .unwrap();
     assert_eq!(
@@ -1461,7 +1466,7 @@ fn kvm_live_children_beyond_lifecycle_records_are_counted_refusals() {
             absent,
             |_| true,
             |life| window.clear(life),
-            |_| true,
+            |_| done(true),
         )
         .unwrap();
     assert_eq!(returned, 1);
@@ -1550,7 +1555,7 @@ fn refused_release_keeps_the_child_quarantined_and_its_stock_held() {
             |_| true,
             |absence| {
                 released.borrow_mut().push(absence.mm());
-                false
+                done(false)
             },
         ),
         Ok(0)
@@ -1589,7 +1594,7 @@ fn deferred_candidate_does_not_block_later_candidates() {
         absent,
         |_| true,
         |_| true,
-        |absence| absence.mm() != mm(302),
+        |absence| done(absence.mm() != mm(302)),
     );
     assert_eq!(result, Ok(1));
     assert!(stock.is_quarantined(mm(302)));
@@ -1617,7 +1622,7 @@ fn failed_clear_after_release_is_retried_without_a_second_release() {
             |_| true,
             |_| {
                 releases.set(releases.get() + 1);
-                true
+                done(true)
             },
         )
     };
@@ -1644,7 +1649,7 @@ fn slot_absence_is_minted_only_when_no_slot_installs_the_mm() {
         |_| SlotAbsence::scan(mm(999), []),
         |_| true,
         |_| true,
-        |_| true,
+        |_| done(true),
     );
     assert_eq!(foreign, Ok(0));
     assert!(stock.is_quarantined(mm(302)));
@@ -1720,7 +1725,7 @@ fn reclaim_releases_each_child_once_across_a_retire_failure() {
             |_| true,
             |_| {
                 releases.set(releases.get() + 1);
-                true
+                done(true)
             },
         )
     };
@@ -1757,7 +1762,7 @@ fn second_candidate_refusal_keeps_first_candidate_released_and_returned() {
             } else {
                 "refuse 303"
             });
-            absence.mm() == mm(302)
+            done(absence.mm() == mm(302))
         },
     );
     assert_eq!(result, Ok(1));
@@ -2149,7 +2154,7 @@ fn admitted_custody_token_drops_reserved_pins_on_abort_and_consumes_infallibly_o
             absent,
             |_| true,
             |_| true,
-            |_| true,
+            |_| done(true),
         )
         .unwrap();
     assert_eq!(dropped.load(Ordering::SeqCst), 2);
@@ -2333,7 +2338,7 @@ fn registered_root_draws_shared_tables_and_retires_once() {
                 absent,
                 |_| true,
                 |_| true,
-                |_| true
+                |_| done(true)
             )
             .unwrap(),
         1
@@ -2347,7 +2352,7 @@ fn registered_root_draws_shared_tables_and_retires_once() {
                 absent,
                 |_| true,
                 |_| true,
-                |_| true
+                |_| done(true)
             )
             .unwrap(),
         0
@@ -2768,7 +2773,7 @@ fn second_root_reuses_carrier_fork_stock_after_first_root_exits() {
             |_| true,
             |absence| {
                 released.borrow_mut().push(absence.mm());
-                true
+                done(true)
             },
         )
         .unwrap();
@@ -3228,16 +3233,13 @@ fn settlement_exclusion_reclaims_all_64_slots_held_by_exited_fork_children() {
                     |_| true,
                     |_| true,
                     |absence| {
-                        self.spaces
-                            .unpublished(absence.mm().raw())
-                            .is_some_and(|absent| {
-                                release_child_mm(
-                                    &DummyInventory,
-                                    self.residency,
-                                    self.table,
-                                    &absent,
-                                )
-                            })
+                        release_unpublished_child_mm(
+                            self.spaces,
+                            &DummyInventory,
+                            self.residency,
+                            self.table,
+                            absence,
+                        )
                     },
                 )
                 .map(|_| ())
@@ -3329,7 +3331,7 @@ fn a_root_exec_with_built_tables_moves_into_the_stock_and_execs_again_as_a_child
                 cleared.borrow_mut().extend_from_slice(tables);
                 true
             },
-            |_, _| false,
+            |_, _| done(false),
         )
         .unwrap();
     assert!(
@@ -3371,7 +3373,7 @@ fn a_root_exec_with_built_tables_moves_into_the_stock_and_execs_again_as_a_child
                 cleared.borrow_mut().extend_from_slice(tables);
                 true
             },
-            |_, _| true,
+            |_, _| done(true),
         )
         .unwrap();
     assert_eq!(
@@ -3433,7 +3435,7 @@ fn a_built_exec_successor_commits_its_linked_tables_and_returns_the_rest() {
                 cleared.borrow_mut().extend_from_slice(tables);
                 true
             },
-            |_, _| true,
+            |_, _| done(true),
         )
         .unwrap();
     assert_eq!(cleared.borrow().len(), 1, "the predecessor's one table");

@@ -2963,7 +2963,7 @@ mod tests {
     fn kvm_fork_retire_cycles_beyond_zone_capacity_release_child_state() {
         use carrick_hal::fork_stock::{
             ForkStock, LifecycleWindow, NoTableLedger, UntaggedRoots, lifecycle_slots,
-            release_child_mm,
+            release_unpublished_child_mm,
         };
         use std::sync::Arc;
 
@@ -3188,11 +3188,13 @@ mod tests {
                     |_| true,
                     |life| window.clear(life),
                     |absence| {
-                        spaces
-                            .unpublished(absence.mm().raw())
-                            .is_some_and(|absent| {
-                                release_child_mm(&*inventory, &residency, &*returns, &absent)
-                            })
+                        release_unpublished_child_mm(
+                            &spaces,
+                            &*inventory,
+                            &residency,
+                            &*returns,
+                            absence,
+                        )
                     },
                 )
                 .unwrap_or_else(|error| panic!("cycle {cycle}: {error:?}"));

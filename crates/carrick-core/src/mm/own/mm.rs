@@ -8,6 +8,7 @@
 use core::num::NonZeroU64;
 
 use super::editor::MmEditor;
+use super::release::MmLife;
 
 /// One guest address space of one carrier, by the key the guest's space
 /// table publishes for it.
@@ -26,6 +27,7 @@ impl MmKey {
 /// The core's record of one admitted MM.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct MmRecord {
+    pub(super) life: MmLife,
     pub(super) editor: MmEditor,
     /// The base of the MM's arena chunk with room, if any (G4).
     pub(super) chunk: Option<u64>,
@@ -34,6 +36,7 @@ pub(super) struct MmRecord {
 impl MmRecord {
     pub(super) const fn admitted() -> Self {
         Self {
+            life: MmLife::Live,
             editor: MmEditor::Free,
             chunk: None,
         }

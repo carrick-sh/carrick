@@ -15,7 +15,7 @@
 //! - [`CarrierCore::begin_settle`], [`CarrierCore::settle_cow`] and
 //!   [`CarrierCore::finish_settle`] hand back, one by one, the completed
 //!   grants the guest's receipts name, for the shell to publish.
-//! - [`CarrierCore::retire_mm`] returns every grant of a retired MM, claimed
+//! - [`CarrierCore::begin_release`] returns every grant of a retired MM, claimed
 //!   or not: no member is left to complete one.
 //!
 //! Replacements come from a **per-MM arena** (#3099): the core carves each
@@ -23,7 +23,7 @@
 //! ([`CowSupply::NeedsChunk`]) only when the MM has none with room. The shell
 //! installs one backend mapping per chunk (one KVM memslot for 128 grants),
 //! never one per grant, and the chunk lives exactly as long as its MM: it
-//! leaves the core with [`CarrierCore::retire_mm`], as the shell's chunk
+//! leaves the core with [`CarrierCore::begin_release`], as the shell's chunk
 //! mapping leaves with the MM's retirement.
 //!
 //! Invariants, checked by [`CarrierCore::check_invariants`]:
@@ -225,6 +225,11 @@ impl<V: CoreVenue, M, B, G: GrantPayload> CarrierCore<V, M, B, G> {
             .mms
             .entry(excluded.mm())
             .or_insert_with(MmRecord::admitted);
+        // An exited MM has no member to edit it, and its release owns what
+        // it held: no host edit is admitted for it (L1, L2).
+        if record.life != super::release::MmLife::Live {
+            return Err(MmRefusal::Refused(Refusal::NotFound));
+        }
         match record.editor {
             MmEditor::Free => {
                 record.editor = MmEditor::Host(edit);
@@ -492,58 +497,26 @@ impl<V: CoreVenue, M, B, G: GrantPayload> CarrierCore<V, M, B, G> {
         }
     }
 
-    /// The MM left the carrier: every grant it holds, claimed or not, comes
-    /// back to the shell, and its record goes. "Not now" while the guest
-    /// holds its editor; a host edit in progress is a broken invariant.
-    pub fn retire_mm(&mut self, mm: MmKey) -> Result<Vec<G>, MmRefusal> {
-        match self.mms.get(&mm).map(|record| record.editor) {
-            None => return Ok(Vec::new()),
-            Some(MmEditor::Free) => {}
-            Some(MmEditor::Guest) => return Err(MmRefusal::NotNow(NotNow::EditorRelease(mm))),
-            Some(MmEditor::Host(_)) => return Err(MmRefusal::Refused(Refusal::InFlight)),
-        }
-        self.mms.remove(&mm);
-        // Its arena goes with it: the shell's chunk mappings retire with
-        // the MM (on x86, `CarrierMemory::retire_child`).
-        self.chunks.retain(|_, chunk| chunk.mm != mm);
-        let mut returned = Vec::new();
-        let bases: Vec<u64> = self
-            .grants
-            .iter()
-            .filter(|(_, g)| g.mm == mm)
-            .map(|(&base, _)| base)
-            .collect();
-        for base in bases {
-            if let Some(CowGrantRecord {
-                state: GrantState::Provisioned(payload),
-                ..
-            }) = self.grants.remove(&base)
-            {
-                returned.push(payload);
-            }
-        }
-        Ok(returned)
-    }
-
     /// The carrier is ending: every MM retires. Refused, with nothing
     /// changed, while any editor is held.
     pub fn retire_all_mms(&mut self) -> Result<Vec<G>, MmRefusal> {
-        if let Some((&mm, record)) = self
-            .mms
-            .iter()
-            .find(|(_, record)| record.editor != MmEditor::Free)
-        {
+        if let Some((&mm, record)) = self.mms.iter().find(|(_, record)| {
+            record.editor != MmEditor::Free || record.life == super::release::MmLife::Releasing
+        }) {
             return Err(match record.editor {
                 MmEditor::Guest => MmRefusal::NotNow(NotNow::EditorRelease(mm)),
                 _ => MmRefusal::Refused(Refusal::InFlight),
             });
         }
-        let mut returned = Vec::new();
-        let mms: Vec<MmKey> = self.mms.keys().copied().collect();
-        for mm in mms {
-            returned.extend(self.retire_mm(mm)?);
-        }
-        Ok(returned)
+        self.mms.clear();
+        self.chunks.clear();
+        Ok(core::mem::take(&mut self.grants)
+            .into_values()
+            .filter_map(|grant| match grant.state {
+                GrantState::Provisioned(payload) => Some(payload),
+                GrantState::Supplying => None,
+            })
+            .collect())
     }
 
     /// How many grants the core holds, in any state.

@@ -690,7 +690,7 @@ mod tests {
                 |mm| SlotAbsence::scan(mm, [0]),
                 |_| true,
                 |_| true,
-                |_| true,
+                |_| carrick_core_abi::mm::ReleaseOutcome::Done,
             )
             .unwrap();
         terminal.join().unwrap();

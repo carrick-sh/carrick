@@ -372,13 +372,78 @@ fn a_cow_grant_settles_once_under_its_own_mm_and_retires_with_it() {
         "settled once"
     );
     core.finish_settle(proof).unwrap();
-    let mut returned = core.retire_mm(a).unwrap();
+    assert_eq!(
+        core.begin_release(a).map(|_| ()),
+        Err(MmRefusal::Refused(Refusal::Live)),
+        "a live MM is never released"
+    );
+    core.exit_mm(a).unwrap();
+    assert_eq!(
+        core.supply_cow(&xa, 0x1000),
+        Err(MmRefusal::Refused(Refusal::NotFound)),
+        "no host edit of an exited MM"
+    );
+    let (ticket, mut returned) = core.begin_release(a).unwrap();
     returned.sort();
     assert_eq!(returned, [1, 2]);
     assert_eq!(core.grant_count(), 0);
     assert_eq!(core.chunk_count(), 1, "b's chunk stays with b");
-    assert!(core.retire_mm(b).unwrap().is_empty());
+    assert_eq!(
+        core.finish_release(ticket, ReleaseOutcome::Done),
+        Ok(ReleaseOutcome::Done)
+    );
+    assert_eq!(core.mm_life(a), None, "a released MM retires");
+    core.exit_mm(b).unwrap();
+    let (ticket, returned) = core.begin_release(b).unwrap();
+    assert!(returned.is_empty());
+    assert_eq!(
+        core.finish_release(ticket, ReleaseOutcome::Done),
+        Ok(ReleaseOutcome::Done)
+    );
     assert!(core.teardown().is_ok());
+}
+
+/// #3061 PR 1b: the release is two-phase and its outcome is typed. "Not
+/// now" leaves the MM exiting, to be released again; `Broken` comes back
+/// as the verdict and keeps the MM releasing (the venue ends the carrier);
+/// a ticket finishes once.
+#[test]
+fn a_release_outcome_is_typed_and_not_now_leaves_the_mm_releasable() {
+    let a = MmKey::new(NonZeroU64::MIN);
+    let mut core = small_arena();
+    let xa = ExcludedMm::claimed(a);
+    let (ticket, _) = supply(&mut core, &xa, 0x10_000);
+    core.finish_supply_cow(ticket, Supplied::Published(7))
+        .unwrap();
+    core.exit_mm(a).unwrap();
+    core.exit_mm(a).unwrap();
+    let (ticket, returned) = core.begin_release(a).unwrap();
+    assert_eq!(returned, [7]);
+    assert_eq!(
+        core.begin_release(a).map(|_| ()),
+        Err(MmRefusal::Refused(Refusal::InFlight)),
+        "one release at a time"
+    );
+    let wait = ReleaseOutcome::NotNow(ReleaseWait::Unpublish);
+    assert_eq!(core.finish_release(ticket.clone(), wait), Ok(wait));
+    assert_eq!(core.mm_life(a), Some(MmLife::Exiting));
+    assert!(
+        core.finish_release(ticket, ReleaseOutcome::Done).is_err(),
+        "a finished ticket is spent"
+    );
+    let (ticket, returned) = core.begin_release(a).unwrap();
+    assert!(
+        returned.is_empty(),
+        "the grants left with the first release"
+    );
+    let broken = ReleaseOutcome::Broken(BrokenRelease::at("test"));
+    assert_eq!(core.finish_release(ticket, broken), Ok(broken));
+    assert_eq!(core.mm_life(a), Some(MmLife::Releasing));
+    assert!(
+        core.retire_all_mms().is_err(),
+        "a broken release leaves the carrier to end, not to retire"
+    );
+    core.forget_for_explorer();
 }
 
 /// #3099: grants are carved from the MM's chunk, so N supplies ask the
