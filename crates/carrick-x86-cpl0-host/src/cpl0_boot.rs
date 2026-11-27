@@ -9493,15 +9493,74 @@ pub fn unexpected_boot_wake(
     Ok(())
 }
 
+/// An event a stopped CPU was delivering when it left the guest. The CPU
+/// finishes delivering it, into CPL0, before it runs any other instruction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PendingEvent {
+    /// An external or IPI vector, already accepted by the local APIC.
+    Interrupt { vector: u8 },
+    /// An architectural exception.
+    Exception { vector: u8 },
+    /// A non-maskable interrupt.
+    Nmi,
+}
+
+/// Where a stopped production CPU resumes, as its run admission reads it
+/// once before reentry. Each class has exactly one answer to shootdown debt,
+/// and every caller matches all of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoppedCpu {
+    /// CS.DPL 0. The ring takes a queued KICK at its next interruptible point.
+    Kernel,
+    /// CPL3 with IF set, no interrupt shadow and no event in delivery: the
+    /// next instruction is a user instruction, and a KICK queued before
+    /// reentry is taken ahead of it.
+    UserInterruptible,
+    /// CPL3 with an event in delivery. The event enters CPL0 before any user
+    /// instruction runs, and a KICK queued behind it is taken no later than
+    /// the IRET back to user mode.
+    UserEventPending { event: PendingEvent, rip: u64 },
+    /// CPL3 in an STI or MOV SS interrupt shadow: the shadowed instruction
+    /// retires, then the CPU is interruptible and takes a queued KICK.
+    UserShadowed { rip: u64 },
+    /// CPL3 with IF clear. Linux user code cannot mask interrupts here, so
+    /// this is a broken invariant, not a stop to schedule around.
+    UserInterruptsMasked { rip: u64 },
+    /// A privilege level the production carrier never runs (CPL 1 or 2, or a
+    /// CS whose selector RPL disagrees with its DPL).
+    Unsupported { cpl: u8, rip: u64 },
+}
+
+impl StoppedCpu {
+    /// Classify a stopped x86 CPU from its architectural state.
+    pub fn classify(
+        cs_dpl: u8,
+        cs_selector: u16,
+        rip: u64,
+        rflags: u64,
+        shadow: bool,
+        event: Option<PendingEvent>,
+    ) -> Self {
+        const IF: u64 = 1 << 9;
+        match (cs_dpl, cs_selector & 3) {
+            (0, _) => Self::Kernel,
+            (3, 3) => match event {
+                Some(event) => Self::UserEventPending { event, rip },
+                None if rflags & IF == 0 => Self::UserInterruptsMasked { rip },
+                None if shadow => Self::UserShadowed { rip },
+                None => Self::UserInterruptible,
+            },
+            (cpl, _) => Self::Unsupported { cpl, rip },
+        }
+    }
+}
+
 /// The backend operations one production CPU's run admission needs: the
-/// stopped privilege level and interruptibility, a KICK queued to the CPU's
-/// own APIC before reentry, and one guest run.
+/// stopped CPU's class, a KICK queued to the CPU's own APIC before reentry,
+/// and one guest run.
 pub trait ProductionMemberCpu {
-    /// The stopped CPU's current privilege level (CS.DPL).
-    fn stopped_cpl(&self) -> Result<u8, TrapError>;
-    /// Stopped at CPL3 with interrupts enabled and no interrupt shadow or
-    /// injected event pending.
-    fn stopped_at_interruptible_user(&self) -> Result<bool, TrapError>;
+    /// Where the stopped CPU resumes.
+    fn stopped(&self) -> Result<StoppedCpu, TrapError>;
     /// Queue `KICK_VECTOR` to this CPU's own local APIC, durable across the
     /// reentry that follows.
     fn queue_reentry_kick(&mut self) -> Result<(), TrapError>;
@@ -9536,15 +9595,23 @@ pub fn run_production_member<C: ProductionMemberCpu>(
     // races this pre-run scan, which queues its durable MSI before KVM_RUN.
     member.running.store(1, Ordering::Release);
     let running_admission = RunningAdmission(&member.running);
-    let cpl = cpu.stopped_cpl()?;
+    let stop = cpu.stopped()?;
     let has_debt = table.requests.iter().any(|request| {
         request.generation.load(Ordering::Acquire) > request.served[slot].load(Ordering::Acquire)
     });
     if has_debt {
-        if cpl == 3 && !cpu.stopped_at_interruptible_user()? {
-            return Err(fail("shootdown debt requires interruptible CPL3 reentry"));
-        } else if cpl != 0 && cpl != 3 {
-            return Err(fail("shootdown debt on unsupported CPL reentry"));
+        match stop {
+            StoppedCpu::Kernel | StoppedCpu::UserInterruptible => {}
+            StoppedCpu::UserEventPending { .. } | StoppedCpu::UserShadowed { .. } => {
+                return Err(fail(format!(
+                    "shootdown debt requires interruptible CPL3 reentry: {stop:?}"
+                )));
+            }
+            StoppedCpu::UserInterruptsMasked { .. } | StoppedCpu::Unsupported { .. } => {
+                return Err(fail(format!(
+                    "shootdown debt on unsupported CPL reentry: {stop:?}"
+                )));
+            }
         }
         cpu.queue_reentry_kick()?;
     }
@@ -9555,7 +9622,7 @@ pub fn run_production_member<C: ProductionMemberCpu>(
     let result = cpu.run_guest()?;
     drop(actual_guard);
     drop(running_admission);
-    if cpu.stopped_at_interruptible_user()? {
+    if cpu.stopped()? == StoppedCpu::UserInterruptible {
         // The host may release a sender after this vCPU has stopped, but
         // leaves `served` behind until native KICK settles debt on reentry.
         for request in &table.requests {

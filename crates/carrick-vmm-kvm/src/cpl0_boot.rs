@@ -147,18 +147,36 @@ impl Drop for Watchdog {
     }
 }
 
-fn stopped_at_interruptible_user(cpu: &KvmVcpu) -> Result<bool, TrapError> {
+/// Classify a stopped KVM vCPU from its registers and its in-flight event
+/// state (`KVM_GET_VCPU_EVENTS`).
+fn stopped_cpu(cpu: &KvmVcpu) -> Result<StoppedCpu, TrapError> {
     let sregs = cpu.fd().get_sregs().map_err(|e| fail(e.to_string()))?;
     let regs = cpu.fd().get_regs().map_err(|e| fail(e.to_string()))?;
     let events = cpu
         .fd()
         .get_vcpu_events()
         .map_err(|e| fail(e.to_string()))?;
-    Ok(sregs.cs.dpl == 3
-        && sregs.cs.selector & 3 == 3
-        && regs.rflags & (1 << 9) != 0
-        && events.interrupt.shadow == 0
-        && events.interrupt.injected == 0)
+    let event = if events.exception.injected != 0 || events.exception.pending != 0 {
+        Some(PendingEvent::Exception {
+            vector: events.exception.nr,
+        })
+    } else if events.nmi.injected != 0 {
+        Some(PendingEvent::Nmi)
+    } else if events.interrupt.injected != 0 {
+        Some(PendingEvent::Interrupt {
+            vector: events.interrupt.nr,
+        })
+    } else {
+        None
+    };
+    Ok(StoppedCpu::classify(
+        sregs.cs.dpl,
+        sregs.cs.selector,
+        regs.rip,
+        regs.rflags,
+        events.interrupt.shadow != 0,
+        event,
+    ))
 }
 
 /// One KVM vCPU and its VM's MSI route, as the shared production run
@@ -169,17 +187,8 @@ struct KvmMember<'a> {
 }
 
 impl ProductionMemberCpu for KvmMember<'_> {
-    fn stopped_cpl(&self) -> Result<u8, TrapError> {
-        Ok(self
-            .cpu
-            .fd()
-            .get_sregs()
-            .map_err(|e| fail(e.to_string()))?
-            .cs
-            .dpl)
-    }
-    fn stopped_at_interruptible_user(&self) -> Result<bool, TrapError> {
-        stopped_at_interruptible_user(self.cpu)
+    fn stopped(&self) -> Result<StoppedCpu, TrapError> {
+        stopped_cpu(self.cpu)
     }
     fn queue_reentry_kick(&mut self) -> Result<(), TrapError> {
         let lapic = self.cpu.fd().get_lapic().map_err(|e| fail(e.to_string()))?;
