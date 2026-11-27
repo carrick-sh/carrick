@@ -33,7 +33,7 @@ pub use owner::*;
 mod user_write;
 pub use user_write::{
     CopyoutPreparation, CopyoutRequest, OwnedOperationYield, UserWriteError, UserWriteRequest,
-    UserWriteTarget, UserWriteVenue,
+    UserWriteTarget, UserWriteVenue, VenueRefusal,
 };
 
 pub use crate::mm::frames::{GrantTarget, grant_target};

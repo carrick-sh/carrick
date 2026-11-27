@@ -510,6 +510,20 @@ impl NativeProcessError {
         }
     }
 
+    /// The same reading for a user-write venue's supply crossing, on both
+    /// ISAs (#3082): a crossing that reported no refusal met the MM's editor
+    /// held elsewhere, which the shared protocol answers with the editor
+    /// release it observed before the crossing.
+    pub fn venue_cow_supply(
+        refusal: carrick_core_abi::CowSupplyRefusal<NativeProcessError>,
+    ) -> carrick_core::mm::transaction::VenueRefusal<NativeProcessError> {
+        use carrick_core::mm::transaction::VenueRefusal;
+        match refusal {
+            carrick_core_abi::CowSupplyRefusal::Unserved(None) => VenueRefusal::EditorHeld,
+            refusal => VenueRefusal::Failed(Self::from_cow_supply(refusal)),
+        }
+    }
+
     /// Separate owner contention from a refusal with a Linux answer.
     /// Contention is "not now": the caller parks on the owner's release or
     /// retains its syscall, and has no errno or run failure to report.

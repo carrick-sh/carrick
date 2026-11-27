@@ -13931,16 +13931,22 @@ fn prepare_poll_argument(
                 slot: 0,
             }
         }
-        fn settle_completions(&mut self, _: &UserWriteRequest<'_>) -> Result<(), ()> {
+        fn settle_completions(
+            &mut self,
+            _: &UserWriteRequest<'_>,
+        ) -> Result<(), carrick_core::mm::transaction::VenueRefusal<()>> {
             panic!("read preparation has no output")
         }
-        fn supply_cow(&mut self, _: carrick_el1_abi::PortalGrantWindow) -> Result<(), ()> {
+        fn supply_cow(
+            &mut self,
+            _: carrick_el1_abi::PortalGrantWindow,
+        ) -> Result<(), carrick_core::mm::transaction::VenueRefusal<()>> {
             panic!("read preparation cannot request write COW")
         }
         fn supply_backing(
             &mut self,
             window: carrick_el1_abi::PortalGrantWindow,
-        ) -> Option<Result<(), ()>> {
+        ) -> Option<Result<(), carrick_core::mm::transaction::VenueRefusal<()>>> {
             assert_eq!(window.operation.mm, self.mm);
             assert_eq!(window.fault_page, VA);
             assert!(!self.supplied, "one input page, one backing supply");

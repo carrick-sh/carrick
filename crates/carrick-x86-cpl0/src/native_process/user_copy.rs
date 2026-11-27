@@ -1,7 +1,7 @@
 //! Native process user-copy mechanics.
 use super::*;
 use carrick_core::mm::transaction::{
-    SelectionVenues, UserWriteError, UserWriteRequest, UserWriteVenue,
+    SelectionVenues, UserWriteError, UserWriteRequest, UserWriteVenue, VenueRefusal,
 };
 use carrick_el1_abi::KernelFaultVenues;
 
@@ -32,17 +32,25 @@ impl NativeWriteVenue<'_> {
     fn settle_cow_grants(
         &mut self,
         handle: carrick_el1_abi::El1MmHandle,
-    ) -> Result<(), NativeProcessError> {
+    ) -> Result<(), VenueRefusal<NativeProcessError>> {
         let mm = handle.mm().raw();
         if !self.pool.has_completions_for(mm) {
             return Ok(());
         }
+        #[cfg(feature = "test-support")]
+        crate::test_support::hold_editor_for_copy_cow_settle(
+            carrick_x86_carrier::native_execution::source(self.slot).zone,
+            u32::from(self.slot.raw()),
+            handle,
+        );
         carrick_x86_carrier::entry::cross_owner_grant(
             carrick_guest_arch::CpuId::new(u32::from(self.slot.raw())),
             self.address,
         );
         if self.pool.has_completions_for(mm) {
-            return Err(NativeProcessError::Busy);
+            #[cfg(feature = "test-support")]
+            crate::test_support::record_copy_cow_editor_held();
+            return Err(VenueRefusal::EditorHeld);
         }
         Ok(())
     }
@@ -61,7 +69,10 @@ impl<'a> UserWriteVenue<ParkedContextWords> for NativeWriteVenue<'a> {
             slot: u32::from(self.slot.raw()),
         }
     }
-    fn settle_completions(&mut self, request: &UserWriteRequest<'_>) -> Result<(), Self::Error> {
+    fn settle_completions(
+        &mut self,
+        request: &UserWriteRequest<'_>,
+    ) -> Result<(), VenueRefusal<Self::Error>> {
         self.settle_cow_grants(request.handle)
     }
     /// A preparation resolves the same COW grants as a write (#2716): it
@@ -69,13 +80,13 @@ impl<'a> UserWriteVenue<ParkedContextWords> for NativeWriteVenue<'a> {
     fn settle_preparation(
         &mut self,
         target: &carrick_core::mm::transaction::UserWriteTarget,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), VenueRefusal<Self::Error>> {
         self.settle_cow_grants(target.handle)
     }
     fn supply_cow(
         &mut self,
         window: carrick_el1_abi::PortalGrantWindow,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), VenueRefusal<Self::Error>> {
         let cpu = carrick_guest_arch::CpuId::new(u32::from(self.slot.raw()));
         self.slots
             .grant(usize::from(self.slot.raw()))
@@ -89,13 +100,13 @@ impl<'a> UserWriteVenue<ParkedContextWords> for NativeWriteVenue<'a> {
             })
             // The carrier met this MM's editor held on the other CPU and
             // supplied nothing; the lane withdrew its selection. The copy is
-            // contended, not failed.
-            .map_err(NativeProcessError::from_cow_supply)
+            // contended, not failed: it waits for the editor's release.
+            .map_err(NativeProcessError::venue_cow_supply)
     }
     fn supply_backing(
         &mut self,
         window: carrick_el1_abi::PortalGrantWindow,
-    ) -> Option<Result<(), Self::Error>> {
+    ) -> Option<Result<(), VenueRefusal<Self::Error>>> {
         if !self.allow_backing {
             return None;
         }
@@ -105,11 +116,11 @@ impl<'a> UserWriteVenue<ParkedContextWords> for NativeWriteVenue<'a> {
                 .grant(usize::from(self.slot.raw()))
                 .ok_or(NativeProcessError::Stale)?;
             if !slot.publish_fault_selection(window.operation.sequence.get(), window) {
-                return Err(NativeProcessError::Busy);
+                return Err(NativeProcessError::Busy.into());
             }
             // The shared service owner retains its reply across MM waits and
             // CPU migration; a per-CPU physical reply cannot survive that park.
-            Err(NativeProcessError::SupplySelected)
+            Err(NativeProcessError::SupplySelected.into())
         })())
     }
     fn copy(
