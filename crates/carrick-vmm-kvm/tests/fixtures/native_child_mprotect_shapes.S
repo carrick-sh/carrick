@@ -27,6 +27,8 @@
  *   16 as 14 with every other page of the 256 KiB committed (32 runs)
  *   17 V8's FreePages: as 14, but one mprotect(PROT_NONE) over the whole
  *     range, then the read of page 0 must fault
+ *   18 as 14 with no mprotect: munmap of the sparse range returns 0, and the
+ *     read of page 2 (the second resident run, past the hole) then faults
  * The parent propagates the child's exit status. */
 
 /* rax = mmap(0, rsi, edx prot, r10 flags, -1, 0); r15 = base or exit errno */
@@ -75,7 +77,7 @@
 .global _start
 .text
 _start:
-#if CASE == 8 || CASE == 11 || CASE == 12 || CASE == 14 || CASE == 16 || CASE == 17
+#if CASE == 8 || CASE == 11 || CASE == 12 || CASE == 14 || CASE == 16 || CASE == 17 || CASE == 18
     jmp child               /* the run root itself, no fork */
 #endif
 #if CASE == 9
@@ -154,6 +156,7 @@ child:
 #if CASE == 17
     MPROTECT %r15, $SPARSE_LEN, $0  /* V8's FreePages */
 #else
+#if CASE != 18
     MPROTECT %r15, $SPARSE_LEN, $1
     cmpb $0xa5, (%r15)
     jne bad
@@ -161,6 +164,7 @@ child:
     jne bad
     cmpb $0, 4096(%r15)     /* the hole reads zero */
     jne bad
+#endif
     mov %r15, %rdi          /* munmap(base, SPARSE_LEN) */
     mov $SPARSE_LEN, %rsi
     mov $11, %eax
@@ -181,7 +185,11 @@ child:
     syscall
     test %rax, %rax
     js harness
+#if CASE == 18
+    movb 8192(%r15), %al    /* the second run, unmapped: must fault */
+#else
     movb (%r15), %al        /* unmapped or PROT_NONE: must fault */
+#endif
     mov $93, %edi
     jmp exit
 segv:

@@ -9012,6 +9012,13 @@ reservation_shape_witness!(
     16,
     "#3073: as the root's sparse range with every other page written: 32 resident runs."
 );
+reservation_shape_witness!(
+    production_munmap_retires_every_run_of_a_sparse_resident_range,
+    18,
+    "#3073: the root writes pages 0 and 2 of a 256 KiB RW map and munmaps the whole range with \
+     no mprotect first; its read of page 2, the second resident run, then faults (ENOSYS from \
+     the munmap before the fix)."
+);
 
 /// #3073, V8's `FreePages`: one `mprotect(PROT_NONE)` over the whole sparse
 /// range, then a read that must fault. The sparse range itself is served
