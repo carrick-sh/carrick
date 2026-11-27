@@ -1025,17 +1025,26 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
             {
                 continue;
             }
+            // An orphan this retirement can't revoke yet (another MM's drain
+            // or root) is left as it was, never refused: the retirement of
+            // a slot's own MM must not wait on an unrelated one.
+            let orphan = slot.allowed.is_empty();
             // `revoke`'s preconditions, checked now so the revoke cannot
             // refuse after the bookkeeping below has run.
             let extent = &slot.backing.extent;
             let start = extent.base.raw();
             let end = start + extent.len as u64;
-            if self.roots.iter().any(|(owner, root)| {
+            let foreign_root = self.roots.iter().any(|(owner, root)| {
                 *owner != mm && (start..end).contains(&root.root.address().raw())
-            }) {
+            });
+            let foreign_drain = slot.drains.iter().any(|drained| drained.mm.raw() != mm);
+            if orphan && (foreign_root || foreign_drain) {
+                continue;
+            }
+            if foreign_root {
                 return Err(error("retired child slot holds a live CR3/table arena"));
             }
-            if slot.drains.iter().any(|drained| drained.mm.raw() != mm) {
+            if foreign_drain {
                 return Err(error("retired child slot owes a live context drain"));
             }
             // An arena chunk holds one frame per grant, each retired with
@@ -1050,6 +1059,9 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
                         .is_some()
                 })
             {
+                if orphan {
+                    continue;
+                }
                 return Err(error("retired child memslot frame is still mapped"));
             }
             private.push(slot.handle);
