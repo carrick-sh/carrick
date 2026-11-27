@@ -1165,6 +1165,55 @@ impl RetireFixture {
             .unwrap();
     }
 
+    /// Publish one fresh inventory row of a fresh frame in `mm` at `gpa`.
+    fn map_frame(&self, mm: u64, gpa: u64) -> (carrick_hal::FrameId, carrick_hal::MappingId) {
+        use carrick_hal::{
+            FrameEventCapacity, FrameInventoryEvent, FrameLength, MappingGeneration,
+        };
+        let mut reservation = self
+            .authority
+            .reserve(
+                &self.ids,
+                1,
+                1,
+                FrameEventCapacity::for_event_count(2).unwrap(),
+            )
+            .unwrap();
+        let transaction = reservation.transaction();
+        let frame = reservation.claim_frame().unwrap();
+        let mapping = reservation.claim_mapping().unwrap();
+        let generation = MappingGeneration::from_backend_counter(nz(1));
+        reservation
+            .push(FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame,
+                mapping,
+                generation,
+                gpa: carrick_guest_mem::Gpa::new(gpa),
+                length: FrameLength::from_mapping_extent(nz(PAGE)),
+                permissions: carrick_hal::MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .push(FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation,
+            })
+            .unwrap();
+        self.authority
+            .apply(
+                carrick_kernel::kernel::FrameOwner::GuestMm(self.context(mm).into()),
+                reservation.commit(()),
+            )
+            .unwrap();
+        (frame, mapping)
+    }
+
     fn retire(&mut self, mm: u64) -> Result<RetiredChild, MemoryError> {
         let absence = carrick_hal::fork_stock::SlotAbsence::scan(
             carrick_el1_abi::ReservationMm::new(self.key(mm).get()).unwrap(),
@@ -1336,6 +1385,51 @@ pub fn an_owner_retired_slot_goes_with_the_retirement_that_drops_its_last_hold(
     assert!(fixture.held_by(2).is_empty() && fixture.held_by(3).is_empty());
     fixture.assert_admitted_exact();
     assert!(!fixture.memory.is_quarantined());
+}
+
+/// #3132 P0: a slot released by its last holder's drain debt, whose frame
+/// another MM still maps with no hold on the slot (a broken ledger), is
+/// never revoked. Owner 1 owns slot A; inheritor 2 aliases it, the owner
+/// retires, then 2 unmaps (its COW repoint off A), so 2's drain debt is
+/// A's last hold. MM 3 still has a published row of A's frame. 2's
+/// retirement must see that row although it is another MM's, refuse to
+/// revoke A, and quarantine the carrier: no holder is left to wait for.
+pub fn a_released_slot_whose_frame_another_mm_maps_quarantines_the_carrier(
+    _make: fn() -> MemoryTestIo,
+) {
+    let mut fixture = RetireFixture::new(3, _make);
+    let (frame, _) = fixture.map_frame(3, 0x800000);
+    let mut prepared = backing(0x800000, PAGE as usize, 91);
+    prepared.identity.frame_id = nz(frame.raw());
+    let a = fixture.slot_with(prepared, &[1]);
+    fixture.alias(2, a, 0x4000, Some(0x800000));
+    let owner = fixture.retire(1).unwrap();
+    assert_eq!(owner.revoked_slots, 0, "2 still aliases A");
+    let two = fixture.context(2);
+    fixture
+        .memory
+        .remove_aliases(fixture.key(2), PageSpan::new(0x4000, PAGE), two);
+    assert_eq!(
+        fixture.memory.holds.drains(a.slot),
+        [SlotDrain(two)],
+        "2's drain debt is A's last hold"
+    );
+    assert!(!fixture.memory.is_quarantined());
+
+    let refused = fixture.retire(2);
+
+    assert!(
+        refused.is_err(),
+        "A was revoked under MM 3's live row: {refused:?}"
+    );
+    assert!(fixture.memory.record(a).is_ok(), "A stays registered");
+    assert!(
+        fixture.memory.is_quarantined(),
+        "a broken invariant is fatal"
+    );
+    // Nothing moved before the refusal.
+    assert!(fixture.memory.root(fixture.key(2)).is_some());
+    assert_eq!(fixture.held_by(2), BTreeSet::from([a.slot]));
 }
 
 pub fn refused_retire_child_mutates_nothing_and_its_retry_completes(_make: fn() -> MemoryTestIo) {
