@@ -710,6 +710,34 @@ fn mounted_static_x86_fork_cow_arena_chunks_retire_with_their_last_inheritor() {
     );
 }
 
+/// #3127: the same, when the grandchild unmaps every inherited replacement
+/// before it exits. Its last hold on the chunks is then the unmap's drain
+/// debt rather than an alias, and the chunks must still retire with it:
+/// by the end of the run the carrier holds no more memslots than without
+/// a grandchild.
+#[test]
+fn mounted_static_x86_fork_cow_arena_chunks_retire_after_their_last_inheritor_unmaps() {
+    let Some(plain) = fork_child_cow_pages(4096, "x86-fork-cow-plain-u", Duration::from_secs(30))
+    else {
+        return;
+    };
+    let unmapped = fork_child_cow_pages_with(
+        4096,
+        &["-DGRANDCHILD", "-DUNMAP"],
+        "x86-fork-cow-grandchild-unmap",
+        Duration::from_secs(30),
+    )
+    .expect("kvm");
+    eprintln!("#3127 memslots: plain {plain:?}, grandchild unmapped {unmapped:?}");
+    assert!(
+        unmapped.live <= plain.live,
+        "the unmapping grandchild run ended holding {} memslots against {} without it: \
+         chunks whose last holder was an unmap's drain debt stayed registered",
+        unmapped.live,
+        plain.live
+    );
+}
+
 /// #3099: past KVM's memslot limit (32764 here). One memslot per COW page
 /// ended the carrier ("carrier memslot capacity") partway through the
 /// child's stores; from the arena the run matches native.
