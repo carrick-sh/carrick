@@ -1018,3 +1018,112 @@ fn soft_root_private_file_row_survives_its_edits_on_the_host() {
         "every edit returned 0 and every load saw the file's (or the new anonymous) bytes"
     );
 }
+
+/// C6.2.70 CSET: `cset xd, eq` (CSINC xd, xzr, xzr, ne).
+const fn cset_eq(rd: u32) -> u32 {
+    0x9a9f_17e0 | rd
+}
+
+/// `mmap(NULL, len_reg, PROT_READ | PROT_WRITE, MAP_PRIVATE |
+/// MAP_ANONYMOUS, -1, 0)`, the result in x0.
+fn mmap_anonymous(code: &mut Vec<u32>, len_reg: u32) {
+    code.push(movz(0, 0, 0));
+    code.push(mov(1, len_reg));
+    code.push(movz(2, 3, 0));
+    code.push(movz(3, 0x22, 0));
+    code.push(movz(4, 1, 0));
+    code.push(neg(4, 4));
+    code.push(movz(5, 0, 0));
+    code.push(movz(8, NR_MMAP, 0));
+    code.push(A64_SVC_0);
+}
+
+/// `mremap(old, old_len, new_len, flags)`, the result in x0.
+fn mremap(code: &mut Vec<u32>, old: u32, old_len: u32, new_len: u32, flags: u16) {
+    code.push(mov(0, old));
+    code.push(mov(1, old_len));
+    code.push(mov(2, new_len));
+    code.push(movz(3, flags, 0));
+    code.push(movz(4, 0, 0));
+    code.push(movz(8, NR_MREMAP, 0));
+    code.push(A64_SVC_0);
+}
+
+/// `mremap` of the soft root's private anonymous rows, as Linux serves it
+/// (#3152): a written one-page row grows to three pages in place (its byte
+/// kept, the new pages 0 and writable), shrinks back at the same address,
+/// and an untouched page with its own next page in the way grows to two
+/// pages with `MREMAP_MAYMOVE` at a new address that reads 0. Exits a mask,
+/// one bit per check (most significant first): the in-place address, the
+/// kept byte, the extension's 0, the shrink's address, a moved address, a
+/// non-error move, the moved extension's 0. 0 iff every shape is Linux's.
+///
+/// The ARM run root keeps its host `mremap` venue (#3152 routes the ring's
+/// decoder only for ring-only MMs and native children), so this pins the
+/// soft root's shapes across the shared validator's move.
+#[test]
+#[ignore = "requires CARRICK_A64_ELF pointing to the production EL1 ELF (native arm64 host)"]
+fn soft_root_mremap_grows_shrinks_and_moves_anonymous_rows_as_linux() {
+    let _carrier_lock = lock_soft_carrier_test();
+    let mut code = Vec::new();
+    code.extend(mov32(10, 0x1000));
+    code.extend(mov32(11, 0x2000));
+    code.extend(mov32(12, 0x3000));
+    code.extend(mov32(13, 0x4000));
+    // x19 = a four-page row; free its top three pages for in-place growth.
+    mmap_anonymous(&mut code, 13);
+    code.push(mov(19, 0));
+    code.push(add(0, 19, 10));
+    code.push(mov(1, 12));
+    code.push(movz(8, NR_MUNMAP, 0));
+    code.push(A64_SVC_0);
+    code.push(movz(9, 0x5a, 0));
+    code.push(str_imm(9, 19, 0));
+    // x20 = mremap(x19, 1 page, 3 pages, 0); x21 = its byte; x22 = page 2.
+    mremap(&mut code, 19, 10, 12, 0);
+    code.push(mov(20, 0));
+    code.push(ldr(21, 19, 0));
+    code.push(add(14, 19, 11));
+    code.push(ldr(22, 14, 0));
+    code.push(str_imm(9, 14, 0));
+    // x24 = mremap(x19, 3 pages, 1 page, 0).
+    mremap(&mut code, 19, 12, 10, 0);
+    code.push(mov(24, 0));
+    // x25 = an untouched two-page row; x26 = mremap(x25, 1 page, 2 pages,
+    // MREMAP_MAYMOVE), blocked in place by x25's own second page.
+    mmap_anonymous(&mut code, 11);
+    code.push(mov(25, 0));
+    mremap(&mut code, 25, 10, 11, 1);
+    code.push(mov(26, 0));
+    code.push(add(14, 26, 10));
+    code.push(ldr(27, 14, 0));
+    code.push(str_imm(9, 14, 0));
+    code.push(movz(28, 0x5a, 0));
+    code.push(movz(23, 0, 0));
+    for (got, want) in [(20, 19), (21, 28), (22, 31), (24, 19)] {
+        code.push(cmp(got, want));
+        code.push(cset_ne(15));
+        push_mismatch(&mut code, 15);
+    }
+    code.push(cmp(26, 25));
+    code.push(cset_eq(15));
+    push_mismatch(&mut code, 15);
+    code.push(lsr(15, 26, 63));
+    push_mismatch(&mut code, 15);
+    code.push(cmp(27, 31));
+    code.push(cset_ne(15));
+    push_mismatch(&mut code, 15);
+    code.push(mov(0, 23));
+    exit_with_x0(&mut code);
+    let (run, _) = run(&build_elf(&code, &[]), "/mremap-anonymous", None);
+    println!(
+        "mremap anonymous: exit={} fault={:?} census={:?} counted_enosys={:?}",
+        run.exit_code, run.terminating_fault, run.reply_census, run.counted_enosys
+    );
+    assert_eq!(run.terminating_fault, None, "every row page is served");
+    assert_eq!(run.counted_enosys, Vec::new(), "nothing is refused");
+    assert_eq!(
+        run.exit_code, 0,
+        "each mremap returned Linux's address and every page its bytes"
+    );
+}
