@@ -25,12 +25,21 @@
  *     SIGSEGV handler exits 7 (93 = no fault)
  *   15 as 14, in a forked child
  *   16 as 14 with every other page of the 256 KiB committed (32 runs)
- *   17 V8's FreePages: as 14, but one mprotect(PROT_NONE) over the whole
- *     range, then the read of page 0 must fault
+ *   17 (#2875) V8's FreePages: as 14, but one mprotect(PROT_NONE) over the
+ *     whole range. A kernel read (write(2) to a pipe) and write (getrandom(2)) of the
+ *     range are EFAULT (95, 96), and the read of page 0 must fault with
+ *     SEGV_ACCERR at page 0 (97 = other si_code, 98 = other si_addr). The
+ *     handler widens the range back to RW: pages 0 and 2 still hold their
+ *     bytes and the hole reads zero
  *   18 as 14 with no mprotect: munmap of the sparse range returns 0, and the
  *     read of page 2 (the second resident run, past the hole) then faults
  *   19 as 14, then mprotect(PROT_READ|PROT_WRITE) over the whole range: pages
  *     0, 1 (the hole) and 2 take a write and read it back, then munmap
+ *   20 (#2875) two live threads: a sibling thread reads a resident RW page
+ *     (its CPU caches the translation), the main thread mprotects it
+ *     PROT_NONE and wakes the sibling, whose second read must fault with
+ *     SEGV_ACCERR at the page; the handler widens it back and its byte is
+ *     still there (94 = a futex wait timed out)
  *   21 (#3121) the root writes a private RW page, mprotects it PROT_READ and
  *     forks. The child widens it back to RW and writes it; the parent, after
  *     the child exits, still reads its own byte (99 if the child's write
@@ -62,6 +71,42 @@
     js fail
 .endm
 
+/* rt_sigaction(SIGSEGV, {\handler, SA_SIGINFO|SA_RESTORER}, NULL, 8) */
+.macro SEGV_INFO handler
+    lea \handler(%rip), %rax
+    mov %rax, act(%rip)
+    movq $0x04000004, act+8(%rip)
+    lea restorer(%rip), %rax
+    mov %rax, act+16(%rip)
+    mov $11, %edi
+    lea act(%rip), %rsi
+    xor %edx, %edx
+    mov $8, %r10d
+    mov $13, %eax
+    syscall
+    test %rax, %rax
+    js harness
+.endm
+/* futex(\word, FUTEX_WAIT_PRIVATE, \old, &ten_seconds); 94 on timeout */
+.macro WAIT_WHILE word, old
+    lea \word(%rip), %rdi
+    mov $128, %esi
+    mov \old, %edx
+    lea ten_seconds(%rip), %r10
+    mov $202, %eax
+    syscall
+    cmp $-110, %rax
+    je timed_out
+.endm
+/* futex(\word, FUTEX_WAKE_PRIVATE, 1) */
+.macro WAKE word
+    lea \word(%rip), %rdi
+    mov $129, %esi
+    mov $1, %edx
+    mov $202, %eax
+    syscall
+.endm
+
 #if CASE == 6
 #define RESERVE 0x1000000
 #define COMMIT_AT 0x100000
@@ -83,7 +128,7 @@
 .global _start
 .text
 _start:
-#if CASE == 8 || CASE == 11 || CASE == 12 || CASE == 14 || CASE == 16 || CASE == 17 || CASE == 18 || CASE == 19
+#if CASE == 8 || CASE == 11 || CASE == 12 || CASE == 14 || CASE == 16 || CASE == 17 || CASE == 18 || CASE == 19 || CASE == 20
     jmp child               /* the run root itself, no fork */
 #endif
 #if CASE == 21
@@ -160,6 +205,73 @@ child:
     movb $0x3c, (%r14)
     cmpb $0x3c, (%r14)
     jne bad
+#elif CASE == 20
+    MMAP $0x1000, $3, $0x22
+    mov %r15, base(%rip)
+    mov %r15, %rbx
+    movb $0xa5, (%rbx)
+    SEGV_INFO segv_info
+    MMAP $0x10000, $3, $0x22
+    lea 0x10000(%r15), %rsi /* the sibling's stack */
+    mov $0x50f00, %edi      /* VM|FS|FILES|SIGHAND|THREAD|SYSVSEM */
+    xor %edx, %edx
+    xor %r10d, %r10d
+    xor %r8d, %r8d
+    mov $56, %eax
+    syscall
+    test %rax, %rax
+    js harness
+    jz sibling
+1:  cmpl $1, flag(%rip)     /* wait for the sibling's first read */
+    je 2f
+    WAIT_WHILE flag, $0
+    jmp 1b
+2:  MPROTECT %rbx, $0x1000, $0  /* PROT_NONE under the sibling's cached translation */
+    movl $2, flag(%rip)
+    WAKE flag
+3:  WAIT_WHILE never, $0    /* the sibling's handler ends the process */
+    jmp 3b
+sibling:
+    cmpb $0xa5, (%rbx)
+    jne bad
+    movl $1, flag(%rip)
+    WAKE flag
+1:  cmpl $2, flag(%rip)
+    je 2f
+    WAIT_WHILE flag, $1
+    jmp 1b
+2:  movb (%rbx), %al        /* PROT_NONE now: must fault SEGV_ACCERR */
+    mov $93, %edi
+    jmp exit
+restorer:
+    ud2
+/* SIGSEGV with siginfo: SEGV_ACCERR at the page, then widen it back to RW
+ * and read the bytes it kept */
+segv_info:
+    cmpl $2, 8(%rsi)        /* si_code */
+    mov $97, %edi
+    jne exit
+    mov base(%rip), %rax
+    cmp 16(%rsi), %rax      /* si_addr */
+    mov $98, %edi
+    jne exit
+#if CASE == 17
+    MPROTECT base(%rip), $SPARSE_LEN, $3
+    mov base(%rip), %rax
+    cmpb $0xa5, (%rax)
+    jne bad
+    cmpb $0, 4096(%rax)
+    jne bad
+    cmpb $0xa5, 8192(%rax)
+    jne bad
+#else
+    MPROTECT base(%rip), $0x1000, $3
+    mov base(%rip), %rax
+    cmpb $0xa5, (%rax)
+    jne bad
+#endif
+    mov $7, %edi
+    jmp exit
 #elif CASE >= 14
     /* V8's code range: a PROT_NONE reserve, committed RW a page at a time */
     MMAP $0x1000000, $0, $0x4022
@@ -176,6 +288,32 @@ child:
     jb 1b
 #if CASE == 17
     MPROTECT %r15, $SPARSE_LEN, $0  /* V8's FreePages */
+    mov %r15, base(%rip)
+    lea fds(%rip), %rdi     /* pipe(fds) */
+    mov $22, %eax
+    syscall
+    test %rax, %rax
+    js harness
+    movl fds+4(%rip), %edi  /* write(pipe, page 0, 1): a kernel read is EFAULT */
+    mov %r15, %rsi
+    mov $1, %edx
+    mov $1, %eax
+    syscall
+    cmp $-14, %rax
+    mov $95, %edi
+    jne exit
+    lea 8192(%r15), %rdi    /* getrandom(page 2, 1, 0): a kernel write is EFAULT */
+    mov $1, %esi
+    xor %edx, %edx
+    mov $318, %eax
+    syscall
+    cmp $-14, %rax
+    mov $96, %edi
+    jne exit
+    SEGV_INFO segv_info
+    movb (%r15), %al        /* PROT_NONE: must fault SEGV_ACCERR */
+    mov $93, %edi
+    jmp exit
 #else
 #if CASE != 18
     MPROTECT %r15, $SPARSE_LEN, $1
@@ -230,6 +368,35 @@ segv:
     jmp exit
 restorer:
     ud2
+#if CASE == 17
+/* SIGSEGV with siginfo: SEGV_ACCERR at the page, then widen it back to RW
+ * and read the bytes it kept */
+segv_info:
+    cmpl $2, 8(%rsi)        /* si_code */
+    mov $97, %edi
+    jne exit
+    mov base(%rip), %rax
+    cmp 16(%rsi), %rax      /* si_addr */
+    mov $98, %edi
+    jne exit
+#if CASE == 17
+    MPROTECT base(%rip), $SPARSE_LEN, $3
+    mov base(%rip), %rax
+    cmpb $0xa5, (%rax)
+    jne bad
+    cmpb $0, 4096(%rax)
+    jne bad
+    cmpb $0xa5, 8192(%rax)
+    jne bad
+#else
+    MPROTECT base(%rip), $0x1000, $3
+    mov base(%rip), %rax
+    cmpb $0xa5, (%rax)
+    jne bad
+#endif
+    mov $7, %edi
+    jmp exit
+#endif
 #elif CASE >= 11
 #if CASE == 12
     MMAP $0x1000000, $0, $0x4022
@@ -267,6 +434,9 @@ restorer:
 bad:
     mov $92, %edi
     jmp exit
+timed_out:
+    mov $94, %edi
+    jmp exit
 fail_mmap:
     neg %eax
     add $100, %eax
@@ -284,4 +454,11 @@ exit:
 status: .space 4
 .balign 8
 act: .space 32
+base: .space 8
+flag: .space 4
+never: .space 4
+fds: .space 8
+.section .rodata
+.balign 8
+ten_seconds: .quad 10, 0
 .section .note.GNU-stack,"",@progbits

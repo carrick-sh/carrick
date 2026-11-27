@@ -9014,6 +9014,8 @@ reservation_shape_witness!(
 );
 /// #3108: as the root's sparse range, then one `mprotect(PROT_READ|PROT_WRITE)`
 /// over it after the `PROT_READ`; pages 0 to 2 take a write (ENOSYS on x86).
+/// The refusing leaf is the hole, first touched by a read under `PROT_READ`:
+/// its grant records no write ceiling, so the widening is refused.
 #[test]
 #[ignore = "x86 mprotect RW after PROT_READ over a sparse range, see #3108"]
 fn production_mprotect_widens_a_sparse_resident_range_back_to_rw() {
@@ -9033,21 +9035,20 @@ reservation_shape_witness!(
      the munmap before the fix)."
 );
 
-/// #3073, V8's `FreePages`: one `mprotect(PROT_NONE)` over the whole sparse
-/// range, then a read that must fault. The sparse range itself is served
-/// (cases 14 to 16); x86 has no leaf encoding for a resident page with no
-/// user access yet, so the descriptor step still refuses `PROT_NONE`.
-#[test]
-#[ignore = "x86 PROT_NONE over a resident private page, see #2875"]
-fn production_mprotect_none_covers_a_sparse_resident_range() {
-    let outcome = run_reservation_shape(17);
-    assert_eq!(
-        (outcome.run.exit_code, outcome.run.terminating_signal),
-        (7, None),
-        "case 17 exit (7 = Linux; else the errno, +100 from mmap): {:?}",
-        outcome.run
-    );
-}
+reservation_shape_witness!(
+    production_mprotect_none_covers_a_sparse_resident_range,
+    17,
+    "#2875, V8's `FreePages`: one `mprotect(PROT_NONE)` over the root's sparse resident range \
+     returns 0 (ENOSYS before the fix). A kernel read and write of it are EFAULT, a read faults \
+     `SEGV_ACCERR` at page 0, and widening it back to RW finds both resident pages' bytes."
+);
+reservation_shape_witness!(
+    production_mprotect_none_faults_a_sibling_thread_with_accerr,
+    20,
+    "#2875, two live threads: a sibling reads a resident page, the main thread mprotects it \
+     `PROT_NONE` and wakes it, and the sibling's next read faults `SEGV_ACCERR` at the page; \
+     widening it back finds its byte."
+);
 reservation_shape_witness!(
     production_mprotect_widening_in_a_forked_child_keeps_the_parents_page,
     21,
