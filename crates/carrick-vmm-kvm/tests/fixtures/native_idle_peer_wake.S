@@ -41,6 +41,19 @@
  * poll (a host descheduling the vCPU). A stall is not a broken APIC: the
  * poll reads idle and the resend goes out (exit 93 or a fatal otherwise).
  *
+ * -DLAST_RETURN_STALLED_AFTER_POLL (#3083): as LAST_RETURN, but the
+ * vCPU stalls past the bound right after the wait's poll read the ICR
+ * busy, and the ICR recovers meanwhile. That stale busy result started
+ * inside the bound: the next poll reads idle and the resend goes out, the
+ * census as LAST_RETURN's (exit 93 or a fatal otherwise).
+ *
+ * -DLAST_RETURN_STALLED_AFTER_SEND (#3083): as LAST_RETURN, but with no
+ * busy poll: the first send and two resends at the return find the ICR
+ * busy, and the vCPU stalls past the bound right after the third, while
+ * the ICR recovers. The next resend goes out: the census must read three
+ * busy sends, one resend, no transition, at the syscall's own return
+ * (exit 93 or a fatal otherwise).
+ *
  * -DICR_FLAPPING (#3083): as LAST_RETURN, but every send finds the ICR
  * busy while every idle-ICR poll reads it idle, a local APIC that never
  * accepts its send. The hold's return must end the run with a CPL0 fatal
@@ -75,12 +88,22 @@
 #elif defined(LAST_RETURN_STALLED)
 #define LAST_RETURN 1
 #define BUSY_INJECT     INJECT_RESCHED_STALL_AT_LAST_RETURN
+#elif defined(LAST_RETURN_STALLED_AFTER_POLL)
+#define LAST_RETURN 1
+#define BUSY_INJECT     INJECT_RESCHED_STALL_AFTER_BUSY_POLL
+#elif defined(LAST_RETURN_STALLED_AFTER_SEND)
+#define LAST_RETURN 1
+#define BUSY_INJECT     INJECT_RESCHED_STALL_AFTER_BUSY_SEND
 #elif defined(LAST_RETURN)
 #define BUSY_INJECT     INJECT_RESCHED_BUSY_THROUGH_LAST_RETURN
 #else
 #define BUSY_INJECT     INJECT_RESCHED_BUSY_ONCE
 #endif
-#if defined(LAST_RETURN_STALLED)
+#if defined(LAST_RETURN_STALLED_AFTER_SEND)
+#define BUSY_RESCHED 1
+#define BUSY_AFTER_HOLD 0x0001000000010003
+#define BUSY_AT_END     0x0001000000010003
+#elif defined(LAST_RETURN_STALLED)
 #define BUSY_RESCHED 1
 #define BUSY_AFTER_HOLD 0x0001000000010002
 #define BUSY_AT_END     0x0001000000010002
@@ -95,6 +118,8 @@
 #define INJECT_RESCHED_BUSY_THROUGH_LAST_RETURN 0xfffffffffffffe5f
 #define INJECT_RESCHED_ICR_FLAPPING        0xfffffffffffffe60
 #define INJECT_RESCHED_STALL_AT_LAST_RETURN 0xfffffffffffffe61
+#define INJECT_RESCHED_STALL_AFTER_BUSY_POLL 0xfffffffffffffe62
+#define INJECT_RESCHED_STALL_AFTER_BUSY_SEND 0xfffffffffffffe63
 #define SPIN_USER                          0x1000000
 #ifdef BUSY_RESCHED
 #define AFTER_IDLE_READ 1

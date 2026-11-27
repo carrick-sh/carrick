@@ -4510,6 +4510,35 @@ fn production_resched_ipi_busy_across_a_stalled_last_chance_wait_is_sent() {
     );
 }
 
+/// #3083 on x86 CPL0: the last-return witness, with the vCPU stalled past
+/// the last-chance bound right after a poll read the ICR busy (a host
+/// descheduling it), while the ICR recovers. A busy result read inside the
+/// bound is not a broken APIC once time has passed: the next poll reads
+/// idle and the resend goes out, never a false `ApicFault`.
+#[test]
+fn production_resched_ipi_stale_busy_poll_after_a_stall_is_not_fatal() {
+    bounded_contention_witness(
+        "production_resched_ipi_stale_busy_poll_after_a_stall_is_not_fatal",
+        "native_idle_peer_wake.S",
+        &["-DLAST_RETURN_STALLED_AFTER_POLL=1"],
+        "a last-chance wait stalled past its bound after a busy poll",
+    );
+}
+
+/// #3083 on x86 CPL0: as above, but the stall comes right after a resend
+/// at the last return found the ICR busy (the third busy send), and no
+/// poll reads busy. That refusal started inside the bound: the next
+/// resend goes out, never a false `ApicFault`.
+#[test]
+fn production_resched_ipi_stale_refused_resend_after_a_stall_is_not_fatal() {
+    bounded_contention_witness(
+        "production_resched_ipi_stale_refused_resend_after_a_stall_is_not_fatal",
+        "native_idle_peer_wake.S",
+        &["-DLAST_RETURN_STALLED_AFTER_SEND=1"],
+        "a last-chance wait stalled past its bound after a refused resend",
+    );
+}
+
 /// #3083 on x86 CPL0: the last-return witness above, with a local APIC
 /// whose sends always find the ICR busy while its polls read it idle. The
 /// last-chance wait's bound must hold across retries that send nothing:
