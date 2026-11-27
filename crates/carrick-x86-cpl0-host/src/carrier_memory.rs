@@ -1961,11 +1961,17 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
                 // no longer COW-armed. The guest published it before this
                 // settlement crossed, so a sibling may already have edited
                 // it: protected it (even `PROT_NONE`, which keeps the frame
-                // in a no-access leaf, #2875) or retired it. Each leaves an
-                // owned state of the same frame, decoded once.
+                // in a no-access leaf, #2875) or retired it. A host-mapped
+                // (not private) leaf breaks COW too, so a present or
+                // retired leaf is accepted whatever its owner, and a
+                // no-access one only as private custody, decoded once.
                 DescriptorOp::CowRepoint { .. } => {
-                    use carrick_guest_arch::El1PrivateLeafState::{Resident, Retired};
-                    entry & COW == 0 && matches!(private_leaf_state(entry), Resident | Retired)
+                    use carrick_guest_arch::El1PrivateLeafState::Resident;
+                    entry & COW == 0
+                        && (entry & PRESENT != 0
+                            || entry & (PRESENT | PREPARED | RETIRED) == RETIRED
+                                && entry & ADDRESS != 0
+                            || matches!(private_leaf_state(entry), Resident))
                 }
                 DescriptorOp::Unmap(_) | DescriptorOp::UnmapWindow(_) => {
                     entry & (PRESENT | PREPARED) == 0
