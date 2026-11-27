@@ -757,6 +757,48 @@ pub use carrick_guest_arch::AbsentLeaves;
 /// have crossed the instruction-cache authority, which the ring lacks.
 pub use carrick_guest_arch::EditCeiling as GuestPermissionCeiling;
 
+/// What an mprotect(2) may give a COW-armed private leaf, on either ISA.
+/// The frame is still shared with the other side of a fork, so the edit
+/// may not exceed the mapping's ceiling, COW stays armed, and write is only
+/// recorded as intent: the first write still takes the copy (#3121).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CowArmedProtection {
+    /// Any user access at all (`false` is `PROT_NONE`).
+    pub user: bool,
+    /// Linux write permission, recorded as intent; never hardware write.
+    pub write_intent: bool,
+    pub executable: bool,
+}
+
+/// The shared rule for a COW-armed leaf's protection edit. `leaf_may_exec`
+/// is the ISA's own execute authority for this leaf. With no ceiling from
+/// the reservation owner the edit is `CowArmed`; past it, it is
+/// `PermissionWidening`.
+pub fn cow_armed_protection(
+    readable: bool,
+    writable: bool,
+    executable: bool,
+    ceiling: Option<GuestPermissionCeiling>,
+    leaf_may_exec: bool,
+) -> Result<CowArmedProtection, crate::descriptor_refusal::DescriptorRefusal> {
+    use crate::descriptor_refusal::DescriptorRefusal;
+    let Some(ceiling) = ceiling else {
+        return Err(DescriptorRefusal::CowArmed);
+    };
+    let user = readable || writable || executable;
+    if (user && !ceiling.readable)
+        || (writable && !ceiling.writable)
+        || (executable && (!ceiling.executable || !leaf_may_exec))
+    {
+        return Err(DescriptorRefusal::PermissionWidening);
+    }
+    Ok(CowArmedProtection {
+        user,
+        write_intent: writable,
+        executable,
+    })
+}
+
 /// One resident private-anonymous permission transition owned by guest EL1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GuestPermissionEdit {

@@ -84,6 +84,9 @@ pub enum DescriptorOp {
         span: PageSpan,
         permissions: Permissions,
         exec: ExecAuthority,
+        /// The mapping's ceiling from its reservation owner, which alone
+        /// authorizes a COW-armed leaf's edit (#3121).
+        cow_ceiling: Option<crate::aarch64::GuestPermissionCeiling>,
         /// Whether a page with no entry is a lazy page of a range its
         /// reservation owner proved mapped, or refuses the edit (#3073).
         absent: carrick_guest_arch::AbsentLeaves,
@@ -223,6 +226,7 @@ impl<'a> DescriptorTxn<'a> {
             } => DescriptorOp::Protect {
                 span,
                 absent,
+                cow_ceiling: ceiling,
                 permissions: permissions(requested).ok_or(DescriptorRefusal::BadEncoding)?,
                 exec: if ceiling.is_some_and(|ceiling| ceiling.executable) {
                     ExecAuthority::Mapping
@@ -536,12 +540,20 @@ pub fn split_terminal_descriptor(
     Ok((leaf_output(entry, level) + index as u64 * level_bytes(level + 1)) | flags)
 }
 
+/// Arm fork COW on one terminal. Every leaf that is writable now, or that
+/// may be written later (a private leaf keeping `MAY_WRITE` under a
+/// read-only protection), shares its frame only COW-armed: otherwise a later
+/// mprotect(2) widening on either side writes the other's page (#3121). On
+/// an armed leaf `MAY_WRITE` is current write intent, as on AArch64, and a
+/// widening takes [`crate::aarch64::cow_armed_protection`].
 pub fn arm_cow_terminal(entry: u64) -> Result<u64, DescriptorRefusal> {
     if entry & (PRESENT | PREPARED) == 0 {
         return Err(DescriptorRefusal::MissingTable);
     }
-    Ok(if entry & WRITE != 0 {
-        (entry & !WRITE) | COW | MAY_WRITE
+    let may_be_written = entry & WRITE != 0 || entry & (PRIVATE | MAY_WRITE) == PRIVATE | MAY_WRITE;
+    Ok(if entry & COW == 0 && may_be_written {
+        let intent = if entry & WRITE != 0 { MAY_WRITE } else { 0 };
+        (entry & !(WRITE | MAY_WRITE)) | COW | intent
     } else {
         entry
     })
@@ -767,6 +779,7 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
             DescriptorOp::Protect {
                 permissions: p,
                 exec,
+                cow_ceiling,
                 ..
             } => {
                 if entry & (PRESENT | PREPARED) == 0 {
@@ -776,7 +789,23 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                     return Err(DescriptorRefusal::NotPrivateAnonymous);
                 }
                 if entry & COW != 0 {
-                    return Err(DescriptorRefusal::CowArmed);
+                    // Fork-shared: COW stays armed and write stays intent.
+                    let cow = crate::aarch64::cow_armed_protection(
+                        true,
+                        p.writable,
+                        p.executable,
+                        cow_ceiling,
+                        entry & MAY_EXEC != 0 || exec == ExecAuthority::Mapping,
+                    )?;
+                    let new = (entry & !(WRITE | USER | NX | MAY_WRITE))
+                        | if cow.user { USER } else { 0 }
+                        | if cow.executable { MAY_EXEC } else { NX }
+                        | if cow.write_intent { MAY_WRITE } else { 0 };
+                    check_leaf_privilege_matches_range(
+                        UserVa::new(self.txn.op.span().va + offset),
+                        new,
+                    )?;
+                    return self.set(slot, new);
                 }
                 // Write stays a leaf fact: MAY_WRITE says the frame is this
                 // MM's own to write.
@@ -926,9 +955,14 @@ impl DescriptorTxn<'_> {
             DescriptorOp::Protect {
                 permissions: p,
                 exec,
+                cow_ceiling,
                 ..
             } => (
-                0,
+                cow_ceiling.map_or(0, |c| {
+                    1 | u64::from(c.readable) << 1
+                        | u64::from(c.writable) << 2
+                        | u64::from(c.executable) << 3
+                }),
                 u64::from(exec == ExecAuthority::Mapping),
                 permissions(p),
                 None,

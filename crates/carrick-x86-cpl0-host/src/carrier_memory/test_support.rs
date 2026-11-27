@@ -1566,6 +1566,7 @@ pub fn inherited_inventory_edge_survives_protect_advancing_mapping_generation(
                 user: true,
             },
             exec: carrick_mmu_core::x86::descriptor_txn::ExecAuthority::Leaf,
+            cow_ceiling: None,
             absent: carrick_guest_arch::AbsentLeaves::Refuse,
         },
     };
