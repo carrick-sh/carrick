@@ -1725,27 +1725,41 @@ impl NativeOwnerSignalFixture {
             frame.x[0] = address;
             frame.x[1] = 1;
             let mut cpu = crate::sched::FakeCpu::default();
-            let route = crate::dispatch::dispatch_syscall_with_native(
-                &mut frame,
-                &carrick_el1_abi::Counters::new(),
-                core::slice::from_ref(self.root),
-                &[],
-                &[],
-                &[],
-                &[],
-                &carrick_el1_abi::InotifyNameCache::new(),
-                Some(crate::dispatch::Zone {
-                    tables: self.zone,
-                    cpu: &mut cpu,
-                    user: &crate::sched::HardwareUserWord,
-                }),
-                Some(&venue),
-                None,
-                Some(&mut *entry),
-                Some(source),
-                None,
-                |_| core::ptr::null_mut(),
-            );
+            let route = {
+                let completed = crate::dispatch::dispatch_syscall_with_native(
+                    &mut frame,
+                    &carrick_el1_abi::Counters::new(),
+                    core::slice::from_ref(self.root),
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &carrick_el1_abi::InotifyNameCache::new(),
+                    Some(crate::dispatch::Zone {
+                        tables: self.zone,
+                        cpu: &mut cpu,
+                        user: &crate::sched::HardwareUserWord,
+                    }),
+                    Some(&venue),
+                    None,
+                    Some(&mut *entry),
+                    Some(source),
+                    None,
+                    |_| core::ptr::null_mut(),
+                );
+                // The entry runs the switch a park owed it (#3093).
+                crate::dispatch::run_owed_entry_route(
+                    &mut frame,
+                    &carrick_el1_abi::Counters::new(),
+                    core::slice::from_ref(self.root),
+                    crate::dispatch::Zone {
+                        tables: self.zone,
+                        cpu: &mut cpu,
+                        user: &crate::sched::HardwareUserWord,
+                    },
+                    completed,
+                )
+            };
             assert_eq!(
                 route,
                 carrick_personality_linux::dispatch::CompletionRoute::Suspended,
@@ -14852,27 +14866,41 @@ fn native_arm_pselect6_handback(
         freq: 1_000_000_000,
         ..Default::default()
     };
-    let route = crate::dispatch::dispatch_syscall_with_native(
-        &mut frame,
-        &carrick_el1_abi::Counters::new(),
-        core::slice::from_ref(fixture.task),
-        &[],
-        &[],
-        &[],
-        &[],
-        &carrick_el1_abi::InotifyNameCache::new(),
-        Some(crate::dispatch::Zone {
-            tables: fixture.zone,
-            cpu: &mut cpu,
-            user: &crate::sched::HardwareUserWord,
-        }),
-        Some(&venue),
-        None,
-        Some(&mut *entry),
-        Some(source),
-        None,
-        |_| core::ptr::null_mut(),
-    );
+    let route = {
+        let completed = crate::dispatch::dispatch_syscall_with_native(
+            &mut frame,
+            &carrick_el1_abi::Counters::new(),
+            core::slice::from_ref(fixture.task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &carrick_el1_abi::InotifyNameCache::new(),
+            Some(crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            }),
+            Some(&venue),
+            None,
+            Some(&mut *entry),
+            Some(source),
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        // The entry runs the switch a park owed it (#3093).
+        crate::dispatch::run_owed_entry_route(
+            &mut frame,
+            &carrick_el1_abi::Counters::new(),
+            core::slice::from_ref(fixture.task),
+            crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            },
+            completed,
+        )
+    };
     assert_eq!(
         route,
         CompletionRoute::Suspended,

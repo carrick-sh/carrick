@@ -95,7 +95,7 @@ fn serve_on(
     if zone.slot(slot).mm() == 0 {
         host_publish(zone, slot, task.mm.key.load(Ordering::Relaxed), None, 0);
     }
-    Sched {
+    let mut sched = Sched {
         handoff: None,
         zone,
         slot,
@@ -103,8 +103,10 @@ fn serve_on(
         cpu,
         user: &HardwareUserWord,
         counters,
-    }
-    .serve_futex(frame)
+    };
+    let served = sched.serve_futex(frame);
+    // The entry runs the switch a park owed it (#3093).
+    crate::dispatch::run_owed_switch(&mut sched, frame, served == Some(Served::Idle)).or(served)
 }
 
 fn serve(
@@ -396,7 +398,7 @@ fn production_futex_wait_switch_keeps_successor_result_separate_from_wait_result
     let (mut frame, mut cpu) = live(0xA, uaddr, operation, 0);
     frame.x[5] = u32::MAX as u64;
     let run = |frame: &mut TrapFrame, cpu: &mut FakeCpu| {
-        crate::dispatch::dispatch_syscall_with_regions(
+        let action = crate::dispatch::dispatch_syscall_with_regions(
             frame,
             counters,
             &tasks,
@@ -407,10 +409,22 @@ fn production_futex_wait_switch_keeps_successor_result_separate_from_wait_result
             &names,
             Some(crate::dispatch::Zone {
                 tables: zone,
-                cpu,
+                cpu: &mut *cpu,
                 user: &HardwareUserWord,
             }),
             |_| core::ptr::null_mut(),
+        );
+        // The entry runs the switch a park owed it (#3093).
+        crate::dispatch::run_owed_entry_switch(
+            frame,
+            counters,
+            &tasks,
+            crate::dispatch::Zone {
+                tables: zone,
+                cpu,
+                user: &HardwareUserWord,
+            },
+            action,
         )
     };
     assert_eq!(run(&mut frame, &mut cpu), carrick_el1_abi::Action::Served);
@@ -1316,7 +1330,7 @@ fn queued_threads_do_not_send_other_syscalls_to_the_host() {
     let names = InotifyNameCache::new();
     let (mut frame, mut cpu) = live(0xA, uaddr, FUTEX_WAKE_PRIVATE, 1);
     let run = |frame: &mut TrapFrame, cpu: &mut FakeCpu| {
-        crate::dispatch::dispatch_syscall_with_regions(
+        let action = crate::dispatch::dispatch_syscall_with_regions(
             frame,
             &counters,
             &tasks,
@@ -1327,10 +1341,22 @@ fn queued_threads_do_not_send_other_syscalls_to_the_host() {
             &names,
             Some(crate::dispatch::Zone {
                 tables: zone,
-                cpu,
+                cpu: &mut *cpu,
                 user: &HardwareUserWord,
             }),
             |_| core::ptr::null_mut(),
+        );
+        // The entry runs the switch a park owed it (#3093).
+        crate::dispatch::run_owed_entry_switch(
+            frame,
+            &counters,
+            &tasks,
+            crate::dispatch::Zone {
+                tables: zone,
+                cpu,
+                user: &HardwareUserWord,
+            },
+            action,
         )
     };
     assert_eq!(run(&mut frame, &mut cpu), carrick_el1_abi::Action::Served);

@@ -1631,32 +1631,46 @@ fn loan_call_with_anonymous(
                 editor,
                 origin,
             });
-            let route = crate::dispatch::dispatch_syscall_with_native(
-                frame,
-                counters,
-                core::slice::from_ref(task),
-                &[],
-                &[],
-                &[],
-                &[],
-                &cache,
-                Some(crate::dispatch::Zone {
-                    tables: fixture.zone,
-                    cpu,
-                    user: &crate::sched::HardwareUserWord,
-                }),
-                None,
-                Some(&LoanLifecycle),
-                Some(&mut *process),
-                Some(BornInZoneSource {
-                    zone: fixture.zone,
-                    slot: fixture.slot,
-                }),
-                venue
-                    .as_mut()
-                    .map(|venue| venue as &mut dyn PendingAnonymousVenue),
-                |_| core::ptr::null_mut(),
-            );
+            let route = {
+                let completed = crate::dispatch::dispatch_syscall_with_native(
+                    frame,
+                    counters,
+                    core::slice::from_ref(task),
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &cache,
+                    Some(crate::dispatch::Zone {
+                        tables: fixture.zone,
+                        cpu: &mut *cpu,
+                        user: &crate::sched::HardwareUserWord,
+                    }),
+                    None,
+                    Some(&LoanLifecycle),
+                    Some(&mut *process),
+                    Some(BornInZoneSource {
+                        zone: fixture.zone,
+                        slot: fixture.slot,
+                    }),
+                    venue
+                        .as_mut()
+                        .map(|venue| venue as &mut dyn PendingAnonymousVenue),
+                    |_| core::ptr::null_mut(),
+                );
+                // The entry runs the switch a park owed it (#3093).
+                crate::dispatch::run_owed_entry_route(
+                    frame,
+                    counters,
+                    core::slice::from_ref(task),
+                    crate::dispatch::Zone {
+                        tables: fixture.zone,
+                        cpu,
+                        user: &crate::sched::HardwareUserWord,
+                    },
+                    completed,
+                )
+            };
             assert!(
                 process.take_run_failure().is_none(),
                 "native lifecycle invariant failed"
@@ -3356,29 +3370,43 @@ fn composed_native_supply_with_prepared(
     // Dispatch the child's first syscall through the real ARM native adapter.
     frame.x[8] = 172;
     let cache = carrick_el1_abi::InotifyNameCache::new();
-    let route = super::super::dispatch::dispatch_arm_syscall_with_native_process(
-        &mut frame,
-        &counters,
-        core::slice::from_ref(&fixture.task),
-        &[],
-        &[],
-        &[],
-        &[],
-        &cache,
-        Some(crate::dispatch::Zone {
-            tables: fixture.zone,
-            cpu: &mut cpu,
-            user: &crate::sched::HardwareUserWord,
-        }),
-        None,
-        Some(fixture),
-        page,
-        control,
-        Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
-        child_root,
-        &mut service,
-        |_| core::ptr::null_mut(),
-    )
+    let route = {
+        let completed = super::super::dispatch::dispatch_arm_syscall_with_native_process(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &cache,
+            Some(crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            }),
+            None,
+            Some(fixture),
+            page,
+            control,
+            Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
+            child_root,
+            &mut service,
+            |_| core::ptr::null_mut(),
+        );
+        // The entry runs the switch a park owed it (#3093).
+        crate::dispatch::run_owed_entry_result(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            },
+            completed,
+        )
+    }
     .unwrap();
     assert!(matches!(
         route,

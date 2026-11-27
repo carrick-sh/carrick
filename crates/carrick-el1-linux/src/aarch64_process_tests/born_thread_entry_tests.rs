@@ -132,29 +132,43 @@ fn loaded_call(
     // SAFETY: the scheduler selected this exact record on this slot.
     let saved = unsafe { *fixture.zone.record(current).ctx_mut() };
     let ttbr0 = cpu.ttbr.0;
-    super::super::dispatch::dispatch_arm_syscall_with_native_process(
-        frame,
-        &counters,
-        core::slice::from_ref(task),
-        &[],
-        &[],
-        &[],
-        &[],
-        &cache,
-        Some(crate::dispatch::Zone {
-            tables: fixture.zone,
-            cpu,
-            user: &crate::sched::HardwareUserWord,
-        }),
-        None,
-        Some(&LoadedVenue),
-        page,
-        control,
-        Aarch64EntryContext::saved(&saved),
-        ttbr0,
-        service,
-        |_| core::ptr::null_mut(),
-    )
+    {
+        let completed = super::super::dispatch::dispatch_arm_syscall_with_native_process(
+            frame,
+            &counters,
+            core::slice::from_ref(task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &cache,
+            Some(crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut *cpu,
+                user: &crate::sched::HardwareUserWord,
+            }),
+            None,
+            Some(&LoadedVenue),
+            page,
+            control,
+            Aarch64EntryContext::saved(&saved),
+            ttbr0,
+            service,
+            |_| core::ptr::null_mut(),
+        );
+        // The entry runs the switch a park owed it (#3093).
+        crate::dispatch::run_owed_entry_result(
+            frame,
+            &counters,
+            core::slice::from_ref(task),
+            crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu,
+                user: &crate::sched::HardwareUserWord,
+            },
+            completed,
+        )
+    }
 }
 
 /// Run the production scheduler's switch-in on `fixture.slot`.
@@ -811,29 +825,43 @@ fn call_on_slot(
     };
     let counters = carrick_el1_abi::Counters::new();
     let cache = carrick_el1_abi::InotifyNameCache::new();
-    let route = super::super::dispatch::dispatch_arm_syscall_with_native_process(
-        frame,
-        &counters,
-        tasks,
-        &[],
-        &[],
-        &[],
-        &[],
-        &cache,
-        Some(crate::dispatch::Zone {
-            tables: fixture.zone,
-            cpu: &mut resume_cpu,
-            user: &crate::sched::HardwareUserWord,
-        }),
-        None,
-        Some(&LoadedVenue),
-        page,
-        control,
-        Aarch64EntryContext::saved(&saved),
-        ttbr0,
-        dispatch_service,
-        |_| core::ptr::null_mut(),
-    )
+    let route = {
+        let completed = super::super::dispatch::dispatch_arm_syscall_with_native_process(
+            frame,
+            &counters,
+            tasks,
+            &[],
+            &[],
+            &[],
+            &[],
+            &cache,
+            Some(crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut resume_cpu,
+                user: &crate::sched::HardwareUserWord,
+            }),
+            None,
+            Some(&LoadedVenue),
+            page,
+            control,
+            Aarch64EntryContext::saved(&saved),
+            ttbr0,
+            dispatch_service,
+            |_| core::ptr::null_mut(),
+        );
+        // The entry runs the switch a park owed it (#3093).
+        crate::dispatch::run_owed_entry_result(
+            frame,
+            &counters,
+            tasks,
+            crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut resume_cpu,
+                user: &crate::sched::HardwareUserWord,
+            },
+            completed,
+        )
+    }
     .expect("production ARM native process dispatch");
     *cpu = core::mem::take(&mut resume_cpu.inner);
     route
@@ -2236,29 +2264,43 @@ impl MultiSlotEnv {
         crate::sched::ThreadCpu::save(cpu, frame, &mut saved);
         let saved_native = saved.native;
         let mut service = self.service(slot);
-        super::super::dispatch::dispatch_arm_syscall_with_native_process(
-            frame,
-            counters,
-            self.tasks,
-            &[],
-            &[],
-            &[],
-            &[],
-            &cache,
-            Some(crate::dispatch::Zone {
-                tables: self.fixture.zone,
-                cpu,
-                user: &crate::sched::HardwareUserWord,
-            }),
-            None,
-            Some(&LoadedVenue),
-            page,
-            control,
-            Aarch64EntryContext::saved(&after_svc(saved_native)),
-            ttbr0,
-            &mut service,
-            |_| core::ptr::null_mut(),
-        )
+        {
+            let completed = super::super::dispatch::dispatch_arm_syscall_with_native_process(
+                frame,
+                counters,
+                self.tasks,
+                &[],
+                &[],
+                &[],
+                &[],
+                &cache,
+                Some(crate::dispatch::Zone {
+                    tables: self.fixture.zone,
+                    cpu: &mut *cpu,
+                    user: &crate::sched::HardwareUserWord,
+                }),
+                None,
+                Some(&LoadedVenue),
+                page,
+                control,
+                Aarch64EntryContext::saved(&after_svc(saved_native)),
+                ttbr0,
+                &mut service,
+                |_| core::ptr::null_mut(),
+            );
+            // The entry runs the switch a park owed it (#3093).
+            crate::dispatch::run_owed_entry_result(
+                frame,
+                counters,
+                self.tasks,
+                crate::dispatch::Zone {
+                    tables: self.fixture.zone,
+                    cpu,
+                    user: &crate::sched::HardwareUserWord,
+                },
+                completed,
+            )
+        }
         .expect("syscall must dispatch cleanly")
     }
 
@@ -5551,29 +5593,43 @@ fn arm_ring_born_member_raw_exit_during_group_close_retires_in_ring() {
         })),
         calls: core::cell::Cell::new(0),
     };
-    let route = super::super::dispatch::dispatch_arm_syscall_with_native_process(
-        &mut raw_exit,
-        &counters,
-        h.env.tasks,
-        &[],
-        &[],
-        &[],
-        &[],
-        &cache,
-        Some(crate::dispatch::Zone {
-            tables: h.env.fixture.zone,
-            cpu: &mut born_cpu,
-            user: &crate::sched::HardwareUserWord,
-        }),
-        None,
-        Some(&venue),
-        h.target_page,
-        h.born_control,
-        Aarch64EntryContext::saved(&after_svc(saved_native)),
-        ttbr0,
-        &mut born_service,
-        |_| core::ptr::null_mut(),
-    )
+    let route = {
+        let completed = super::super::dispatch::dispatch_arm_syscall_with_native_process(
+            &mut raw_exit,
+            &counters,
+            h.env.tasks,
+            &[],
+            &[],
+            &[],
+            &[],
+            &cache,
+            Some(crate::dispatch::Zone {
+                tables: h.env.fixture.zone,
+                cpu: &mut born_cpu,
+                user: &crate::sched::HardwareUserWord,
+            }),
+            None,
+            Some(&venue),
+            h.target_page,
+            h.born_control,
+            Aarch64EntryContext::saved(&after_svc(saved_native)),
+            ttbr0,
+            &mut born_service,
+            |_| core::ptr::null_mut(),
+        );
+        // The entry runs the switch a park owed it (#3093).
+        crate::dispatch::run_owed_entry_result(
+            &mut raw_exit,
+            &counters,
+            h.env.tasks,
+            crate::dispatch::Zone {
+                tables: h.env.fixture.zone,
+                cpu: &mut born_cpu,
+                user: &crate::sched::HardwareUserWord,
+            },
+            completed,
+        )
+    }
     .expect("racing raw exit must dispatch cleanly");
     assert_eq!(
         counters.lifecycle_declines[carrick_el1_abi::LifecycleDecline::ExitGate as usize]
