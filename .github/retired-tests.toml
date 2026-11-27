@@ -447,3 +447,9 @@ test = "carrick_el1_linux::native_process_runtime::host_test_support::native_ser
 reason = "#1051 (#3045 P0-5): a native service exit retains its IPC operation whenever its record retains an adapter operation, by construction from the record rather than the exit's shape, so the `NativeServiceExit::Bridge` classification and its 'a bridge keeps Busy' refusal row are gone; Busy with a retained operation yields through the service checkpoint (native_service_exit_busy_retains_ipc_operation_and_pin)."
 replaced_by = "carrick_el1_linux::native_process_runtime::host_test_support::native_service_exit_busy_retains_ipc_operation_and_pin"
 pr = 3045
+
+[[retired]]
+test = "soft_zone::soft_root_rt_sigaction_refuses_a_handler_it_cannot_deliver"
+reason = "#2814: the admitted soft root now delivers a caught handler (soft_root_delivers_a_caught_sigusr1_and_returns_through_rt_sigreturn), so the refusal witness became the served shape and was renamed for what it proves."
+replaced_by = "soft_zone::soft_root_rt_sigaction_serves_a_handler_an_ignore_and_a_query_in_ring"
+pr = 3118
