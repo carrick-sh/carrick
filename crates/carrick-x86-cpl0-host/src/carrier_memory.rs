@@ -997,7 +997,20 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
             }
         }
         let mut private = Vec::new();
-        for index in self.admitted.get(&mm).into_iter().flatten() {
+        // The slots this MM's retirement may revoke: those admitted only for
+        // it, and orphans, whose admitted MMs all retired while a descendant
+        // still held inherited aliases into them (`allowed` is empty and only
+        // this MM's aliases remain). Without the orphans, a slot whose owner
+        // retired before its last inheritor stayed registered for the run.
+        let admitted = self.admitted.get(&mm);
+        let orphans = held.keys().filter(|index| {
+            !admitted.is_some_and(|slots| slots.contains(*index))
+                && self
+                    .slots
+                    .get(*index)
+                    .is_some_and(|slot| slot.allowed.is_empty())
+        });
+        for index in admitted.into_iter().flatten().chain(orphans) {
             let slot = self
                 .slots
                 .get(index)
@@ -1005,7 +1018,7 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
             let remaining = slot.alias_count - held.get(index).copied().unwrap_or(0);
             // A shared file window slot is one per file chunk, kept for the
             // run and reused by every later fault (#1338).
-            if slot.allowed != [mm]
+            if !(slot.allowed == [mm] || slot.allowed.is_empty())
                 || remaining != 0
                 || slot.bootstrap
                 || slot.backing.extent.is_host_file_window()
