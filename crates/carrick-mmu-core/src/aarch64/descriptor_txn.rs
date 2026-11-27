@@ -2050,7 +2050,11 @@ impl Executor<'_> {
         descriptor: u64,
         base: u64,
     ) -> Result<u64, DescriptorRefusal> {
-        if descriptor == 0 && matches!(self.op, DescriptorOp::Retire(_)) {
+        // An absent entry is a lazy page: a retirement owes nothing there,
+        // and a protection change is the root model's metadata alone, which
+        // the first touch maps from (mprotect(2) ignores residency, #3073).
+        if descriptor == 0 && matches!(self.op, DescriptorOp::Retire(_) | DescriptorOp::Protect(_))
+        {
             return Ok(0);
         }
         let span = entry_span(level);
@@ -3964,6 +3968,47 @@ mod tests {
             );
             assert_eq!(words.image(), before);
             assert!(words.live_cas().is_empty());
+        }
+
+        /// #3073: mprotect(2) ignores residency. A range resident in separate
+        /// runs, with lazy pages (no entry) between and after them, changes
+        /// every terminal in one transaction and leaves every hole absent.
+        #[test]
+        fn protect_skips_absent_entries_between_resident_runs() {
+            let words = fixture(3);
+            applied(run(
+                &words,
+                prepare(4, PageSpan::new(VA, 4 * PT_PAGE), true),
+                &TableGrants::NONE,
+            ));
+            words.set(leaf_pa(VA + PT_PAGE), 0);
+            let none = GuestPermissionEdit {
+                va: VA,
+                len: 8 * PT_PAGE,
+                readable: false,
+                writable: false,
+                executable: false,
+                cow_ceiling: None,
+            };
+            let outcome = applied(run(&words, DescriptorOp::Protect(none), &TableGrants::NONE));
+            assert_eq!(outcome.pages, 8);
+            for n in [0, 2, 3] {
+                let d = words.get(leaf_pa(VA + n * PT_PAGE));
+                assert_eq!(d & AP_EL0_ACCESS, 0, "page {n} denies EL0");
+                assert_eq!(
+                    d & PA_MASK_4KIB,
+                    IPA + n * PT_PAGE,
+                    "page {n} keeps its frame"
+                );
+                assert_ne!(d & VALID, 0, "page {n} stays resident");
+            }
+            for n in [1, 4, 5, 6, 7] {
+                assert_eq!(
+                    words.get(leaf_pa(VA + n * PT_PAGE)),
+                    0,
+                    "hole {n} stays absent"
+                );
+            }
         }
 
         #[test]

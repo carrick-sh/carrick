@@ -592,12 +592,16 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
         validate_entry(entry, level)?;
         let bytes = level_bytes(level);
         let remaining = self.txn.op.span().len - offset;
+        // An absent entry is a lazy page: an unmap owes nothing there, and a
+        // protection change is the root model's metadata alone, which the
+        // first touch maps from (mprotect(2) ignores residency, #3073).
         if entry == 0
             && matches!(
                 self.txn.op,
                 DescriptorOp::Unmap(_)
                     | DescriptorOp::UnmapWindow(_)
                     | DescriptorOp::Retire(_)
+                    | DescriptorOp::Protect { .. }
                     | DescriptorOp::ProtectWindow { .. }
             )
         {
