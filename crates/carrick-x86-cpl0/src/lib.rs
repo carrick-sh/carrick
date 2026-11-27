@@ -167,6 +167,23 @@ mod test_support {
     static SCAN_HOLD: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
     /// The held slot, plus one (0: none).
     static SCAN_HOLD_SLOT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+    /// Wake the peer CPU and stop its next idle pass at its top, before it
+    /// looks for work, as [`INJECT_HOLD_PEER_SCAN`] but with no time bound
+    /// (#3117): only [`INJECT_HOLD_RUN_QUEUE_ACROSS_PEER_HLT`] lets it go
+    /// on, and the test's own bound fails a run that never does.
+    pub const INJECT_STOP_PEER_SCAN: u64 = 0xffff_ffff_ffff_fe66;
+    /// With the peer stopped by [`INJECT_STOP_PEER_SCAN`] and a thread
+    /// queued here (#3117): hold this CPU's run-queue lock, let the peer go
+    /// on, and wait until it is published IdleWfi past its pre-HLT recheck
+    /// (every scan it ran meanwhile met the busy lock). Then release the
+    /// lock through its guard, send what the release owes through this
+    /// CPU's production venue, let the peer HLT, and return only once an
+    /// idle scan stole from this CPU. 0: the peer's scans had enrolled on
+    /// the busy lock; 1: they had not, so nothing was proven.
+    pub const INJECT_HOLD_RUN_QUEUE_ACROSS_PEER_HLT: u64 = 0xffff_ffff_ffff_fe67;
+    /// The armed scan hold ends only on its release, never on a clock.
+    static SCAN_HOLD_UNBOUNDED: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
     /// Wake the peer CPU and stop its next idle pass right after the pass
     /// has read its conditions (the scan hold above, timers), until this
     /// CPU says it published (#3053). The peer's pass then goes on only
@@ -700,6 +717,12 @@ mod test_support {
         {
             return;
         }
+        if SCAN_HOLD_UNBOUNDED.load(Ordering::Acquire) {
+            while SCAN_HOLD.load(Ordering::Acquire) != SCAN_RELEASED {
+                core::hint::spin_loop();
+            }
+            return;
+        }
         let mut backend = carrick_el1::isa::x86::X86Backend;
         let now = |backend: &mut carrick_el1::isa::x86::X86Backend| {
             backend
@@ -817,6 +840,58 @@ mod test_support {
             .unwrap_or_else(|_| carrick_x86_carrier::entry::fatal_boot!());
         ORDER_ARM_SENT.store(true, Ordering::Release);
         Some(0)
+    }
+
+    /// [`INJECT_HOLD_RUN_QUEUE_ACROSS_PEER_HLT`]. Runs in this CPU's syscall
+    /// with interrupts masked, so nothing here hands the queued thread over
+    /// but the peer's own idle scan.
+    fn hold_run_queue_across_peer_hlt(
+        binding: &carrick_el1::isa::x86::context::native::CpuBinding,
+    ) -> Option<u64> {
+        let own = carrick_sched_core::SlotId::new(u8::try_from(binding.cpu_slot).ok()?);
+        let peer = carrick_sched_core::SlotId::new(u8::from(binding.cpu_slot == 0));
+        if SCAN_HOLD.load(Ordering::Acquire) != SCAN_HELD
+            || !SCAN_HOLD_UNBOUNDED.load(Ordering::Acquire)
+            || ORDER_STATE.load(Ordering::Acquire) != 0
+        {
+            return None;
+        }
+        let zone = carrick_x86_carrier::native_execution::source(own).zone;
+        let steals = zone.counters.el1_steals.load(Ordering::Acquire);
+        let passes = carrick_sched_core::OwedPasses::new();
+        let guard = loop {
+            if let Some(guard) =
+                zone.slot_lock(own, &carrick_sched_core::BoundedSpin(1024), &passes)
+            {
+                break guard;
+            }
+            core::hint::spin_loop();
+        };
+        // Stop the peer once it is IdleWfi past its pre-HLT recheck, at a
+        // pass that owes no wake already (`order_peer`).
+        ORDER_SLOT.store(peer.raw() + 1, Ordering::Release);
+        ORDER_POINT.store(ORDER_BEFORE_HLT, Ordering::Release);
+        ORDER_ARM_SENT.store(true, Ordering::Release);
+        ORDER_STATE.store(ORDER_ARMED, Ordering::Release);
+        SCAN_HOLD.store(SCAN_RELEASED, Ordering::Release);
+        while ORDER_STATE.load(Ordering::Acquire) != ORDER_REACHED {
+            core::hint::spin_loop();
+        }
+        let enrolled = zone.scan_enrolled(own);
+        drop(guard);
+        carrick_el1::substrate::sched::object_wait::deliver_owed_passes(zone, own, passes);
+        ORDER_STATE
+            .compare_exchange(
+                ORDER_REACHED,
+                ORDER_PUBLISHED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()?;
+        while zone.counters.el1_steals.load(Ordering::Acquire) == steals {
+            core::hint::spin_loop();
+        }
+        Some(u64::from(!enrolled))
     }
 
     fn ordered_peer_task() -> Option<&'static carrick_el1_abi::CurrentTask> {
@@ -1505,6 +1580,21 @@ mod test_support {
             INJECT_PEER_SCAN_HELD => {
                 Some(u64::from(SCAN_HOLD.load(Ordering::Acquire) >= SCAN_HELD))
             }
+            INJECT_STOP_PEER_SCAN => {
+                let peer = carrick_sched_core::SlotId::new(u8::from(binding.cpu_slot == 0));
+                if SCAN_HOLD
+                    .compare_exchange(0, SCAN_ARMED, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    return None;
+                }
+                SCAN_HOLD_UNBOUNDED.store(true, Ordering::Release);
+                SCAN_HOLD_SLOT.store(peer.raw() + 1, Ordering::Release);
+                carrick_el1::isa::x86::interrupt::send_resched(peer)
+                    .unwrap_or_else(|_| carrick_x86_carrier::entry::fatal_boot!());
+                Some(0)
+            }
+            INJECT_HOLD_RUN_QUEUE_ACROSS_PEER_HLT => hold_run_queue_across_peer_hlt(binding),
             INJECT_ORDER_PEER_AFTER_IDLE_READ => arm_peer_order(binding, ORDER_AFTER_READ),
             INJECT_ORDER_PEER_BEFORE_IDLE_HLT => arm_peer_order(binding, ORDER_BEFORE_HLT),
             INJECT_ORDER_PEER_REACHED => Some(u64::from(
