@@ -952,7 +952,7 @@ impl HostFileOutput {
                 (reply.len() <= self.len).then_some(alloc::borrow::Cow::Borrowed(reply))
             }
             // Completed per staged range by `socket::complete`, the vector
-            // scatter and `complete_select`.
+            // scatter and `select_spans`.
             OutputLayout::Net | OutputLayout::Vector | OutputLayout::Select => None,
             OutputLayout::X8664Stat => {
                 let stat =
@@ -2731,7 +2731,7 @@ const SELECT_NFDS_MAX: usize = 1024;
 /// in-zone or not in the caller's ring table, or a set larger than one
 /// record keeps its route (`None`). The three sets are read once and made
 /// writable before the crossing; completion rewrites them
-/// ([`complete_select`]).
+/// ([`select_spans`], through [`completion`]).
 ///
 /// Divergence from Linux: the timeout is not rewritten with the time left.
 fn stage_select(
