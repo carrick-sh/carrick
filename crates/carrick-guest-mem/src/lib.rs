@@ -980,13 +980,6 @@ pub trait GuestMemory {
         false
     }
 
-    /// Who serves an admitted root's private file pages
-    /// ([`PrivateFileVenue`]). Only a carrier that serves owner frame grants
-    /// answers `OwnerGrant`.
-    fn private_file_venue(&self) -> PrivateFileVenue {
-        PrivateFileVenue::HostEager
-    }
-
     /// Whether this backend can safely publish executable protection changes
     /// while sibling guest threads remain live. Backends default to the
     /// conservative answer; translation-backed execution can opt in when
