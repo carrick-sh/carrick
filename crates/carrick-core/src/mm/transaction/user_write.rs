@@ -309,10 +309,9 @@ impl<
     ) -> Result<(), UserWriteError<E>> {
         let editor = self.observe_wait(handle, carrick_core_abi::PortalWaitCause::Editor)?;
         crossing().map_err(|refusal| match refusal {
-            VenueRefusal::EditorHeld => {
-                let _ = editor;
-                UserWriteError::Busy
-            }
+            VenueRefusal::EditorHeld => editor.map_or(UserWriteError::Busy, |wait| {
+                UserWriteError::Owner(MmError::Wait(wait))
+            }),
             VenueRefusal::Failed(error) => UserWriteError::Mechanics(error),
         })
     }
