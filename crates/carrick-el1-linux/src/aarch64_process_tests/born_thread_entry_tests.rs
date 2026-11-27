@@ -1756,10 +1756,16 @@ fn arm_host_root_vfork_child_keeps_sibling_block_copyout_completable() {
                 slot: 0,
             }
         }
-        fn settle_completions(&mut self, _: &UserWriteRequest<'_>) -> Result<(), ()> {
+        fn settle_completions(
+            &mut self,
+            _: &UserWriteRequest<'_>,
+        ) -> Result<(), carrick_core::mm::transaction::CowCrossing<()>> {
             Ok(())
         }
-        fn supply_cow(&mut self, _: carrick_el1_abi::PortalGrantWindow) -> Result<(), ()> {
+        fn supply_cow(
+            &mut self,
+            _: carrick_el1_abi::PortalGrantWindow,
+        ) -> Result<(), carrick_core::mm::transaction::CowCrossing<()>> {
             panic!("the exact replacement grant was published before the crossing")
         }
         fn copy(

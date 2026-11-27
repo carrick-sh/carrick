@@ -1,7 +1,7 @@
 //! Native process user-copy mechanics.
 use super::*;
 use carrick_core::mm::transaction::{
-    SelectionVenues, UserWriteError, UserWriteRequest, UserWriteVenue,
+    CowCrossing, SelectionVenues, UserWriteError, UserWriteRequest, UserWriteVenue,
 };
 use carrick_el1_abi::KernelFaultVenues;
 
@@ -27,12 +27,12 @@ impl NativeWriteVenue<'_> {
     /// one of the MM under one exclusion: whichever member sees one rings,
     /// from either CPU, a sibling's completion included (#2749). One still
     /// in the pool after the crossing means the carrier met the MM's editor
-    /// held on the other CPU: the copy is contended, and its retry rings
-    /// again.
+    /// held on the other CPU: the copy parks on that editor's release, and
+    /// its rerun rings again (#3061).
     fn settle_cow_grants(
         &mut self,
         handle: carrick_el1_abi::El1MmHandle,
-    ) -> Result<(), NativeProcessError> {
+    ) -> Result<(), CowCrossing<NativeProcessError>> {
         let mm = handle.mm().raw();
         if !self.pool.has_completions_for(mm) {
             return Ok(());
@@ -42,7 +42,7 @@ impl NativeWriteVenue<'_> {
             self.address,
         );
         if self.pool.has_completions_for(mm) {
-            return Err(NativeProcessError::Busy);
+            return Err(CowCrossing::EditorHeld);
         }
         Ok(())
     }
@@ -61,7 +61,10 @@ impl<'a> UserWriteVenue<ParkedContextWords> for NativeWriteVenue<'a> {
             slot: u32::from(self.slot.raw()),
         }
     }
-    fn settle_completions(&mut self, request: &UserWriteRequest<'_>) -> Result<(), Self::Error> {
+    fn settle_completions(
+        &mut self,
+        request: &UserWriteRequest<'_>,
+    ) -> Result<(), CowCrossing<Self::Error>> {
         self.settle_cow_grants(request.handle)
     }
     /// A preparation resolves the same COW grants as a write (#2716): it
@@ -69,13 +72,13 @@ impl<'a> UserWriteVenue<ParkedContextWords> for NativeWriteVenue<'a> {
     fn settle_preparation(
         &mut self,
         target: &carrick_core::mm::transaction::UserWriteTarget,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), CowCrossing<Self::Error>> {
         self.settle_cow_grants(target.handle)
     }
     fn supply_cow(
         &mut self,
         window: carrick_el1_abi::PortalGrantWindow,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), CowCrossing<Self::Error>> {
         let cpu = carrick_guest_arch::CpuId::new(u32::from(self.slot.raw()));
         self.slots
             .grant(usize::from(self.slot.raw()))
@@ -88,8 +91,8 @@ impl<'a> UserWriteVenue<ParkedContextWords> for NativeWriteVenue<'a> {
                 Ok::<(), NativeProcessError>(())
             })
             // The carrier met this MM's editor held on the other CPU and
-            // supplied nothing; the lane withdrew its selection. The copy is
-            // contended, not failed.
+            // supplied nothing; the lane withdrew its selection. The copy
+            // parks on that editor's release, as an EL0 fault does.
             .map_err(NativeProcessError::from_cow_supply)
     }
     fn supply_backing(

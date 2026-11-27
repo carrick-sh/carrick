@@ -43,10 +43,16 @@ fn permission_transition_rounds_preserve_separate_signal_stack_owner_writes() {
                 slot: 0,
             }
         }
-        fn settle_completions(&mut self, _: &UserWriteRequest<'_>) -> Result<(), ()> {
+        fn settle_completions(
+            &mut self,
+            _: &UserWriteRequest<'_>,
+        ) -> Result<(), carrick_core::mm::transaction::CowCrossing<()>> {
             Ok(())
         }
-        fn supply_cow(&mut self, _: PortalGrantWindow) -> Result<(), ()> {
+        fn supply_cow(
+            &mut self,
+            _: PortalGrantWindow,
+        ) -> Result<(), carrick_core::mm::transaction::CowCrossing<()>> {
             panic!("permission edits must not allocate frames")
         }
         fn copy(&mut self, fence: &ValidatedChunk<'_, Aarch64ParkedContext>, bytes: &[u8]) -> bool {
@@ -3715,10 +3721,16 @@ fn fork_child_write_preparation_mode(prepare_first: bool, race_drain: bool) {
                     slot: 0,
                 }
             }
-            fn settle_completions(&mut self, _: &UserWriteRequest<'_>) -> Result<(), ()> {
+            fn settle_completions(
+                &mut self,
+                _: &UserWriteRequest<'_>,
+            ) -> Result<(), carrick_core::mm::transaction::CowCrossing<()>> {
                 Ok(())
             }
-            fn supply_cow(&mut self, _: carrick_el1_abi::PortalGrantWindow) -> Result<(), ()> {
+            fn supply_cow(
+                &mut self,
+                _: carrick_el1_abi::PortalGrantWindow,
+            ) -> Result<(), carrick_core::mm::transaction::CowCrossing<()>> {
                 panic!("the exact child grant is already supplied")
             }
             fn copy(
@@ -7435,12 +7447,18 @@ mod native_child_tid_cow {
                     slot: 0,
                 }
             }
-            fn settle_completions(&mut self, request: &UserWriteRequest<'_>) -> Result<(), ()> {
+            fn settle_completions(
+                &mut self,
+                request: &UserWriteRequest<'_>,
+            ) -> Result<(), carrick_core::mm::transaction::CowCrossing<()>> {
                 assert_eq!(request.handle.mm().raw(), MM);
                 self.settled += 1;
                 Ok(())
             }
-            fn supply_cow(&mut self, window: PortalGrantWindow) -> Result<(), ()> {
+            fn supply_cow(
+                &mut self,
+                window: PortalGrantWindow,
+            ) -> Result<(), carrick_core::mm::transaction::CowCrossing<()>> {
                 self.supplied += 1;
                 assert_eq!(window.operation.mm.raw(), MM);
                 assert_eq!(window.fault_page, VA);
@@ -7450,10 +7468,14 @@ mod native_child_tid_cow {
                 let editor = self.spaces.try_begin_edit(index, MM, nz(2)).unwrap();
                 drop(editor);
                 if self.refuse {
-                    return Err(());
+                    return Err(().into());
                 }
                 if self.no_progress {
-                    return if self.supplied <= 2 { Ok(()) } else { Err(()) };
+                    return if self.supplied <= 2 {
+                        Ok(())
+                    } else {
+                        Err(().into())
+                    };
                 }
                 self.cow.pool.publish(MM, GRANT, backing()).unwrap();
                 self.cow.refuse = self.select_fails;
@@ -7591,10 +7613,16 @@ fn copy_preparation_selects_backing(read: bool) {
                 slot: 0,
             }
         }
-        fn settle_completions(&mut self, _: &UserWriteRequest<'_>) -> Result<(), ()> {
+        fn settle_completions(
+            &mut self,
+            _: &UserWriteRequest<'_>,
+        ) -> Result<(), carrick_core::mm::transaction::CowCrossing<()>> {
             Ok(())
         }
-        fn supply_cow(&mut self, _: carrick_el1_abi::PortalGrantWindow) -> Result<(), ()> {
+        fn supply_cow(
+            &mut self,
+            _: carrick_el1_abi::PortalGrantWindow,
+        ) -> Result<(), carrick_core::mm::transaction::CowCrossing<()>> {
             panic!("not COW")
         }
         fn supply_backing(
@@ -7865,16 +7893,25 @@ fn copyin_mapping_change_retains_selected_owner_retry_and_redispatches_once() {
                 slot: 0,
             }
         }
-        fn settle_completions(&mut self, _: &UserWriteRequest<'_>) -> Result<(), ()> {
+        fn settle_completions(
+            &mut self,
+            _: &UserWriteRequest<'_>,
+        ) -> Result<(), carrick_core::mm::transaction::CowCrossing<()>> {
             panic!("read preparation has no output completion")
         }
-        fn settle_preparation(&mut self, _: &UserWriteTarget) -> Result<(), ()> {
+        fn settle_preparation(
+            &mut self,
+            _: &UserWriteTarget,
+        ) -> Result<(), carrick_core::mm::transaction::CowCrossing<()>> {
             if self.selections == 1 {
                 (self.change)();
             }
             Ok(())
         }
-        fn supply_cow(&mut self, _: PortalGrantWindow) -> Result<(), ()> {
+        fn supply_cow(
+            &mut self,
+            _: PortalGrantWindow,
+        ) -> Result<(), carrick_core::mm::transaction::CowCrossing<()>> {
             panic!("resident readable input needs no supply")
         }
         fn copy(

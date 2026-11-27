@@ -71,10 +71,12 @@ fn native_user_write_preserves_nonfault_refusals() {
 
 /// #3040: both ISAs' `supply_cow` read a supply the same way, and the lane's
 /// slot is empty after each refusal, ready for the next lane's selection.
-/// Contention is "not now": Busy once, then the rerun is supplied.
+/// Contention is "not now": a held editor is the editor-release wait the
+/// shared protocol sampled (#3061), and the rerun is supplied.
 #[cfg(test)]
 #[test]
 fn refused_cow_supply_keeps_the_crossing_refusal_and_frees_the_slot() {
+    use carrick_core::mm::transaction::CowCrossing;
     let window = carrick_core_abi::PortalGrantWindow::decode([
         1, 77, 2, 3, 4, 0x4000, 0x5000, 3, 0x4000, 0, 0, 0, 0,
     ])
@@ -92,11 +94,11 @@ fn refused_cow_supply_keeps_the_crossing_refusal_and_frees_the_slot() {
     // kept, and the selection is withdrawn.
     assert_eq!(
         supply(&|| Err(NativeProcessError::Fault)),
-        Err(NativeProcessError::Fault)
+        Err(CowCrossing::Failed(NativeProcessError::Fault))
     );
     assert_eq!(slot.selection_snapshot().0, 0);
     // x86: the carrier met the MM's editor held and supplied nothing.
-    assert_eq!(supply(&|| Ok(())), Err(NativeProcessError::Busy));
+    assert_eq!(supply(&|| Ok(())), Err(CowCrossing::EditorHeld));
     assert_eq!(slot.selection_snapshot().0, 0);
     // The carrier took it: supplied.
     assert_eq!(supply(&carrier_takes), Ok(()));
@@ -106,7 +108,7 @@ fn refused_cow_supply_keeps_the_crossing_refusal_and_frees_the_slot() {
     assert!(slot.publish_fault_selection(9, window));
     assert_eq!(
         supply(&|| panic!("an occupied slot must not cross")),
-        Err(NativeProcessError::Busy)
+        Err(CowCrossing::Failed(NativeProcessError::Busy))
     );
     assert_eq!(slot.pending_fault_selection(77, 0x4000), Some((9, window)));
     assert!(slot.cancel_fault_selection(window, 9));
@@ -1534,7 +1536,10 @@ impl<X: ForkStockCrossing> UserWriteVenue<Aarch64ParkedContext> for NativeWriteV
         }
     }
 
-    fn settle_completions(&mut self, _: &UserWriteRequest<'_>) -> Result<(), Self::Error> {
+    fn settle_completions(
+        &mut self,
+        _: &UserWriteRequest<'_>,
+    ) -> Result<(), carrick_core::mm::transaction::CowCrossing<Self::Error>> {
         // Host settlement runs at the next exact-MM exclusion; provisioning
         // adds an unmapped inventory extent and does not inspect old mappings.
         Ok(())
@@ -1543,7 +1548,7 @@ impl<X: ForkStockCrossing> UserWriteVenue<Aarch64ParkedContext> for NativeWriteV
     fn supply_cow(
         &mut self,
         window: carrick_el1_abi::PortalGrantWindow,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), carrick_core::mm::transaction::CowCrossing<Self::Error>> {
         let cpu = u64::from(self.slot.raw());
         // A supply the carrier refused is withdrawn before this returns; a
         // selection left published would be read by this CPU's next native

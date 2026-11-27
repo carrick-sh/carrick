@@ -494,19 +494,21 @@ impl NativeProcessError {
 
     /// The one reading of a lane's copy-on-write supply refusal, on both
     /// ISAs (#3040). The slot holds none of the lane's selection after any of
-    /// them. A supply that refused nothing, or a slot another selection
-    /// occupies, is contention; a crossing's own refusal is kept.
+    /// them. A supply that refused nothing met the MM's editor held: the
+    /// shared protocol parks that on the editor's release (#3061). A slot
+    /// another selection occupies is contention; a crossing's own refusal is
+    /// kept.
     pub fn from_cow_supply(
         refusal: carrick_core_abi::CowSupplyRefusal<NativeProcessError>,
-    ) -> NativeProcessError {
+    ) -> carrick_core::mm::transaction::CowCrossing<NativeProcessError> {
+        use carrick_core::mm::transaction::CowCrossing;
         use carrick_core_abi::CowSupplyRefusal;
         match refusal {
-            CowSupplyRefusal::SlotOccupied | CowSupplyRefusal::Unserved(None) => {
-                NativeProcessError::Busy
-            }
-            CowSupplyRefusal::Unserved(Some(error)) => error,
-            CowSupplyRefusal::Invalid => NativeProcessError::Invalid,
-            CowSupplyRefusal::Lost => NativeProcessError::Stale,
+            CowSupplyRefusal::Unserved(None) => CowCrossing::EditorHeld,
+            CowSupplyRefusal::SlotOccupied => CowCrossing::Failed(NativeProcessError::Busy),
+            CowSupplyRefusal::Unserved(Some(error)) => CowCrossing::Failed(error),
+            CowSupplyRefusal::Invalid => CowCrossing::Failed(NativeProcessError::Invalid),
+            CowSupplyRefusal::Lost => CowCrossing::Failed(NativeProcessError::Stale),
         }
     }
 

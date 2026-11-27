@@ -87,6 +87,29 @@ impl<E> From<crate::mm::transfer::TransferError> for UserWriteError<E> {
     }
 }
 
+/// Why a venue's copy-on-write crossing (a supply or a settlement) did not
+/// finish. The carrier met the MM's editor held on another CPU: that is "not
+/// now", and the protocol answers it with the editor-release wait it sampled
+/// before the crossing (#3061), the same wait an EL0 copy-on-write fault
+/// parks on. Only a refusal of the crossing itself is the venue's error.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
+pub enum CowCrossing<E> {
+    /// The MM's editor was held: nothing was supplied or settled.
+    EditorHeld,
+    Failed(E),
+}
+impl<E> From<E> for CowCrossing<E> {
+    fn from(error: E) -> Self {
+        Self::Failed(error)
+    }
+}
+
 /// ISA copy mechanics and the existing physical supply crossing. This owns
 /// neither grants nor a pool. Supply must publish or return a refusal; it
 /// cannot report progress merely because the producer was notified.
@@ -96,18 +119,38 @@ pub trait UserWriteVenue<Context: Copy + Send + Sync + zerocopy::FromZeros> {
     type Error;
 
     fn selection_venues(&mut self) -> SelectionVenues<'_, Self::Prepared, Self::Cow>;
-    fn settle_completions(&mut self, request: &UserWriteRequest<'_>) -> Result<(), Self::Error>;
-    fn supply_cow(&mut self, window: PortalGrantWindow) -> Result<(), Self::Error>;
+    fn settle_completions(
+        &mut self,
+        request: &UserWriteRequest<'_>,
+    ) -> Result<(), CowCrossing<Self::Error>>;
+    fn supply_cow(&mut self, window: PortalGrantWindow) -> Result<(), CowCrossing<Self::Error>>;
     fn supply_backing(&mut self, _window: PortalGrantWindow) -> Option<Result<(), Self::Error>> {
         None
     }
-    fn settle_preparation(&mut self, _target: &UserWriteTarget) -> Result<(), Self::Error> {
+    fn settle_preparation(
+        &mut self,
+        _target: &UserWriteTarget,
+    ) -> Result<(), CowCrossing<Self::Error>> {
         Ok(())
     }
 
     /// Copy only while the exact owner fence is live; the bytes are the
     /// selected slice of the original kernel source, never a replayed prefix.
     fn copy(&mut self, fence: &ValidatedChunk<'_, Context>, bytes: &[u8]) -> bool;
+}
+
+/// A copy-on-write crossing's refusal, as the protocol's answer: a held
+/// editor is the editor-release wait sampled before the crossing.
+fn cow_crossing_refusal<E>(
+    crossing: CowCrossing<E>,
+    editor: Option<carrick_core_abi::PortalOwnerWait>,
+) -> UserWriteError<E> {
+    match crossing {
+        CowCrossing::EditorHeld => editor.map_or(UserWriteError::Busy, |wait| {
+            UserWriteError::Owner(MmError::Wait(wait))
+        }),
+        CowCrossing::Failed(error) => UserWriteError::Mechanics(error),
+    }
 }
 
 impl<
@@ -189,6 +232,12 @@ impl<
             if venues.slot != slot {
                 return Err(MmError::Stale.into());
             }
+            // The editor-release source, sampled before this pass's
+            // copy-on-write crossings probe the MM's editor: a crossing that
+            // meets the editor held parks on this wait, which a release after
+            // the sample completes, and never re-rings while it is held.
+            let editor =
+                self.observe_wait(target.handle, carrick_core_abi::PortalWaitCause::Editor)?;
             let step = self.select(&continuation, words, venues);
             // The settlement follows every selection, a failed one included:
             // an earlier supply of this call may still be owed to the venue
@@ -198,7 +247,7 @@ impl<
                 None => venue.settle_preparation(&target),
             };
             let step = step?;
-            settled.map_err(UserWriteError::Mechanics)?;
+            settled.map_err(|crossing| cow_crossing_refusal(crossing, editor))?;
             match step {
                 TransferStep::CowSupply(window) => {
                     if awaiting_supply_progress {
@@ -206,7 +255,7 @@ impl<
                     }
                     venue
                         .supply_cow(window)
-                        .map_err(UserWriteError::Mechanics)?;
+                        .map_err(|crossing| cow_crossing_refusal(crossing, editor))?;
                     awaiting_supply_progress = true;
                 }
                 TransferStep::Selected(selected) => {
