@@ -6240,11 +6240,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     drop(consumed);
                     return Ok(returned(result));
                 }
-                WaitWork::Other(WaitSelection::NoChild) => return Err(NativeFailure::NoChild),
-                WaitWork::Other(WaitSelection::Event(_) | WaitSelection::Exited(_)) => {
-                    return Err(NativeFailure::Unsupported);
-                }
-                WaitWork::Other(WaitSelection::StillRunning(precheck)) => {
+                WaitWork::Other(other) => {
+                    let precheck = match *other {
+                        WaitSelection::NoChild => return Err(NativeFailure::NoChild),
+                        WaitSelection::Event(_) | WaitSelection::Exited(_) => {
+                            return Err(NativeFailure::Unsupported);
+                        }
+                        WaitSelection::StillRunning(precheck) => precheck,
+                    };
                     if nohang {
                         if matches!(output, PendingWaitOutput::WaitId { .. }) && status.raw() != 0 {
                             let copied = self.service.copy_siginfo(
@@ -8387,6 +8390,56 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
     }
 
+    /// The resumed child's pending CLONE_CHILD_SETTID store, kept off the
+    /// owned checkpoint's frame: a drained copyout and a rerun wait descend
+    /// beneath that frame (#3093). `Some`: the checkpoint ends here.
+    #[inline(never)]
+    fn resume_pending_child_tid(
+        &mut self,
+    ) -> Result<Option<NativeResume>, carrick_core_abi::NativeRunFailureCause> {
+        // CLONE_CHILD_SETTID is an effect in the child's MM. The selected
+        // record now owns that MM, and no EL0 instruction has resumed yet.
+        let pending = {
+            let graph = self.runtime.graph.lock();
+            let resources = graph
+                .owner
+                .task(self.key)
+                .map_err(|_| NativeFailure::Stale.run_failure_reason().at_caller())?
+                .native()
+                .resources();
+            resources
+                .pending_child_tid
+                .map(|address| (resources.mm.clone(), address))
+        };
+        if let Some((mm, address)) = pending {
+            // Linux ignores a fault while storing CLONE_CHILD_SETTID in the
+            // child, and a stale admission never repeats the store. Contention
+            // is "not now": the store stays pending and the child, which has
+            // run no EL0 instruction, reruns this checkpoint (#2306).
+            match self
+                .service
+                .copy_signal_bytes(&mm, address, &self.calling_tid.to_ne_bytes())
+                .map_err(NativeProcessError::failure)
+            {
+                Ok(()) | Err(Ok(NativeFailure::Fault | NativeFailure::Stale)) => {}
+                Err(Ok(failure)) => return Err(failure.run_failure_reason().at_caller()),
+                Err(Err(contention)) => {
+                    return self.resume_not_now(contention.into()).map(Some);
+                }
+            }
+            self.runtime
+                .graph
+                .lock()
+                .owner
+                .task_mut(self.key)
+                .map_err(|_| NativeFailure::Stale.run_failure_reason().at_caller())?
+                .native_mut()
+                .resources_mut()
+                .pending_child_tid = None;
+        }
+        Ok(None)
+    }
+
     #[inline(never)]
     fn resume_owned_checkpoint(
         &mut self,
@@ -8417,45 +8470,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 resumed => return Ok(resumed),
             }
         }
-        // CLONE_CHILD_SETTID is an effect in the child's MM. The selected
-        // record now owns that MM, and no EL0 instruction has resumed yet.
-        let pending = {
-            let graph = self.runtime.graph.lock();
-            let resources = graph
-                .owner
-                .task(self.key)
-                .map_err(|_| NativeFailure::Stale.run_failure_reason().at_caller())?
-                .native()
-                .resources();
-            resources
-                .pending_child_tid
-                .map(|address| (resources.mm.clone(), address))
-        };
-        if let Some((mm, address)) = pending {
-            // Linux ignores a fault while storing CLONE_CHILD_SETTID in the
-            // child, and a stale admission never repeats the store. Contention
-            // is "not now": the store stays pending and the child, which has
-            // run no EL0 instruction, reruns this checkpoint (#2306).
-            match self
-                .service
-                .copy_signal_bytes(&mm, address, &self.calling_tid.to_ne_bytes())
-                .map_err(NativeProcessError::failure)
-            {
-                Ok(()) | Err(Ok(NativeFailure::Fault | NativeFailure::Stale)) => {}
-                Err(Ok(failure)) => return Err(failure.run_failure_reason().at_caller()),
-                Err(Err(contention)) => {
-                    return self.resume_not_now(contention.into());
-                }
-            }
-            self.runtime
-                .graph
-                .lock()
-                .owner
-                .task_mut(self.key)
-                .map_err(|_| NativeFailure::Stale.run_failure_reason().at_caller())?
-                .native_mut()
-                .resources_mut()
-                .pending_child_tid = None;
+        if let Some(resumed) = self.resume_pending_child_tid()? {
+            return Ok(resumed);
         }
         let outcome = self.resume_pending_lifecycle();
         if let Some(reason) = self.take_run_failure() {

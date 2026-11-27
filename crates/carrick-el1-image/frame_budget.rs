@@ -205,6 +205,9 @@ impl Frames {
                 "::resume_checkpoint::",
                 "::resume_pending_lifecycle::",
             ]);
+        // The checkpoint's owned stage, live beneath a drained copyout and a
+        // rerun pending wait; the signal checkpoint runs after it returns.
+        let owned_resume = resume + self.maximum("::resume_owned_checkpoint::");
         // Notification retirement and allocation can wake a guest while every
         // outer owner/editor frame is live. Include panic tails as well.
         let schedule = self.sum(&[
@@ -576,7 +579,7 @@ impl Frames {
             // the forbidden nested completion/copy chain.
             (
                 "ring completed copyout",
-                native.max(resume)
+                native.max(owned_resume)
                     + self.sum(&[
                         "::drain_copyout::",
                         "::finish_copyout::",
@@ -622,7 +625,9 @@ impl Frames {
             ("ring pipe backing preparation", adapter_stage),
             (
                 "native wait copy",
-                native.max(resume)
+                // A resumed wait4 reruns its query beneath the whole
+                // checkpoint chain (#3093).
+                native.max(owned_resume + self.maximum("::resume_pending_wait::"))
                     + self.required("::wait_query::")?
                     + self.maximum("::copy_with::")
                     + write,
@@ -831,8 +836,9 @@ const SWITCHES: [&str; 3] = [
 /// itself would nest the whole resumed thread beneath its own frames: the
 /// arm64 apt overflow of #3093 resumed a wait4 checkpoint under
 /// `serve_ipc_with_signals`. A park owes its switch to the entry instead.
-const SWITCH_VENUES: [&str; 9] = [
+const SWITCH_VENUES: [&str; 10] = [
     "carrick_el1_syscall",
+    "carrick_el1_linux::dispatch::run_owed_entry_switch::",
     "carrick_el1::substrate::sched::Sched$LT$C$C$U$GT$::run_next::",
     "carrick_el1::substrate::sched::Sched$LT$C$C$U$GT$::idle::",
     "carrick_el1::substrate::sched::Sched$LT$C$C$U$GT$::idle_entry::",
