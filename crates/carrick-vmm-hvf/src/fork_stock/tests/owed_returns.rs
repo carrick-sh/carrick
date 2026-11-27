@@ -36,6 +36,9 @@ impl carrick_hal::PhysicalFrameInventory for Inventory {
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok(0)
     }
+    fn frame_is_mapped(&self, _: carrick_hal::FrameId) -> bool {
+        false
+    }
 }
 struct RestoreRegion(usize);
 impl Drop for RestoreRegion {

@@ -598,14 +598,19 @@ unsafe impl TranslationDrain for QuarantinedContextDrain {
 }
 
 /// Inventory side of revoking a retired child's private memslot: its
-/// frames were retired with the MM, so this only proves none is still live.
-struct AlreadyRetiredInventory {
-    authority: std::sync::Arc<dyn carrick_hal::FrameCowAuthority>,
+/// frames were retired with the MM, so this only proves no MM, of any
+/// owner, still maps one.
+struct AlreadyRetiredInventory<'a> {
+    inventory: &'a dyn carrick_hal::PhysicalFrameInventory,
 }
-impl InventoryRetirement for AlreadyRetiredInventory {
+impl InventoryRetirement for AlreadyRetiredInventory<'_> {
     fn retire(&mut self, identity: BackingIdentity) -> Result<(), MemoryError> {
-        let mapping = carrick_hal::MappingId::from_kernel_allocation(identity.mapping_id);
-        if self.authority.live_mapping_row(mapping).is_some() {
+        if self
+            .inventory
+            .frame_is_mapped(carrick_hal::FrameId::from_kernel_allocation(
+                identity.frame_id,
+            ))
+        {
             return Err(error("retired child memslot frame is still mapped"));
         }
         Ok(())
@@ -800,6 +805,12 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
     pub fn retained_bytes(&self) -> usize {
         self.slots.values().map(|s| s.backing.extent.len).sum()
     }
+    /// A broken carrier invariant: quarantine (every later edit fails
+    /// closed, so the run ends) and say which.
+    fn broken(&mut self, what: &str) -> MemoryError {
+        self.quarantined = true;
+        error(what)
+    }
     fn admit(&self) -> Result<(), MemoryError> {
         if self.quarantined {
             Err(error("carrier memory quarantined"))
@@ -984,13 +995,16 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
     /// the revoke checks that rather than retiring them again. Shared slots
     /// keep no drain entry for the retired context.
     ///
-    /// Two phases: every precondition (root, alias slots and counts,
-    /// admitted slots, and each private slot's revoke preconditions) is
-    /// checked before anything mutates, so a refusal leaves the carrier
-    /// exactly as it was and the stock's retry is idempotent. After the
-    /// checks only the memslot deletion ioctl can fail; that is a host
-    /// fault, never guest-reachable, and it quarantines the carrier as every
-    /// other indeterminate memslot change does.
+    /// Two phases: every precondition (root, alias records per slot, held
+    /// slots, and each released slot's revoke preconditions) is checked
+    /// before any bookkeeping moves. A released slot has no holder left, so
+    /// a failed precondition on it (a live CR3 arena, a frame any MM still
+    /// maps, alias records that differ from the ledger) is a broken
+    /// invariant: it quarantines the carrier, never a refusal for the
+    /// stock to retry, which could only loop. After the checks only the
+    /// memslot deletion ioctl can fail; that is a host fault, never
+    /// guest-reachable, and it quarantines the carrier as every other
+    /// indeterminate memslot change does.
     pub fn retire_child(
         &mut self,
         absence: &carrick_hal::fork_stock::SlotAbsence,
@@ -1002,8 +1016,6 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
             .roots
             .get(&mm)
             .ok_or_else(|| error("retired MM has no carrier CR3 root"))?;
-        // Bind to the exact retired root incarnation, not just the MM number.
-        let authority = inventory.bind(context.into());
         // Phase 1: validate, mutating nothing. The ledger names every slot
         // whose last hold this retirement drops, whatever kind it was: the
         // MM's admission, its aliases, or the drain debt of an alias it
@@ -1011,46 +1023,61 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
         let plan = self.holds.retirement(key(mm));
         let mut private = Vec::new();
         for index in &plan.released {
-            let slot = self
-                .slots
-                .get(index)
-                .ok_or_else(|| error("retired MM holds no carrier slot"))?;
+            let Some(slot) = self.slots.get(index) else {
+                return Err(self.broken("retired MM holds a slot the carrier lost"));
+            };
             // Bootstrap memory and a shared file window slot (one per file
             // chunk, reused by every later fault, #1338) stay for the run.
             if slot.bootstrap || slot.backing.extent.is_host_file_window() {
                 continue;
             }
             // `revoke`'s preconditions, checked now so the revoke cannot
-            // refuse after the bookkeeping below has run. Nothing else holds
-            // the slot, so each is a broken invariant, never a wait.
+            // refuse after the bookkeeping below has run. Nothing holds the
+            // slot any more, so each is a broken invariant: it quarantines
+            // the carrier (fatal), never a refusal the stock retries, which
+            // could only loop.
             let extent = &slot.backing.extent;
             let start = extent.base.raw();
             let end = start + extent.len as u64;
             if self.roots.iter().any(|(owner, root)| {
                 *owner != mm && (start..end).contains(&root.root.address().raw())
             }) {
-                return Err(error("retired child slot holds a live CR3/table arena"));
+                return Err(self.broken("retired child slot holds a live CR3/table arena"));
             }
-            // An arena chunk holds one frame per grant, each retired with
-            // the MM; none may still be mapped.
+            // Every frame the slot backs (an arena chunk holds one per
+            // grant) must be unmapped in every MM, not just the retiring
+            // one: a row anywhere means some MM still uses the backing
+            // without a hold, and revoking it would pull memory out from
+            // under that MM.
             if core::iter::once(&slot.backing.identity)
                 .chain(slot.frame_identities.values())
                 .any(|identity| {
-                    authority
-                        .live_mapping_row(carrick_hal::MappingId::from_kernel_allocation(
-                            identity.mapping_id,
-                        ))
-                        .is_some()
+                    inventory.frame_is_mapped(carrick_hal::FrameId::from_kernel_allocation(
+                        identity.frame_id,
+                    ))
                 })
             {
-                return Err(error("retired child memslot frame is still mapped"));
+                return Err(self.broken("retired child memslot frame is still mapped"));
             }
             private.push(slot.handle);
         }
-        let aliases = self.aliases.get(&mm).map_or(0, BTreeMap::len);
-        if aliases != plan.aliases {
-            return Err(error("retired MM alias count mismatch"));
+        // The carrier's alias records match the ledger slot by slot, and
+        // every slot the MM holds is still installed.
+        let mut aliases_by_slot = BTreeMap::<u32, usize>::new();
+        for alias in self.aliases.get(&mm).into_iter().flat_map(BTreeMap::values) {
+            *aliases_by_slot.entry(alias.slot).or_default() += 1;
         }
+        if aliases_by_slot != plan.aliases {
+            return Err(self.broken("retired MM alias records differ from its holds"));
+        }
+        if plan
+            .held
+            .iter()
+            .any(|index| !self.slots.contains_key(index))
+        {
+            return Err(self.broken("retired MM holds a slot the carrier lost"));
+        }
+        let aliases = plan.alias_total();
         // Phase 2: bookkeeping, infallible after the checks above. The
         // absence proof discharges every pending drain of this MM's
         // contexts, so shared slots do not accumulate retired children.
@@ -1063,7 +1090,7 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
         self.holds.retire(key(mm));
         // Phase 3: revoke the private slots (only the ioctl can fail).
         let mut drain = QuarantinedContextDrain { context };
-        let mut retired = AlreadyRetiredInventory { authority };
+        let mut retired = AlreadyRetiredInventory { inventory };
         for handle in &private {
             self.revoke(*handle, &mut drain, &mut retired)?;
         }
