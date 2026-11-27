@@ -2138,6 +2138,14 @@ where
 }
 
 impl<X> SoftAarch64Vmm<X> {
+    /// This carrier's one identity, minted once with its stage 2's core.
+    /// The MM portal binds to it and the transfer custody names it, so
+    /// nothing mints a second one for the same carrier.
+    #[must_use]
+    pub fn carrier(&self) -> CarrierId {
+        self.stage2.carrier
+    }
+
     pub fn stage2_geometry(&self) -> Result<MappingGeometry, TrapError> {
         Ok(self.stage2.try_borrow()?.geometry())
     }
@@ -2182,8 +2190,7 @@ impl<X> SoftAarch64Vmm<X> {
         let stage2 = Arc::downgrade(&self.stage2);
         let identity = carrick_hal::birth_serial::BirthSourceIdentity::from_backend_identity(
             Arc::new(stage2.clone()),
-            NonZeroU64::new(zone.as_ptr() as u64)
-                .ok_or_else(|| TrapError::Hypervisor("null soft carrier EL1 zone".into()))?,
+            self.carrier().raw(),
             NonZeroU64::MIN,
         );
         Ok(Arc::new(SoftBirthZone {
@@ -2764,7 +2771,7 @@ where
     fn owner_transfer_custody(&self) -> Option<Box<ErasedPhysicalCustody>> {
         Some(Box::new(ErasedTransferCustody(SoftTransferCustody {
             stage2: Arc::downgrade(&self.stage2),
-            carrier: self.stage2.carrier.raw(),
+            carrier: self.carrier().raw(),
         })))
     }
 

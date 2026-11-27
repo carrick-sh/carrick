@@ -872,6 +872,9 @@ pub struct SoftRootPublication {
     pub page_serves_ring: bool,
     /// The carrier the MM portal at `EL1_MM_PORTAL_BASE` is bound to.
     pub portal_carrier: Option<NonZeroU64>,
+    /// The carrier's own identity, the one its stage-2 core and transfer
+    /// custody hold. The portal must be bound to exactly this.
+    pub carrier: NonZeroU64,
     /// The published owner-memory wait venue is this region's zone and portal.
     pub portal_is_owner_wait_venue: bool,
 }
@@ -884,7 +887,7 @@ impl SoftRootPublication {
         self.in_metadata_aperture
             && self.control_visible_tid.is_some()
             && self.page_serves_ring
-            && self.portal_carrier.is_some()
+            && self.portal_carrier == Some(self.carrier)
             && self.portal_is_owner_wait_venue
     }
 }
@@ -955,6 +958,7 @@ where
         control_visible_tid,
         page_serves_ring,
         portal_carrier: portal.carrier(),
+        carrier: backend.carrier().raw(),
         portal_is_owner_wait_venue,
     })
 }
@@ -1125,19 +1129,20 @@ where
             root_ctx.thread().key().serial.raw(),
             std::sync::atomic::Ordering::Release,
         );
-        if let Some(carrier_id) = NonZeroU64::new(ptr as u64) {
+        {
             // SAFETY: `el1_host_ptr` points to the live `LINUX_EL1_KERNEL_SIZE`
             // stage-2 window, and `EL1_MM_PORTAL_OFFSET` is aligned inside it.
             let portal =
                 unsafe { &*((ptr + EL1_MM_PORTAL_OFFSET as usize) as *const MmPortalSlots) };
-            // Owner-memory waits authenticate against this carrier binding.
-            if !portal.bind_carrier(carrier_id) {
+            // Owner-memory waits, and the root's transfer custody, authenticate
+            // against this binding: it is the carrier's one identity, the one
+            // its stage-2 core was minted with.
+            if !portal.bind_carrier(engine.backend().carrier().raw()) {
                 return Err("soft carrier MM portal is already bound".to_owned());
             }
-            // The soft engine has no owner-transfer custody, so the root's
-            // MM opens on the legacy venue and only the owner could write a
-            // signal frame there: EL1 accepts a caught handler only for an
-            // owner-admitted MM (#2814 retires this).
+            // Only the MM portal owner writes signal frames here, so EL1
+            // accepts a caught handler only for an owner-admitted MM; the
+            // root is admitted through the soft transfer custody (#2814).
             if !portal.publish_signal_frame_custody(SignalFrameCustody::AdmittedOwner) {
                 return Err("soft carrier signal-frame custody is already published".to_owned());
             }
