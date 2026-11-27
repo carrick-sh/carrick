@@ -16,7 +16,7 @@
 //! The cell is the slot's own: only the vCPU running that slot's EL1 entry
 //! stages or takes it.
 
-use super::{Sched, Served, ThreadCpu, UserWord};
+use crate::substrate::sched::{Sched, Served, ThreadCpu, UserWord};
 use carrick_el1_abi::{SlotId, TrapFrame};
 
 /// What the entry must run for a slot a park vacated.
@@ -43,7 +43,7 @@ impl OwedSwitch {
 
 #[cfg(target_os = "none")]
 mod cell {
-    use super::OwedSwitch;
+    use crate::substrate::sched::entry_switch::OwedSwitch;
     use carrick_el1_abi::SlotId;
     use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -90,7 +90,7 @@ mod cell {
 
 #[cfg(not(target_os = "none"))]
 mod cell {
-    use super::OwedSwitch;
+    use crate::substrate::sched::entry_switch::OwedSwitch;
     use carrick_el1_abi::SlotId;
 
     std::thread_local! {
