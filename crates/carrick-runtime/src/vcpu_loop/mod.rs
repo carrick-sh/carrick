@@ -73,8 +73,6 @@ mod fd_ceiling;
 mod owner_wait;
 #[cfg(all(test, feature = "loom"))]
 mod owner_wait_loom;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-mod reservations;
 #[cfg(all(test, feature = "loom"))]
 mod terminal_clear_loom;
 mod thread_adoption;
