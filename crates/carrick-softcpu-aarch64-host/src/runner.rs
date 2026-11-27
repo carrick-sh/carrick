@@ -860,6 +860,8 @@ where
 pub struct SoftRootPublication {
     /// `CurrentTask[0]`'s loaded task (its kernel TID, 0: none).
     pub task_tid: u64,
+    /// `CurrentTask[0]`'s MM key: the root's kernel `MmId` (0: none).
+    pub mm_key: u64,
     /// `CurrentTask[0]`'s published lifecycle page (guest address, 0: none).
     pub lifecycle_page: u64,
     /// `CurrentTask[0]`'s published control slot (guest address, 0: none).
@@ -923,6 +925,7 @@ where
         )
     };
     let task_tid = task.execution.task.load(Ordering::Acquire);
+    let mm_key = task.mm.key.load(Ordering::Acquire);
     let lifecycle_page = task.metadata.lifecycle_page.load(Ordering::Acquire);
     let control_slot = task.metadata.control_slot.load(Ordering::Acquire);
     let inside = |gpa: u64, len: usize| {
@@ -952,6 +955,7 @@ where
         && carrick_kernel::dispatch::carrier_loop::OwnerWaitVenue::published().is_ok();
     Ok(SoftRootPublication {
         task_tid,
+        mm_key,
         lifecycle_page,
         control_slot,
         in_metadata_aperture,

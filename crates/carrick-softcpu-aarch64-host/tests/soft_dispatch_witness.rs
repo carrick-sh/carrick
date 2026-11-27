@@ -1252,6 +1252,75 @@ fn soft_carrier_enforces_single_live_aperture_and_compare_clears() {
     assert_eq!(carrick_el1_abi::get_el1_region_host_ptr(), 0);
 }
 
+/// Two soft roots run one after the other in one process, and each run's
+/// engine names its own root's MM before the root's first instruction. The
+/// kernel's MM ids come from one process-wide source, so the second root is
+/// never the first root's MM: an engine left at a fixed MM 1 snapshots, BINDs
+/// and authenticates owner transfers against another root's (or no) MM.
+/// Read through the engine's production task snapshot, against the MM key
+/// the root's `CurrentTask` publishes.
+#[test]
+fn soft_root_engine_names_its_own_mm_on_every_run_in_one_process() {
+    use carrick_hal::threaded::ThreadedEngine as _;
+    let _test_guard = lock_soft_carrier_test();
+
+    let elf = build_witness_elf(&[A64_SVC_0], &[]);
+    let mut roots = Vec::new();
+    for path in ["/identity-first", "/identity-second"] {
+        let mailbox = Arc::new(AtomicPtr::new(null_mut()));
+        let executor = SequenceHvc2Executor {
+            mailbox: Arc::clone(&mailbox),
+            calls: vec![(NR_EXIT_GROUP, [0; 6])],
+            returns: Arc::new(Mutex::new(Vec::new())),
+            next_seq: 1,
+        };
+        let observed = Arc::new(Mutex::new(None));
+        let observed_in_setup = Arc::clone(&observed);
+        let config = SoftSingleProcessConfig::new(&elf, path);
+        let run = run_single_process_with_executor_and_setup(&config, executor, move |engine| {
+            let mut vec_stub = [0u8; 8];
+            vec_stub[0..4].copy_from_slice(&A64_HVC_2.to_le_bytes());
+            vec_stub[4..8].copy_from_slice(&A64_ERET.to_le_bytes());
+            engine
+                .backend()
+                .write_gpa(LINUX_EL1_VECTORS_BASE + 0x400, &vec_stub)
+                .map_err(|e| format!("install witness EL1 vector stub: {e}"))?;
+            let ptr = engine
+                .backend()
+                .host_ptr(
+                    LINUX_SYSCALL_MAILBOX_BASE,
+                    AARCH64_SYSCALL_MAILBOX_SIZE as usize,
+                )
+                .ok_or_else(|| "missing stage-2 syscall mailbox host_ptr".to_owned())?;
+            mailbox.store(ptr.cast::<Aarch64SyscallMailbox>(), Ordering::Release);
+            let root = sample_root_publication(engine)?.mm_key;
+            let snapshot = engine
+                .snapshot_guest_state_for_publication()
+                .map_err(|e| format!("snapshot the root's task state: {e}"))?;
+            *observed_in_setup.lock().unwrap() = Some((root, snapshot.task_identity()));
+            Ok(())
+        })
+        .expect("the root must run to exit on the production soft entry");
+        assert_eq!(run.exit_code, 0, "{path}");
+        let (root, identity) = observed
+            .lock()
+            .unwrap()
+            .expect("setup observed the root before its first instruction");
+        assert_ne!(root, 0, "{path}: the root's CurrentTask names its MM");
+        assert_eq!(
+            identity,
+            (root, root),
+            "{path}: the engine's task identity must be the root's own MM (and, with no \
+             process context, its ASID generation)"
+        );
+        roots.push(root);
+    }
+    assert_ne!(
+        roots[0], roots[1],
+        "the second root is a new MM, so the witness covers an MM other than the first"
+    );
+}
+
 enum NegativeMmCase {
     StoreAfterMprotectReadOnly,
     LoadAfterMunmap,
