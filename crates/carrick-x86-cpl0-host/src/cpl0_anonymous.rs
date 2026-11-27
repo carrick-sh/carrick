@@ -2356,34 +2356,29 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             return Err(fail("owner COW source custody mismatch"));
         }
         let size = carrick_el1_abi::COW_GRANT_SIZE;
-        let physical = self
-            .anonymous_next_gpa
-            .raw()
-            .checked_add(size - 1)
-            .map(|next| next & !(size - 1))
-            .ok_or_else(|| fail("owner COW GPA exhausted"))?;
-        if physical == run.old_ipa.raw() & !(size - 1) {
-            return Err(fail("owner COW source/replacement physical alias"));
-        }
-        let gpa = FrameGpa::new(physical);
-        self.anonymous_next_gpa = FrameGpa::new(
-            physical
-                .checked_add(size)
-                .ok_or_else(|| fail("owner COW GPA exhausted"))?,
-        );
         // The core owns the grant from here: one supply transition for an
-        // EL0 write and a kernel user copy alike, under this exclusion.
+        // EL0 write and a kernel user copy alike, under this exclusion. It
+        // carves the replacement from the MM's arena, and asks for a chunk
+        // only when the arena has no room (#3099).
         let excluded = core_excluded(pause.proof())?;
-        let demand = carrick_core::mm::own::CowDemand {
-            page: window.fault_page,
-            replacement: carrick_core::mm::own::GpaExtent::new(physical, size)
-                .ok_or_else(|| fail("owner COW replacement extent"))?,
-        };
-        let ticket = self
+        let (ticket, staged) = match self
             .mm_core
-            .supply_cow(&excluded, demand)
-            .map_err(|refusal| fail(format!("owner COW supply refused: {refusal:?}")))?;
-        let supplied = self.publish_cow_supply(execution, gpa, physical, size, mm);
+            .supply_cow(&excluded, window.fault_page)
+            .map_err(|refusal| fail(format!("owner COW supply refused: {refusal:?}")))?
+        {
+            carrick_core::mm::own::CowSupply::Carved(ticket) => (ticket, None),
+            carrick_core::mm::own::CowSupply::NeedsChunk(demand) => {
+                let (ticket, staged) = self.map_cow_chunk(execution, mm, demand)?;
+                (ticket, Some(staged))
+            }
+        };
+        let physical = ticket.extent().ipa();
+        let supplied =
+            if physical == run.old_ipa.raw() & !(size - 1) || ticket.extent().len().get() != size {
+                Err(fail("owner COW source/replacement physical alias"))
+            } else {
+                self.publish_cow_supply(execution, physical, size, mm, staged)
+            };
         let outcome = match supplied {
             Ok(cow) => carrick_core::mm::own::Supplied::Published(cow),
             Err(error) => {
@@ -2414,20 +2409,17 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         wake.finish()
     }
 
-    /// Map one replacement compound and publish it to the MM's pool. A
-    /// failure leaves nothing exposed to the guest.
-    fn publish_cow_supply(
-        &mut self,
+    /// Stage one replacement grant's frame in the physical inventory.
+    fn stage_cow_grant(
+        &self,
         execution: GrantExecution,
-        gpa: FrameGpa,
         physical: u64,
         size: u64,
-        mm: NonZeroU64,
-    ) -> Result<SuppliedCow, TrapError> {
-        let (mut inventory, _) = InitialInventory::stage(
+    ) -> Result<(InitialInventory, BackingIdentity), TrapError> {
+        let (inventory, _) = InitialInventory::stage(
             Arc::clone(&self.initial_rollback_fault),
             Arc::clone(&self.frame_inventory),
-            [gpa],
+            [FrameGpa::new(physical)],
             0,
             size,
             execution.context.into(),
@@ -2437,23 +2429,102 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .first()
             .ok_or_else(|| fail("owner COW identity"))?
             .1;
-        let extent =
-            BackingExtent::private(gpa, size as usize).map_err(|error| fail(error.to_string()))?;
-        let handles = self
+        Ok((inventory, backing))
+    }
+
+    /// The MM's arena has no room: map one chunk (one memslot for every
+    /// grant it holds, #3099) at fresh GPA, admit it to the core, and stage
+    /// the first grant the core carves from it. A failure before the core
+    /// admits the chunk cancels the demand, so the MM's editor is free.
+    fn map_cow_chunk(
+        &mut self,
+        execution: GrantExecution,
+        mm: NonZeroU64,
+        demand: carrick_core::mm::own::ChunkDemand,
+    ) -> Result<
+        (
+            carrick_core::mm::own::SupplyTicket,
+            (InitialInventory, BackingIdentity),
+        ),
+        TrapError,
+    > {
+        let grant = self.mm_core.cow_geometry().grant();
+        let len = demand.chunk_len();
+        let base = self
+            .anonymous_next_gpa
+            .raw()
+            .checked_add(grant - 1)
+            .map(|next| next & !(grant - 1));
+        let installed = base
+            .and_then(|base| Some((base, base.checked_add(len)?)))
+            .ok_or_else(|| fail("owner COW GPA exhausted"))
+            .and_then(|(base, end)| {
+                let staged = self.stage_cow_grant(execution, base, grant)?;
+                let extent = BackingExtent::private(FrameGpa::new(base), len as usize)
+                    .map_err(|error| fail(error.to_string()))?;
+                let handle = self
+                    ._vm
+                    .install_arena_chunk(
+                        mm,
+                        PreparedBacking {
+                            extent: Arc::new(extent),
+                            identity: staged.1,
+                        },
+                    )
+                    .map_err(|error| fail(error.to_string()))?;
+                Ok((base, end, staged, handle))
+            });
+        let (base, end, staged, _chunk) = match installed {
+            Ok(installed) => installed,
+            Err(error) => {
+                if self.mm_core.cancel_chunk(demand).is_err() {
+                    return Err(fail("owner COW chunk demand refused"));
+                }
+                return Err(error);
+            }
+        };
+        self.anonymous_next_gpa = FrameGpa::new(end);
+        let extent = carrick_core::mm::own::GpaExtent::new(base, len)
+            .ok_or_else(|| fail("owner COW chunk extent"))?;
+        // A refusal here is a broken invariant: the chunk is fresh GPA. The
+        // carrier ends, its editor still recorded as the shell's.
+        let ticket = self
+            .mm_core
+            .admit_chunk(demand, extent)
+            .map_err(|refused| fail(format!("owner COW chunk refused: {:?}", refused.reason)))?;
+        if ticket.extent().ipa() != base {
+            return Err(fail("owner COW chunk's first grant is not at its base"));
+        }
+        Ok((ticket, staged))
+    }
+
+    /// Bind one replacement grant inside its MM's arena chunk and publish
+    /// it to the MM's pool: no memslot change and no host mapping call. A
+    /// failure leaves nothing exposed to the guest.
+    fn publish_cow_supply(
+        &mut self,
+        execution: GrantExecution,
+        physical: u64,
+        size: u64,
+        mm: NonZeroU64,
+        staged: Option<(InitialInventory, BackingIdentity)>,
+    ) -> Result<SuppliedCow, TrapError> {
+        let (mut inventory, backing) = match staged {
+            Some(staged) => staged,
+            None => self.stage_cow_grant(execution, physical, size)?,
+        };
+        let gpa = FrameGpa::new(physical);
+        let handle = self
             ._vm
-            .prepare(
-                &[PreparedBacking {
-                    extent: Arc::new(extent),
-                    identity: backing,
-                }],
-                &mut inventory,
-            )
+            .adopt_frames(mm, gpa, size, backing, &mut inventory)
             .map_err(|error| fail(error.to_string()))?;
-        let handle = handles[0];
         let Some(grant) = self.cow_pool()?.publish(mm.get(), physical, backing) else {
             // SAFETY: no grant exposed this fresh physical extent to the guest.
-            unsafe { self._vm.cancel_prepared(&[handle], &mut inventory) }
-                .map_err(|error| fail(error.to_string()))?;
+            unsafe {
+                self._vm
+                    .cancel_adopted(handle, gpa, size, backing, &mut inventory)
+            }
+            .map_err(|error| fail(error.to_string()))?;
             return Err(fail("owner COW pool full"));
         };
         // The original pool record now permits a guest copy/repoint. On any
