@@ -812,9 +812,121 @@ impl Frames {
     }
 }
 
+/// The scheduler's switch: it loads the next thread and runs that thread's
+/// resume (a wait4 checkpoint, a signal delivery) on the current stack.
+const SWITCHES: [&str; 3] = [
+    "carrick_el1::substrate::sched::Sched$LT$C$C$U$GT$::run_next::",
+    "carrick_el1::substrate::sched::Sched$LT$C$C$U$GT$::run_ready::",
+    "carrick_el1::substrate::sched::Sched$LT$C$C$U$GT$::idle::",
+];
+
+/// The only frames that may call a [`SWITCHES`] function: the scheduler's
+/// own loop and the entry boundaries, whose stack holds nothing but the
+/// vector record and the entry frames the `resume` chains charge. A park
+/// site (an IPC transfer, a fault wait, a futex wait, an exit) that switched
+/// itself would nest the whole resumed thread beneath its own frames: the
+/// arm64 apt overflow of #3093 resumed a wait4 checkpoint under
+/// `serve_ipc_with_signals`. A park owes its switch to the entry instead.
+const SWITCH_VENUES: [&str; 9] = [
+    "carrick_el1_syscall",
+    "carrick_el1::substrate::sched::Sched$LT$C$C$U$GT$::run_next::",
+    "carrick_el1::substrate::sched::Sched$LT$C$C$U$GT$::idle::",
+    "carrick_el1::substrate::sched::Sched$LT$C$C$U$GT$::idle_entry::",
+    "carrick_el1::substrate::sched::Sched$LT$C$C$U$GT$::preempt_record::",
+    "carrick_el1::substrate::sched::Sched$LT$C$C$U$GT$::run_entry_switch::",
+    "carrick_el1_linux::dispatch::dispatch_irq::",
+    "carrick_el1_linux::dispatch::dispatch_irq_with_regions::",
+    "carrick_el1_linux::dispatch::dispatch_entry::",
+];
+
+/// Refuse a scheduler switch called from anywhere but an entry boundary
+/// ([`SWITCH_VENUES`]). Direct `bl`/`b` edges suffice: a caller that inlines
+/// the switch's own callers still branches to one of [`SWITCHES`].
+pub(crate) fn check_switch_venues(disassembly: &str) -> Result<(), String> {
+    let mut current: Option<&str> = None;
+    let mut seen = false;
+    let mut failures = std::collections::BTreeSet::new();
+    for line in disassembly.lines() {
+        let line = line.trim();
+        if let Some((address, name)) = line.strip_suffix(">:").and_then(|s| s.split_once(" <"))
+            && u64::from_str_radix(address, 16).is_ok()
+        {
+            current = Some(name);
+            continue;
+        }
+        let Some(caller) = current else {
+            continue;
+        };
+        let Some((_, instruction)) = line.split_once(':') else {
+            continue;
+        };
+        let mut words = instruction.split_whitespace();
+        if !matches!(words.next(), Some("bl" | "b")) {
+            continue;
+        }
+        let Some(target) = instruction
+            .split_once(" <")
+            .and_then(|(_, rest)| rest.strip_suffix('>'))
+        else {
+            continue;
+        };
+        if !SWITCHES.iter().any(|switch| target.starts_with(switch)) {
+            continue;
+        }
+        seen = true;
+        if !SWITCH_VENUES.iter().any(|venue| caller.starts_with(venue)) {
+            failures.insert(format!(
+                "EL1 scheduler switch outside an entry: {caller} -> {target}"
+            ));
+        }
+    }
+    if !seen {
+        return Err("no EL1 scheduler switch measured".to_owned());
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.into_iter().collect::<Vec<_>>().join("\n"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const IDLE: &str = "carrick_el1::substrate::sched::Sched$LT$C$C$U$GT$::idle::h1";
+
+    fn switch_call(caller: &str, mnemonic: &str) -> String {
+        format!("1000 <{caller}>:\n1000: {mnemonic} 0x2000 <{IDLE}>\n2000 <{IDLE}>:\n2000: ret\n")
+    }
+
+    #[test]
+    fn an_entry_may_run_the_scheduler_switch() {
+        for caller in [
+            "carrick_el1_linux::dispatch::dispatch_irq::h2",
+            "carrick_el1::substrate::sched::Sched$LT$C$C$U$GT$::run_entry_switch::h3",
+        ] {
+            assert_eq!(check_switch_venues(&switch_call(caller, "bl")), Ok(()));
+        }
+    }
+
+    #[test]
+    fn a_park_site_that_switches_on_its_own_stack_is_refused() {
+        // The #3093 chain: the IPC park ran the scheduler beneath the
+        // transfer, so the resumed wait4 nested under the whole IPC prefix.
+        let park = "_$LT$carrick_el1..substrate..sched..Sched$LT$C$C$U$GT$$u20$as$u20$\
+                    carrick_el1_linux..ipc..execution..IpcExecution$GT$::park::h4";
+        for mnemonic in ["bl", "b"] {
+            let error = check_switch_venues(&switch_call(park, mnemonic)).unwrap_err();
+            assert!(error.contains("outside an entry"), "{error}");
+            assert!(error.contains("IpcExecution"), "{error}");
+        }
+    }
+
+    #[test]
+    fn the_switch_check_requires_a_measured_switch() {
+        assert!(check_switch_venues("1000 <x::h0>:\n1000: ret\n").is_err());
+    }
 
     #[test]
     fn native_backing_reply_keeps_imported_headroom() {
