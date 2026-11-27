@@ -1576,7 +1576,17 @@ impl ZoneSlot {
     }
 }
 
-/// A held slot run-queue lock.
+/// The slot run-queue lock word's holder bit.
+const SLOT_LOCK_HELD: u32 = 1;
+/// The slot run-queue lock word's enrolment bit: an idle scan found the lock
+/// held and gave up on this run queue "for now", so the release owes idle
+/// slots another scan ([`ZoneTables::owe_scan_passes`], #3083). Set only
+/// while [`SLOT_LOCK_HELD`] is.
+const SLOT_LOCK_SCAN_OWED: u32 = 2;
+
+/// A held slot run-queue lock. Its release is the one way the lock word is
+/// cleared, and it delivers what the word owes: a release that finds an
+/// idle scan enrolled ([`SLOT_LOCK_SCAN_OWED`]) owes idle slots a scan.
 pub struct SlotGuard<'a, C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     zone: &'a ZoneTables<C>,
     slot: SlotId,
@@ -1584,9 +1594,12 @@ pub struct SlotGuard<'a, C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx
 
 impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for SlotGuard<'_, C> {
     fn drop(&mut self) {
-        self.zone.slots[self.slot.index()]
+        let word = self.zone.slots[self.slot.index()]
             .lock
-            .store(0, Ordering::Release);
+            .swap(0, Ordering::AcqRel);
+        if word & SLOT_LOCK_SCAN_OWED != 0 {
+            self.zone.owe_scan_passes(self.slot);
+        }
     }
 }
 
@@ -1702,6 +1715,10 @@ pub struct ZoneTables<C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     /// One bit per slot whose run queue is not empty (a hint for stealing;
     /// the slot's lock decides).
     queued_map: [AtomicU64; ZONE_SLOTS.div_ceil(64)],
+    /// One bit per idle slot owed a reschedule SGI because a run-queue lock
+    /// an idle scan enrolled on was released ([`Self::owe_scan_passes`]);
+    /// taken by [`Self::take_scan_passes`] (#3083).
+    scan_passes: [AtomicU64; ZONE_SLOTS.div_ceil(64)],
     pub counters: ZoneCounters,
     entries: [ZoneEntry; ZONE_ENTRIES],
     records: [ZoneRecord<C>; ZONE_RECORDS],
@@ -4281,7 +4298,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         let mut attempt: u32 = 0;
         loop {
             if lock
-                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .compare_exchange(0, SLOT_LOCK_HELD, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
                 return Some(SlotGuard { zone: self, slot });
@@ -4291,6 +4308,36 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 return None;
             }
         }
+    }
+
+    /// An idle scan whose bounded spin on `slot`'s lock ran out: enrol on the
+    /// holder's release ([`SLOT_LOCK_SCAN_OWED`]), then probe the lock once.
+    /// Returns the guard if the lock was free at the enrolment or the probe;
+    /// `None` is "not now": the holder's release owes this scan (whose idle
+    /// bit is published) another pass ([`Self::owe_scan_passes`]), never an
+    /// empty queue.
+    fn slot_lock_or_enrol_scan(&self, slot: SlotId) -> Option<SlotGuard<'_, C>> {
+        let lock = &self.slot(slot).lock;
+        let mut word = lock.load(Ordering::Relaxed);
+        loop {
+            let next = if word & SLOT_LOCK_HELD == 0 {
+                SLOT_LOCK_HELD
+            } else {
+                word | SLOT_LOCK_SCAN_OWED
+            };
+            // Release on the enrolment: the releaser's swap reads it, and so
+            // the idle bit this scan published before it.
+            match lock.compare_exchange_weak(word, next, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) if next == SLOT_LOCK_HELD => return Some(SlotGuard { zone: self, slot }),
+                Ok(_) => break,
+                Err(current) => word = current,
+            }
+        }
+        // The probe: the holder may have released between the spin and the
+        // enrolment (its release then owed a pass already).
+        lock.compare_exchange(0, SLOT_LOCK_HELD, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| SlotGuard { zone: self, slot })
     }
 
     /// Append `record` to the run queue `guard` holds. The first thread
@@ -4979,6 +5026,41 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         }
     }
 
+    /// The release of `released`'s run-queue lock that an idle scan enrolled
+    /// on ([`Self::slot_lock_or_enrol_scan`]): owe every idle slot but
+    /// `released` another scan. The enrolled scan published its idle bit
+    /// before it enrolled, so this read sees it. Each is owed a reschedule
+    /// (the durable half its pre-WFI recheck reads, [`Self::take_resched`])
+    /// and an SGI (for one already in WFI), taken by
+    /// [`Self::take_scan_passes`]. A slot that left idle meanwhile takes
+    /// one spurious pass.
+    fn owe_scan_passes(&self, released: SlotId) {
+        fence(Ordering::SeqCst);
+        for (word_index, word) in self.idle_map.iter().enumerate() {
+            let mut bits = word.load(Ordering::Acquire);
+            while bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let Some(idle) = SlotId::from_index(word_index * 64 + bit) else {
+                    continue;
+                };
+                if idle == released {
+                    continue;
+                }
+                self.owe_resched(idle);
+                self.scan_passes[word_index].fetch_or(1 << bit, Ordering::AcqRel);
+            }
+        }
+    }
+
+    /// Move the SGIs released run-queue locks owe idle scans
+    /// ([`Self::owe_scan_passes`]) into `effects`.
+    pub fn take_scan_passes(&self, effects: &mut WakeEffects) {
+        for (word, owed) in effects.sgi.iter_mut().zip(self.scan_passes.iter()) {
+            *word |= owed.swap(0, Ordering::AcqRel);
+        }
+    }
+
     fn timer_ticket_live(&self, ticket: timer_index::Ticket) -> bool {
         self.live(ticket.record).is_some_and(|record| {
             record.claim() == Claim::Parked { seq: ticket.seq }
@@ -5629,7 +5711,12 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     }
 
     fn steal_from(&self, thief: SlotId, victim: SlotId) -> Option<SwitchedIn> {
-        let guard = self.slot_lock(victim, &BoundedSpin(EL1_SLOT_LOCK_SPINS))?;
+        // A busy victim is "not now": the scan enrols on the holder's
+        // release, which owes it another pass (#3083).
+        let guard = match self.slot_lock(victim, &BoundedSpin(EL1_SLOT_LOCK_SPINS)) {
+            Some(guard) => guard,
+            None => self.slot_lock_or_enrol_scan(victim)?,
+        };
         let s = self.slot(victim);
         let cpu = self.slot(thief).cpu.load(Ordering::Relaxed);
         // A victim in the guest reaches its own run queue (it polls it, or

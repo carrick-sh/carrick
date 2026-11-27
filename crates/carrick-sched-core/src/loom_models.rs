@@ -67,6 +67,7 @@ fn make_zone() -> Arc<Box<ZoneTables>> {
         init!(entry_map, core::array::from_fn(|_| AtomicU64::new(0)));
         init!(idle_map, core::array::from_fn(|_| AtomicU64::new(0)));
         init!(queued_map, core::array::from_fn(|_| AtomicU64::new(0)));
+        init!(scan_passes, core::array::from_fn(|_| AtomicU64::new(0)));
         init!(held_map, core::array::from_fn(|_| AtomicU64::new(0)));
         init!(completion_consumer, AtomicU32::new(0));
         init!(online_cpus, AtomicU64::new(0));
@@ -922,9 +923,13 @@ fn busy_victim_lock_never_lets_an_idle_scan_sleep_past_its_thread() {
         holder.join().unwrap();
         let sleeping = scanner.join().unwrap();
         // A scan that gave up on the busy lock is owed another pass by its
-        // release: at least the reschedule its pre-WFI recheck reads.
+        // release: the reschedule its pre-WFI recheck reads, and the SGI
+        // for a WFI that already began.
+        let mut passes = WakeEffects::default();
+        zone.take_scan_passes(&mut passes);
+        let owed = passes.sgi_slots().any(|slot| slot == thief) && zone.take_resched(thief);
         assert!(
-            !sleeping || zone.take_resched(thief),
+            !sleeping || owed,
             "the idle slot sleeps after a busy victim lock, owed no pass, while {:?} waits on slot 0",
             zone.record(record).claim()
         );
