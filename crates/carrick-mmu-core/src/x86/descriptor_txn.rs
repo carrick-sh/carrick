@@ -539,6 +539,28 @@ pub fn split_terminal_descriptor(
     Ok((leaf_output(entry, level) + index as u64 * level_bytes(level + 1)) | flags)
 }
 
+/// The custody state of an x86 terminal: the one decode the residency walk,
+/// retirement and the carrier's settlement checks share. A `PROT_NONE` page
+/// ([`NO_ACCESS`]) keeps its frame and its bytes (#2875), so it is resident
+/// for every residency, retire and stock count; only the fault and copy
+/// paths read its access, from the mapping.
+pub fn private_leaf_state(entry: u64) -> carrick_guest_arch::El1PrivateLeafState {
+    use carrick_guest_arch::El1PrivateLeafState;
+    if entry & PRIVATE == 0 {
+        El1PrivateLeafState::Unowned
+    } else if entry & PRESENT != 0
+        || entry & (NO_ACCESS | PREPARED | RETIRED) == NO_ACCESS && entry & ADDRESS != 0
+    {
+        El1PrivateLeafState::Resident
+    } else if entry & RETIRED != 0 {
+        El1PrivateLeafState::Retired
+    } else if entry & PREPARED != 0 && entry & ADDRESS != 0 {
+        El1PrivateLeafState::Prepared
+    } else {
+        El1PrivateLeafState::Malformed
+    }
+}
+
 /// Arm fork COW on one terminal. Every leaf that is writable now, or that
 /// may be written later (a private leaf keeping `MAY_WRITE` under a
 /// read-only protection), shares its frame only COW-armed: otherwise a later
