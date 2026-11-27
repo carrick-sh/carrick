@@ -409,7 +409,7 @@ pub fn expect_el1_stack_overflow(
         if let Some(carrick_hal::TrapError::El1StackOverflow(overflow)) =
             current.downcast_ref::<carrick_hal::TrapError>()
         {
-            let report = *overflow;
+            let report = **overflow;
             assert_eq!(
                 report.kind,
                 carrick_el1_abi::El1StackOverflowKind::GuardFault,

@@ -566,7 +566,7 @@ pub enum TrapError {
     /// and the stack, where an unguarded stack once corrupted its neighbour
     /// silently (#338).
     #[error("{0}")]
-    El1StackOverflow(carrick_el1_abi::El1StackOverflow),
+    El1StackOverflow(Box<carrick_el1_abi::El1StackOverflow>),
     /// An ISA-neutral synchronous guest fault, carrying the **already-resolved**
     /// Linux signal triple (NOT a raw architectural syndrome). The runtime's
     /// fault arm delivers `signum`/`si_code` to the guest with `si_addr =

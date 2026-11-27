@@ -2327,14 +2327,14 @@ mod tests {
         .expect("a guard fault");
         let error = classify_run_outcome(
             Err(RuntimeError::Trap(
-                carrick_hal::TrapError::El1StackOverflow(report),
+                carrick_hal::TrapError::El1StackOverflow(Box::new(report)),
             )),
             "test launch",
         )
         .expect_err("a ring stack overflow fails the run");
         assert!(matches!(
             error,
-            RuntimeError::Trap(carrick_hal::TrapError::El1StackOverflow(found)) if found == report
+            RuntimeError::Trap(carrick_hal::TrapError::El1StackOverflow(found)) if *found == report
         ));
     }
 
