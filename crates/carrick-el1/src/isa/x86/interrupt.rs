@@ -796,7 +796,10 @@ const ICR_IDLE_BOUND_NS: u128 = 1_000_000;
 pub fn deliver_owed_resched_before_user(site: UserReturn) {
     // The bound runs from the first busy resend and restarts only when a
     // resend makes progress: an APIC whose polls read idle while its sends
-    // stay busy still reaches it.
+    // stay busy still reaches it. It ends the run only on a fresh failure
+    // after it (this refused resend, or a busy poll), never on elapsed time
+    // alone: a vCPU the host descheduled past the bound finds its ICR
+    // recovered, and sends.
     let mut since = None;
     loop {
         let resent = resend_owed();
@@ -809,8 +812,30 @@ pub fn deliver_owed_resched_before_user(site: UserReturn) {
             return;
         }
         let start = *since.get_or_insert_with(read_tsc);
+        if icr_bound_passed(start) {
+            icr_never_accepted(site);
+        }
         wait_icr_idle(start, site);
     }
+}
+
+/// Whether [`ICR_IDLE_BOUND_NS`] has passed since `start`.
+fn icr_bound_passed(start: u64) -> bool {
+    let Some(hz) = tsc_frequency() else {
+        super::fatal_entry_binding();
+    };
+    let bound = u128::from(hz.get()) * ICR_IDLE_BOUND_NS / 1_000_000_000;
+    u128::from(read_tsc().wrapping_sub(start)) > bound
+}
+
+/// The local APIC broke the ICR handshake before the return to user `at`.
+fn icr_never_accepted(at: UserReturn) -> ! {
+    super::transport::fatal_boot_named(
+        file!(),
+        line!(),
+        column!(),
+        &ApicFault::IcrNeverAccepted { at },
+    )
 }
 
 /// A local APIC that broke the ICR handshake: a broken invariant.
@@ -843,29 +868,24 @@ pub enum UserReturn {
     Interrupt = 4,
 }
 
-/// Wait for this CPU's own ICR to read idle, within [`ICR_IDLE_BOUND_NS`]
-/// of `start` (the first resend that sent nothing), before the return to
-/// user `at`.
+/// Wait for this CPU's own ICR to read idle. A poll that still reads busy
+/// once [`ICR_IDLE_BOUND_NS`] has passed since `start` (the first resend
+/// that sent nothing) is a broken local APIC, before the return to user
+/// `at`; a poll that reads idle returns, however late it ran.
 fn wait_icr_idle(start: u64, at: UserReturn) {
-    let Some(hz) = tsc_frequency() else {
-        super::fatal_entry_binding();
-    };
-    let bound = u128::from(hz.get()) * ICR_IDLE_BOUND_NS / 1_000_000_000;
     #[cfg(feature = "test-support")]
-    injected_stall(bound);
+    {
+        let Some(hz) = tsc_frequency() else {
+            super::fatal_entry_binding();
+        };
+        injected_stall(u128::from(hz.get()) * ICR_IDLE_BOUND_NS / 1_000_000_000);
+    }
     loop {
-        // Checked before the poll, so a poll that reads idle while the
-        // sends stay busy still ends here.
-        if u128::from(read_tsc().wrapping_sub(start)) > bound {
-            super::transport::fatal_boot_named(
-                file!(),
-                line!(),
-                column!(),
-                &ApicFault::IcrNeverAccepted { at },
-            );
-        }
         if !icr_poll_busy() {
             return;
+        }
+        if icr_bound_passed(start) {
+            icr_never_accepted(at);
         }
         core::hint::spin_loop();
     }
