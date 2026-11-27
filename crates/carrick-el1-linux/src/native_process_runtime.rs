@@ -510,10 +510,12 @@ impl NativeProcessError {
         }
     }
 
-    /// The same reading for a user-write venue's supply crossing, on both
-    /// ISAs (#3082): a crossing that reported no refusal met the MM's editor
-    /// held elsewhere, which the shared protocol answers with the editor
-    /// release it observed before the crossing.
+    /// The same reading for a user-write venue's supply crossing whose
+    /// carrier takes the MM's editor (the x86 carrier, #3096): a crossing
+    /// that reported no refusal met the editor held elsewhere, which the
+    /// shared protocol answers with the editor release it observed before
+    /// the crossing. A carrier that never takes the guest editor (HVF) has
+    /// no such answer and keeps [`Self::from_cow_supply`].
     pub fn venue_cow_supply(
         refusal: carrick_core_abi::CowSupplyRefusal<NativeProcessError>,
     ) -> carrick_core::mm::transaction::VenueRefusal<NativeProcessError> {

@@ -1550,7 +1550,11 @@ impl<X: ForkStockCrossing> UserWriteVenue<Aarch64ParkedContext> for NativeWriteV
         let cpu = u64::from(self.slot.raw());
         // A supply the carrier refused is withdrawn before this returns; a
         // selection left published would be read by this CPU's next native
-        // service as its own (#3040).
+        // service as its own (#3040). The HVF host's supply crossing takes
+        // no guest editor: it answers success only once it took the
+        // selection, and a denial otherwise, which the crossing reads as
+        // its own failure. So this venue has no `EditorHeld` (#3096), and
+        // its refusal keeps the lane's one reading.
         self.slots
             .grant(usize::from(self.slot.raw()))
             .ok_or(NativeProcessError::Stale)?
@@ -1558,7 +1562,11 @@ impl<X: ForkStockCrossing> UserWriteVenue<Aarch64ParkedContext> for NativeWriteV
                 self.crossing
                     .cross_cow_supply(UserVa::new(window.fault_page), cpu)
             })
-            .map_err(NativeProcessError::venue_cow_supply)
+            .map_err(|refusal| {
+                carrick_core::mm::transaction::VenueRefusal::Failed(
+                    NativeProcessError::from_cow_supply(refusal),
+                )
+            })
     }
 
     fn supply_backing(
