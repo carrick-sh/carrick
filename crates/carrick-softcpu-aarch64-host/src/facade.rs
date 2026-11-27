@@ -2817,6 +2817,12 @@ where
     /// Soft file windows are mapped whole when they are added, so no lazy
     /// file grant is ever owed. One reaching here fails the run loudly; it
     /// must never decline and turn a valid page into the fault's `SIGSEGV`.
+    /// The soft carrier serves no owner file grant yet (#1236 step 1b), so
+    /// an admitted soft root's private file pages stay host-served.
+    fn private_file_venue(&self) -> carrick_guest_mem::PrivateFileVenue {
+        carrick_guest_mem::PrivateFileVenue::HostEager
+    }
+
     fn prepare_owner_frame_grant(
         &self,
         _target: TransferTarget,
