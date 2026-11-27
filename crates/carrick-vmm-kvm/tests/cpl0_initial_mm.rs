@@ -9044,6 +9044,19 @@ reservation_shape_witness!(
     16,
     "#3073: as the root's sparse range with every other page written: 32 resident runs."
 );
+/// #3108: as the root's sparse range, then one `mprotect(PROT_READ|PROT_WRITE)`
+/// over it after the `PROT_READ`; pages 0 to 2 take a write (ENOSYS on x86).
+#[test]
+#[ignore = "x86 mprotect RW after PROT_READ over a sparse range, see #3108"]
+fn production_mprotect_widens_a_sparse_resident_range_back_to_rw() {
+    let outcome = run_reservation_shape(19);
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (7, None),
+        "case 19 exit (7 = Linux; else the errno, +100 from mmap): {:?}",
+        outcome.run
+    );
+}
 reservation_shape_witness!(
     production_munmap_retires_every_run_of_a_sparse_resident_range,
     18,
