@@ -802,3 +802,134 @@ fn soft_root_serves_a_private_file_page_for_a_read_and_a_fetch() {
         "the read and the fetch both saw the file's bytes"
     );
 }
+
+const NR_MUNMAP: u16 = 215;
+const NR_MREMAP: u16 = 216;
+const NR_MPROTECT: u16 = 226;
+const NR_MADVISE: u16 = 233;
+
+/// The soft root's private file row through its edits, on the production
+/// EL1 image: the soft carrier serves no owner frame grant, so the row stays
+/// host-owned, and EL1 hands each edit of it to the host. The root maps a
+/// 4-page `/data` `MAP_PRIVATE` read-write, where page `i` begins with the
+/// word `1 << i`, then:
+/// - dirties page 0 and `madvise(MADV_DONTNEED)`s it: the load sees 1 again;
+/// - `mprotect`s page 1 to `PROT_NONE` and back to `PROT_READ`: it loads 2;
+/// - grows the 3 pages to 4 in place with `mremap` (no `MREMAP_MAYMOVE`):
+///   page 2 of the grown row still loads 4;
+/// - maps anonymous memory `MAP_FIXED` over page 1: it loads 0;
+/// - `munmap`s the grown page 3.
+///
+/// It exits with the sum of every call's result (each 0, the grown row's
+/// address minus the row's, and the fixed map's address minus its target)
+/// and every load: 7 iff each edit behaved as on Linux.
+#[test]
+#[ignore = "requires CARRICK_A64_ELF pointing to the production EL1 ELF (native arm64 host)"]
+fn soft_root_private_file_row_survives_its_edits_on_the_host() {
+    let _carrier_lock = lock_soft_carrier_test();
+    let rootfs = tempfile::tempdir().expect("create the /data rootfs");
+    let mut file = vec![0u8; 4 * 0x1000];
+    for index in 0..4usize {
+        file[index * 0x1000..index * 0x1000 + 8].copy_from_slice(&(1u64 << index).to_le_bytes());
+    }
+    std::fs::write(rootfs.path().join("data"), &file).expect("write /data");
+    let mut code = Vec::new();
+    // x20 = openat(AT_FDCWD, "/data", O_RDONLY, 0)
+    code.push(movz(0, 100, 0));
+    code.push(neg(0, 0));
+    code.extend(mov32(1, DATA_VA + PATH_OFFSET));
+    code.push(movz(2, 0, 0));
+    code.push(movz(3, 0, 0));
+    code.push(movz(8, NR_OPENAT, 0));
+    code.push(A64_SVC_0);
+    code.push(mov(20, 0));
+    // x19 = mmap(NULL, 3 pages, PROT_READ | PROT_WRITE, MAP_PRIVATE, x20, 0)
+    code.push(movz(0, 0, 0));
+    code.extend(mov32(1, 0x3000));
+    code.push(movz(2, 3, 0));
+    code.push(movz(3, 2, 0));
+    code.push(mov(4, 20));
+    code.push(movz(5, 0, 0));
+    code.push(movz(8, NR_MMAP, 0));
+    code.push(A64_SVC_0);
+    code.push(mov(19, 0));
+    // x10 = one page
+    code.extend(mov32(10, 0x1000));
+    // Dirty page 0, then x23 = madvise(x19, page, MADV_DONTNEED) + [x19].
+    code.push(movz(9, 0x40, 0));
+    code.push(str_imm(9, 19, 0));
+    code.push(mov(0, 19));
+    code.push(mov(1, 10));
+    code.push(movz(2, 4, 0));
+    code.push(movz(8, NR_MADVISE, 0));
+    code.push(A64_SVC_0);
+    code.push(mov(23, 0));
+    code.push(ldr(9, 19, 0));
+    code.push(add(23, 23, 9));
+    // mprotect(x19 + page, page, PROT_NONE), then PROT_READ; load page 1.
+    for prot in [0, 1] {
+        code.push(add(0, 19, 10));
+        code.push(mov(1, 10));
+        code.push(movz(2, prot, 0));
+        code.push(movz(8, NR_MPROTECT, 0));
+        code.push(A64_SVC_0);
+        code.push(add(23, 23, 0));
+    }
+    code.push(ldr(9, 19, 0x1000));
+    code.push(add(23, 23, 9));
+    // x22 = mremap(x19, 3 pages, 4 pages, 0), in place; load its page 2.
+    code.push(mov(0, 19));
+    code.extend(mov32(1, 0x3000));
+    code.extend(mov32(2, 0x4000));
+    code.push(movz(3, 0, 0));
+    code.push(movz(8, NR_MREMAP, 0));
+    code.push(A64_SVC_0);
+    code.push(mov(22, 0));
+    code.push(sub(0, 0, 19));
+    code.push(add(23, 23, 0));
+    code.push(ldr(9, 22, 0x2000));
+    code.push(add(23, 23, 9));
+    // mmap(x22 + page, page, RW, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED,
+    // -1, 0) must return its target; the page then loads 0.
+    code.push(add(0, 22, 10));
+    code.push(mov(1, 10));
+    code.push(movz(2, 3, 0));
+    code.push(movz(3, 0x32, 0));
+    code.push(movz(4, 1, 0));
+    code.push(neg(4, 4));
+    code.push(movz(5, 0, 0));
+    code.push(movz(8, NR_MMAP, 0));
+    code.push(A64_SVC_0);
+    code.push(sub(0, 0, 22));
+    code.push(sub(0, 0, 10));
+    code.push(add(23, 23, 0));
+    code.push(ldr(9, 22, 0x1000));
+    code.push(add(23, 23, 9));
+    // munmap(x22 + 3 pages, page)
+    code.extend(mov32(11, 0x3000));
+    code.push(add(0, 22, 11));
+    code.push(mov(1, 10));
+    code.push(movz(8, NR_MUNMAP, 0));
+    code.push(A64_SVC_0);
+    code.push(add(23, 23, 0));
+    code.push(mov(0, 23));
+    exit_with_x0(&mut code);
+    let (run, _) = run_in(
+        &build_elf(&code, &[(PATH_OFFSET, b"/data\0")]),
+        "/private-file-edits",
+        Some(rootfs.path()),
+        None,
+    );
+    println!(
+        "private file edits: exit={} fault={:?} census={:?} counted_enosys={:?} vmas={:?}",
+        run.exit_code, run.terminating_fault, run.reply_census, run.counted_enosys, run.vmas
+    );
+    assert_eq!(
+        run.terminating_fault, None,
+        "every page of the row is served"
+    );
+    assert_eq!(
+        run.exit_code, 7,
+        "every edit returned 0 and every load saw the file's (or the new anonymous) bytes"
+    );
+}
