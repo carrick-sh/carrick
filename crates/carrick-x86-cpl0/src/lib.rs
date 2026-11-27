@@ -219,6 +219,39 @@ mod test_support {
     /// idle-ICR poll reads it idle: a local APIC that never accepts its
     /// send. The last-chance wait must end fatal, never loop (#3083).
     pub const INJECT_RESCHED_ICR_FLAPPING: u64 = 0xffff_ffff_ffff_fe60;
+    /// The next reschedule send finds the ICR busy and also owes this CPU's
+    /// own slot, so the next resend pass sends two; that pass's first send
+    /// goes out after a stall past the bound and its second finds the ICR
+    /// busy, one poll reads busy and the next idle (#3129 P0 1).
+    pub const INJECT_RESCHED_TWO_OWED_STALLED: u64 = 0xffff_ffff_ffff_fe64;
+    /// Every reschedule send of this CPU finds its ICR busy, and when this
+    /// CPU's current task next parks, the scheduler owes the other CPU a
+    /// reschedule there, as a waker whose syscall then blocks would: the
+    /// next delivery point is the idle pass, never a return to user. The
+    /// idle sender must end fatal past the bound, never spin (#3129 P0 2).
+    pub const INJECT_RESCHED_OWED_AT_PARK: u64 = 0xffff_ffff_ffff_fe65;
+    /// The CPU slot (plus one) whose next park owes the other CPU a
+    /// reschedule ([`INJECT_RESCHED_OWED_AT_PARK`]).
+    static OWE_AT_PARK_SLOT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+    /// Called on each scheduler entry: owe the other CPU a reschedule once
+    /// [`INJECT_RESCHED_OWED_AT_PARK`]'s CPU parks its task.
+    pub fn owe_peer_resched_at_park(slot: carrick_sched_core::SlotId) {
+        if OWE_AT_PARK_SLOT
+            .compare_exchange(
+                u32::from(slot.raw()) + 1,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        let peer = carrick_sched_core::SlotId::new(u8::from(slot.raw() == 0));
+        carrick_el1::isa::x86::interrupt::send_resched(peer)
+            .unwrap_or_else(|_| carrick_x86_carrier::entry::fatal_boot!());
+    }
     const ORDER_AFTER_READ: u8 = 1;
     const ORDER_BEFORE_HLT: u8 = 2;
     const ORDER_ARMED: u8 = 1;
@@ -1528,6 +1561,16 @@ mod test_support {
                     Some(carrick_el1::isa::x86::interrupt::ReschedStall::AfterBusySend(3)),
                 )
                 .then_some(0)
+            }
+            INJECT_RESCHED_TWO_OWED_STALLED => {
+                carrick_el1::isa::x86::interrupt::inject_resched_two_owed_stalled().then_some(0)
+            }
+            INJECT_RESCHED_OWED_AT_PARK => {
+                if !carrick_el1::isa::x86::interrupt::inject_resched_busy(u32::MAX, 0, None) {
+                    return None;
+                }
+                OWE_AT_PARK_SLOT.store(binding.cpu_slot + 1, Ordering::Release);
+                Some(0)
             }
             INJECT_RESCHED_ICR_FLAPPING => {
                 carrick_el1::isa::x86::interrupt::inject_resched_busy(u32::MAX, 0, None)

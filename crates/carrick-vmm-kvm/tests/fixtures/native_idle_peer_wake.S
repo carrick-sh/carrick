@@ -59,6 +59,23 @@
  * accepts its send. The hold's return must end the run with a CPL0 fatal
  * at the bounded wait, never loop; the fixture never reaches its exit.
  *
+ * -DTWO_OWED_STALLED (#3129 P0 1): as LAST_RETURN, but the hold's busy
+ * send also owes this CPU's own slot (a self-kick that found the ICR
+ * busy), so the return's resend pass sends two. Its first send goes out
+ * after a stall past the bound; its second finds the ICR busy with that
+ * fresh IPI; one poll then reads busy, the next idle. The fresh IPI's
+ * busy result is not a broken APIC: the census must read two busy sends,
+ * two resends, one transition, at the syscall's own return, and one stall
+ * (exit 93 or a fatal otherwise).
+ *
+ * -DIDLE_OWED (#3129 P0 2): every send of this CPU finds the ICR busy, and
+ * the scheduler owes the other CPU a reschedule when this CPU's task parks
+ * (in a FUTEX_WAIT nobody ends), as a waker whose syscall then blocks
+ * would. The idle pass is the next delivery point, with no return to user
+ * after it. The idle sender must end the run with a CPL0 fatal past the
+ * bound at the idle pass, never spin; the fixture never reaches its exit
+ * (94: the park returned).
+ *
  * Exit 7: the peer took the publication, and the ordered pass ran once.
  * 81: arming failed; 82: the peer never reached its stop; 83: the
  * publication failed; 84: releasing the peer failed; 90: the ordered pass
@@ -85,6 +102,9 @@
 #ifdef ICR_FLAPPING
 #define LAST_RETURN 1
 #define BUSY_INJECT     INJECT_RESCHED_ICR_FLAPPING
+#elif defined(TWO_OWED_STALLED)
+#define LAST_RETURN 1
+#define BUSY_INJECT     INJECT_RESCHED_TWO_OWED_STALLED
 #elif defined(LAST_RETURN_STALLED)
 #define LAST_RETURN 1
 #define BUSY_INJECT     INJECT_RESCHED_STALL_AT_LAST_RETURN
@@ -99,7 +119,11 @@
 #else
 #define BUSY_INJECT     INJECT_RESCHED_BUSY_ONCE
 #endif
-#if defined(LAST_RETURN_STALLED_AFTER_SEND)
+#if defined(TWO_OWED_STALLED)
+#define BUSY_RESCHED 1
+#define BUSY_AFTER_HOLD 0x0101000100020002
+#define BUSY_AT_END     0x0101000100020002
+#elif defined(LAST_RETURN_STALLED_AFTER_SEND)
 #define BUSY_RESCHED 1
 #define BUSY_AFTER_HOLD 0x0001000000010003
 #define BUSY_AT_END     0x0001000000010003
@@ -120,6 +144,8 @@
 #define INJECT_RESCHED_STALL_AT_LAST_RETURN 0xfffffffffffffe61
 #define INJECT_RESCHED_STALL_AFTER_BUSY_POLL 0xfffffffffffffe62
 #define INJECT_RESCHED_STALL_AFTER_BUSY_SEND 0xfffffffffffffe63
+#define INJECT_RESCHED_TWO_OWED_STALLED    0xfffffffffffffe64
+#define INJECT_RESCHED_OWED_AT_PARK        0xfffffffffffffe65
 #define SPIN_USER                          0x1000000
 #ifdef BUSY_RESCHED
 #define AFTER_IDLE_READ 1
@@ -128,6 +154,22 @@
 .global _start
 .text
 _start:
+#ifdef IDLE_OWED
+    mov $INJECT_RESCHED_OWED_AT_PARK, %rax
+    syscall
+    test %rax, %rax
+    jnz fail_arm
+    /* FUTEX_WAIT_PRIVATE on idle_word == 0, which nobody wakes: the
+     * park owes the other CPU its reschedule. */
+    lea idle_word(%rip), %rdi
+    mov $128, %esi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    mov $202, %eax
+    syscall
+    mov $94, %edi
+    jmp die
+#endif
 #ifdef AFTER_IDLE_READ
     mov $INJECT_ORDER_PEER_AFTER_IDLE_READ, %rax
 #else
@@ -261,3 +303,7 @@ die:
     mov $231, %eax
     syscall
     ud2
+
+.bss
+.balign 8
+idle_word: .space 8
