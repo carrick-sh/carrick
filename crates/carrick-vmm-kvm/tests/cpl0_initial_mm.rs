@@ -8924,17 +8924,49 @@ fn run_x86_fork_exec_poll_witness(become_ready: bool) {
 fn run_reservation_shape(case: u32) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
     let define = format!("-DCASE={case}");
     let elf = native_exit_fixture_with_flags("native_child_mprotect_shapes.S", &[&define]);
+    run_beside_native_oracle(&elf, &format!("case {case}"))
+}
+
+/// Run `elf` natively (it must exit 7, Linux's answer), then on the
+/// production KVM pool.
+fn run_beside_native_oracle(
+    elf: &[u8],
+    label: &str,
+) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
     let dir = tempfile::tempdir().expect("oracle directory");
     let oracle = dir.path().join("oracle");
-    carrick_test_support::executable::write_executable_mode(&oracle, &elf, 0o755);
+    carrick_test_support::executable::write_executable_mode(&oracle, elf, 0o755);
     let native = std::process::Command::new("timeout")
         .arg("10")
         .arg(&oracle)
         .output()
         .expect("run native oracle");
-    assert_eq!(native.status.code(), Some(7), "native oracle case {case}");
-    try_run_pool_fixture_with_root_affinity(&elf, 4096, ROOT_AFFINITY_LOADED)
-        .expect("reservation shape run")
+    assert_eq!(native.status.code(), Some(7), "native oracle {label}");
+    try_run_pool_fixture_with_root_affinity(elf, 4096, ROOT_AFFINITY_LOADED)
+        .unwrap_or_else(|error| panic!("{label} run: {error:?}"))
+}
+
+/// #3133: a sibling thread first-touches the pages of a 16 MiB private RW
+/// region while the main thread toggles its protection RWX/RW; every
+/// mprotect must return 0. On x86 the CPU's page walker sets ACCESSED and
+/// DIRTY in a just-published leaf, possibly between an edit's snapshot and
+/// its store, which the descriptor editor took for contention (an ENOSYS
+/// from mprotect). Today the run ends before that is reachable: the host's
+/// settlement of the sibling's first touch reads a leaf the main thread's
+/// mprotect already edited and quarantines the carrier (`guest MMU
+/// publication live descriptor mismatch`), or the first touch is refused
+/// (`reason 0x9`), 5 of 5 runs either way (#2766).
+#[test]
+#[ignore = "#2766: a first touch's host settlement meets the sibling's mprotect first"]
+fn production_mprotect_beside_a_sibling_threads_first_writes_always_lands() {
+    let elf = native_exit_fixture_with_flags("native_sibling_mprotect_walker.S", &[]);
+    let outcome = run_beside_native_oracle(&elf, "sibling walker");
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (7, None),
+        "exit (7 = Linux; 38 = an mprotect ENOSYS; 92 = a lost byte; 94 = no finish): {:?}",
+        outcome.run
+    );
 }
 
 macro_rules! reservation_shape_witness {

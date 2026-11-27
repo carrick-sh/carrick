@@ -3,7 +3,7 @@ use super::*;
 use alloc::vec;
 use core::num::NonZeroU64;
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 #[test]
 fn owner_grant_projection_preserves_prepared_neighbors_and_refuses_exhaustion() {
@@ -298,6 +298,10 @@ struct Words {
     writes: Cell<usize>,
     fail: Cell<usize>,
     invalidations: Cell<usize>,
+    /// Bits another agent ORs into a present entry just before each
+    /// successive compare-exchange on one: a sibling CPU's page walker
+    /// (`ACCESSED`/`DIRTY`), or any other change (#3133).
+    interleaved: RefCell<VecDeque<u64>>,
 }
 impl Words {
     fn new() -> Self {
@@ -308,6 +312,7 @@ impl Words {
             writes: Cell::new(0),
             fail: Cell::new(usize::MAX),
             invalidations: Cell::new(0),
+            interleaved: RefCell::new(VecDeque::new()),
         }
     }
 }
@@ -334,6 +339,11 @@ impl LiveDescriptorWords for Words {
         }
         let mut words = self.words.borrow_mut();
         let entry = words.get_mut(&pa).ok_or(DescriptorRefusal::MissingTable)?;
+        if *entry & PRESENT != 0
+            && let Some(bits) = self.interleaved.borrow_mut().pop_front()
+        {
+            *entry |= bits;
+        }
         if *entry != before {
             return Ok(false);
         }
@@ -2180,4 +2190,106 @@ fn protect_widens_a_cow_armed_leaf_to_write_intent_only() {
         leaf & (COW | WRITE | MAY_WRITE | USER),
         COW | MAY_WRITE | USER
     );
+}
+
+fn two_private_rw_pages(words: &Words) -> PageSpan {
+    let span = PageSpan::new(0x4000, 2 * PAGE);
+    let writable = Permissions {
+        writable: true,
+        executable: false,
+        user: true,
+    };
+    assert!(matches!(
+        apply(
+            words,
+            private_prepare(span, 0x800000, writable),
+            &[root(0x2000), root(0x3000), root(0x4000)]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    span
+}
+
+fn leaf_at(words: &Words, va: u64) -> u64 {
+    read_terminal_descriptor(words, root(0x1000), UserVa::new(va))
+        .unwrap()
+        .0
+}
+
+fn protect_read_only(span: PageSpan) -> DescriptorOp {
+    DescriptorOp::Protect {
+        span,
+        permissions: Permissions {
+            writable: false,
+            executable: false,
+            user: true,
+        },
+        exec: ExecAuthority::Leaf,
+        cow_ceiling: None,
+        absent: carrick_guest_arch::AbsentLeaves::Refuse,
+    }
+}
+
+/// #3133: a sibling CPU's page walker may set `ACCESSED` or `DIRTY` on a
+/// live leaf between the plan's snapshot and its store. That is not
+/// contention: mprotect's edit lands, and the leaf keeps the walker's bits.
+#[test]
+fn a_walker_set_accessed_or_dirty_bit_is_not_contention() {
+    for bits in [ACCESSED, DIRTY, ACCESSED | DIRTY] {
+        let words = Words::new();
+        let span = two_private_rw_pages(&words);
+        assert_eq!(leaf_at(&words, span.va) & (ACCESSED | DIRTY), 0);
+        // The walker sets `bits` on the first leaf before its store, and
+        // `ACCESSED` again before the retried store when `bits` is DIRTY
+        // alone: two walker updates absorbed in one entry.
+        words
+            .interleaved
+            .borrow_mut()
+            .extend([bits, if bits == DIRTY { ACCESSED } else { 0 }]);
+        assert!(
+            matches!(
+                apply(&words, protect_read_only(span), &[]),
+                DescriptorOutcome::Applied { stores: 2, .. }
+            ),
+            "walker bits {bits:#x}"
+        );
+        let first = leaf_at(&words, span.va);
+        assert_eq!(first & (WRITE | MAY_WRITE | PRESENT), MAY_WRITE | PRESENT);
+        let expected = if bits == DIRTY {
+            ACCESSED | DIRTY
+        } else {
+            bits
+        };
+        assert_eq!(first & (ACCESSED | DIRTY), expected);
+        assert_eq!(
+            leaf_at(&words, span.va + PAGE) & (WRITE | (ACCESSED | DIRTY)),
+            0
+        );
+    }
+}
+
+/// #3133: any other change to a live leaf is still a real mismatch, and the
+/// undo of the leaves already stored absorbs the walker too, so the edit
+/// rolls back cleanly instead of going indeterminate.
+#[test]
+fn a_foreign_change_stays_contended_and_the_undo_absorbs_the_walker() {
+    let words = Words::new();
+    let span = two_private_rw_pages(&words);
+    let second = leaf_at(&words, span.va + PAGE);
+    // First leaf: stored. Second leaf: a bit no walker sets. Then the
+    // walker touches the first leaf before its undo.
+    words
+        .interleaved
+        .borrow_mut()
+        .extend([0, MAY_EXEC, ACCESSED]);
+    assert_eq!(
+        apply(&words, protect_read_only(span), &[]),
+        DescriptorOutcome::RolledBack(DescriptorRefusal::Contended)
+    );
+    let first = leaf_at(&words, span.va);
+    assert_eq!(
+        first & (WRITE | MAY_WRITE | ACCESSED),
+        WRITE | MAY_WRITE | ACCESSED
+    );
+    assert_eq!(leaf_at(&words, span.va + PAGE), second | MAY_EXEC);
 }
