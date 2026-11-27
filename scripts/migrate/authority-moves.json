@@ -332,6 +332,10 @@
     {
       "owner": "carrick_softcpu_aarch64_host::facade::soft_carrier_broken",
       "issue": 3061
+    },
+    {
+      "owner": "carrick_core::mm::own::CarrierId::allocate::CARRIERS",
+      "issue": 3061
     }
   ],
   "terminal_custody": []

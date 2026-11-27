@@ -6472,6 +6472,13 @@
     {
       "family": "global_monotonic_allocator",
       "operation": "global:static",
+      "owner": "carrick_core::mm::own::CarrierId::allocate::CARRIERS",
+      "lane": "shared",
+      "ceiling": 1
+    },
+    {
+      "family": "global_monotonic_allocator",
+      "operation": "global:static",
       "owner": "carrick_kernel::dispatch::fs::pipe::NEXT_PIPE_ID",
       "lane": "shared",
       "ceiling": 1
