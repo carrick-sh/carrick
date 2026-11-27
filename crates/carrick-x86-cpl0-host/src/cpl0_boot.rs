@@ -9338,7 +9338,12 @@ pub fn load_guest_mm<C: Cpl0BootCarrier>(
             carrier
                 .custody_mut()
                 .memory_mut()
-                .publish(&txn, publication, &mut inventory)
+                .publish(
+                    &txn,
+                    publication,
+                    crate::carrier_memory::SettlementCustody::EditorHeld,
+                    &mut inventory,
+                )
                 .map_err(|error| fail(error.to_string()))?;
             used_tables = used_tables
                 .checked_add(publication.tables_linked as usize)

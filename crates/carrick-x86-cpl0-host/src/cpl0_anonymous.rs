@@ -2691,7 +2691,12 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         let publication = GuestMmuPublication::from_x86_cow_completion(&txn, &receipt)
             .ok_or_else(|| fail("owner COW publication identity"))?;
         self._vm
-            .publish(&txn, publication, &mut supplied.inventory)
+            .publish(
+                &txn,
+                publication,
+                crate::carrier_memory::SettlementCustody::EditorHeld,
+                &mut supplied.inventory,
+            )
             .map_err(|error| fail(error.to_string()))?;
         supplied.inventory.finish()?;
         if !self.cow_pool()?.finish(excluded, &supplied.grant) {
@@ -3064,10 +3069,18 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             pending.txn.root.raw(),
             &pending.txn,
             |native| match &mut pending.backing {
-                GrantBacking::Private { inventory, .. } => {
-                    self._vm.publish(native, publication, &mut **inventory)
-                }
-                GrantBacking::Window => self._vm.publish(native, publication, &mut WindowInventory),
+                GrantBacking::Private { inventory, .. } => self._vm.publish(
+                    native,
+                    publication,
+                    crate::carrier_memory::SettlementCustody::EditorReleased,
+                    &mut **inventory,
+                ),
+                GrantBacking::Window => self._vm.publish(
+                    native,
+                    publication,
+                    crate::carrier_memory::SettlementCustody::EditorReleased,
+                    &mut WindowInventory,
+                ),
             },
         )
         .map_err(|error| fail(format!("owner grant projection: {error:?}")))?

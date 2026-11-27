@@ -1915,7 +1915,12 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                     .ok_or_else(|| fail("exec successor table receipt count"))?,
             };
             self._vm
-                .publish(&txn, *publication, &mut data.inventory)
+                .publish(
+                    &txn,
+                    *publication,
+                    crate::carrier_memory::SettlementCustody::EditorHeld,
+                    &mut data.inventory,
+                )
                 .map_err(|error| fail(error.to_string()))?;
             used = next;
         }
