@@ -762,8 +762,14 @@ mod tests {
         };
         let space = zone.spaces.publish_closed(301, ttbr0, ttbr0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 301);
-        zone.publish_slot(slot, 301, Some(0), 1);
+        zone.drive(slot, 301, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(
+            slot,
+            301,
+            Some(0),
+            1,
+            &carrick_sched_core::OwedPasses::new(),
+        );
         zone.enter_guest(slot);
         zone.install_space(slot, 301).unwrap();
         // SAFETY: this stopped CPU's CurrentTask belongs to the fixture.
@@ -958,8 +964,14 @@ mod tests {
         };
         let space = zone.spaces.publish_closed(301, ttbr0, ttbr0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 301);
-        zone.publish_slot(slot, 301, Some(0), 1);
+        zone.drive(slot, 301, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(
+            slot,
+            301,
+            Some(0),
+            1,
+            &carrick_sched_core::OwedPasses::new(),
+        );
         zone.enter_guest(slot);
         zone.install_space(slot, 301).unwrap();
         // SAFETY: this stopped CPU's CurrentTask belongs to the fixture.

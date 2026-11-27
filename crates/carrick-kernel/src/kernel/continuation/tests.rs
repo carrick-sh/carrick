@@ -5252,8 +5252,14 @@ mod serial_host {
             Claim::Transferring { .. }
         ));
         // The host idle boundary returns after the completion was deferred.
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, root.shared().mm().id().raw(), None, 0);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(
+            slot,
+            root.shared().mm().id().raw(),
+            None,
+            0,
+            &carrick_sched_core::OwedPasses::new(),
+        );
         let space = zone
             .spaces
             .publish_closed(root.shared().mm().id().raw(), 0x1000, 0)
@@ -5285,7 +5291,12 @@ mod serial_host {
         assert_eq!(sibling.task().threads().len(), 2);
         // The native checkpoint consumes the retained fault operation. Its
         // later host handback must wake even a lease settled before enrollment.
-        assert_eq!(zone.switch_in_full(slot).unwrap().record, id);
+        assert_eq!(
+            zone.switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record,
+            id
+        );
         // SAFETY: the checkpoint fixture owns this exact OnCpu continuation.
         unsafe {
             assert!(zone.record(id).take_object_operation().is_some());
@@ -5298,14 +5309,15 @@ mod serial_host {
             scheduler.try_take(&executor).unwrap().is_none(),
             "native frame was offered before its host handback"
         );
-        zone.unswitch(slot, id);
+        zone.unswitch(slot, id, &carrick_sched_core::OwedPasses::new());
         assert_eq!(
             zone.claim_for_host(
                 record,
                 None,
                 carrick_el1_abi::Handback::Woken,
                 &crate::el1_zone::HostLockWait,
-                &|owned| crate::el1_zone::complete_object_wake(owned.zone(), owned)
+                &|owned| crate::el1_zone::complete_object_wake(owned.zone(), owned),
+                &carrick_sched_core::OwedPasses::new()
             ),
             carrick_el1_abi::HostClaim::Claimed
         );

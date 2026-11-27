@@ -3451,8 +3451,12 @@ mod tests {
             let index = zone.spaces.publish_closed(mm, ttbr, ttbr).unwrap();
             zone.spaces.open(index);
         }
-        zone.drive(SLOT, u64::from(SLOT.raw()) + 1);
-        zone.publish_slot(SLOT, MM, None, 0);
+        zone.drive(
+            SLOT,
+            u64::from(SLOT.raw()) + 1,
+            &carrick_sched_core::OwedPasses::new(),
+        );
+        zone.publish_slot(SLOT, MM, None, 0, &carrick_sched_core::OwedPasses::new());
         let here = carrick_sched_core::ExecutionSlot::zone(SLOT);
         zone.occupancy.vacate_any(here);
         assert!(zone.occupancy.replace(here, 0, MM));
@@ -3705,6 +3709,7 @@ mod tests {
                 true,
                 &mut |_| panic!("the slot runs it"),
                 &mut |_| placed += 1,
+                &carrick_sched_core::OwedPasses::new(),
             );
             assert_eq!((woken, placed), (1, 1));
         }
@@ -4628,7 +4633,11 @@ mod tests {
         w.map.publish(w.a_tid, a.to_raw()).unwrap();
         w.task.linux.file_table.store(w.a_tid, Ordering::Relaxed);
         w.queue(w.a_tid, MM, &frame, A_SVC);
-        let record = w.zone.switch_in_full(SLOT).unwrap().record;
+        let record = w
+            .zone
+            .switch_in_full(SLOT, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record;
         w.task.execution.task.store(w.a_tid, Ordering::Relaxed);
         w.task.mm.thread_generation.store(1101, Ordering::Relaxed);
         let retained = || w.zone.record(record).has_adapter_operation();
@@ -4719,7 +4728,11 @@ mod tests {
         w.map.publish(w.a_tid, a.to_raw()).unwrap();
         w.task.linux.file_table.store(w.a_tid, Ordering::Relaxed);
         w.queue(w.a_tid, MM, &frame, A_SVC);
-        let record = w.zone.switch_in_full(SLOT).unwrap().record;
+        let record = w
+            .zone
+            .switch_in_full(SLOT, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record;
         w.task.execution.task.store(w.a_tid, Ordering::Relaxed);
         w.task.mm.thread_generation.store(1101, Ordering::Relaxed);
         (frame, a, r1, va, record)
@@ -5613,7 +5626,11 @@ mod tests {
         // A native thread runs on its own selected scheduler record, which
         // retains the suspended operation.
         w.queue(w.a_tid, MM, &frame, A_SVC);
-        assert!(w.zone.switch_in_full(SLOT).is_some());
+        assert!(
+            w.zone
+                .switch_in_full(SLOT, &carrick_sched_core::OwedPasses::new())
+                .is_some()
+        );
         w.task.linux.file_table.store(w.a_tid, Ordering::Relaxed);
         w.map.publish(w.a_tid, a.to_raw()).unwrap();
         // B wakes A through the second member, then blocks on an empty pipe.
@@ -7467,7 +7484,11 @@ mod tests {
             // Terminal custody needs a real selected scheduler record, just
             // as it does for a native process in production.
             w.queue(w.a_tid, MM, &frame, A_SVC);
-            assert!(w.zone.switch_in_full(SLOT).is_some());
+            assert!(
+                w.zone
+                    .switch_in_full(SLOT, &carrick_sched_core::OwedPasses::new())
+                    .is_some()
+            );
             // switch_in_full selects the record; the executor normally
             // publishes its identity into CurrentTask before dispatch.
             w.task.linux.file_table.store(w.a_tid, Ordering::Relaxed);
@@ -7574,7 +7595,11 @@ mod tests {
         w.mem.map(MM, 0x20000, bytes.len() as u64);
         let mut frame = syscall(SYS_READ, read, 0x20000, bytes.len() as u64, A_SVC);
         w.queue(w.a_tid, MM, &frame, A_SVC);
-        assert!(w.zone.switch_in_full(SLOT).is_some());
+        assert!(
+            w.zone
+                .switch_in_full(SLOT, &carrick_sched_core::OwedPasses::new())
+                .is_some()
+        );
         w.task.linux.file_table.store(w.a_tid, Ordering::Relaxed);
         w.map.publish(w.a_tid, table.to_raw()).unwrap();
         struct Contended<'a> {
@@ -9087,7 +9112,11 @@ mod tests {
         w.map.publish(w.a_tid, table.to_raw()).unwrap();
         w.task.linux.file_table.store(w.a_tid, Ordering::Relaxed);
         w.queue(w.a_tid, MM, &frame, A_SVC);
-        let record = w.zone.switch_in_full(SLOT).unwrap().record;
+        let record = w
+            .zone
+            .switch_in_full(SLOT, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record;
         w.queue(
             202,
             MM,
@@ -9104,7 +9133,11 @@ mod tests {
         fds.write(4, 0x1234i16);
         w.host_close(table, write);
         w.zone.clear_current(SLOT);
-        assert!(w.zone.switch_in_full(SLOT).is_some());
+        assert!(
+            w.zone
+                .switch_in_full(SLOT, &carrick_sched_core::OwedPasses::new())
+                .is_some()
+        );
         w.task.execution.task.store(w.a_tid, Ordering::Relaxed);
         w.task.mm.thread_generation.store(1101, Ordering::Relaxed);
         w.task.linux.file_table.store(w.a_tid, Ordering::Relaxed);
@@ -9167,8 +9200,14 @@ mod tests {
             let peer_slot = SlotId::new(1);
             let affinity = (1u64 << SLOT.raw()) | (1u64 << peer_slot.raw());
             for (slot, tid, serial) in [(SLOT, w.a_tid, 1101u64), (peer_slot, 202u64, 1202u64)] {
-                x86_zone.drive(slot, 1);
-                x86_zone.publish_slot(slot, MM, Some(u32::from(slot.raw())), affinity);
+                x86_zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+                x86_zone.publish_slot(
+                    slot,
+                    MM,
+                    Some(u32::from(slot.raw())),
+                    affinity,
+                    &carrick_sched_core::OwedPasses::new(),
+                );
                 let here = carrick_sched_core::ExecutionSlot::zone(slot);
                 x86_zone.occupancy.vacate_any(here);
                 assert!(x86_zone.occupancy.replace(here, 0, MM));
@@ -9187,10 +9226,20 @@ mod tests {
                     })
                     .unwrap();
                 assert!(x86_zone.mark_native_owned(rec));
-                assert!(x86_zone.requeue_preempted(slot, rec).is_queued());
+                assert!(
+                    x86_zone
+                        .requeue_preempted(slot, rec, &carrick_sched_core::OwedPasses::new())
+                        .is_queued()
+                );
             }
-            let parent_record = x86_zone.switch_in_full(SLOT).unwrap().record;
-            let _child_record = x86_zone.switch_in_full(peer_slot).unwrap().record;
+            let parent_record = x86_zone
+                .switch_in_full(SLOT, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record;
+            let _child_record = x86_zone
+                .switch_in_full(peer_slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record;
 
             let parent_table = w
                 .host()
@@ -9338,7 +9387,7 @@ mod tests {
                     |_| core::ptr::null_mut(),
                 );
                 if route == CompletionRoute::Suspended && x86_zone.slot(slot).current().is_none() {
-                    x86_zone.enter_idle(slot, true);
+                    x86_zone.enter_idle(slot, true, &carrick_sched_core::OwedPasses::new());
                 }
                 route
             };
@@ -9375,7 +9424,9 @@ mod tests {
             );
             assert_eq!(child_close.frame.x[0], 0);
             assert_eq!(
-                x86_zone.switch_in_full(SLOT).map(|s| s.record),
+                x86_zone
+                    .switch_in_full(SLOT, &carrick_sched_core::OwedPasses::new())
+                    .map(|s| s.record),
                 Some(parent_record),
                 "native {native}: last writer close on x86 must wake the parked poll record"
             );
@@ -9412,7 +9463,11 @@ mod tests {
         w.map.publish(w.a_tid, table.to_raw()).unwrap();
         w.task.linux.file_table.store(w.a_tid, Ordering::Relaxed);
         w.queue(w.a_tid, MM, &frame, A_SVC);
-        let record = w.zone.switch_in_full(SLOT).unwrap().record;
+        let record = w
+            .zone
+            .switch_in_full(SLOT, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record;
         w.queue(
             202,
             MM,
@@ -9434,7 +9489,9 @@ mod tests {
         // Remove the peer's running claim before selecting the notified waiter.
         w.zone.clear_current(SLOT);
         assert!(
-            w.zone.switch_in_full(SLOT).is_some(),
+            w.zone
+                .switch_in_full(SLOT, &carrick_sched_core::OwedPasses::new())
+                .is_some(),
             "drain must wake the writer lane"
         );
         w.task.execution.task.store(w.a_tid, Ordering::Relaxed);

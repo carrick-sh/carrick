@@ -106,7 +106,11 @@ fn two_live_threads_park_their_own_semop_aarch64() {
 /// Re-enter the fixture leader after its retained carrier work settled.
 fn reenter_leader<C: ProcessContext + 'static>(fixture: &NativeSignalFixture<C>) -> C {
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         fixture.record.id
     );
     // SAFETY: the leader's record was selected just above.
@@ -203,7 +207,11 @@ fn fork_preparation_busy_once_then_forks_aarch64() {
 /// run first.
 fn select_leader<C: ProcessContext + 'static>(fixture: &NativeSignalFixture<C>) -> C {
     loop {
-        let selected = fixture.zone.switch_in_full(fixture.slot).unwrap().record;
+        let selected = fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record;
         if selected == fixture.record.id {
             // SAFETY: the leader's record was selected just above.
             return unsafe { *fixture.zone.record(fixture.record.id).ctx_mut() };
@@ -211,7 +219,11 @@ fn select_leader<C: ProcessContext + 'static>(fixture: &NativeSignalFixture<C>) 
         assert!(
             fixture
                 .zone
-                .requeue_preempted(fixture.slot, selected)
+                .requeue_preempted(
+                    fixture.slot,
+                    selected,
+                    &carrick_sched_core::OwedPasses::new()
+                )
                 .is_queued()
         );
     }
@@ -456,7 +468,11 @@ fn host_request_during_park_yields_then_reparks<
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, record.id)
+            .requeue_preempted(
+                fixture.slot,
+                record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     let saved = select_leader(&fixture);
@@ -481,7 +497,8 @@ fn host_request_during_park_yields_then_reparks<
                 None,
                 Handback::Control,
                 &ShortLockSpin,
-                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+                &carrick_sched_core::OwedPasses::new()
             ),
             HostClaim::El1Held { slot: fixture.slot }
         );
@@ -522,13 +539,18 @@ fn host_request_during_park_yields_then_reparks<
     );
     assert!(fixture.zone.record(record.id).needs_native_handback());
     let mut wanted = alloc::vec::Vec::new();
-    fixture
-        .zone
-        .take_host_wanted(fixture.slot, &mut |wanted_record| {
-            wanted.push(wanted_record)
-        });
+    fixture.zone.take_host_wanted(
+        fixture.slot,
+        &mut |wanted_record| wanted.push(wanted_record),
+        &carrick_sched_core::OwedPasses::new(),
+    );
     assert_eq!(wanted.as_slice(), &[record]);
-    assert!(fixture.zone.place_native_handback(record).is_some());
+    assert!(
+        fixture
+            .zone
+            .place_native_handback(record, &carrick_sched_core::OwedPasses::new())
+            .is_some()
+    );
     // Its next owner entry reruns the retained wait, which now parks.
     let saved = select_leader(&fixture);
     {

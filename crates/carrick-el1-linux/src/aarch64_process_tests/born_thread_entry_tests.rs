@@ -254,7 +254,13 @@ fn born_thread_first_entry_after_foreign_occupant(stale_pid: Option<u32>) {
 
     // The root's executor blocked on the host; the child runs on this vCPU.
     let task: &'static CurrentTask = &fixture.task;
-    fixture.zone.publish_slot(fixture.slot, 0, None, 0);
+    fixture.zone.publish_slot(
+        fixture.slot,
+        0,
+        None,
+        0,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     task.mm.key.store(0, Ordering::Release);
     assert_eq!(
         switch_in(fixture, task, &mut cpu, &mut frame),
@@ -314,7 +320,7 @@ fn born_thread_first_entry_after_foreign_occupant(stale_pid: Option<u32>) {
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, child)
+            .requeue_preempted(fixture.slot, child, &carrick_sched_core::OwedPasses::new())
             .is_queued()
     );
     let slot_task: &'static CurrentTask = Box::leak(Box::new(CurrentTask::new()));
@@ -951,7 +957,13 @@ impl ProductionProcessHarness {
         let parent_control =
             unsafe { &*(parent_identity.control_slot as *const ThreadControlSlot) };
         let task: &'static CurrentTask = &fixture.task;
-        fixture.zone.publish_slot(fixture.slot, 0, None, 0);
+        fixture.zone.publish_slot(
+            fixture.slot,
+            0,
+            None,
+            0,
+            &carrick_sched_core::OwedPasses::new(),
+        );
         task.mm.key.store(0, Ordering::Release);
         assert_eq!(
             switch_in(fixture, task, &mut cpu, &mut frame),
@@ -1249,7 +1261,11 @@ fn arm_two_threads_blocking_wait4_reap_distinct_children() {
         harness
             .fixture
             .zone
-            .requeue_preempted(harness.fixture.slot, child_b)
+            .requeue_preempted(
+                harness.fixture.slot,
+                child_b,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
 
@@ -1275,7 +1291,11 @@ fn arm_two_threads_blocking_wait4_reap_distinct_children() {
         harness
             .fixture
             .zone
-            .requeue_preempted(harness.fixture.slot, harness.parent_record)
+            .requeue_preempted(
+                harness.fixture.slot,
+                harness.parent_record,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     let mut resumed_sibling = carrick_el1_abi::TrapFrame::default();
@@ -1299,7 +1319,11 @@ fn arm_two_threads_blocking_wait4_reap_distinct_children() {
             harness
                 .fixture
                 .zone
-                .requeue_preempted(harness.fixture.slot, harness.parent_record)
+                .requeue_preempted(
+                    harness.fixture.slot,
+                    harness.parent_record,
+                    &carrick_sched_core::OwedPasses::new()
+                )
                 .is_queued()
         );
         assert_eq!(
@@ -1375,7 +1399,11 @@ fn arm_two_threads_blocking_wait4_any_one_reaps_other_blocks_then_echild() {
         harness
             .fixture
             .zone
-            .requeue_preempted(harness.fixture.slot, child_b)
+            .requeue_preempted(
+                harness.fixture.slot,
+                child_b,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
 
@@ -1435,7 +1463,11 @@ fn arm_two_threads_blocking_wait4_any_one_reaps_other_blocks_then_echild() {
         harness
             .fixture
             .zone
-            .requeue_preempted(harness.fixture.slot, winner)
+            .requeue_preempted(
+                harness.fixture.slot,
+                winner,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     let mut loser_frame = carrick_el1_abi::TrapFrame::default();
@@ -1501,7 +1533,11 @@ fn arm_vfork_while_sibling_parked_in_wait4_suspends_parent_until_release() {
         harness
             .fixture
             .zone
-            .requeue_preempted(harness.fixture.slot, child_a)
+            .requeue_preempted(
+                harness.fixture.slot,
+                child_a,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     let mut switched = carrick_el1_abi::TrapFrame::default();
@@ -1526,7 +1562,11 @@ fn arm_vfork_while_sibling_parked_in_wait4_suspends_parent_until_release() {
             harness
                 .fixture
                 .zone
-                .requeue_preempted(harness.fixture.slot, child_a)
+                .requeue_preempted(
+                    harness.fixture.slot,
+                    child_a,
+                    &carrick_sched_core::OwedPasses::new()
+                )
                 .is_queued()
         );
         assert_eq!(
@@ -1565,7 +1605,11 @@ fn arm_vfork_while_sibling_parked_in_wait4_suspends_parent_until_release() {
         harness
             .fixture
             .zone
-            .requeue_preempted(harness.fixture.slot, sibling)
+            .requeue_preempted(
+                harness.fixture.slot,
+                sibling,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     assert_eq!(
@@ -1582,7 +1626,11 @@ fn arm_vfork_while_sibling_parked_in_wait4_suspends_parent_until_release() {
             harness
                 .fixture
                 .zone
-                .requeue_preempted(harness.fixture.slot, sibling)
+                .requeue_preempted(
+                    harness.fixture.slot,
+                    sibling,
+                    &carrick_sched_core::OwedPasses::new()
+                )
                 .is_queued()
         );
         assert_eq!(
@@ -1878,7 +1926,11 @@ fn arm_wait4_child_exits_between_two_waiters_parking_rescans_without_lost_wake()
         harness
             .fixture
             .zone
-            .requeue_preempted(harness.fixture.slot, sibling)
+            .requeue_preempted(
+                harness.fixture.slot,
+                sibling,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     let mut switched = carrick_el1_abi::TrapFrame::default();
@@ -1900,7 +1952,11 @@ fn arm_wait4_child_exits_between_two_waiters_parking_rescans_without_lost_wake()
         harness
             .fixture
             .zone
-            .requeue_preempted(harness.fixture.slot, child_b)
+            .requeue_preempted(
+                harness.fixture.slot,
+                child_b,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     assert_eq!(
@@ -1943,7 +1999,11 @@ fn arm_wait4_child_exits_between_two_waiters_parking_rescans_without_lost_wake()
         harness
             .fixture
             .zone
-            .requeue_preempted(harness.fixture.slot, harness.parent_record)
+            .requeue_preempted(
+                harness.fixture.slot,
+                harness.parent_record,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     assert_eq!(
@@ -1960,7 +2020,11 @@ fn arm_wait4_child_exits_between_two_waiters_parking_rescans_without_lost_wake()
             harness
                 .fixture
                 .zone
-                .requeue_preempted(harness.fixture.slot, harness.parent_record)
+                .requeue_preempted(
+                    harness.fixture.slot,
+                    harness.parent_record,
+                    &carrick_sched_core::OwedPasses::new()
+                )
                 .is_queued()
         );
         assert_eq!(
@@ -2063,7 +2127,11 @@ fn arm_msgrcv_and_sibling_wait4_do_not_block_each_other() {
                 harness
                     .fixture
                     .zone
-                    .requeue_preempted(harness.fixture.slot, sibling)
+                    .requeue_preempted(
+                        harness.fixture.slot,
+                        sibling,
+                        &carrick_sched_core::OwedPasses::new()
+                    )
                     .is_queued()
             );
             let mut resumed = carrick_el1_abi::TrapFrame::default();
@@ -2125,7 +2193,11 @@ fn arm_msgrcv_and_sibling_wait4_do_not_block_each_other() {
                 harness
                     .fixture
                     .zone
-                    .requeue_preempted(harness.fixture.slot, harness.parent_record)
+                    .requeue_preempted(
+                        harness.fixture.slot,
+                        harness.parent_record,
+                        &carrick_sched_core::OwedPasses::new()
+                    )
                     .is_queued()
             );
             let mut resumed = carrick_el1_abi::TrapFrame::default();
@@ -2194,8 +2266,12 @@ impl MultiSlotEnv {
     }
 
     fn init_guest_slot(self, slot: SlotId) {
-        self.fixture.zone.drive(slot, 1);
-        self.fixture.zone.publish_slot(slot, 0, None, 0);
+        self.fixture
+            .zone
+            .drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        self.fixture
+            .zone
+            .publish_slot(slot, 0, None, 0, &carrick_sched_core::OwedPasses::new());
         self.fixture.zone.enter_guest(slot);
     }
 
@@ -2534,7 +2610,13 @@ fn setup_native_owned_ring_birth_before_first_entry() -> NativeOwnedTwoThreadHar
     .unwrap();
 
     let mut leader_cpu = crate::sched::FakeCpu::default();
-    env.fixture.zone.publish_slot(SlotId::new(0), 0, None, 0);
+    env.fixture.zone.publish_slot(
+        SlotId::new(0),
+        0,
+        None,
+        0,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     assert_eq!(
         env.switch_in(SlotId::new(0), &mut leader_cpu),
         carrick_el1_abi::Action::Served
@@ -2901,10 +2983,18 @@ fn adopt_host_sibling_on_slot(
         sib_control as *const _ as u64,
     );
 
-    fixture.zone.drive(slot, fixture.leader.mm);
-    fixture
-        .zone
-        .publish_slot(slot, fixture.leader.mm, Some(0), 1);
+    fixture.zone.drive(
+        slot,
+        fixture.leader.mm,
+        &carrick_sched_core::OwedPasses::new(),
+    );
+    fixture.zone.publish_slot(
+        slot,
+        fixture.leader.mm,
+        Some(0),
+        1,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     fixture.zone.enter_guest(slot);
     fixture.zone.install_space(slot, fixture.leader.mm).unwrap();
     let sib_record = fixture
@@ -2938,9 +3028,18 @@ fn adopt_host_sibling_on_slot(
         ..Default::default()
     };
     if keep_on_cpu {
-        assert!(fixture.zone.requeue_preempted(slot, sib_record).is_queued());
+        assert!(
+            fixture
+                .zone
+                .requeue_preempted(slot, sib_record, &carrick_sched_core::OwedPasses::new())
+                .is_queued()
+        );
         assert_eq!(
-            fixture.zone.switch_in_full(slot).unwrap().record,
+            fixture
+                .zone
+                .switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record,
             sib_record
         );
         let counters = carrick_el1_abi::Counters::new();
@@ -2969,7 +3068,12 @@ fn adopt_host_sibling_on_slot(
             sib_control,
             &mut sib_service,
             |_| {
-                assert!(fixture.zone.requeue_preempted(slot, sib_record).is_queued());
+                assert!(
+                    fixture
+                        .zone
+                        .requeue_preempted(slot, sib_record, &carrick_sched_core::OwedPasses::new())
+                        .is_queued()
+                );
             },
         )
         .unwrap();
@@ -3076,11 +3180,19 @@ fn setup_arm_root_two_live_threads_and_peer() -> ArmRootTwoThreadHarness {
     assert!(
         fixture
             .zone
-            .requeue_preempted(SlotId::new(0), root_record)
+            .requeue_preempted(
+                SlotId::new(0),
+                root_record,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     assert_eq!(
-        fixture.zone.switch_in_full(SlotId::new(0)).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(SlotId::new(0), &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         root_record
     );
 
@@ -3377,7 +3489,11 @@ fn arm_root_ring_born_tgkill_before_first_entry_queues_signal_once() {
     let _ = h.env.tasks[0].linux.take_host_work_doorbell();
     assert!(
         f.zone
-            .requeue_preempted(SlotId::new(0), root_record)
+            .requeue_preempted(
+                SlotId::new(0),
+                root_record,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     assert_eq!(
@@ -3649,7 +3765,11 @@ fn arm_empty_pool_clone_waits_for_stock_then_child_accepts_tgkill() {
     let _ = h.env.tasks[0].linux.take_host_work_doorbell();
     assert!(
         f.zone
-            .requeue_preempted(SlotId::new(0), root_record)
+            .requeue_preempted(
+                SlotId::new(0),
+                root_record,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     assert_eq!(
@@ -4080,6 +4200,7 @@ fn arm_registered_claim_free_birth_before_requeue_sibling_tgkill() {
         SlotId::new(3),
         h.born_record,
         &carrick_sched_core::ShortLockSpin,
+        &carrick_sched_core::OwedPasses::new(),
     );
 
     // Case A: unmasked at clone (`BlockedMask(0)`). `tgkill` while registered
@@ -4130,7 +4251,11 @@ fn arm_registered_claim_free_birth_before_requeue_sibling_tgkill() {
         h.env
             .fixture
             .zone
-            .requeue_preempted(SlotId::new(0), unmasked_record.id)
+            .requeue_preempted(
+                SlotId::new(0),
+                unmasked_record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     let mut child_cpu = crate::sched::FakeCpu::default();
@@ -4206,6 +4331,7 @@ fn arm_registered_claim_free_birth_before_requeue_sibling_tgkill() {
         SlotId::new(3),
         unmasked_record.id,
         &carrick_sched_core::ShortLockSpin,
+        &carrick_sched_core::OwedPasses::new(),
     );
     h.env.fixture.zone.free_record(unmasked_record.id);
     assert_eq!(
@@ -4247,7 +4373,11 @@ fn arm_registered_claim_free_birth_before_requeue_sibling_tgkill() {
         h.env
             .fixture
             .zone
-            .requeue_preempted(SlotId::new(0), masked_record.id)
+            .requeue_preempted(
+                SlotId::new(0),
+                masked_record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     let mut masked_cpu = crate::sched::FakeCpu::default();
@@ -4519,10 +4649,16 @@ fn host_load(
     task.publish_host_loaded(fixture.leader.tid as u32, fixture.address.generation);
     task.publish_lifecycle(fixture.page as *const _ as u64, control as *const _ as u64);
     if slot != fixture.slot {
-        fixture.zone.drive(slot, driver);
         fixture
             .zone
-            .publish_slot(slot, fixture.leader.mm, Some(0), 1);
+            .drive(slot, driver, &carrick_sched_core::OwedPasses::new());
+        fixture.zone.publish_slot(
+            slot,
+            fixture.leader.mm,
+            Some(0),
+            1,
+            &carrick_sched_core::OwedPasses::new(),
+        );
         fixture.zone.enter_guest(slot);
         fixture.zone.install_space(slot, fixture.leader.mm).unwrap();
     }
@@ -4701,10 +4837,18 @@ fn unhomed_host_thread_after_another_process(pending_signal: bool) {
     ));
     // Its executor settles it into a host zone wait and steps away.
     fixture.zone.unhome(slot1, parked, 1);
-    fixture
-        .zone
-        .leave_guest(slot1, &carrick_sched_core::ShortLockSpin);
-    assert!(fixture.zone.step_away(slot1, 7, &mut |_| {}, &mut |_| {}));
+    fixture.zone.leave_guest(
+        slot1,
+        &carrick_sched_core::ShortLockSpin,
+        &carrick_sched_core::OwedPasses::new(),
+    );
+    assert!(fixture.zone.step_away(
+        slot1,
+        7,
+        &mut |_| {},
+        &mut |_| {},
+        &carrick_sched_core::OwedPasses::new()
+    ));
 
     // The root's FUTEX_WAKE places the woken record on the root's vCPU.
     let mut wake = carrick_el1_abi::TrapFrame::default();
@@ -4849,8 +4993,12 @@ struct SecondVcpu {
 impl SecondVcpu {
     fn new(fixture: &'static Fixture) -> Self {
         let slot = SlotId::new(1);
-        fixture.zone.drive(slot, 2);
-        fixture.zone.publish_slot(slot, 0, None, 0);
+        fixture
+            .zone
+            .drive(slot, 2, &carrick_sched_core::OwedPasses::new());
+        fixture
+            .zone
+            .publish_slot(slot, 0, None, 0, &carrick_sched_core::OwedPasses::new());
         fixture.zone.enter_guest(slot);
         let tasks: &'static [CurrentTask; 2] =
             Box::leak(Box::new([CurrentTask::new(), CurrentTask::new()]));
@@ -4949,7 +5097,11 @@ fn wait4_reaps_zombie_while_sibling_holds_birth_reservation(vfork: bool) {
     assert!(
         fixture
             .zone
-            .requeue_preempted(slot0, harness.parent_record)
+            .requeue_preempted(
+                slot0,
+                harness.parent_record,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     let mut frame = carrick_el1_abi::TrapFrame::default();
@@ -4961,7 +5113,12 @@ fn wait4_reaps_zombie_while_sibling_holds_birth_reservation(vfork: bool) {
     harness.exit_current_child(5, &mut cpu, &mut frame);
     // The leader runs on vCPU 0; B waits in vCPU 0's run queue.
     if fixture.zone.slot(slot0).current() == Some(sibling) {
-        assert!(fixture.zone.requeue_preempted(slot0, sibling).is_queued());
+        assert!(
+            fixture
+                .zone
+                .requeue_preempted(slot0, sibling, &carrick_sched_core::OwedPasses::new())
+                .is_queued()
+        );
         assert_eq!(
             harness.switch_next(&mut cpu, &mut frame),
             carrick_el1_abi::Action::Served
@@ -5055,7 +5212,12 @@ fn wait4_reaps_zombie_while_sibling_holds_birth_reservation(vfork: bool) {
     } else {
         let current = fixture.zone.slot(slot0).current().unwrap();
         if current != sibling {
-            assert!(fixture.zone.requeue_preempted(slot0, current).is_queued());
+            assert!(
+                fixture
+                    .zone
+                    .requeue_preempted(slot0, current, &carrick_sched_core::OwedPasses::new())
+                    .is_queued()
+            );
             loop {
                 assert_eq!(
                     harness.switch_next(&mut cpu, &mut resumed),
@@ -5065,7 +5227,12 @@ fn wait4_reaps_zombie_while_sibling_holds_birth_reservation(vfork: bool) {
                 if now == sibling {
                     break;
                 }
-                assert!(fixture.zone.requeue_preempted(slot0, now).is_queued());
+                assert!(
+                    fixture
+                        .zone
+                        .requeue_preempted(slot0, now, &carrick_sched_core::OwedPasses::new())
+                        .is_queued()
+                );
             }
         }
     }
@@ -5122,8 +5289,14 @@ fn arm_pinned_glibc_member_raw_exit_on_an_idle_executor_retires_in_ring() {
     assert_eq!(pin.x[0], 0);
     // Slot 3's executor waits in the guest on CPU 1 with no host task.
     let pinned = SlotId::new(3);
-    zone.drive(pinned, 4);
-    zone.publish_slot(pinned, 0, Some(1), 0);
+    zone.drive(pinned, 4, &carrick_sched_core::OwedPasses::new());
+    zone.publish_slot(
+        pinned,
+        0,
+        Some(1),
+        0,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     zone.enter_guest(pinned);
     let mut cpu = crate::sched::FakeCpu::default();
     assert_eq!(
@@ -5215,7 +5388,12 @@ fn fork_while_sibling_holds_birth_reservation(vfork: bool) {
     let mut frame = carrick_el1_abi::TrapFrame::default();
     if fixture.zone.slot(slot0).current() != Some(harness.parent_record) {
         let current = fixture.zone.slot(slot0).current().unwrap();
-        assert!(fixture.zone.requeue_preempted(slot0, current).is_queued());
+        assert!(
+            fixture
+                .zone
+                .requeue_preempted(slot0, current, &carrick_sched_core::OwedPasses::new())
+                .is_queued()
+        );
         assert_eq!(
             harness.switch_next(&mut cpu, &mut frame),
             carrick_el1_abi::Action::Served
@@ -5330,7 +5508,12 @@ fn fork_while_sibling_holds_birth_reservation(vfork: bool) {
     } else {
         let current = fixture.zone.slot(slot0).current().unwrap();
         if current != sibling {
-            assert!(fixture.zone.requeue_preempted(slot0, current).is_queued());
+            assert!(
+                fixture
+                    .zone
+                    .requeue_preempted(slot0, current, &carrick_sched_core::OwedPasses::new())
+                    .is_queued()
+            );
             loop {
                 assert_eq!(
                     harness.switch_next(&mut cpu, &mut resumed),
@@ -5340,7 +5523,12 @@ fn fork_while_sibling_holds_birth_reservation(vfork: bool) {
                 if now == sibling {
                     break;
                 }
-                assert!(fixture.zone.requeue_preempted(slot0, now).is_queued());
+                assert!(
+                    fixture
+                        .zone
+                        .requeue_preempted(slot0, now, &carrick_sched_core::OwedPasses::new())
+                        .is_queued()
+                );
             }
         }
     }

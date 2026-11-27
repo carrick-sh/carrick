@@ -90,8 +90,8 @@ impl Process {
             assert!(!ptr.is_null());
             Box::from_raw(ptr)
         };
-        zone.drive(SLOT, 1);
-        zone.publish_slot(SLOT, mm, Some(0), 0);
+        zone.drive(SLOT, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(SLOT, mm, Some(0), 0, &carrick_sched_core::OwedPasses::new());
         let space = zone.spaces.publish_closed(mm, mm << 12, 0).unwrap();
         zone.spaces.open(space);
         zone.enter_guest(SLOT);
@@ -162,7 +162,11 @@ impl<'a> Turn<'a> {
         dispatch::dispatch(ordinal, u64::MAX, self)
     }
     fn enter_child(&mut self) {
-        let id = self.process.zone.switch_in(SLOT).unwrap();
+        let id = self
+            .process
+            .zone
+            .switch_in(SLOT, &carrick_sched_core::OwedPasses::new())
+            .unwrap();
         self.process
             .zone
             .install_space(SLOT, self.process.mm)
@@ -317,7 +321,10 @@ impl<'a> LifecycleNative<'a> for Turn<'a> {
         self.child = Some((record, child));
     }
     fn enqueue_born(&mut self, record: RecordRef) -> BornEnqueue {
-        self.process.zone.requeue_preempted(SLOT, record.id).into()
+        self.process
+            .zone
+            .requeue_preempted(SLOT, record.id, &carrick_sched_core::OwedPasses::new())
+            .into()
     }
     fn exit_record(&self) -> Option<ExitRecord> {
         let reference = self.current?;
@@ -392,13 +399,17 @@ impl<'a> LifecycleNative<'a> for Turn<'a> {
                     1
                 );
             }
-            assert_eq!(zone.switch_in(SLOT), Some(record.id));
+            assert_eq!(
+                zone.switch_in(SLOT, &carrick_sched_core::OwedPasses::new()),
+                Some(record.id)
+            );
             assert!(
                 retirement
                     .retire_current(
                         self.binding,
                         BornInZoneSource { zone, slot: SLOT },
-                        record.id
+                        record.id,
+                        &carrick_sched_core::OwedPasses::new()
                     )
                     .is_err()
             );
@@ -408,7 +419,11 @@ impl<'a> LifecycleNative<'a> for Turn<'a> {
             std::thread::scope(|scope| {
                 scope
                     .spawn(move || {
-                        let _guard = process.zone.slot_lock(SLOT, &BoundedSpin(1024)).unwrap();
+                        let passes = carrick_sched_core::OwedPasses::new();
+                        let guard = process
+                            .zone
+                            .slot_lock(SLOT, &BoundedSpin(1024), &passes)
+                            .unwrap();
                         assert!(matches!(
                             process.zone.record(record.id).claim(),
                             Claim::Queued { .. }
@@ -436,13 +451,20 @@ impl<'a> LifecycleNative<'a> for Turn<'a> {
                                 "requeued record became visible before its clear/wake marker"
                             );
                         }
+                        drop(guard);
+                        passes.deliver(|slot| {
+                            panic!("no idle scan runs here, yet {slot:?} was owed a pass")
+                        });
                     })
                     .join()
                     .unwrap();
             });
             // Resume and consume the completed fixture operation through its
             // exclusive OnCpu owner before the next exit attempt.
-            assert_eq!(zone.switch_in(SLOT), Some(record.id));
+            assert_eq!(
+                zone.switch_in(SLOT, &carrick_sched_core::OwedPasses::new()),
+                Some(record.id)
+            );
             // SAFETY: this fixture now owns the switched-in record exclusively.
             assert!(unsafe { zone.record(record.id).take_object_operation() }.is_some());
             return false;
@@ -455,6 +477,7 @@ impl<'a> LifecycleNative<'a> for Turn<'a> {
                     slot: SLOT,
                 },
                 record.id,
+                &carrick_sched_core::OwedPasses::new(),
             )
             .ok();
         if self.handoff.is_some() {
@@ -661,7 +684,15 @@ pub fn x5_exit_requeued_after_wake_wakes_once() {
                 ..a.zone.record(turn.current.unwrap().id).identity()
             })
             .unwrap();
-        assert!(a.zone.requeue_preempted(SlotId::new(1), parent).is_queued());
+        assert!(
+            a.zone
+                .requeue_preempted(
+                    SlotId::new(1),
+                    parent,
+                    &carrick_sched_core::OwedPasses::new()
+                )
+                .is_queued()
+        );
         let before_clear = turn.clears;
         turn.replace_clear_on_wake = replace_clear;
         turn.fail_release = true;

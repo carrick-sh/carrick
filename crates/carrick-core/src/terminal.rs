@@ -994,12 +994,18 @@ impl TerminalCustody<Process, Settled> {
             return None;
         }
         let _pin = crate::lifecycle::MemberControlCustody::retain(member).ok()?;
-        crate::entry::retire_current_with(binding, source, record, || {
-            member
-                .exit_custody()
-                .commit_zone_terminal(crate::lifecycle::NativeExitCompletion::Member);
-            true
-        }, passes)
+        crate::entry::retire_current_with(
+            binding,
+            source,
+            record,
+            || {
+                member
+                    .exit_custody()
+                    .commit_zone_terminal(crate::lifecycle::NativeExitCompletion::Member);
+                true
+            },
+            passes,
+        )
     }
 
     pub fn identity(self) -> ProcessTerminalIdentity {
@@ -1130,9 +1136,14 @@ pub fn settle_losing_zone_current<C: carrick_core_abi::EntryContext>(
     record: carrick_sched_core::RecordId,
     passes: &carrick_sched_core::OwedPasses,
 ) -> Option<LosingMemberSettlement<C>> {
-    settle_losing_zone_current_before_release(member, binding, source, record, || {
-        Ok::<(), core::convert::Infallible>(())
-    }, passes)
+    settle_losing_zone_current_before_release(
+        member,
+        binding,
+        source,
+        record,
+        || Ok::<(), core::convert::Infallible>(()),
+        passes,
+    )
     .ok()
     .flatten()
 }
@@ -1163,8 +1174,10 @@ where
         || member.host_retirement().is_some()
     {
         before_release()?;
-        Ok(crate::entry::retire_current(binding, source, record, passes)
-            .map(LosingMemberSettlement::Released))
+        Ok(
+            crate::entry::retire_current(binding, source, record, passes)
+                .map(LosingMemberSettlement::Released),
+        )
     } else {
         Ok(Some(LosingMemberSettlement::HostCustody))
     }

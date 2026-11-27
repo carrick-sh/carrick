@@ -9637,14 +9637,30 @@ mod tests {
                             1
                         );
                         drop(guard);
-                        assert!(self.zone.switch_in(slot).is_some());
+                        assert!(
+                            self.zone
+                                .switch_in(slot, &carrick_sched_core::OwedPasses::new())
+                                .is_some()
+                        );
                     }
                     _ => {
                         self.zone.clear_current(slot);
                         self.zone.free_record(self.record);
                         let replacement = self.zone.alloc_record(self.identity).unwrap();
-                        assert!(self.zone.requeue_preempted(slot, replacement).is_queued());
-                        assert!(self.zone.switch_in(slot).is_some());
+                        assert!(
+                            self.zone
+                                .requeue_preempted(
+                                    slot,
+                                    replacement,
+                                    &carrick_sched_core::OwedPasses::new()
+                                )
+                                .is_queued()
+                        );
+                        assert!(
+                            self.zone
+                                .switch_in(slot, &carrick_sched_core::OwedPasses::new())
+                                .is_some()
+                        );
                     }
                 }
                 // Bound native idle; no fake family outcome or continuation.
@@ -9664,8 +9680,8 @@ mod tests {
                         let zone =
                             unsafe { carrick_zeroed_pages::ZeroedBox::<ZoneTables>::new_zeroed() };
                         let slot = SlotId::new(0);
-                        zone.drive(slot, 3);
-                        zone.publish_slot(slot, 7, None, 0);
+                        zone.drive(slot, 3, &carrick_sched_core::OwedPasses::new());
+                        zone.publish_slot(slot, 7, None, 0, &carrick_sched_core::OwedPasses::new());
                         let here = ExecutionSlot::zone(slot);
                         zone.occupancy.vacate_any(here);
                         assert!(zone.occupancy.replace(here, 0, 7));
@@ -9685,8 +9701,18 @@ mod tests {
                             control_slot: 0x2000,
                         };
                         let record = zone.alloc_record(identity).unwrap();
-                        assert!(zone.requeue_preempted(slot, record).is_queued());
-                        assert_eq!(zone.switch_in(slot), Some(record));
+                        assert!(
+                            zone.requeue_preempted(
+                                slot,
+                                record,
+                                &carrick_sched_core::OwedPasses::new()
+                            )
+                            .is_queued()
+                        );
+                        assert_eq!(
+                            zone.switch_in(slot, &carrick_sched_core::OwedPasses::new()),
+                            Some(record)
+                        );
                         assert!(matches!(zone.record(record).claim(), Claim::OnCpu { .. }));
                         if switched {
                             let successor = zone
@@ -9697,7 +9723,14 @@ mod tests {
                                     ..identity
                                 })
                                 .unwrap();
-                            assert!(zone.requeue_preempted(slot, successor).is_queued());
+                            assert!(
+                                zone.requeue_preempted(
+                                    slot,
+                                    successor,
+                                    &carrick_sched_core::OwedPasses::new()
+                                )
+                                .is_queued()
+                            );
                         }
                         let tasks = [CurrentTask::new()];
                         tasks[0].set(
@@ -10001,12 +10034,24 @@ mod tests {
         // Executor occupancy is not the installed carrier topology.
         for cpu in 0..4 {
             let slot = SlotId::new(cpu);
-            zone.drive(slot, 1);
-            zone.publish_slot(slot, 1, Some(cpu as u32), 0);
+            zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+            zone.publish_slot(
+                slot,
+                1,
+                Some(cpu as u32),
+                0,
+                &carrick_sched_core::OwedPasses::new(),
+            );
         }
         assert_eq!(zone.carrier_cpu_count(), Some(4));
         assert_eq!(zone.carrier_affinity_mask(), Some(0x0f));
-        zone.publish_slot(SlotId::new(3), 0, None, 0);
+        zone.publish_slot(
+            SlotId::new(3),
+            0,
+            None,
+            0,
+            &carrick_sched_core::OwedPasses::new(),
+        );
         assert_eq!(zone.carrier_cpu_count(), Some(4));
         assert_eq!(zone.carrier_affinity_mask(), Some(0x0f));
 

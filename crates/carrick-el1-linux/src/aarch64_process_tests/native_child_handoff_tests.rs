@@ -228,12 +228,18 @@ fn fork_child_service_ack(
     };
     // The root's host continuation blocked and its executor detached the
     // loaded task. A native child is the only runnable work left.
-    fixture.zone.publish_slot(fixture.slot, 0, None, 0);
+    fixture.zone.publish_slot(
+        fixture.slot,
+        0,
+        None,
+        0,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     task.mm.key.store(0, Ordering::Release);
     assert!(
         fixture
             .zone
-            .take_service_head_for_executor(fixture.slot)
+            .take_service_head_for_executor(fixture.slot, &carrick_sched_core::OwedPasses::new())
             .is_none(),
         "the executor cannot adopt a child with no host thread"
     );
@@ -1392,7 +1398,13 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
             "the root continues through host exec after two native forks"
         );
     }
-    fixture.zone.publish_slot(fixture.slot, 0, None, 0);
+    fixture.zone.publish_slot(
+        fixture.slot,
+        0,
+        None,
+        0,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     fixture.task.mm.key.store(0, Ordering::Release);
     let counters = carrick_el1_abi::Counters::new();
     let mut pending = Vec::new();
@@ -1918,9 +1930,12 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
             "exactly one continuation consumed"
         );
         assert!(matches!(
-            fixture
-                .zone
-                .release_current(fixture.slot, child, &carrick_sched_core::ShortLockSpin),
+            fixture.zone.release_current(
+                fixture.slot,
+                child,
+                &carrick_sched_core::ShortLockSpin,
+                &carrick_sched_core::OwedPasses::new()
+            ),
             carrick_sched_core::CurrentRelease::Released
         ));
     }
@@ -2219,7 +2234,11 @@ fn namespace_baseline(
             assert!(
                 fixture
                     .zone
-                    .requeue_preempted(fixture.slot, binding.record.id)
+                    .requeue_preempted(
+                        fixture.slot,
+                        binding.record.id,
+                        &carrick_sched_core::OwedPasses::new()
+                    )
                     .is_queued()
             );
         }
@@ -2405,8 +2424,16 @@ fn forked_child_futex_wake_reaches_a_waiter_pinned_to_a_busy_vcpu() {
         // Guest CPU 1's vCPU is in the guest, busy running a thread of
         // the child's address space (not idle).
         assert!(fixture.zone.reset_slot(other));
-        fixture.zone.drive(other, 2);
-        fixture.zone.publish_slot(other, child_mm, Some(1), 1 << 1);
+        fixture
+            .zone
+            .drive(other, 2, &carrick_sched_core::OwedPasses::new());
+        fixture.zone.publish_slot(
+            other,
+            child_mm,
+            Some(1),
+            1 << 1,
+            &carrick_sched_core::OwedPasses::new(),
+        );
         fixture.zone.enter_guest(other);
         fixture.zone.install_space(other, child_mm).unwrap();
         fixture.zone.slot(other).set_sgi_target(0x77);
@@ -2591,8 +2618,16 @@ fn forked_child_futex_wake_places_a_waiter_pinned_to_a_stopped_vcpu_on_it() {
         // Guest CPU 1's executor drives its slot but is stopped at a host
         // exit: the slot is live and out of the guest.
         assert!(fixture.zone.reset_slot(other));
-        fixture.zone.drive(other, 2);
-        fixture.zone.publish_slot(other, child_mm, Some(1), 1 << 1);
+        fixture
+            .zone
+            .drive(other, 2, &carrick_sched_core::OwedPasses::new());
+        fixture.zone.publish_slot(
+            other,
+            child_mm,
+            Some(1),
+            1 << 1,
+            &carrick_sched_core::OwedPasses::new(),
+        );
         fixture.zone.slot(other).set_sgi_target(0x77);
         assert!(!fixture.zone.slot(other).state().in_guest());
 
@@ -2649,7 +2684,10 @@ fn forked_child_futex_wake_places_a_waiter_pinned_to_a_stopped_vcpu_on_it() {
     // CPU 1's executor comes back to the guest and runs its thread.
     fixture.zone.enter_guest(other);
     fixture.zone.install_space(other, child_mm).unwrap();
-    let selected = fixture.zone.switch_in_full(other).unwrap();
+    let selected = fixture
+        .zone
+        .switch_in_full(other, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     assert_eq!(selected.record, waiter);
     assert_eq!(selected.result, Some(0));
 }
@@ -2681,9 +2719,23 @@ fn forked_child_futex_wake_hands_a_waiter_no_driven_vcpu_may_run_to_the_host() {
         // Guest CPU 1's executor drove its slot, then its mailbox lease
         // moved on: the slot keeps CPU 1 but nobody drives it.
         assert!(fixture.zone.reset_slot(other));
-        fixture.zone.drive(other, 2);
-        fixture.zone.publish_slot(other, child_mm, Some(1), 1 << 1);
-        assert!(fixture.zone.leave_slot(other, 2, &mut |_| {}, &mut |_| {}));
+        fixture
+            .zone
+            .drive(other, 2, &carrick_sched_core::OwedPasses::new());
+        fixture.zone.publish_slot(
+            other,
+            child_mm,
+            Some(1),
+            1 << 1,
+            &carrick_sched_core::OwedPasses::new(),
+        );
+        assert!(fixture.zone.leave_slot(
+            other,
+            2,
+            &mut |_| {},
+            &mut |_| {},
+            &carrick_sched_core::OwedPasses::new()
+        ));
         assert_eq!(fixture.zone.slot(other).driver(), None);
 
         // The child's partner thread, pinned to CPU 1, parks on the word.
@@ -2749,17 +2801,20 @@ fn forked_child_futex_wake_hands_a_waiter_no_driven_vcpu_may_run_to_the_host() {
         carrick_kernel::el1_zone::hand_back_completions();
     });
     assert_eq!(fixture.zone.record(waiter).claim(), Claim::Held { seq });
-    fixture.zone.drive(other, 2);
+    fixture
+        .zone
+        .drive(other, 2, &carrick_sched_core::OwedPasses::new());
     fixture.zone.publish_slot(
         other,
         fixture.zone.record(waiter).identity().mm,
         Some(1),
         1 << 1,
+        &carrick_sched_core::OwedPasses::new(),
     );
     fixture.zone.enter_guest(other);
     let switched = fixture
         .zone
-        .switch_in_full(other)
+        .switch_in_full(other, &carrick_sched_core::OwedPasses::new())
         .expect("held waiter runs on returning CPU 1");
     assert_eq!(switched.record, waiter);
     assert_eq!(switched.result, Some(0));

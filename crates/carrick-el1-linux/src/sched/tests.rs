@@ -68,8 +68,18 @@ fn identity(tid: u64) -> ThreadIdentity {
 /// loaded task's address space before it runs the vCPU).
 fn host_publish(zone: &ZoneTables, slot: SlotId, mm: u64, cpu: Option<u32>, affinity: u64) {
     // The executor that loads it drives the slot (one executor per slot).
-    zone.drive(slot, u64::from(slot.raw()) + 1);
-    zone.publish_slot(slot, mm, cpu, affinity);
+    zone.drive(
+        slot,
+        u64::from(slot.raw()) + 1,
+        &carrick_sched_core::OwedPasses::new(),
+    );
+    zone.publish_slot(
+        slot,
+        mm,
+        cpu,
+        affinity,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     let here = carrick_sched_core::ExecutionSlot::zone(slot);
     zone.occupancy.vacate_any(here);
     if mm != 0 {
@@ -263,10 +273,16 @@ fn host_request_during_repark(kind: Handback) {
     impl UserWord for RequestOnRead<'_> {
         fn read_u32(&self, task: &CurrentTask, uaddr: u64) -> Option<u32> {
             assert_eq!(
-                self.zone
-                    .claim_for_host(self.record, None, self.kind, &HostWait, &|owned| {
+                self.zone.claim_for_host(
+                    self.record,
+                    None,
+                    self.kind,
+                    &HostWait,
+                    &|owned| {
                         crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-                    }),
+                    },
+                    &carrick_sched_core::OwedPasses::new()
+                ),
                 carrick_el1_abi::HostClaim::El1Held { slot: SLOT }
             );
             // Model delivery of the claimant's kick after dispatch admission.
@@ -315,9 +331,13 @@ fn host_request_during_repark(kind: Handback) {
 
     // The stopped executor's normal reconciliation: queue cancellation,
     // requested handbacks, then the current record, if one remains.
-    zone.sweep_cancelled(SLOT);
+    zone.sweep_cancelled(SLOT, &carrick_sched_core::OwedPasses::new());
     let mut handed = std::vec::Vec::new();
-    zone.take_host_wanted(SLOT, &mut |record| handed.push(record));
+    zone.take_host_wanted(
+        SLOT,
+        &mut |record| handed.push(record),
+        &carrick_sched_core::OwedPasses::new(),
+    );
     if zone.slot(SLOT).current() == Some(b) {
         let _ = zone.handback_current(SLOT, b);
     }
@@ -391,7 +411,10 @@ fn production_futex_wait_switch_keeps_successor_result_separate_from_wait_result
         *zone.record(successor).ctx_mut() =
             Aarch64ParkedContext::from_register(saved, TTBR_MM, MM, 1);
     }
-    assert!(zone.requeue_preempted(SLOT, successor).is_queued());
+    assert!(
+        zone.requeue_preempted(SLOT, successor, &carrick_sched_core::OwedPasses::new())
+            .is_queued()
+    );
     let counters = counters();
     let names = InotifyNameCache::new();
     let operation = carrick_personality_linux::sched::FUTEX_WAIT_BITSET_PRIVATE_REALTIME;
@@ -575,7 +598,8 @@ fn host_service_posted_at_idle_boundary_does_not_sleep_in_wfi() {
             Some(seq),
             Handback::Service,
             &HostWait,
-            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+            &carrick_sched_core::OwedPasses::new()
         ),
         carrick_el1_abi::HostClaim::Claimed
     );
@@ -589,7 +613,7 @@ fn host_service_posted_at_idle_boundary_does_not_sleep_in_wfi() {
         let publisher = scope.spawn(move || {
             publisher_gate.wait();
             let placed = publisher_zone
-                .place_from_host(service)
+                .place_from_host(service, &carrick_sched_core::OwedPasses::new())
                 .expect("other process has a live idle executor");
             assert_eq!(placed.slot, SLOT);
             assert!(placed.resched, "the host owes an idle reschedule");
@@ -718,8 +742,8 @@ fn a_wake_hands_a_thread_to_the_idle_vcpu_it_belongs_to() {
         doorbell.settled();
     }
     // Pretend the kick never happened: OTHER is parked in WFI.
-    assert!(!zone.enter_idle(OTHER, false));
-    assert!(zone.enter_idle(OTHER, true));
+    assert!(!zone.enter_idle(OTHER, false, &carrick_sched_core::OwedPasses::new()));
+    assert!(zone.enter_idle(OTHER, true, &carrick_sched_core::OwedPasses::new()));
     let rb = zone.slot(OTHER).host_record().unwrap();
 
     // A on SLOT wakes B.
@@ -847,7 +871,7 @@ fn an_el1_futex_wake_always_finishes_in_ring() {
     // Pinned to a vCPU stopped at a host exit: queued there, where its
     // driver runs it on re-entry, never on the waker (#1961 review).
     let zone = setup();
-    zone.leave_guest(OTHER, &HostWait);
+    zone.leave_guest(OTHER, &HostWait, &carrick_sched_core::OwedPasses::new());
     let (b, seq) = park(&zone, 202, 1 << 1, &[uaddr]);
     let (served, x0, sgis, task) = wake(&zone, uaddr);
     assert_eq!(
@@ -1010,7 +1034,10 @@ fn late_host_work_on_a_switched_native_record_enters_its_owner_boundary() {
         *zone.record(record).ctx_mut() =
             Aarch64ParkedContext::from_register(thread_ctx(0xA, 0x1000), TTBR_MM, MM, 1);
     }
-    assert!(zone.requeue_preempted(SLOT, record).is_queued());
+    assert!(
+        zone.requeue_preempted(SLOT, record, &carrick_sched_core::OwedPasses::new())
+            .is_queued()
+    );
     let task = CurrentTask::new();
     let counters = counters();
     let mut frame = TrapFrame {
@@ -1071,7 +1098,10 @@ fn late_host_work_settles_native_owner_before_host_affinity_exit() {
         *zone.record(record).ctx_mut() =
             Aarch64ParkedContext::from_register(thread_ctx(0xA, 0x1000), TTBR_MM, MM, 1);
     }
-    assert!(zone.requeue_preempted(SLOT, record).is_queued());
+    assert!(
+        zone.requeue_preempted(SLOT, record, &carrick_sched_core::OwedPasses::new())
+            .is_queued()
+    );
     let task = CurrentTask::new();
     let counters = counters();
     let mut frame = TrapFrame {
@@ -1098,7 +1128,13 @@ fn late_host_work_settles_native_owner_before_host_affinity_exit() {
     affinity.initialize(1 << 1);
     // SAFETY: this fixture retains `affinity` through the scheduler call.
     let source = unsafe { carrick_sched_core::AffinitySource::from_authority(&affinity) };
-    zone.publish_slot_with_affinity(SLOT, 0, Some(0), source);
+    zone.publish_slot_with_affinity(
+        SLOT,
+        0,
+        Some(0),
+        source,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     assert!(zone.slot(SLOT).affinity_excludes_cpu());
     let decision = Sched {
         handoff: None,
@@ -1399,11 +1435,16 @@ fn host_runnable(zone: &ZoneTables, slot: SlotId, tid: u64) -> RecordId {
             None,
             Handback::Service,
             &HostWait,
-            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+            &carrick_sched_core::OwedPasses::new()
         ),
         carrick_el1_abi::HostClaim::Claimed
     );
-    assert_eq!(zone.place_from_host(record).map(|p| p.slot), Some(slot));
+    assert_eq!(
+        zone.place_from_host(record, &carrick_sched_core::OwedPasses::new())
+            .map(|p| p.slot),
+        Some(slot)
+    );
     record
 }
 
@@ -1419,7 +1460,10 @@ fn an_idle_vcpu_does_not_steal_host_service_work() {
     host_publish(&zone, OTHER, MM, Some(1), 0);
     zone.enter_guest(OTHER);
 
-    assert!(zone.steal(OTHER).is_none());
+    assert!(
+        zone.steal(OTHER, &carrick_sched_core::OwedPasses::new())
+            .is_none()
+    );
     assert_eq!(zone.runnable_head(SLOT), Some(service));
     assert_eq!(zone.runnable_head(OTHER), None);
     assert_eq!(zone.counters.el1_steals.load(Ordering::Relaxed), 0);
@@ -1675,6 +1719,7 @@ fn queue_foreign_binding(
         true,
         &mut |_| panic!("no slot could run the woken thread"),
         &mut |_| placed += 1,
+        &carrick_sched_core::OwedPasses::new(),
     );
     drop(guard);
     assert_eq!((woken, placed), (1, 1));
@@ -1746,6 +1791,7 @@ fn a_futex_wait_switches_the_vcpu_to_another_process_in_guest() {
             true,
             &mut |_| panic!("A's home slot is in the guest"),
             &mut |_| {},
+            &carrick_sched_core::OwedPasses::new(),
         );
         assert_eq!(woken, 1);
     }
@@ -1799,7 +1845,8 @@ fn a_raised_gate_sends_the_thread_to_its_executor() {
     assert_eq!(zone.installed_space(SLOT), MM);
     assert!(cpu.translations.is_empty());
     assert_eq!(
-        zone.take_service_head(SLOT).map(|r| r.id),
+        zone.take_service_head(SLOT, &carrick_sched_core::OwedPasses::new())
+            .map(|r| r.id),
         Some(b),
         "the executor takes B"
     );
@@ -1949,7 +1996,11 @@ fn round_trip_then_switch_in(
         );
     }
     let switches_before = zone.counters.el1_space_switches.load(Ordering::Relaxed);
-    assert_eq!(zone.take_service_head(TRIP).map(|r| r.id), Some(b));
+    assert_eq!(
+        zone.take_service_head(TRIP, &carrick_sched_core::OwedPasses::new())
+            .map(|r| r.id),
+        Some(b)
+    );
     {
         let guard = zone
             .lock(ZoneTables::bucket_of_with_context(MM, a_addr), &HostWait)
@@ -1963,6 +2014,7 @@ fn round_trip_then_switch_in(
             true,
             &mut |_| panic!("A's home slot is in the guest"),
             &mut |_| {},
+            &carrick_sched_core::OwedPasses::new(),
         );
         assert_eq!(woken, 1);
     }
@@ -2289,6 +2341,7 @@ fn the_idle_entry_runs_no_thread_itself() {
         true,
         &mut |_| handed += 1,
         &mut |_| placed += 1,
+        &carrick_sched_core::OwedPasses::new(),
     );
     drop(guard);
     assert_eq!((woken, handed, placed), (1, 1, 0), "handed to the host");
@@ -2696,9 +2749,13 @@ fn concurrent_timer_park_and_guard_refusal_preserve_record_ownership() {
     assert!(parked.matches(&zone, SLOT));
     assert_eq!(zone.timer_deadline(SLOT), Some(5000));
     assert_eq!(
-        zone.expire_timer(SLOT, 5000, 0, &|owned| {
-            crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-        }),
+        zone.expire_timer(
+            SLOT,
+            5000,
+            0,
+            &|owned| { crate::sched::object_wait::deliver_host_completion(owned.zone(), owned) },
+            &carrick_sched_core::OwedPasses::new()
+        ),
         Ok(true)
     );
     assert_eq!(zone.timer_deadline(SLOT), Some(10000));
@@ -2725,7 +2782,13 @@ fn idle_resched_keeps_an_affinity_excluded_home_record_queued() {
         let counters = counters();
         host_publish(&zone, SLOT, MM, Some(0), 3);
         host_publish(&zone, LOADED, MM, Some(1), 3);
-        zone.publish_slot_with_affinity(LOADED, MM, Some(1), source);
+        zone.publish_slot_with_affinity(
+            LOADED,
+            MM,
+            Some(1),
+            source,
+            &carrick_sched_core::OwedPasses::new(),
+        );
         zone.enter_guest(SLOT);
         zone.enter_guest(LOADED);
 
@@ -2820,7 +2883,7 @@ fn switched_affinity_boundary(at_return: bool) {
     host_publish(&zone, other, MM, Some(0), 3);
     zone.enter_guest(SLOT);
     zone.enter_guest(other);
-    zone.enter_idle(other, false);
+    zone.enter_idle(other, false, &carrick_sched_core::OwedPasses::new());
     let control = carrick_personality_linux::abi::thread::ThreadControlSlot::new();
     control.initialize_affinity(carrick_core::affinity::CpuAffinity::all(2));
     // SAFETY: this stack control outlives the record and both scheduler slots.
@@ -2829,8 +2892,16 @@ fn switched_affinity_boundary(at_return: bool) {
     let mut id = identity(202);
     id.affinity_source = source;
     let record = zone.alloc_record(id).unwrap();
-    assert!(zone.requeue_preempted(SLOT, record).is_queued());
-    assert_eq!(zone.switch_in_full(SLOT).unwrap().record, record);
+    assert!(
+        zone.requeue_preempted(SLOT, record, &carrick_sched_core::OwedPasses::new())
+            .is_queued()
+    );
+    assert_eq!(
+        zone.switch_in_full(SLOT, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
+        record
+    );
     struct NoHostResidency;
     impl carrick_core::affinity::AffinityNotifier for NoHostResidency {
         fn notify(&mut self, _: carrick_core::affinity::AffinityNotification) {}
@@ -2861,7 +2932,12 @@ fn switched_affinity_boundary(at_return: bool) {
         );
     }
     assert_eq!(zone.slot(SLOT).current(), None);
-    assert_eq!(zone.switch_in_full(other).unwrap().record, record);
+    assert_eq!(
+        zone.switch_in_full(other, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
+        record
+    );
     assert_eq!(cpu.now, before);
 }
 
@@ -2896,7 +2972,10 @@ fn switched_admission_rechecks_affinity_before_loading_its_frame() {
     host_publish(&zone, SLOT, MM, Some(1), 3);
     zone.enter_guest(SLOT);
     let record = zone.alloc_record(identity(703)).unwrap();
-    assert!(zone.requeue_preempted(SLOT, record).is_queued());
+    assert!(
+        zone.requeue_preempted(SLOT, record, &carrick_sched_core::OwedPasses::new())
+            .is_queued()
+    );
     zone.record(record).set_affinity(1);
     let task = task_for(703);
     let mut cpu = FakeCpu::default();
