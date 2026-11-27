@@ -710,11 +710,12 @@ fn mounted_static_x86_fork_cow_arena_chunks_retire_with_their_last_inheritor() {
     );
 }
 
-/// #3127: the same, when the grandchild unmaps every inherited replacement
-/// before it exits. Its last hold on the chunks is then the unmap's drain
-/// debt rather than an alias, and the chunks must still retire with it:
-/// by the end of the run the carrier holds no more memslots than without
-/// a grandchild.
+/// #3127: the same, when the grandchild first replaces every inherited
+/// page (its own COW, which repoints it off the child's chunks) and then
+/// unmaps the range. Its last hold on the chunks is then the drain debt of
+/// those unlinks rather than an alias, and the chunks must still retire
+/// with it: by the end of the run the carrier holds no more memslots than
+/// without a grandchild.
 #[test]
 fn mounted_static_x86_fork_cow_arena_chunks_retire_after_their_last_inheritor_unmaps() {
     let Some(plain) = fork_child_cow_pages(4096, "x86-fork-cow-plain-u", Duration::from_secs(30))
