@@ -8922,6 +8922,14 @@ fn run_x86_fork_exec_poll_witness(become_ready: bool) {
 /// `native_child_mprotect_shapes.S` for the cases). The same binary runs
 /// natively first, as the Linux oracle.
 fn run_reservation_shape(case: u32) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
+    run_reservation_shape_on(case, ROOT_AFFINITY_LOADED)
+}
+
+/// [`run_reservation_shape`] with the run root schedulable on `affinity`.
+fn run_reservation_shape_on(
+    case: u32,
+    affinity: u64,
+) -> carrick_runtime::prepare::PreparedKvmPoolOutcome {
     let define = format!("-DCASE={case}");
     let elf = native_exit_fixture_with_flags("native_child_mprotect_shapes.S", &[&define]);
     let dir = tempfile::tempdir().expect("oracle directory");
@@ -8933,8 +8941,7 @@ fn run_reservation_shape(case: u32) -> carrick_runtime::prepare::PreparedKvmPool
         .output()
         .expect("run native oracle");
     assert_eq!(native.status.code(), Some(7), "native oracle case {case}");
-    try_run_pool_fixture_with_root_affinity(&elf, 4096, ROOT_AFFINITY_LOADED)
-        .expect("reservation shape run")
+    try_run_pool_fixture_with_root_affinity(&elf, 4096, affinity).expect("reservation shape run")
 }
 
 macro_rules! reservation_shape_witness {
@@ -9035,20 +9042,69 @@ reservation_shape_witness!(
      the munmap before the fix)."
 );
 
-reservation_shape_witness!(
-    production_mprotect_none_covers_a_sparse_resident_range,
-    17,
-    "#2875, V8's `FreePages`: one `mprotect(PROT_NONE)` over the root's sparse resident range \
-     returns 0 (ENOSYS before the fix). A kernel read and write of it are EFAULT, a read faults \
-     `SEGV_ACCERR` at page 0, and widening it back to RW finds both resident pages' bytes."
-);
-reservation_shape_witness!(
-    production_mprotect_none_faults_a_sibling_thread_with_accerr,
-    20,
-    "#2875, two live threads: a sibling reads a resident page, the main thread mprotects it \
-     `PROT_NONE` and wakes it, and the sibling's next read faults `SEGV_ACCERR` at the page; \
-     widening it back finds its byte."
-);
+/// #2875, V8's `FreePages`: one `mprotect(PROT_NONE)` over the root's sparse
+/// resident range returns 0 (ENOSYS before the fix). A kernel read and write
+/// of it are EFAULT, a read faults `SEGV_ACCERR` at page 0, and widening it
+/// back to RW finds both resident pages' bytes.
+#[test]
+fn production_mprotect_none_covers_a_sparse_resident_range() {
+    let outcome = run_reservation_shape(17);
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (7, None),
+        "case 17 exit (7 = Linux; else the errno, +100 from mmap): {:?}",
+        outcome.run
+    );
+}
+
+/// #2875, two live threads, with the root schedulable on either vCPU: the
+/// sibling keeps reading a resident page, so its CPU holds a live
+/// translation, while the main thread mprotects it `PROT_NONE`. Once the
+/// mprotect has returned, the sibling's read must fault `SEGV_ACCERR` at the
+/// page (93 is a stale translation), and widening it back finds its byte.
+/// The x86 ring doesn't yet serve getcpu(2) or sched_setaffinity(2) (#3131),
+/// so the two threads' placement on different vCPUs is not forced or checked.
+#[test]
+fn production_mprotect_none_faults_a_spinning_sibling_thread_with_accerr() {
+    let outcome = run_reservation_shape_on(20, kvm_pool_fixture::ROOT_AFFINITY_ANY);
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (7, None),
+        "case 20 exit (7 = Linux; 93 = no fault after the mprotect): {:?}",
+        outcome.run
+    );
+}
+
+/// #2875: forking a `PROT_NONE` private page. Until slice B (the fork arm
+/// of a no-access leaf, through #3061's core fork), Carrick refuses the fork
+/// with EFAULT; the refusal must be clean, so the parent then widens the page
+/// and still reads its byte (exit 120 + EFAULT; 92 if the byte is gone, 7 once
+/// slice B makes the fork succeed as on Linux).
+#[test]
+fn production_fork_of_a_prot_none_page_refuses_cleanly_and_keeps_the_parents_page() {
+    let outcome = run_reservation_shape(22);
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (120 + 14, None),
+        "case 22 exit (134 = a clean EFAULT refusal; 7 = Linux): {:?}",
+        outcome.run
+    );
+}
+
+/// #2875 slice B: the Linux contract for case 22. The child inherits the
+/// no-access page, widens it and reads the parent's byte; the parent keeps
+/// its own copy.
+#[test]
+#[ignore = "x86 fork of a PROT_NONE private page, #2875 slice B"]
+fn production_fork_of_a_prot_none_page_inherits_it_as_on_linux() {
+    let outcome = run_reservation_shape(22);
+    assert_eq!(
+        (outcome.run.exit_code, outcome.run.terminating_signal),
+        (7, None),
+        "case 22 exit (7 = Linux): {:?}",
+        outcome.run
+    );
+}
 reservation_shape_witness!(
     production_mprotect_widening_in_a_forked_child_keeps_the_parents_page,
     21,
