@@ -2111,6 +2111,44 @@ fn mounted_static_x86_munmap_split_keeps_residency_when_the_table_is_full() {
     );
 }
 
+/// `mremap` of private anonymous rows, in the root and in a forked child
+/// beside its live parent (#3152): grow in place, shrink, and grow by move
+/// past a blocker, each with Linux's address and bytes. Before #3152 the x86
+/// ring had no `mremap` arm and every shape answered a counted ENOSYS.
+#[test]
+fn mounted_static_x86_mremap_grows_shrinks_and_moves_anonymous_rows_as_native() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("mremap-anonymous-growth");
+    compile_assembly_with_flags(
+        "x86_mremap_anonymous_growth.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native mremap oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+    assert_eq!(native.stdout, b"mremap ok\n", "native oracle");
+    let guest = run_mounted_binary(&elf, "mremap-anonymous-growth", false);
+    assert_eq!(
+        (guest.status.code(), guest.stdout.as_slice()),
+        (native.status.code(), native.stdout.as_slice()),
+        "11-13 a root shape (grow in place, shrink, grow by move), 21-23 the \
+         child's, 9 a setup map; the errno or bad value is printed. stdout: {} \
+         stderr: {}",
+        String::from_utf8_lossy(&guest.stdout),
+        String::from_utf8_lossy(&guest.stderr)
+    );
+}
+
 #[test]
 fn mounted_static_x86_exec_refuses_before_replacement_identity() {
     if skip_without_kvm() {
