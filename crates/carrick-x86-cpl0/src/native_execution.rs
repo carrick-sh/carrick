@@ -45,6 +45,22 @@ pub fn schedule(slot: SlotId) -> ! {
     crate::test_support::release_fork_cow_editor_on_park(source);
     settle_current_work(current);
     'schedule: loop {
+        // Drain any APIC timer or reschedule vector latched while IF was masked
+        // on the outgoing thread before selecting and preparing the next one;
+        // xAPIC IA32_TSC_DEADLINE latches IRR on expiry and WRMSR(0) does not
+        // clear an already-pending IRR bit.
+        //
+        // The drain comes before every condition this pass reads (#3053), as
+        // ARM's idle pass takes its interrupts first. A reschedule vector
+        // carries no state of its own: its sender publishes the condition,
+        // then sends it. Read before the drain, a condition published after
+        // that read had its vector consumed here, and the HLT below slept
+        // past it. Read after, the condition is either visible to this pass
+        // or its vector is still pending at the `sti; hlt`, which then
+        // returns at once.
+        unsafe {
+            core::arch::asm!("sti", "nop", "cli", options(nomem, nostack));
+        }
         #[cfg(feature = "test-support")]
         crate::test_support::hold_idle_scan(slot);
         #[cfg(feature = "test-support")]
@@ -56,13 +72,6 @@ pub fn schedule(slot: SlotId) -> ! {
         expire_timers(slot);
         #[cfg(feature = "test-support")]
         crate::test_support::order_after_idle_read(slot, current);
-        // Drain any APIC timer or reschedule vector latched while IF was masked
-        // on the outgoing thread before selecting and preparing the next one;
-        // xAPIC IA32_TSC_DEADLINE latches IRR on expiry and WRMSR(0) does not
-        // clear an already-pending IRR bit.
-        unsafe {
-            core::arch::asm!("sti", "nop", "cli", options(nomem, nostack));
-        }
         if let Some(selected) = source.zone.take_idle_work(slot) {
             source.zone.leave_idle(slot);
             let record = source.zone.record_ref(selected.record);
@@ -350,8 +359,16 @@ pub fn schedule(slot: SlotId) -> ! {
         if source.zone.enter_idle(slot, true) {
             #[cfg(feature = "test-support")]
             crate::test_support::order_before_idle_hlt(slot, current);
-            unsafe {
-                core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
+            // The slot is IdleWfi: a waker that queues here from now on sends
+            // a vector, which stays pending in the IRR. Work announced before
+            // it only by a durable word (host work published on this CPU while
+            // it was stopped in a crossing, an owed reschedule) has no such
+            // vector, so recheck those words before HLT (#3053), as ARM does
+            // before WFI. A pass that finds one runs again and settles it.
+            if !carrick_el1::substrate::sched::idle_wake_owed(current, source.zone, slot) {
+                unsafe {
+                    core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
+                }
             }
             source.zone.leave_idle(slot);
         }
