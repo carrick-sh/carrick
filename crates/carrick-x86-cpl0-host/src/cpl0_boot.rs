@@ -5441,15 +5441,18 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
         }
         let slot = SlotId::new(cpu.raw() as u8);
         let sink = custody.carrier_zone_wake()?;
-        if zone.claim_for_host(
+        let passes = carrick_sched_core::OwedPasses::new();
+        let claim = zone.claim_for_host(
             zone.record_ref(record),
             None,
             carrick_sched_core::Handback::Resumed,
             &carrick_sched_core::BoundedSpin(0),
             &|owned| custody.complete_object_wake(cpu, &*sink, owned),
-        ) != carrick_sched_core::HostClaim::Claimed
-            || sink.take_undelivered().is_some()
-        {
+            &passes,
+        );
+        // Kick the idle CPUs the claim's lock releases owe a scan (#3083).
+        passes.deliver(|slot| sink.resched(slot));
+        if claim != carrick_sched_core::HostClaim::Claimed || sink.take_undelivered().is_some() {
             return Err(fail("fixture queue placement refused"));
         }
         if pin_thread {
@@ -5460,7 +5463,10 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
             // CPU running its own home thread (CPU 0's root) keeps it.
             let _ = zone.unhome(slot, record, 1 << cpu.raw());
         }
-        if zone.requeue_on(slot, record).is_none() {
+        let passes = carrick_sched_core::OwedPasses::new();
+        let placed = zone.requeue_on(slot, record, &passes);
+        passes.deliver(|slot| sink.resched(slot));
+        if placed.is_none() || sink.take_undelivered().is_some() {
             return Err(fail("fixture queue placement refused"));
         }
         Ok(())
@@ -5489,14 +5495,18 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
         // SAFETY: boot initialized the aligned zone in this retained window.
         let zone = unsafe { &*pointer.cast::<X86Cpl0Zone>() };
         let slot = SlotId::new(cpu.raw() as u8);
-        let Some(_guard) = zone.slot_lock(slot, &carrick_sched_core::BoundedSpin(0)) else {
-            return Ok(false);
-        };
-        Ok(
-            zone.slot(slot).state() == carrick_sched_core::SlotState::IdleWfi
-                && zone.slot(slot).current().is_none()
-                && zone.slot(slot).queued() == 0,
-        )
+        let sink = custody.carrier_zone_wake()?;
+        let passes = carrick_sched_core::OwedPasses::new();
+        let idle = zone
+            .slot_lock(slot, &carrick_sched_core::BoundedSpin(0), &passes)
+            .is_some_and(|_guard| {
+                zone.slot(slot).state() == carrick_sched_core::SlotState::IdleWfi
+                    && zone.slot(slot).current().is_none()
+                    && zone.slot(slot).queued() == 0
+            });
+        // A guest scan that met this census's lock is owed a pass (#3083).
+        passes.deliver(|slot| sink.resched(slot));
+        Ok(idle)
     }
 
     /// Atomic fixture census of the actual native wait enrollment.
@@ -5573,31 +5583,35 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
         if cpu.raw() >= 2 {
             return Err(fail("unknown native fixture CPU"));
         }
-        let pointer = {
+        let (pointer, sink) = {
             let custody = self
                 .custody
                 .lock()
                 .map_err(|_| fail("physical custody poisoned"))?;
-            custody
+            let pointer = custody
                 .ram
                 .host_ptr(
                     META_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
                     size_of::<X86Cpl0Zone>(),
                 )
-                .ok_or_else(|| fail("fixture native zone backing"))?
+                .ok_or_else(|| fail("fixture native zone backing"))?;
+            (pointer, custody.carrier_zone_wake()?)
         };
         // SAFETY: boot initialized the aligned zone in this retained window,
         // and this factory (borrowed for the whole call) retains the RAM.
         let zone = unsafe { &*pointer.cast::<X86Cpl0Zone>() };
-        let guard = zone
+        let passes = carrick_sched_core::OwedPasses::new();
+        let result = zone
             .slot_lock(
                 SlotId::new(cpu.raw() as u8),
                 &carrick_sched_core::BoundedSpin(0),
+                &passes,
             )
-            .ok_or_else(|| fail("fixture slot lock busy"))?;
-        let result = body();
-        drop(guard);
-        Ok(result)
+            .map(|_guard| body());
+        // The guest scans that gave up on this held lock are owed a pass
+        // (#3083): kick them, as the guest's own release would.
+        passes.deliver(|slot| sink.resched(slot));
+        result.ok_or_else(|| fail("fixture slot lock busy"))
     }
 
     /// Whether a guest CPU holds futex bucket `bucket`'s lock now (a waker
@@ -9738,13 +9752,20 @@ fn publish_production_reservations<M: CarrierMemoryIo>(
         return Err(error);
     }
     let slot = SlotId::new(0);
+    let passes = carrick_sched_core::OwedPasses::new();
     zone.drive_and_publish(
         slot,
         1,
         mm.raw(),
         Some(0),
         carrick_sched_core::AffinitySource::UNBOUND,
+        &passes,
     );
+    // The vCPUs are stopped, so no idle scan can have met this lock: an
+    // owed pass here is a broken invariant (#3083), never a kick to send.
+    passes
+        .expect_none()
+        .map_err(|_| fail("stopped boot publication owed an idle-scan pass"))?;
     zone.enter_guest(slot);
     zone.install_space(slot, mm.raw())
         .ok_or_else(|| fail("production installed MM"))?;

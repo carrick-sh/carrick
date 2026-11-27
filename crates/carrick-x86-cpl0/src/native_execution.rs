@@ -79,7 +79,11 @@ pub fn schedule(slot: SlotId) -> ! {
         expire_timers(slot);
         #[cfg(feature = "test-support")]
         crate::test_support::order_after_idle_read(slot, current);
-        if let Some(selected) = source.zone.take_idle_work(slot) {
+        // An idle scan's lock releases can owe other idle CPUs a pass (#3083).
+        let passes = carrick_sched_core::OwedPasses::new();
+        let selected = source.zone.take_idle_work(slot, &passes);
+        carrick_el1::substrate::sched::object_wait::deliver_owed_passes(source.zone, slot, passes);
+        if let Some(selected) = selected {
             source.zone.leave_idle(slot);
             let record = source.zone.record_ref(selected.record);
             if let Ok(now) = carrick_guest_arch::InterruptBackend::counter(&mut x86::X86Backend) {
@@ -369,7 +373,12 @@ pub fn schedule(slot: SlotId) -> ! {
             let _ =
                 carrick_el1::isa::x86::X86Backend.arm_timer(Some(Deadline(CounterTick::new(dl))));
         }
-        if source.zone.enter_idle(slot, true) {
+        // Send what the idle entry's lock release owes (#3083) before the
+        // pre-HLT recheck, as ARM sends it before its pre-WFI recheck.
+        let passes = carrick_sched_core::OwedPasses::new();
+        let idle = source.zone.enter_idle(slot, true, &passes);
+        carrick_el1::substrate::sched::object_wait::deliver_owed_passes(source.zone, slot, passes);
+        if idle {
             #[cfg(feature = "test-support")]
             crate::test_support::order_before_idle_hlt(slot, current);
             // The slot is IdleWfi: a waker that queues here from now on sends
@@ -428,6 +437,7 @@ fn expire_timers(slot: SlotId) {
     let mut backend = x86::X86Backend;
     let now = backend.counter().unwrap_or_else(|_| fatal_boot!());
     let retry_ticks = ticks(&mut backend, TIMER_RETRY_NS);
+    let passes = carrick_sched_core::OwedPasses::new();
     let deadline = zone.expire_timer_and_rearm(
         slot,
         now.raw(),
@@ -436,7 +446,9 @@ fn expire_timers(slot: SlotId) {
         &|owned| {
             carrick_el1::substrate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
         },
+        &passes,
     );
+    carrick_el1::substrate::sched::object_wait::deliver_owed_passes(zone, slot, passes);
     backend
         .arm_timer(deadline.map(|ticks| Deadline(CounterTick::new(ticks))))
         .unwrap_or_else(|_| fatal_boot!());

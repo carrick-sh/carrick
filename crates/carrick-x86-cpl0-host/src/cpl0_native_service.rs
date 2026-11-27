@@ -633,8 +633,14 @@ mod stopped_completion_tests {
         let stopped = SlotId::new(0);
         let peer = SlotId::new(1);
         for slot in [stopped, peer] {
-            zone.drive(slot, 1);
-            zone.publish_slot(slot, MM, Some(u32::from(slot.raw())), 0b11);
+            zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+            zone.publish_slot(
+                slot,
+                MM,
+                Some(u32::from(slot.raw())),
+                0b11,
+                &carrick_sched_core::OwedPasses::new(),
+            );
             let here = carrick_sched_core::ExecutionSlot::zone(slot);
             zone.occupancy.vacate_any(here);
             assert!(zone.occupancy.replace(here, 0, MM));
