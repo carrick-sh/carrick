@@ -2170,6 +2170,38 @@ fn a_migration_after_an_idle_scan_published_places_the_thread_there() {
     assert_eq!(zone.counters.el1_steals.load(Ordering::Relaxed), 0);
 }
 
+/// #3083: the idle slot's scan ran while a peer's migration had the
+/// thread off every run queue, and the slot now holds its own lock to
+/// decide its sleep. The migration finds the slot idle, cannot take its
+/// lock, and puts the thread back on its own queue: the put-back owes the
+/// idle slot a kick, or the slot sleeps past the thread (main owed none).
+#[test]
+fn a_migration_put_back_kicks_an_idle_slot_it_could_not_place_on() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    enter(&zone, OTHER, 1);
+    let running = zone.alloc_record(identity(40)).unwrap();
+    assert!(zone.requeue_preempted(SLOT, running).is_queued());
+    assert_eq!(zone.switch_in_full(SLOT).map(|s| s.record), Some(running));
+    let stranded = zone.alloc_record(identity(41)).unwrap();
+    assert!(zone.requeue_preempted(SLOT, stranded).is_queued());
+    assert!(!zone.enter_idle(OTHER, false));
+    let held = zone.slot_lock(OTHER, &SpinForever).unwrap();
+    let mut effects = WakeEffects::default();
+    assert_eq!(zone.migrate_queued(SLOT, &mut effects), 0);
+    drop(held);
+    assert_eq!(
+        zone.record(stranded).claim(),
+        Claim::Queued { slot: SLOT, seq: 1 },
+        "put back on its own queue"
+    );
+    assert_eq!(
+        effects.sgi_slots().collect::<Vec<_>>(),
+        [OTHER],
+        "the idle slot is owed a kick"
+    );
+}
+
 /// Stealing never takes a home record or a record needing the thief's host
 /// executor. Such a move would wake an idle vCPU only to exit immediately.
 #[test]
