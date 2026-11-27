@@ -93,20 +93,16 @@ mod cell {
     use crate::substrate::sched::entry_switch::OwedSwitch;
     use carrick_el1_abi::SlotId;
 
+    // One fixed cell per slot, as at EL1: staging a switch never allocates
+    // (the zero-allocation I/O witnesses run through this tail). Per thread,
+    // because host tests share a process.
     std::thread_local! {
-        static CELLS: core::cell::RefCell<std::collections::BTreeMap<u16, OwedSwitch>> =
-            const { core::cell::RefCell::new(std::collections::BTreeMap::new()) };
+        static CELLS: [core::cell::Cell<Option<OwedSwitch>>; carrick_sched_core::ZONE_SLOTS] =
+            const { [const { core::cell::Cell::new(None) }; carrick_sched_core::ZONE_SLOTS] };
     }
 
     pub(super) fn replace(slot: SlotId, owed: Option<OwedSwitch>) -> Option<OwedSwitch> {
-        let key = u16::from(slot.raw());
-        CELLS.with(|cells| {
-            let mut cells = cells.borrow_mut();
-            match owed {
-                Some(owed) => cells.insert(key, owed),
-                None => cells.remove(&key),
-            }
-        })
+        CELLS.with(|cells| cells[usize::from(slot.raw())].replace(owed))
     }
 }
 
