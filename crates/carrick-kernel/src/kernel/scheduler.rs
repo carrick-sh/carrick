@@ -9293,10 +9293,14 @@ mod tests {
         );
         // The spare waits in the guest on its slot, as its executor does,
         // then its vCPU leaves for the host.
-        zone.drive(slot, 2);
-        zone.publish_slot(slot, 0, Some(0), 0);
+        zone.drive(slot, 2, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 0, Some(0), 0, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
-        zone.leave_guest(slot, &crate::el1_zone::HostLockWait);
+        zone.leave_guest(
+            slot,
+            &crate::el1_zone::HostLockWait,
+            &carrick_sched_core::OwedPasses::new(),
+        );
         assert!(zone.slot(slot).is_live());
 
         // The spare rescans only once its lent CPU is wanted back, so the
@@ -9347,7 +9351,7 @@ mod tests {
             })
             .unwrap();
         let placed = zone
-            .place_from_host(service)
+            .place_from_host(service, &carrick_sched_core::OwedPasses::new())
             .map(|placement| placement.slot);
         assert_eq!(
             placed, None,
@@ -10922,7 +10926,8 @@ mod tests {
                     &carrick_sched_core::ShortLockSpin,
                     &|owned| {
                         let _ = owned.into_parts();
-                    }
+                    },
+                    &carrick_sched_core::OwedPasses::new()
                 ),
                 carrick_sched_core::HostClaim::Claimed
             );
@@ -10948,6 +10953,7 @@ mod tests {
                 &|owned| {
                     let _ = owned.into_parts();
                 },
+                &carrick_sched_core::OwedPasses::new(),
             );
             zone.free_record(record_id);
             scheduler.close();

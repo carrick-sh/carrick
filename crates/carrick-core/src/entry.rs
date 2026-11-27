@@ -565,8 +565,8 @@ mod tests {
             mm: EntryMmKey::from_raw(13),
             thread_generation: EntryThreadGeneration::from_raw(17),
         };
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 0, Some(0), 0);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 0, Some(0), 0, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         let space = zone.spaces.publish_closed(13, 0x1000, 0x1000).unwrap();
         zone.spaces.open(space);
@@ -584,8 +584,14 @@ mod tests {
             })
             .unwrap();
         assert!(zone.mark_native_owned(record));
-        assert!(zone.requeue_preempted(slot, record).is_queued());
-        assert_eq!(zone.switch_in(slot), Some(record));
+        assert!(
+            zone.requeue_preempted(slot, record, &carrick_sched_core::OwedPasses::new())
+                .is_queued()
+        );
+        assert_eq!(
+            zone.switch_in(slot, &carrick_sched_core::OwedPasses::new()),
+            Some(record)
+        );
         assert!(zone.install_space(slot, 13).is_some());
         let source = BornInZoneSource { zone: &zone, slot };
         let start = prepare_handoff(binding, source, record).unwrap();
@@ -598,11 +604,12 @@ mod tests {
                 &ShortLockSpin,
                 &|owned| {
                     let _ = owned.into_parts();
-                }
+                },
+                &carrick_sched_core::OwedPasses::new()
             ),
             HostClaim::El1Held { .. }
         ));
-        let published = zone.unswitch(slot, record);
+        let published = zone.unswitch(slot, record, &carrick_sched_core::OwedPasses::new());
         // Deterministically interleave the host claimant before receipt completion.
         assert!(matches!(
             zone.claim_for_host(
@@ -612,7 +619,8 @@ mod tests {
                 &ShortLockSpin,
                 &|owned| {
                     let _ = owned.into_parts();
-                }
+                },
+                &carrick_sched_core::OwedPasses::new()
             ),
             HostClaim::Claimed
         ));

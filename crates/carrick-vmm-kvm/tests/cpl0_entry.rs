@@ -2529,12 +2529,13 @@ fn x1_boot_shared_substrate() {
         Box::from_raw(ptr)
     };
     let slot = SlotId::new(0);
-    zone.drive(slot, 1);
+    zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
     zone.publish_slot_with_affinity(
         slot,
         11,
         Some(0),
         carrick_sched_core::AffinitySource::UNBOUND,
+        &carrick_sched_core::OwedPasses::new(),
     );
     zone.enter_guest(slot);
 
@@ -2579,8 +2580,13 @@ fn x1_boot_shared_substrate() {
         *zone.record(record).ctx_mut() =
             park_native_context(&native, carrick_sched_core::SavedSyscallPc::AfterSyscall)
     };
-    assert!(zone.requeue_preempted(slot, record).is_queued());
-    let on_cpu = zone.switch_in(slot).unwrap();
+    assert!(
+        zone.requeue_preempted(slot, record, &carrick_sched_core::OwedPasses::new())
+            .is_queued()
+    );
+    let on_cpu = zone
+        .switch_in(slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     assert_eq!(on_cpu, record);
 
     let binding = ContextBinding {

@@ -870,15 +870,27 @@ mod tests {
         // Diagnostic observation neither acquires nor edits custody.
         assert_eq!(zone.record(record).identity(), identity);
         assert_eq!(zone.record(record).claim(), crate::Claim::Free);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, identity.mm, Some(0), 0b11);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(
+            slot,
+            identity.mm,
+            Some(0),
+            0b11,
+            &carrick_sched_core::OwedPasses::new(),
+        );
         assert!(zone.occupancy.replace(
             carrick_sched_core::ExecutionSlot::zone(slot),
             0,
             identity.mm
         ));
-        assert!(zone.requeue_preempted(slot, record).is_queued());
-        assert_eq!(zone.switch_in(slot), Some(record));
+        assert!(
+            zone.requeue_preempted(slot, record, &carrick_sched_core::OwedPasses::new())
+                .is_queued()
+        );
+        assert_eq!(
+            zone.switch_in(slot, &carrick_sched_core::OwedPasses::new()),
+            Some(record)
+        );
         let current = ArmEntryBindingFatal::capture(registers, &frame, binding(), &zone, slot);
         let observed = current.record.unwrap();
         assert_eq!(observed.source, ArmEntryRecordSource::Current);

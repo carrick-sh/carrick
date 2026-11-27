@@ -550,6 +550,7 @@ mod tests {
                 false,
                 &mut |transfer| transfers.push(transfer),
                 &mut |_| panic!("host wake must return this record"),
+                &carrick_sched_core::OwedPasses::new(),
             ),
             1
         );

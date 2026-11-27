@@ -167,8 +167,8 @@ mod tests {
         let ttbr = (4 << 48) | 0x90000;
         let space = zone.spaces.publish_closed(5, ttbr, ttbr).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 5);
-        zone.publish_slot(slot, 5, Some(3), 1);
+        zone.drive(slot, 5, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 5, Some(3), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 5).unwrap();
         let task_offset = carrick_el1_abi::EL1_CURRENT_TASKS_OFFSET as usize

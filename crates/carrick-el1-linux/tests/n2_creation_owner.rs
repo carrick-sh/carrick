@@ -187,8 +187,8 @@ fn admitted_thread_creation_owns_one_completion_at_1_8_32() {
         for (i, task) in tasks.iter().take(n).enumerate() {
             let slot = SlotId::from_index(i).unwrap();
             let mm = task.mm.key.load(Ordering::Acquire);
-            zone.drive(slot, i as u64 + 1);
-            zone.publish_slot(slot, mm, None, 0);
+            zone.drive(slot, i as u64 + 1, &carrick_sched_core::OwedPasses::new());
+            zone.publish_slot(slot, mm, None, 0, &carrick_sched_core::OwedPasses::new());
         }
         let (ready_tx, ready_rx) = mpsc::channel();
         std::thread::scope(|scope| {

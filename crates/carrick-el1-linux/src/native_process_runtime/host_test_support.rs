@@ -882,8 +882,8 @@ impl<C: ProcessContext + 'static> NativeSignalFixture<C> {
         zone.mm_issuer().observe_existing(address.mm);
         let space = zone.spaces.publish_closed(mm, root, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, mm).unwrap();
         zone.current_or_new(
@@ -1474,8 +1474,8 @@ impl NativeOwnerSignalFixture {
         task.publish_visible_pid(pid);
         task.publish_root_generation(address.generation);
         task.publish_lifecycle(page as *const _ as u64, control as *const _ as u64);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, binding.mm.raw()).unwrap();
         let record = zone
@@ -1498,12 +1498,17 @@ impl NativeOwnerSignalFixture {
         // The physical test service is a stopped host venue. Publishing a
         // running vCPU here would route host continuations into an undriven
         // guest service queue instead of their registered executor.
-        zone.leave_guest(slot, &carrick_sched_core::ShortLockSpin);
+        zone.leave_guest(
+            slot,
+            &carrick_sched_core::ShortLockSpin,
+            &carrick_sched_core::OwedPasses::new(),
+        );
         assert!(zone.step_away(
             slot,
             1,
             &mut |_| panic!("fresh host fixture has no queued handback"),
-            &mut |_| panic!("fresh host fixture has no displaced placement")
+            &mut |_| panic!("fresh host fixture has no displaced placement"),
+            &carrick_sched_core::OwedPasses::new()
         ));
         task
     }
@@ -1791,10 +1796,17 @@ impl NativeOwnerSignalFixture {
         physical.child_copy_error = None;
         // The fake executor returns its vCPU before the release, so the real
         // queue may place this exact parked record instead of a host handback.
-        self.zone.drive(slot, 1);
+        self.zone
+            .drive(slot, 1, &carrick_sched_core::OwedPasses::new());
         self.zone.enter_guest(slot);
         access.lower(space.index());
-        assert_eq!(self.zone.switch_in_full(slot).unwrap().record, record.id);
+        assert_eq!(
+            self.zone
+                .switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record,
+            record.id
+        );
         let saved = unsafe { self.runtime.record_binding(record) }
             .unwrap()
             .words;
@@ -1991,7 +2003,10 @@ impl NativeServiceCapacityFixture {
             assert!(root.take_handoff_receipt().is_some());
         }
         publish_test_exec_reply(&fixture, fixture.control, fixture.slot, 211, 0x120_0000);
-        let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+        let selected = fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap();
         assert_eq!(selected.record, fixture.record.id);
         let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
             .unwrap()
@@ -2128,7 +2143,9 @@ impl<C: ProcessContext + 'static> NativeServiceCapacityFixture<C> {
 
     fn select(&self) -> Option<(RecordRef, AddressContext<RootGpa>, C)> {
         let fixture = &self.fixture;
-        let selected = fixture.zone.switch_in_full(fixture.slot)?;
+        let selected = fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())?;
         let record = fixture.zone.record_ref(selected.record);
         let identity = fixture.zone.record(selected.record).identity();
         let key = fixture
@@ -2536,7 +2553,11 @@ fn native_clock_sample_retains_reply_across_copyout_busy() {
             .unwrap();
         drop(queue);
         assert_eq!(
-            fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+            fixture
+                .zone
+                .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record,
             fixture.record.id
         );
         let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
@@ -2792,7 +2813,10 @@ fn carrier_work_wake_preserves_the_completed_syscall_result() {
         .unwrap();
     drop(queue);
 
-    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    let selected = fixture
+        .zone
+        .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     assert_eq!(selected.record, fixture.record.id);
     let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
         .unwrap()
@@ -3024,7 +3048,10 @@ fn refused_exec_case_for<
             0xd0_0000,
         ));
     }
-    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    let selected = fixture
+        .zone
+        .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     assert_eq!(selected.record, fixture.record.id);
     // SAFETY: the prepared-service wake selected this exact record.
     let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
@@ -3119,7 +3146,10 @@ fn lost_exec_fatal_signal_case_for<
         .process_exit_custody()
         .publish_cancellation(carrick_core::terminal::ProcessCancellation::FatalSignal);
 
-    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    let selected = fixture
+        .zone
+        .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     assert_eq!(selected.record, fixture.record.id);
     // SAFETY: the prepared-service wake selected this exact record.
     let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
@@ -3277,8 +3307,12 @@ fn prepare_signal_sibling<C: ProcessContext + 'static>(
     task.publish_root_generation(fixture.address.generation);
     task.publish_lifecycle(fixture.page as *const _ as u64, control as *const _ as u64);
     let slot = SlotId::new(1);
-    fixture.zone.drive(slot, 2);
-    fixture.zone.publish_slot(slot, 1, Some(1), 1);
+    fixture
+        .zone
+        .drive(slot, 2, &carrick_sched_core::OwedPasses::new());
+    fixture
+        .zone
+        .publish_slot(slot, 1, Some(1), 1, &carrick_sched_core::OwedPasses::new());
     fixture.zone.enter_guest(slot);
     fixture.zone.install_space(slot, 1).unwrap();
     let record = fixture
@@ -3990,7 +4024,11 @@ mod anonymous_wait_cancellation_tests {
             .notify_object(sibling.slot, &mut Default::default())
             .unwrap();
         assert_eq!(
-            fixture.zone.switch_in_full(sibling.slot).unwrap().record,
+            fixture
+                .zone
+                .switch_in_full(sibling.slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record,
             sibling.record.id
         );
         let retained = fixture.zone.record(sibling.record.id);
@@ -4041,6 +4079,7 @@ mod anonymous_wait_cancellation_tests {
                 carrick_sched_core::Handback::Control,
                 &carrick_sched_core::ShortLockSpin,
                 &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+                &carrick_sched_core::OwedPasses::new(),
             ),
             carrick_sched_core::HostClaim::Claimed,
         );
@@ -4253,6 +4292,7 @@ mod anonymous_wait_cancellation_tests {
                 carrick_sched_core::Handback::Cancelled,
                 &carrick_sched_core::ShortLockSpin,
                 &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+                &carrick_sched_core::OwedPasses::new(),
             ),
             carrick_sched_core::HostClaim::Claimed
         );
@@ -4350,7 +4390,10 @@ mod anonymous_wait_cancellation_tests {
         }
         let _successor =
             publish_test_exec_reply(&fixture, fixture.control, fixture.slot, 0x1846, 0xa0_0000);
-        let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+        let selected = fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap();
         assert_eq!(selected.record, fixture.record.id);
         // SAFETY: the production service completion selected this exact root record.
         let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
@@ -4424,9 +4467,11 @@ fn exit_group_cancels_exception_service_before_publishing_host_wakes() {
         );
         assert!(!fixture.zone.record(sibling.record.id).is_native_owned());
         if stop_sibling_slot {
-            fixture
-                .zone
-                .leave_guest(sibling.slot, &carrick_sched_core::ShortLockSpin);
+            fixture.zone.leave_guest(
+                sibling.slot,
+                &carrick_sched_core::ShortLockSpin,
+                &carrick_sched_core::OwedPasses::new(),
+            );
         }
         let page = fixture.page;
         *fixture.runtime.service_cancel_hook.lock() = Some(Box::new(move || {
@@ -4482,7 +4527,11 @@ fn exit_group_cancels_exception_service_before_publishing_host_wakes() {
             "terminal checkpoint must stay native"
         );
         assert_eq!(
-            fixture.zone.switch_in_full(slot).unwrap().record,
+            fixture
+                .zone
+                .switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record,
             sibling.record.id
         );
         assert!(!fixture.zone.current_affinity_excludes_cpu(slot));
@@ -4517,7 +4566,11 @@ fn exit_group_cancels_exception_service_before_publishing_host_wakes() {
             .find(|slot| fixture.zone.slot(*slot).queued() != 0)
             .unwrap();
         assert_eq!(
-            fixture.zone.switch_in_full(slot).unwrap().record,
+            fixture
+                .zone
+                .switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record,
             fixture.record.id
         );
         let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
@@ -4624,7 +4677,10 @@ fn native_exec_successor_retracts_exec_cancellation_before_owner_wait() {
     let successor_mm =
         publish_test_exec_reply(&fixture, fixture.control, fixture.slot, 47, 0x90_0000);
 
-    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    let selected = fixture
+        .zone
+        .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     assert_eq!(selected.record, fixture.record.id);
     // SAFETY: `switch_in_full` handed this exact selected record to the test
     // lane, which retains it until the entry below consumes the continuation.
@@ -4770,7 +4826,10 @@ fn sole_member_exec_closes_admission_before_adopting_successor() {
     let successor_mm =
         publish_test_exec_reply(&fixture, fixture.control, fixture.slot, 59, 0x98_0000);
 
-    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    let selected = fixture
+        .zone
+        .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     assert_eq!(selected.record, fixture.record.id);
     let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
         .unwrap()
@@ -4860,7 +4919,10 @@ fn exec_succeeds_when_task_keys_are_not_namespace_tids() {
     }
     let successor_mm =
         publish_test_exec_reply(&fixture, fixture.control, fixture.slot, 67, 0x9a_0000);
-    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    let selected = fixture
+        .zone
+        .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     assert_eq!(selected.record, fixture.record.id);
     let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
         .unwrap()
@@ -4935,7 +4997,10 @@ fn exec_closes_over_predecessor_gate(gate: carrick_el1_abi::GateState) {
     let successor_mm =
         publish_test_exec_reply(&fixture, fixture.control, fixture.slot, 61, 0x99_0000);
 
-    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    let selected = fixture
+        .zone
+        .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     assert_eq!(selected.record, fixture.record.id);
     let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
         .unwrap()
@@ -5011,7 +5076,10 @@ fn exec_after_sibling_drain(parked_read: bool) {
     let successor_mm =
         publish_test_exec_reply(&fixture, fixture.control, fixture.slot, 71, 0xa0_0000);
 
-    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    let selected = fixture
+        .zone
+        .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     assert_eq!(selected.record, fixture.record.id);
     // SAFETY: the root record was selected by this lane and remains retained
     // until `resume_checkpoint` publishes the owned exec-drain continuation.
@@ -5054,7 +5122,10 @@ fn exec_after_sibling_drain(parked_read: bool) {
             .into_iter()
             .find(|slot| fixture.zone.slot(*slot).queued() != 0)
             .unwrap();
-        let selected = fixture.zone.switch_in_full(sibling_resume_slot).unwrap();
+        let selected = fixture
+            .zone
+            .switch_in_full(sibling_resume_slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap();
         assert_eq!(selected.record, sibling.record.id);
         let sibling_source = BornInZoneSource {
             zone: fixture.zone,
@@ -5129,7 +5200,10 @@ fn exec_after_sibling_drain(parked_read: bool) {
         .into_iter()
         .find(|slot| fixture.zone.slot(*slot).queued() != 0)
         .unwrap();
-    let selected = fixture.zone.switch_in_full(resume_slot).unwrap();
+    let selected = fixture
+        .zone
+        .switch_in_full(resume_slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     assert_eq!(selected.record, fixture.record.id);
     let resumed_source = BornInZoneSource {
         zone: fixture.zone,
@@ -5285,7 +5359,10 @@ fn concurrent_native_exec_loser_is_killed_without_a_run_failure() {
         false,
     );
 
-    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    let selected = fixture
+        .zone
+        .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     assert_eq!(selected.record, fixture.record.id);
     let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
         .unwrap()
@@ -5313,7 +5390,10 @@ fn concurrent_native_exec_loser_is_killed_without_a_run_failure() {
         );
     }
 
-    let selected = fixture.zone.switch_in_full(sibling.slot).unwrap();
+    let selected = fixture
+        .zone
+        .switch_in_full(sibling.slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     assert_eq!(selected.record, sibling.record.id);
     let saved = unsafe { fixture.runtime.record_binding(sibling.record) }
         .unwrap()
@@ -5346,7 +5426,10 @@ fn concurrent_native_exec_loser_is_killed_without_a_run_failure() {
         .into_iter()
         .find(|slot| fixture.zone.slot(*slot).queued() != 0)
         .unwrap();
-    let selected = fixture.zone.switch_in_full(resume_slot).unwrap();
+    let selected = fixture
+        .zone
+        .switch_in_full(resume_slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     assert_eq!(selected.record, fixture.record.id);
     let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
         .unwrap()
@@ -5450,7 +5533,10 @@ fn exec_drain_is_upgraded_by_terminal_sibling_for<
         0xf0_0000,
         false,
     );
-    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    let selected = fixture
+        .zone
+        .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     assert_eq!(selected.record, fixture.record.id);
     let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
         .unwrap()
@@ -5523,7 +5609,10 @@ fn exec_drain_is_upgraded_by_terminal_sibling_for<
         "terminal close must replace the exec drain and retain its status"
     );
 
-    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    let selected = fixture
+        .zone
+        .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     assert_eq!(selected.record, fixture.record.id);
     let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
         .unwrap()
@@ -5595,7 +5684,10 @@ fn exec_drain_is_upgraded_by_terminal_sibling_for<
         .into_iter()
         .find(|slot| fixture.zone.slot(*slot).queued() != 0)
         .unwrap();
-    let selected = fixture.zone.switch_in_full(resume_slot).unwrap();
+    let selected = fixture
+        .zone
+        .switch_in_full(resume_slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     assert_eq!(selected.record, sibling.record.id);
     let saved = unsafe { fixture.runtime.record_binding(sibling.record) }
         .unwrap()
@@ -7457,7 +7549,10 @@ fn parent_reaps_then_execs_child(namespace_census: bool) {
     }
     let successor_mm = publish_test_exec_reply(fixture, child_control, fixture.slot, 91, 0xb0_0000);
 
-    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    let selected = fixture
+        .zone
+        .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     assert_eq!(selected.record, child_record.id);
     // SAFETY: the prepared-service wake selected this exact child record.
     let saved = unsafe { fixture.runtime.record_binding(child_record) }
@@ -8124,7 +8219,7 @@ fn portal_wait_terminal_cancellation_resumes_exact_native_service_waiter() {
     );
     let selected = fixture
         .zone
-        .switch_in_full(fixture.slot)
+        .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
         .expect("cancelled portal waiter must be runnable");
     assert_eq!(selected.record, fixture.record.id);
     assert_eq!(
@@ -8192,6 +8287,7 @@ fn tgkill_reaches_a_futex_parked_host_issued_sibling() {
         start,
         &guard,
         carrick_core_abi::EntryRecordGeneration(seq),
+        &carrick_sched_core::OwedPasses::new(),
     )
     .unwrap();
     drop(guard);
@@ -8256,7 +8352,7 @@ fn tgkill_reaches_a_futex_parked_host_issued_sibling() {
     );
     let selected = fixture
         .zone
-        .switch_in_full(sibling.slot)
+        .switch_in_full(sibling.slot, &carrick_sched_core::OwedPasses::new())
         .expect("signal must make the exact futex waiter runnable");
     assert_eq!(selected.record, sibling.record.id);
     assert_eq!(selected.result.map(|value| value as i64), Some(-4));
@@ -8439,8 +8535,16 @@ fn x86_registered_claim_free_birth_before_requeue_sibling_tgkill() {
         };
 
     let sib_slot_id = SlotId::new(1);
-    fixture.zone.drive(sib_slot_id, 1);
-    fixture.zone.publish_slot(sib_slot_id, 1, Some(0), 1);
+    fixture
+        .zone
+        .drive(sib_slot_id, 1, &carrick_sched_core::OwedPasses::new());
+    fixture.zone.publish_slot(
+        sib_slot_id,
+        1,
+        Some(0),
+        1,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     fixture.zone.enter_guest(sib_slot_id);
     fixture
         .zone
@@ -8450,11 +8554,19 @@ fn x86_registered_claim_free_birth_before_requeue_sibling_tgkill() {
     assert!(
         fixture
             .zone
-            .requeue_preempted(sib_slot_id, sib_record.id)
+            .requeue_preempted(
+                sib_slot_id,
+                sib_record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     assert_eq!(
-        fixture.zone.switch_in_full(sib_slot_id).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(sib_slot_id, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         sib_record.id
     );
     let sib_id = fixture.zone.record(sib_record.id).identity();
@@ -8477,8 +8589,16 @@ fn x86_registered_claim_free_birth_before_requeue_sibling_tgkill() {
     assert_eq!(fixture.page.live(), 2);
 
     let child_slot_id = SlotId::new(2);
-    fixture.zone.drive(child_slot_id, 1);
-    fixture.zone.publish_slot(child_slot_id, 1, Some(0), 1);
+    fixture
+        .zone
+        .drive(child_slot_id, 1, &carrick_sched_core::OwedPasses::new());
+    fixture.zone.publish_slot(
+        child_slot_id,
+        1,
+        Some(0),
+        1,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     fixture.zone.enter_guest(child_slot_id);
     fixture
         .zone
@@ -8536,11 +8656,19 @@ fn x86_registered_claim_free_birth_before_requeue_sibling_tgkill() {
     assert!(
         fixture
             .zone
-            .requeue_preempted(child_slot_id, child_record.id)
+            .requeue_preempted(
+                child_slot_id,
+                child_record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     assert_eq!(
-        fixture.zone.switch_in_full(child_slot_id).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(child_slot_id, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         child_record.id
     );
     let mut first_frame = carrick_el1_abi::TrapFrame {
@@ -8584,6 +8712,7 @@ fn x86_registered_claim_free_birth_before_requeue_sibling_tgkill() {
         child_slot_id,
         child_record.id,
         &carrick_sched_core::ShortLockSpin,
+        &carrick_sched_core::OwedPasses::new(),
     );
     fixture.zone.free_record(child_record.id);
     let mut sender = fixture
@@ -8646,11 +8775,19 @@ fn x86_registered_claim_free_birth_before_requeue_sibling_tgkill() {
     assert!(
         fixture
             .zone
-            .requeue_preempted(child_slot_id, masked_record.id)
+            .requeue_preempted(
+                child_slot_id,
+                masked_record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     assert_eq!(
-        fixture.zone.switch_in_full(child_slot_id).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(child_slot_id, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         masked_record.id
     );
     let mut masked_frame = carrick_el1_abi::TrapFrame {
@@ -8816,7 +8953,11 @@ fn completed_output_busy_yields(in_preparation: bool) {
     service.child_copy_error = None;
     service.prepare_copy_error = None;
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         fixture.record.id
     );
     let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
@@ -9207,7 +9348,10 @@ fn retained_poll_output_owner_wait(
     // win before any re-preparation, not merely rely on a still-closed gate.
     service.child_copy_error = None;
     access.lower(space.index());
-    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    let selected = fixture
+        .zone
+        .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     assert_eq!(selected.record, fixture.record.id);
     let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
         .unwrap()
@@ -9721,7 +9865,10 @@ fn retained_ipc_supply_for<
                     .remove_signal_wait(&fixture.record);
             }
             drop(entry);
-            let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+            let selected = fixture
+                .zone
+                .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap();
             assert_eq!(selected.record, fixture.record.id);
             let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
                 .unwrap()
@@ -9797,7 +9944,10 @@ fn retained_ipc_supply_for<
             .unwrap()
             .is_none()
     );
-    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    let selected = fixture
+        .zone
+        .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     assert_eq!(selected.record, fixture.record.id);
     let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
         .unwrap()
@@ -9823,7 +9973,10 @@ fn retained_ipc_supply_for<
         );
         assert!(entry.take_handoff_receipt().is_some());
         drop(entry);
-        let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+        let selected = fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap();
         assert_eq!(selected.record, fixture.record.id);
         let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
             .unwrap()
@@ -10032,7 +10185,11 @@ fn retained_ipc_terminal_close_for<
     assert!(
         fixture
             .zone
-            .requeue_preempted(sibling.slot, sibling.record.id)
+            .requeue_preempted(
+                sibling.slot,
+                sibling.record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     fixture.zone.clear_current(sibling.slot);
@@ -10069,7 +10226,10 @@ fn retained_ipc_terminal_close_for<
         }
         let successor_mm =
             publish_test_exec_reply(&fixture, fixture.control, fixture.slot, 0x1756, 0xa0_0000);
-        let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+        let selected = fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap();
         assert_eq!(selected.record, fixture.record.id);
         // SAFETY: the production service completion selected this exact root record.
         let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
@@ -10118,7 +10278,11 @@ fn retained_ipc_terminal_close_for<
         carrick_el1_abi::GateState::Closed
     );
     assert_eq!(
-        fixture.zone.switch_in_full(sibling.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(sibling.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         sibling.record.id
     );
     {
@@ -10202,7 +10366,10 @@ fn retained_ipc_terminal_close_for<
         "a second retirement of the same token must return Stale"
     );
 
-    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    let selected = fixture
+        .zone
+        .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     assert_eq!(selected.record, fixture.record.id);
     // SAFETY: the sibling's terminal notification woke this exact closing owner.
     let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
@@ -10462,7 +10629,10 @@ fn readiness_record_cancelled_for<
         .notify_object(fixture.slot, &mut WakeEffects::default())
         .unwrap();
     drop(queue);
-    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    let selected = fixture
+        .zone
+        .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     assert_eq!(selected.record, fixture.record.id);
     let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
         .unwrap()
@@ -10646,11 +10816,14 @@ fn host_contended_service_park(
     // A second live process: the root task is alive and not the child.
     assert_ne!(record.id, fixture.record.id);
     assert_eq!(
-        fixture
-            .zone
-            .claim_for_host(record, None, Handback::Control, &ShortLockSpin, &|owned| {
-                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-            }),
+        fixture.zone.claim_for_host(
+            record,
+            None,
+            Handback::Control,
+            &ShortLockSpin,
+            &|owned| { crate::sched::object_wait::deliver_host_completion(owned.zone(), owned) },
+            &carrick_sched_core::OwedPasses::new()
+        ),
         HostClaim::El1Held { slot: fixture.slot }
     );
     let mut service = fixture.service();
@@ -10682,7 +10855,11 @@ fn host_contended_service_park(
                 // (`el1_zone::hand_back_wanted`) before the receipt exists.
                 let mut wanted = alloc::vec::Vec::new();
                 assert_eq!(
-                    zone.take_host_wanted(slot, &mut |wanted_record| wanted.push(wanted_record)),
+                    zone.take_host_wanted(
+                        slot,
+                        &mut |wanted_record| wanted.push(wanted_record),
+                        &carrick_sched_core::OwedPasses::new()
+                    ),
                     1
                 );
                 assert_eq!(wanted.as_slice(), &[record]);
@@ -10751,15 +10928,21 @@ fn host_contended_service_park(
     if !takeover_before_receipt {
         let mut wanted = alloc::vec::Vec::new();
         assert_eq!(
-            fixture
-                .zone
-                .take_host_wanted(fixture.slot, &mut |wanted_record| wanted
-                    .push(wanted_record)),
+            fixture.zone.take_host_wanted(
+                fixture.slot,
+                &mut |wanted_record| wanted.push(wanted_record),
+                &carrick_sched_core::OwedPasses::new()
+            ),
             1
         );
         assert_eq!(wanted.as_slice(), &[record]);
     }
-    assert!(fixture.zone.place_native_handback(record).is_some());
+    assert!(
+        fixture
+            .zone
+            .place_native_handback(record, &carrick_sched_core::OwedPasses::new())
+            .is_some()
+    );
     assert!(!fixture.zone.record(record.id).needs_host());
 
     // Its next owner entry reparks the same exact request.
@@ -10919,11 +11102,17 @@ fn host_request_during_owner_wait_park_yields_then_reparks() {
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, fixture.record.id)
+            .requeue_preempted(
+                fixture.slot,
+                fixture.record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     assert_eq!(
-        fixture.zone.switch_in(fixture.slot),
+        fixture
+            .zone
+            .switch_in(fixture.slot, &carrick_sched_core::OwedPasses::new()),
         Some(fixture.record.id)
     );
     assert_eq!(
@@ -10932,7 +11121,8 @@ fn host_request_during_owner_wait_park_yields_then_reparks() {
             None,
             Handback::Control,
             &ShortLockSpin,
-            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+            &carrick_sched_core::OwedPasses::new()
         ),
         HostClaim::El1Held { slot: fixture.slot }
     );
@@ -10983,14 +11173,24 @@ fn host_request_during_owner_wait_park_yields_then_reparks() {
     );
     let mut wanted = alloc::vec::Vec::new();
     assert_eq!(
-        fixture
-            .zone
-            .take_host_wanted(fixture.slot, &mut |record| wanted.push(record)),
+        fixture.zone.take_host_wanted(
+            fixture.slot,
+            &mut |record| wanted.push(record),
+            &carrick_sched_core::OwedPasses::new()
+        ),
         1
     );
     assert_eq!(wanted.as_slice(), &[fixture.record]);
-    assert!(fixture.zone.place_native_handback(fixture.record).is_some());
-    let selected = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    assert!(
+        fixture
+            .zone
+            .place_native_handback(fixture.record, &carrick_sched_core::OwedPasses::new())
+            .is_some()
+    );
+    let selected = fixture
+        .zone
+        .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     assert_eq!(selected.record, fixture.record.id);
     {
         let mut entry = fixture
@@ -11215,7 +11415,11 @@ fn signal_setup_output_owner_wait(cross_page: bool) {
     service.child_copy_error = None;
     access.lower(space.index());
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         fixture.record.id
     );
     let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
@@ -11409,7 +11613,11 @@ fn rehomed_signal_copy_service(input: bool) {
         .notify_object(fixture.slot, &mut Default::default())
         .unwrap();
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         record
     );
     let saved = unsafe { fixture.runtime.record_binding(reference) }
@@ -11574,7 +11782,11 @@ fn sigprocmask_set_owner_wait_redispatches_before_effects() {
     service.prepare_copy_error = None;
     access.lower(space.index());
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         fixture.record.id
     );
     let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
@@ -11718,7 +11930,11 @@ fn entropy_service_retained_cursor(owner_wait: bool) {
         .unwrap();
     drop(queue);
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         fixture.record.id
     );
     let gate = if owner_wait {
@@ -11821,7 +12037,11 @@ fn entropy_service_retained_cursor(owner_wait: bool) {
     }
     service.child_copy_error = None;
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         fixture.record.id
     );
     let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
@@ -12022,7 +12242,11 @@ fn entropy_service_result(case: EntropyReplyCase) {
     drop(queue);
     service.prepare_copy_error = None;
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         fixture.record.id
     );
     let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
@@ -12138,7 +12362,11 @@ fn entropy_service_preparation_busy_retries_before_generation() {
     drop(queue);
     service.prepare_copy_error = None;
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         fixture.record.id
     );
     let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
@@ -12322,7 +12550,12 @@ fn entropy_physical_checkpoint(busy: bool) {
         ));
     }
     if busy {
-        assert_eq!(zone.switch_in_full(fixture.slot).unwrap().record, record.id);
+        assert_eq!(
+            zone.switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record,
+            record.id
+        );
         // SAFETY: fixture owns the selected continuation and its saved words.
         let saved = unsafe { fixture.runtime.record_binding(record) }
             .unwrap()
@@ -12362,7 +12595,12 @@ fn entropy_physical_checkpoint(busy: bool) {
         "physical ACK cannot bypass owner copyout"
     );
     assert!(task.service_notice.take().unwrap().is_none());
-    assert_eq!(zone.switch_in_full(fixture.slot).unwrap().record, record.id);
+    assert_eq!(
+        zone.switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
+        record.id
+    );
     // SAFETY: switch-in selected this fixture-owned exact record.
     let saved = unsafe { fixture.runtime.record_binding(record) }
         .unwrap()
@@ -12533,7 +12771,11 @@ fn entropy_fault_completion(cancel_wait: bool) {
         .unwrap();
     drop(queue);
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         fixture.record.id
     );
     let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
@@ -12595,7 +12837,11 @@ fn entropy_fault_completion(cancel_wait: bool) {
         drop(queue);
     }
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         fixture.record.id
     );
     let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
@@ -12973,7 +13219,11 @@ fn native_root_stock_busy_claim_parks_then_release_retries_same_clone() {
     entry.lifecycle_admission_settled().unwrap();
     drop(entry);
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         fixture.record.id
     );
     let mut entry = fixture
@@ -13123,15 +13373,21 @@ fn native_futex_atomic_owner_retry_keeps_deadline_and_key_scope() {
     drop(guard);
     assert_eq!(fixture.zone.timer_deadline(fixture.slot), Some(2000));
     assert_eq!(
-        fixture
-            .zone
-            .expire_timer(fixture.slot, 2000, ETIMEDOUT_RESULT, &|owned| {
-                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-            },),
+        fixture.zone.expire_timer(
+            fixture.slot,
+            2000,
+            ETIMEDOUT_RESULT,
+            &|owned| { crate::sched::object_wait::deliver_host_completion(owned.zone(), owned) },
+            &carrick_sched_core::OwedPasses::new(),
+        ),
         Ok(true)
     );
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().result,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .result,
         Some(ETIMEDOUT_RESULT)
     );
     assert_eq!(fixture.zone.timer_node_count(), 0);
@@ -13173,7 +13429,10 @@ fn native_yield_requeues_its_caller_behind_a_runnable_sibling() {
     identity.tid += 1;
     identity.serial += 1;
     let sibling = zone.alloc_record(identity).unwrap();
-    assert!(zone.requeue_preempted(slot, sibling).is_queued());
+    assert!(
+        zone.requeue_preempted(slot, sibling, &carrick_sched_core::OwedPasses::new())
+            .is_queued()
+    );
     assert!(matches!(
         entry.native_yield(),
         Some(LifecycleOutcome::Transferred {
@@ -13183,7 +13442,11 @@ fn native_yield_requeues_its_caller_behind_a_runnable_sibling() {
     ));
     assert!(entry.take_handoff_receipt().is_some());
     assert_eq!(zone.slot(slot).current(), None);
-    assert_eq!(zone.switch_in(slot), Some(sibling), "the sibling runs next");
+    assert_eq!(
+        zone.switch_in(slot, &carrick_sched_core::OwedPasses::new()),
+        Some(sibling),
+        "the sibling runs next"
+    );
     assert_eq!(
         zone.runnable_head(slot),
         Some(caller),
@@ -13202,8 +13465,8 @@ fn native_futex_unplaceable_wake_keeps_mask_count_and_placement_custody() {
     let fixture = native_exec_fixture();
     let zone = fixture.zone;
     let away = SlotId::new(1);
-    zone.drive(away, 2);
-    zone.publish_slot(away, 1, Some(1), 1);
+    zone.drive(away, 2, &carrick_sched_core::OwedPasses::new());
+    zone.publish_slot(away, 1, Some(1), 1, &carrick_sched_core::OwedPasses::new());
     zone.enter_guest(away);
     zone.install_space(away, 1).unwrap();
     let mut records = Vec::new();
@@ -13223,7 +13486,7 @@ fn native_futex_unplaceable_wake_keeps_mask_count_and_placement_custody() {
         zone.publish_park(id, seq);
         records.push(record);
     }
-    zone.step_back(away, 2);
+    zone.step_back(away, 2, &carrick_sched_core::OwedPasses::new());
     let mut service = fixture.service();
     let saved = words(fixture.address);
     let mut entry = fixture
@@ -13274,10 +13537,12 @@ fn native_futex_unplaceable_wake_keeps_mask_count_and_placement_custody() {
         2
     );
     // Returning the eligible driver consumes the retained scheduler custody.
-    zone.drive(away, 2);
+    zone.drive(away, 2, &carrick_sched_core::OwedPasses::new());
     zone.enter_guest(away);
     zone.install_space(away, 1).unwrap();
-    let selected = zone.switch_in_full(away).unwrap();
+    let selected = zone
+        .switch_in_full(away, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     assert!(records[1..].iter().any(|r| r.id == selected.record));
     assert_eq!(selected.result, Some(0));
     assert!(
@@ -13627,7 +13892,7 @@ fn native_zone_poll_signal_before_enrolment_completes_eintr_and_delivers_once() 
 
     let selected = fixture
         .zone
-        .switch_in_full(fixture.slot)
+        .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
         .expect("post-enrolment signal wake must requeue the parked poll record");
     assert_eq!(selected.record, fixture.record.id);
 
@@ -14086,11 +14351,14 @@ fn host_request_during_child_wait_park(vfork: bool) {
     };
     // The host requests this exact running child before it parks.
     assert_eq!(
-        fixture
-            .zone
-            .claim_for_host(record, None, Handback::Control, &ShortLockSpin, &|owned| {
-                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-            }),
+        fixture.zone.claim_for_host(
+            record,
+            None,
+            Handback::Control,
+            &ShortLockSpin,
+            &|owned| { crate::sched::object_wait::deliver_host_completion(owned.zone(), owned) },
+            &carrick_sched_core::OwedPasses::new()
+        ),
         HostClaim::El1Held { slot: fixture.slot }
     );
     let outcome = match grandchild {
@@ -14127,13 +14395,18 @@ fn host_request_during_child_wait_park(vfork: bool) {
 
     // The stopped executor honours the request and hands the record back.
     let mut wanted = alloc::vec::Vec::new();
-    fixture
-        .zone
-        .take_host_wanted(fixture.slot, &mut |wanted_record| {
-            wanted.push(wanted_record)
-        });
+    fixture.zone.take_host_wanted(
+        fixture.slot,
+        &mut |wanted_record| wanted.push(wanted_record),
+        &carrick_sched_core::OwedPasses::new(),
+    );
     assert_eq!(wanted.as_slice(), &[record]);
-    assert!(fixture.zone.place_native_handback(record).is_some());
+    assert!(
+        fixture
+            .zone
+            .place_native_handback(record, &carrick_sched_core::OwedPasses::new())
+            .is_some()
+    );
 
     // Its next owner entry reruns the retained wait, which now parks.
     let (again, address, words) = loop {
@@ -14144,7 +14417,11 @@ fn host_request_during_child_wait_park(vfork: bool) {
         assert!(
             fixture
                 .zone
-                .requeue_preempted(fixture.slot, selected.0.id)
+                .requeue_preempted(
+                    fixture.slot,
+                    selected.0.id,
+                    &carrick_sched_core::OwedPasses::new()
+                )
                 .is_queued()
         );
     };
@@ -14270,7 +14547,11 @@ fn wait4_status_owner_wait_retains_zombie_until_release() {
     service.child_copy_error = None;
     access.lower(space.index());
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         fixture.record.id
     );
     let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
@@ -14413,7 +14694,11 @@ fn wait4_rusage_owner_wait_retains_reaped_answer_until_release() {
     service.child_copy_error = None;
     access.lower(space.index());
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         fixture.record.id
     );
     let saved = unsafe { fixture.runtime.record_binding(fixture.record) }
@@ -14546,7 +14831,11 @@ fn wait4_status_owner_released_before_enrolment(direct: bool) {
         assert!(service.copies.is_empty());
         access.lower(space.index());
         assert_eq!(
-            fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+            fixture
+                .zone
+                .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record,
             fixture.record.id
         );
         saved = unsafe { fixture.runtime.record_binding(fixture.record) }
@@ -14921,16 +15210,25 @@ fn native_arm_pselect6_handback(
             IpcCause::Control => unreachable!(),
         };
         assert!(matches!(
-            fixture
-                .zone
-                .claim_for_host(record, None, handback, &HostIpcWait, &completion),
+            fixture.zone.claim_for_host(
+                record,
+                None,
+                handback,
+                &HostIpcWait,
+                &completion,
+                &carrick_sched_core::OwedPasses::new()
+            ),
             HostClaim::Claimed
         ));
     } else {
         if eof {
             table.close(Fd(1)).unwrap();
         }
-        fixture.zone.leave_guest(fixture.slot, &HostIpcWait);
+        fixture.zone.leave_guest(
+            fixture.slot,
+            &HostIpcWait,
+            &carrick_sched_core::OwedPasses::new(),
+        );
         let object = region.lock(object, &HostIpcWait).unwrap();
         let queue = fixture
             .zone
@@ -14938,9 +15236,11 @@ fn native_arm_pselect6_handback(
             .unwrap();
         let mut handed = None;
         let report = queue
-            .notify_object_host(&mut |record| handed = Some(record), &mut |_| {
-                panic!("no slot can admit this waiter")
-            })
+            .notify_object_host(
+                &mut |record| handed = Some(record),
+                &mut |_| panic!("no slot can admit this waiter"),
+                &carrick_sched_core::OwedPasses::new(),
+            )
             .unwrap();
         assert_eq!(report.handed, 1);
         assert_eq!(handed, Some(record));

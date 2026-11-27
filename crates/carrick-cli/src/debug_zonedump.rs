@@ -147,7 +147,7 @@ mod tests {
         // SAFETY: zero is the valid empty zone.
         let zone: Box<carrick_el1_abi::ZoneTables> = unsafe { read_abi(&zeros, 0).unwrap() };
         drop(zeros);
-        zone.enter_idle(SlotId::new(2), false);
+        zone.enter_idle(SlotId::new(2), false, &carrick_el1_abi::OwedPasses::new());
         let tasks: [carrick_el1_abi::CurrentTask; 2] = [
             carrick_el1_abi::CurrentTask::new(),
             carrick_el1_abi::CurrentTask::new(),

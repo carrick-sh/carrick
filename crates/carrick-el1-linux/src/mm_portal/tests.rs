@@ -4399,8 +4399,14 @@ fn anonymous_munmap_busy_parks_once_then_completes_or_cancels() {
             .with_zone(zone)
             .unwrap();
         let slot = SlotId::from_index(0).unwrap();
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, mm.raw(), None, 0);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(
+            slot,
+            mm.raw(),
+            None,
+            0,
+            &carrick_sched_core::OwedPasses::new(),
+        );
         assert!(
             zone.occupancy
                 .replace(carrick_sched_core::ExecutionSlot::zone(slot), 0, mm.raw())
@@ -4549,7 +4555,9 @@ fn anonymous_munmap_busy_parks_once_then_completes_or_cancels() {
             portal.cancel_prepared(permit, request, 0).unwrap();
         }
         assert_eq!(zone.object_queue_census(key.index()).unwrap().waiters, 0);
-        let switched = zone.switch_in_full(slot).unwrap();
+        let switched = zone
+            .switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap();
         // SAFETY: switch_in_full assigned this exact record to the execution slot.
         let context = unsafe { zone.record(switched.record).ctx_mut() };
         assert_eq!(context.native.pc, 0x1000);
@@ -4645,8 +4653,14 @@ fn anonymous_contention_then_metadata_provisions_without_park_serial_host() {
         .with_zone(zone)
         .unwrap();
     let slot = SlotId::from_index(0).unwrap();
-    zone.drive(slot, 1);
-    zone.publish_slot(slot, mm.raw(), None, 0);
+    zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+    zone.publish_slot(
+        slot,
+        mm.raw(),
+        None,
+        0,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     assert!(
         zone.occupancy
             .replace(carrick_sched_core::ExecutionSlot::zone(slot), 0, mm.raw())
@@ -5938,8 +5952,14 @@ fn prepared_copy_el1_edit_parks_then_commit_or_cancel_wakes_exact_saved_syscall(
                 .unwrap()
                 .unwrap();
             let slot = SlotId::from_index(0).unwrap();
-            zone.drive(slot, 1);
-            zone.publish_slot(slot, mm.raw(), None, 0);
+            zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+            zone.publish_slot(
+                slot,
+                mm.raw(),
+                None,
+                0,
+                &carrick_sched_core::OwedPasses::new(),
+            );
             assert!(zone.occupancy.replace(
                 carrick_sched_core::ExecutionSlot::zone(slot),
                 0,
@@ -6032,7 +6052,7 @@ fn prepared_copy_el1_edit_parks_then_commit_or_cancel_wakes_exact_saved_syscall(
             assert!(delivered.get(), "the holder owns eventual wake delivery");
             assert_eq!(zone.object_queue_census(key.index()).unwrap().waiters, 0);
             let switched = zone
-                .switch_in_full(slot)
+                .switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
                 .expect("settlement must queue waiter");
             // SAFETY: switch_in_full assigned the exact context to this slot.
             let context = unsafe { zone.record(switched.record).ctx_mut() };
@@ -6232,8 +6252,14 @@ fn schedulerless_settlement_preserves_prepared_permit(cancel: bool) {
         .unwrap()
         .unwrap();
     let slot = SlotId::from_index(0).unwrap();
-    zone.drive(slot, 1);
-    zone.publish_slot(slot, mm.raw(), None, 0);
+    zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+    zone.publish_slot(
+        slot,
+        mm.raw(),
+        None,
+        0,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     assert!(
         zone.occupancy
             .replace(carrick_sched_core::ExecutionSlot::zone(slot), 0, mm.raw())
@@ -6308,7 +6334,7 @@ fn schedulerless_settlement_preserves_prepared_permit(cancel: bool) {
         .expect("delivery refusal must preserve rightful cancellation custody");
     assert_eq!(zone.object_queue_census(key.index()).unwrap().waiters, 0);
     let switched = zone
-        .switch_in_full(slot)
+        .switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
         .expect("correct cancellation must wake enrolled edit");
     let context = unsafe { zone.record(switched.record).ctx_mut() };
     assert_eq!(context.native.x, original);

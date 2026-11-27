@@ -1040,8 +1040,8 @@ fn allocator_control_with_pending_host_work_and_no_token_enrolls_three_waiters()
                 lifecycle_page: 0,
                 control_slot: 0,
             };
-            zone.drive(slot, 3);
-            zone.publish_slot(slot, mm, None, 0);
+            zone.drive(slot, 3, &carrick_sched_core::OwedPasses::new());
+            zone.publish_slot(slot, mm, None, 0, &carrick_sched_core::OwedPasses::new());
             let here = ExecutionSlot::zone(slot);
             zone.occupancy.vacate_any(here);
             assert!(zone.occupancy.replace(here, 0, mm));
@@ -1124,7 +1124,7 @@ fn allocator_control_with_pending_host_work_and_no_token_enrolls_three_waiters()
     // and completes its resumed control call while settling pending host work.
     for (idx, participant) in participants.iter_mut().enumerate() {
         assert_eq!(
-            zone.switch_in(participant.slot),
+            zone.switch_in(participant.slot, &carrick_sched_core::OwedPasses::new()),
             Some(participant.record),
             "participant {idx} switches back onto its slot"
         );

@@ -13430,8 +13430,8 @@ mod tests {
             let slot = carrick_sched_core::SlotId::new(0);
             let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
             zone.spaces.open(space);
-            zone.drive(slot, 1);
-            zone.publish_slot(slot, 1, Some(0), 1);
+            zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+            zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
             zone.enter_guest(slot);
             zone.install_space(slot, 1).unwrap();
             zone.current_or_new(
@@ -13506,7 +13506,10 @@ mod tests {
                 .or_else(|| zone.slot(slot).host_record())
                 .unwrap();
             drop(parent);
-            assert!(zone.requeue_preempted(slot, parent_record).is_queued());
+            assert!(
+                zone.requeue_preempted(slot, parent_record, &carrick_sched_core::OwedPasses::new())
+                    .is_queued()
+            );
             activate(&runtime, source, &task, child_key);
             let child_words = runtime.task_binding(child_key).unwrap().words;
             let contended = child_copy_error == Some(NativeProcessError::Busy);
@@ -13526,8 +13529,20 @@ mod tests {
                 child.service.child_copy_error = None;
                 drop(child);
                 // The parent was queued first; run it, then reselect the child.
-                assert_eq!(zone.switch_in_full(slot).unwrap().record, parent_record);
-                assert!(zone.requeue_preempted(slot, parent_record).is_queued());
+                assert_eq!(
+                    zone.switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+                        .unwrap()
+                        .record,
+                    parent_record
+                );
+                assert!(
+                    zone.requeue_preempted(
+                        slot,
+                        parent_record,
+                        &carrick_sched_core::OwedPasses::new()
+                    )
+                    .is_queued()
+                );
                 activate(&runtime, source, &task, child_key);
                 let child_record = runtime.task_binding(child_key).unwrap().record;
                 // SAFETY: the child's record was selected just above.
@@ -13610,11 +13625,21 @@ mod tests {
                 drop(child);
                 let child_record = runtime.task_binding(child_key).unwrap().record;
                 loop {
-                    let selected = zone.switch_in_full(slot).unwrap().record;
+                    let selected = zone
+                        .switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+                        .unwrap()
+                        .record;
                     if selected == child_record.id {
                         break;
                     }
-                    assert!(zone.requeue_preempted(slot, selected).is_queued());
+                    assert!(
+                        zone.requeue_preempted(
+                            slot,
+                            selected,
+                            &carrick_sched_core::OwedPasses::new()
+                        )
+                        .is_queued()
+                    );
                 }
                 // SAFETY: the child's record was selected just above.
                 let child_words = unsafe { runtime.record_binding(child_record) }
@@ -13720,8 +13745,14 @@ mod tests {
             };
             let space = zone.spaces.publish_closed(mm, root, 0).unwrap();
             zone.spaces.open(space);
-            zone.drive(slot, 1);
-            zone.publish_slot(slot, 1, Some(index as u32), 1);
+            zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+            zone.publish_slot(
+                slot,
+                1,
+                Some(index as u32),
+                1,
+                &carrick_sched_core::OwedPasses::new(),
+            );
             zone.enter_guest(slot);
             zone.install_space(slot, mm).unwrap();
             zone.current_or_new(
@@ -14259,8 +14290,14 @@ mod tests {
             };
             let space = zone.spaces.publish_closed(mm.raw().get(), root, 0).unwrap();
             zone.spaces.open(space);
-            zone.drive(slot, 1);
-            zone.publish_slot(slot, 1, Some(index as u32), 1);
+            zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+            zone.publish_slot(
+                slot,
+                1,
+                Some(index as u32),
+                1,
+                &carrick_sched_core::OwedPasses::new(),
+            );
             zone.enter_guest(slot);
             zone.install_space(slot, mm.raw().get()).unwrap();
             zone.current_or_new(
@@ -14485,8 +14522,14 @@ mod tests {
             };
             let space = zone.spaces.publish_closed(mm.raw().get(), root, 0).unwrap();
             zone.spaces.open(space);
-            zone.drive(slot, 1);
-            zone.publish_slot(slot, 1, Some(index as u32), 1);
+            zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+            zone.publish_slot(
+                slot,
+                1,
+                Some(index as u32),
+                1,
+                &carrick_sched_core::OwedPasses::new(),
+            );
             zone.enter_guest(slot);
             zone.install_space(slot, mm.raw().get()).unwrap();
             zone.current_or_new(
@@ -14631,8 +14674,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -14755,8 +14798,16 @@ mod tests {
             })
             .unwrap();
         thread_control.bind_zone_record(zone.record_ref(record));
-        assert!(zone.requeue_preempted(slot, record).is_queued());
-        assert_eq!(zone.switch_in_full(slot).unwrap().record, record);
+        assert!(
+            zone.requeue_preempted(slot, record, &carrick_sched_core::OwedPasses::new())
+                .is_queued()
+        );
+        assert_eq!(
+            zone.switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record,
+            record
+        );
         thread.set(
             carrick_el1_abi::El1TaskId::from_linux_tid(42),
             carrick_el1_abi::SnapshotGeneration::INITIAL,
@@ -14829,13 +14880,31 @@ mod tests {
         // Retire the registered observer, retaining the leader and its process.
         process.retire_thread_identity(42);
         assert!(registry.for_external_event(&zone, event).is_some());
-        let retired = carrick_core::entry::retire_current(observed, source, record).unwrap();
+        let retired = carrick_core::entry::retire_current(
+            observed,
+            source,
+            record,
+            &carrick_sched_core::OwedPasses::new(),
+        )
+        .unwrap();
         let _ = retired;
         drop(observer_claim);
         drop(process);
         let leader_record = runtime.task_binding(process_key).unwrap().record;
-        assert!(zone.requeue_preempted(slot, leader_record.id).is_queued());
-        assert_eq!(zone.switch_in_full(slot).unwrap().record, leader_record.id);
+        assert!(
+            zone.requeue_preempted(
+                slot,
+                leader_record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
+            .is_queued()
+        );
+        assert_eq!(
+            zone.switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record,
+            leader_record.id
+        );
         let mut leader_entry = runtime
             .enter_registered(
                 registry,
@@ -14991,8 +15060,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -15076,8 +15145,16 @@ mod tests {
             })
             .unwrap();
         thread_control.bind_zone_record(zone.record_ref(record));
-        assert!(zone.requeue_preempted(slot, record).is_queued());
-        assert_eq!(zone.switch_in_full(slot).unwrap().record, record);
+        assert!(
+            zone.requeue_preempted(slot, record, &carrick_sched_core::OwedPasses::new())
+                .is_queued()
+        );
+        assert_eq!(
+            zone.switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record,
+            record
+        );
         thread.set(
             carrick_el1_abi::El1TaskId::from_linux_tid(43),
             carrick_el1_abi::SnapshotGeneration::from_raw(13),
@@ -15191,8 +15268,8 @@ mod tests {
             let slot = carrick_sched_core::SlotId::new(0);
             let space = zone.spaces.publish_closed(1, register, 0).unwrap();
             zone.spaces.open(space);
-            zone.drive(slot, 1);
-            zone.publish_slot(slot, 1, Some(0), 1);
+            zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+            zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
             zone.enter_guest(slot);
             zone.install_space(slot, 1).unwrap();
             zone.current_or_new(
@@ -15282,8 +15359,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -15455,18 +15532,32 @@ mod tests {
             carrick_sched_core::Claim::Parked { .. }
         ));
         assert_eq!(
-            zone.expire_timer(slot, 1999, (-11i64) as u64, &|owned| {
-                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-            }),
+            zone.expire_timer(
+                slot,
+                1999,
+                (-11i64) as u64,
+                &|owned| {
+                    crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                },
+                &carrick_sched_core::OwedPasses::new()
+            ),
             Ok(false)
         );
         assert_eq!(
-            zone.expire_timer(slot, 2000, (-11i64) as u64, &|owned| {
-                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-            }),
+            zone.expire_timer(
+                slot,
+                2000,
+                (-11i64) as u64,
+                &|owned| {
+                    crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                },
+                &carrick_sched_core::OwedPasses::new()
+            ),
             Ok(true)
         );
-        let selected = zone.switch_in_full(slot).unwrap();
+        let selected = zone
+            .switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap();
         assert_eq!(zone.record_ref(selected.record), timer.record);
         let mut entry = runtime
             .enter(source, &task, words(address), &mut service)
@@ -15640,8 +15731,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -15758,8 +15849,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -15913,8 +16004,8 @@ mod tests {
             let slot = carrick_sched_core::SlotId::new(0);
             let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
             zone.spaces.open(space);
-            zone.drive(slot, 1);
-            zone.publish_slot(slot, 1, Some(0), 1);
+            zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+            zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
             zone.enter_guest(slot);
             zone.install_space(slot, 1).unwrap();
             zone.current_or_new(
@@ -16134,7 +16225,9 @@ mod tests {
                 matches!(entry.fork(ProcessForkChildTid::NONE), LifecycleOutcome::Returned { result, .. } if result.raw() == -11)
             );
             drop(entry);
-            let selected = zone.switch_in_full(slot).unwrap();
+            let selected = zone
+                .switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap();
             assert_eq!(selected.record, home);
             let mut entry = runtime
                 .enter(source, &task, words(address), &mut service)
@@ -16193,8 +16286,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -16438,8 +16531,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -16613,7 +16706,12 @@ mod tests {
             11,
             "fork inherits the root task's retained file/loader capability"
         );
-        assert_eq!(zone.switch_in_full(slot).unwrap().record, child_record.id);
+        assert_eq!(
+            zone.switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record,
+            child_record.id
+        );
         zone.install_space(slot, child_address.mm.raw().get())
             .unwrap();
         let child_identity = zone.record(child_record.id).identity();
@@ -16865,7 +16963,12 @@ mod tests {
             .native()
             .resources()
             .record;
-        assert_eq!(zone.switch_in_full(slot).unwrap().record, parent_record.id);
+        assert_eq!(
+            zone.switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record,
+            parent_record.id
+        );
         zone.install_space(slot, address.mm.raw().get()).unwrap();
         let parent_identity = zone.record(parent_record.id).identity();
         task.set(
@@ -17006,7 +17109,9 @@ mod tests {
         let resources = row.native().resources();
         let zone = source.zone;
         assert_eq!(
-            zone.switch_in_full(source.slot).unwrap().record,
+            zone.switch_in_full(source.slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record,
             resources.record.id
         );
         zone.install_space(source.slot, resources.address.mm.raw().get())
@@ -17068,8 +17173,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -17265,8 +17370,14 @@ mod tests {
             .resources()
             .address;
         let peer_slot = carrick_sched_core::SlotId::new(1);
-        zone.drive(peer_slot, 1);
-        zone.publish_slot(peer_slot, 1, Some(1), 1);
+        zone.drive(peer_slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(
+            peer_slot,
+            1,
+            Some(1),
+            1,
+            &carrick_sched_core::OwedPasses::new(),
+        );
         zone.enter_guest(peer_slot);
         assert_eq!(
             zone.claim_for_host(
@@ -17274,11 +17385,19 @@ mod tests {
                 None,
                 Handback::Resumed,
                 &BoundedSpin(0),
-                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+                &carrick_sched_core::OwedPasses::new()
             ),
             carrick_sched_core::HostClaim::Claimed
         );
-        assert!(zone.requeue_on(peer_slot, child_record.id).is_some());
+        assert!(
+            zone.requeue_on(
+                peer_slot,
+                child_record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
+            .is_some()
+        );
         let peer_source = BornInZoneSource {
             zone: &zone,
             slot: peer_slot,
@@ -17518,8 +17637,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -17717,8 +17836,8 @@ mod tests {
             let slot = carrick_sched_core::SlotId::new(0);
             let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
             zone.spaces.open(space);
-            zone.drive(slot, 1);
-            zone.publish_slot(slot, 1, Some(0), 1);
+            zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+            zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
             zone.enter_guest(slot);
             zone.install_space(slot, 1).unwrap();
             zone.current_or_new(
@@ -17955,8 +18074,8 @@ mod tests {
             let slot = carrick_sched_core::SlotId::new(0);
             let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
             zone.spaces.open(space);
-            zone.drive(slot, 1);
-            zone.publish_slot(slot, 1, Some(0), 1);
+            zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+            zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
             zone.enter_guest(slot);
             zone.install_space(slot, 1).unwrap();
             zone.current_or_new(
@@ -18135,7 +18254,8 @@ mod tests {
                         &|owned| crate::sched::object_wait::deliver_host_completion(
                             owned.zone(),
                             owned
-                        )
+                        ),
+                        &carrick_sched_core::OwedPasses::new()
                     ),
                     carrick_sched_core::HostClaim::Claimed
                 ));
@@ -18242,8 +18362,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -18482,8 +18602,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -18591,8 +18711,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -18734,8 +18854,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -18839,8 +18959,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -18912,7 +19032,14 @@ mod tests {
             .expect("fork child succeeds") as i32;
         drop(entry);
 
-        assert!(zone.requeue_preempted(slot, parent_record.id).is_queued());
+        assert!(
+            zone.requeue_preempted(
+                slot,
+                parent_record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
+            .is_queued()
+        );
         let child_key = {
             let graph = runtime.graph.lock();
             graph
@@ -18933,7 +19060,12 @@ mod tests {
                 row.native().resources().record,
             )
         };
-        assert_eq!(zone.switch_in_full(slot).unwrap().record, child_record.id);
+        assert_eq!(
+            zone.switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record,
+            child_record.id
+        );
         zone.install_space(slot, child_address.mm.raw().get())
             .unwrap();
         let child_identity = zone.record(child_record.id).identity();
@@ -18998,8 +19130,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -19451,8 +19583,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -19609,8 +19741,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -19831,12 +19963,20 @@ mod tests {
         if operation == 4 {
             assert_eq!(zone.timer_deadline(slot), Some(1001));
             assert_eq!(
-                zone.expire_timer(slot, 1001, (-11_i64) as u64, &|owned| {
-                    crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-                }),
+                zone.expire_timer(
+                    slot,
+                    1001,
+                    (-11_i64) as u64,
+                    &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    },
+                    &carrick_sched_core::OwedPasses::new()
+                ),
                 Ok(true)
             );
-            let selected = zone.switch_in_full(slot).expect("timer must wake semop");
+            let selected = zone
+                .switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+                .expect("timer must wake semop");
             assert_eq!(zone.record_ref(selected.record), entry.record);
             assert!(
                 matches!(entry.resume_pending_wait(), Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == carrick_syscall_abi::LINUX_EAGAIN.guest_retval())
@@ -19850,7 +19990,9 @@ mod tests {
                 entry.msgsnd(queue, 1, &[7], 0),
                 Ok(IpcOutcome::Returned(_))
             ));
-            let selected = zone.switch_in_full(slot).expect("message must wake msgrcv");
+            let selected = zone
+                .switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+                .expect("message must wake msgrcv");
             assert_eq!(zone.record_ref(selected.record), entry.record);
             assert!(
                 matches!(entry.resume_pending_wait(), Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == carrick_syscall_abi::LINUX_EFAULT.guest_retval())
@@ -19891,7 +20033,7 @@ mod tests {
                 .unwrap();
         }
         let selected = zone
-            .switch_in_full(slot)
+            .switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
             .expect("signal must wake the owned IPC continuation");
         assert_eq!(zone.record_ref(selected.record), entry.record);
         assert!(
@@ -20147,8 +20289,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -20371,8 +20513,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -20432,7 +20574,9 @@ mod tests {
         assert_eq!(child_pid.raw(), 42);
         assert_eq!(entry.service.committed_children.len(), 1);
         let (committed_task, committed_execution) = entry.service.committed_children[0];
-        let switched = zone.switch_in_full(slot).expect("runnable forked child");
+        let switched = zone
+            .switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+            .expect("runnable forked child");
         let child_identity = zone.record(switched.record).identity();
         assert_eq!(committed_task.get(), 102);
         assert_ne!(

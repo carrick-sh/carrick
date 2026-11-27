@@ -2932,8 +2932,8 @@ mod tests {
         let ttbr = (4 << 48) | 0x90000;
         let space = zone.spaces.publish_closed(5, ttbr, ttbr).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 5);
-        zone.publish_slot(slot, 5, Some(3), 1);
+        zone.drive(slot, 5, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 5, Some(3), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 5).unwrap();
         // SAFETY: this fixed initialized CurrentTask belongs to the fixture.
@@ -3116,10 +3116,10 @@ mod tests {
         let ttbr = (4 << 48) | 0x90000;
         let space = zone.spaces.publish_closed(5, ttbr, ttbr).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 5);
+        zone.drive(slot, 5, &carrick_sched_core::OwedPasses::new());
         // A native switch keeps the host-loaded MM distinct from the MM
         // actually installed on the stopped vCPU.
-        zone.publish_slot(slot, 6, Some(3), 1);
+        zone.publish_slot(slot, 6, Some(3), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 5).unwrap();
         // SAFETY: this CPU's fixed initialized CurrentTask record belongs to the fixture.
@@ -3209,8 +3209,8 @@ mod tests {
         let ttbr = (4 << 48) | 0x90000;
         let space = zone.spaces.publish_closed(5, ttbr, ttbr).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 5);
-        zone.publish_slot(slot, 5, Some(3), 1);
+        zone.drive(slot, 5, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 5, Some(3), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 5).unwrap();
         let task = carrick_el1_abi::CurrentTask::new();

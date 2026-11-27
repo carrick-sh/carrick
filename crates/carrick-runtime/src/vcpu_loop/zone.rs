@@ -2611,7 +2611,13 @@ mod ipc_tests {
                     )
                 })
                 .unwrap();
-            guard.notify_object_host(&mut |_| {}, &mut |_| {}).unwrap();
+            guard
+                .notify_object_host(
+                    &mut |_| {},
+                    &mut |_| {},
+                    &carrick_sched_core::OwedPasses::new(),
+                )
+                .unwrap();
         }
         let record = zone
             .alloc_record(ThreadIdentity {

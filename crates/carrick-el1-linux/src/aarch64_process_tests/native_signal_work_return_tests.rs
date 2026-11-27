@@ -103,11 +103,19 @@ fn resident_signal_work_return(
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, owner_record)
+            .requeue_preempted(
+                fixture.slot,
+                owner_record,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         peer.id
     );
     run_as(fixture, 42, 12, 102, peer_control);
@@ -136,11 +144,19 @@ fn resident_signal_work_return(
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, peer.id)
+            .requeue_preempted(
+                fixture.slot,
+                peer.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         owner_record
     );
     run_as_leader(fixture);
@@ -207,11 +223,19 @@ fn resident_signal_work_return(
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, owner_record)
+            .requeue_preempted(
+                fixture.slot,
+                owner_record,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         peer.id
     );
     run_as(fixture, 42, 12, 102, peer_control);
