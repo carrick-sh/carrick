@@ -869,9 +869,47 @@ pub fn dispatch_entry(
         }
     };
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+    let action = run_owed_entry_switch(frame, counters, action);
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     return final_user_return(frame, action, arm_signal_user_return);
     #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
     action
+}
+
+/// Run the scheduler switch a park owed this entry (#3093), now that the
+/// dispatch's frames have unwound: the next thread's resume runs beneath
+/// the entry alone, never beneath the park site. A park releases its slot
+/// as `Idle`; any other exit with a switch owed is a broken invariant.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+fn run_owed_entry_switch(frame: &mut TrapFrame, counters: &Counters, action: Action) -> Action {
+    let Some(slot) = SlotId::from_index(frame.slot as usize) else {
+        return action;
+    };
+    if !sched::entry_switch::owed(slot) {
+        return action;
+    }
+    if action != Action::Idle {
+        invalid_completion(NativeInvariant::EntryBinding);
+    }
+    let current_tasks =
+        unsafe { &*(EL1_CURRENT_TASKS_BASE as *const [CurrentTask; EL1_STACK_SLOTS as usize]) };
+    let Some(task) = current_tasks.get(frame.slot as usize) else {
+        invalid_completion(NativeInvariant::EntryBinding);
+    };
+    let zone = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
+    let mut sched = sched::Sched {
+        handoff: None,
+        zone,
+        slot,
+        task,
+        cpu: &mut sched::HardwareCpu,
+        user: &sched::HardwareUserWord,
+        counters,
+    };
+    match sched.run_entry_switch(frame) {
+        Some(sched::Served::Returned { .. }) => Action::Served,
+        Some(sched::Served::Idle) | None => Action::Idle,
+    }
 }
 
 /// Re-enter the selected owner after dispatch and scheduler continuation settle.

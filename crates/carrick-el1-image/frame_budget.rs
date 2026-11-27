@@ -187,8 +187,12 @@ impl Frames {
                 .required("::dispatch::dispatch_syscall::")?
                 .max(self.required("::dispatch::arm_signal_user_return::")?)
             + self.required("::aarch64_process::with_process_entry::")?;
+        // A park's owed switch runs from `dispatch_entry` (#3093), beside
+        // the interrupt and idle entries.
         let resume_entry = entry
             + self.sum(&[
+                "::run_owed_entry_switch::",
+                "::run_entry_switch::",
                 "::interrupt::",
                 "::preempt_record::",
                 "::idle::",

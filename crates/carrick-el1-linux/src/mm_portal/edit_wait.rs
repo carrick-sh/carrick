@@ -103,7 +103,7 @@ pub fn park_prepared_edit<C: ThreadCpu, U: UserWord>(
             if sched.task.linux.has_pending_host_work() {
                 sched.leave_after_object_park(parked)
             } else {
-                sched.resume_after_object_park(frame, parked, 0)
+                sched.defer_after_object_park(parked)
             }
         }
         EditWaitOutcome::NoConflict | EditWaitOutcome::Refused => None,
@@ -233,7 +233,7 @@ pub(super) fn park_anonymous_edit_with_allocator<C: ThreadCpu, U: UserWord>(
             if sched.task.linux.has_pending_host_work() {
                 sched.leave_after_object_park(parked)
             } else {
-                sched.resume_after_object_park(frame, parked, 0)
+                sched.defer_after_object_park(parked)
             }
         }
         EditWaitOutcome::NoConflict | EditWaitOutcome::StaleToken => {

@@ -106,7 +106,7 @@ impl<
         {
             let task_index = self.frame.task_index();
             let slot = self.frame.slot();
-            if let (Some(zone), Some(frame)) = (self.zone.as_mut(), self.frame.arm_frame()) {
+            if let (Some(zone), true) = (self.zone.as_mut(), self.frame.arm_frame().is_some()) {
                 let task = self.current_tasks.get(task_index).unwrap_or_else(|| {
                     super::dispatch::invalid_completion(
                         super::dispatch::NativeInvariant::EntryBinding,
@@ -117,12 +117,10 @@ impl<
                         super::dispatch::NativeInvariant::EntryBinding,
                     )
                 });
-                if let Some(ready) =
-                    native_scheduler(zone, task, self.counters, slot, &mut self.handoff)
-                        .run_ready(frame)
-                {
-                    *progress = ready;
-                }
+                // Ready work runs from the entry, never under this transfer
+                // (#3093); the progress stays the released slot's Idle.
+                native_scheduler(zone, task, self.counters, slot, &mut self.handoff)
+                    .defer_run_ready();
             }
         }
     }
@@ -443,7 +441,7 @@ impl<
         {
             let task_index = self.frame.task_index();
             let slot = self.frame.slot();
-            if let (Some(zone), Some(frame)) = (self.zone.as_mut(), self.frame.arm_frame()) {
+            if let (Some(zone), true) = (self.zone.as_mut(), self.frame.arm_frame().is_some()) {
                 let task = self.current_tasks.get(task_index).unwrap_or_else(|| {
                     super::dispatch::invalid_completion(
                         super::dispatch::NativeInvariant::EntryBinding,
@@ -454,12 +452,10 @@ impl<
                         super::dispatch::NativeInvariant::EntryBinding,
                     )
                 });
-                if let Some(ready) =
-                    native_scheduler(zone, task, self.counters, slot, &mut self.handoff)
-                        .run_ready(frame)
-                {
-                    *progress = ready;
-                }
+                // Ready work runs from the entry, never under this transfer
+                // (#3093); the progress stays the released slot's Idle.
+                native_scheduler(zone, task, self.counters, slot, &mut self.handoff)
+                    .defer_run_ready();
             }
         }
         Some(outcome)
@@ -1016,15 +1012,14 @@ impl<
                 SyscallResult::new(self.frame.result().0 as i64),
             );
         };
-        let served = native_scheduler(zone, task, self.counters, slot, &mut self.handoff).run_next(
-            match self.frame.arm_frame() {
-                Some(frame) => frame,
-                None => super::dispatch::invalid_completion(
-                    super::dispatch::NativeInvariant::MissingNativeFrame,
-                ),
-            },
-            timeout_result.raw() as u64,
-        );
+        if self.frame.arm_frame().is_none() {
+            super::dispatch::invalid_completion(
+                super::dispatch::NativeInvariant::MissingNativeFrame,
+            );
+        }
+        // The next thread runs from the entry, never under the exit (#3093).
+        let served = native_scheduler(zone, task, self.counters, slot, &mut self.handoff)
+            .defer_run_next(timeout_result.raw() as u64);
         (served, SyscallResult::new(self.frame.result().0 as i64))
     }
     fn result(&self) -> SyscallResult {

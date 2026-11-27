@@ -301,7 +301,7 @@ impl<C: ThreadCpu, U: UserWord> IpcExecution for Sched<'_, C, U> {
         let served = if self.task.linux.has_pending_host_work() {
             self.leave_after_object_park(parked)
         } else {
-            self.resume_after_object_park(frame, parked, 0)
+            self.defer_after_object_park(parked)
         };
         Ok(match served {
             Some(super::Served::Returned { switched }) => IpcServed::Returned { switched },
