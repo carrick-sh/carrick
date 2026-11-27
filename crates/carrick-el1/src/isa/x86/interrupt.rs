@@ -577,16 +577,22 @@ static OWED_RESCHED_RESENT: core::sync::atomic::AtomicU64 = core::sync::atomic::
 /// Reschedule IPIs that found the ICR busy by injection, for the census.
 #[cfg(feature = "test-support")]
 static RESCHED_BUSY_INJECTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// The next reschedule IPI this kernel sends finds the ICR busy, once.
+/// The CPU slot (plus one) whose next reschedule IPI finds the ICR busy,
+/// once; 0 when none is armed.
 #[cfg(feature = "test-support")]
-static RESCHED_BUSY_ARMED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+static RESCHED_BUSY_ARMED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// Make the next reschedule IPI find its ICR busy, once (#3083 witness).
-/// False when one is already armed.
+/// Make this CPU's next reschedule IPI find its ICR busy, once (#3083
+/// witness); another CPU's sends never consume it. False when one is
+/// already armed, or this CPU has no binding.
 #[cfg(feature = "test-support")]
 pub fn inject_resched_busy_once() -> bool {
-    !RESCHED_BUSY_ARMED.swap(true, Ordering::AcqRel)
+    let Some(binding) = super::context::current_cpu_binding() else {
+        return false;
+    };
+    RESCHED_BUSY_ARMED
+        .compare_exchange(0, binding.cpu_slot + 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
 }
 
 /// `(injected busy sends, owed IPIs resent)`, for the #3083 witness.
@@ -600,7 +606,11 @@ pub fn resched_busy_census() -> (u64, u64) {
 
 fn send_resched_ipi(apic: interrupts::ApicId) -> Result<(), interrupts::IpiBusy> {
     #[cfg(feature = "test-support")]
-    if RESCHED_BUSY_ARMED.swap(false, Ordering::AcqRel) {
+    if let Some(binding) = super::context::current_cpu_binding()
+        && RESCHED_BUSY_ARMED
+            .compare_exchange(binding.cpu_slot + 1, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
         RESCHED_BUSY_INJECTED.fetch_add(1, Ordering::AcqRel);
         return Err(interrupts::IpiBusy);
     }
