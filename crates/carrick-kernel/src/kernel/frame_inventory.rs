@@ -169,6 +169,11 @@ impl carrick_hal::PhysicalFrameInventory for PhysicalInventoryProjection {
         }
         Ok(retired)
     }
+    fn frame_is_mapped(&self, frame: FrameId) -> bool {
+        self.inventory
+            .frame_mapping_count(frame)
+            .is_some_and(|count| count != 0)
+    }
 }
 impl carrick_hal::FrameCowAuthority for PhysicalInventoryBinding {
     fn quiesce(

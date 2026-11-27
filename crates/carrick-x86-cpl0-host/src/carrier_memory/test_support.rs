@@ -1432,54 +1432,17 @@ pub fn a_released_slot_whose_frame_another_mm_maps_quarantines_the_carrier(
     assert_eq!(fixture.held_by(2), BTreeSet::from([a.slot]));
 }
 
-pub fn refused_retire_child_mutates_nothing_and_its_retry_completes(_make: fn() -> MemoryTestIo) {
-    use carrick_hal::{FrameEventCapacity, FrameInventoryEvent, FrameLength, MappingGeneration};
+/// The retiring MM's own private frame is still mapped when the carrier
+/// retires it: production releases the inventory side first
+/// (`release_child_mm`), so a live row here means the ledger and the
+/// inventory disagree. The slot has no holder left to wait for, so the
+/// carrier quarantines (fatal) instead of refusing for a retry that could
+/// only loop, and it moves nothing before it does.
+pub fn a_released_slot_its_retiring_mm_still_maps_quarantines_the_carrier(
+    _make: fn() -> MemoryTestIo,
+) {
     let mut fixture = RetireFixture::new(2, _make);
-    // The child's private frame is still mapped in the inventory: the
-    // carrier must refuse before touching any of its own state.
-    let child = fixture.context(2);
-    let mut reservation = fixture
-        .authority
-        .reserve(
-            &fixture.ids,
-            1,
-            1,
-            FrameEventCapacity::for_event_count(2).unwrap(),
-        )
-        .unwrap();
-    let transaction = reservation.transaction();
-    let frame = reservation.claim_frame().unwrap();
-    let mapping = reservation.claim_mapping().unwrap();
-    let generation = MappingGeneration::from_backend_counter(nz(1));
-    reservation
-        .push(FrameInventoryEvent::PrepareMapping {
-            transaction,
-            frame,
-            mapping,
-            generation,
-            gpa: carrick_guest_mem::Gpa::new(0x800000),
-            length: FrameLength::from_mapping_extent(nz(PAGE)),
-            permissions: carrick_hal::MemPerms {
-                read: true,
-                write: true,
-                exec: false,
-            },
-        })
-        .unwrap();
-    reservation
-        .push(FrameInventoryEvent::PublishMapping {
-            transaction,
-            mapping,
-            generation,
-        })
-        .unwrap();
-    fixture
-        .authority
-        .apply(
-            carrick_kernel::kernel::FrameOwner::GuestMm(child.into()),
-            reservation.commit(()),
-        )
-        .unwrap();
+    let (frame, mapping) = fixture.map_frame(2, 0x800000);
     let mut prepared = backing(0x800000, PAGE as usize, 91);
     prepared.identity.frame_id = nz(frame.raw());
     prepared.identity.mapping_id = nz(mapping.raw());
@@ -1489,8 +1452,13 @@ pub fn refused_retire_child_mutates_nothing_and_its_retry_completes(_make: fn() 
     fixture.owe_drain(2, shared);
 
     assert!(fixture.retire(2).is_err());
+    assert!(
+        fixture.memory.is_quarantined(),
+        "a broken invariant is fatal"
+    );
     // Nothing moved: root, aliases, drains and admissions all intact.
     assert!(fixture.memory.root(fixture.key(2)).is_some());
+    assert!(fixture.memory.record(private).is_ok());
     assert_eq!(fixture.allowed(private), vec![fixture.key(2)]);
     assert_eq!(
         fixture.allowed(shared),
@@ -1505,24 +1473,9 @@ pub fn refused_retire_child_mutates_nothing_and_its_retry_completes(_make: fn() 
         fixture.held_by(2),
         BTreeSet::from([private.slot, shared.slot])
     );
-    assert!(!fixture.memory.is_quarantined());
-
-    // Once the inventory side releases the MM, the same call completes.
-    fixture
-        .inventory()
-        .retire_mm(MmGeneration::new(fixture.key(2)))
-        .unwrap();
-    let retired = fixture.retire(2).unwrap();
-    assert_eq!(
-        retired,
-        RetiredChild {
-            aliases: 1,
-            revoked_slots: 1
-        }
-    );
-    assert!(fixture.memory.record(private).is_err());
-    assert_eq!(fixture.allowed(shared), vec![fixture.key(1)]);
     fixture.assert_admitted_exact();
+    // Quarantined: no later edit, the same retirement included, proceeds.
+    assert!(fixture.retire(2).is_err());
 }
 
 /// Returns the first carrier refusal instead of panicking: this harness is

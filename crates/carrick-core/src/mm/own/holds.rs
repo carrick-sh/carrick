@@ -84,15 +84,24 @@ impl<C: DrainContext> Holds<C> {
 }
 
 /// An MM's retirement, planned before anything changes.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HoldRetirement<S> {
     /// Every slot the MM holds anything in.
     pub held: Vec<S>,
     /// The slots whose last hold is the MM's: nothing holds them once it
     /// retires. The caller revokes exactly these.
     pub released: Vec<S>,
-    /// How many aliases the MM held, over every slot.
-    pub aliases: usize,
+    /// How many aliases the MM held in each slot (nonzero counts only), so
+    /// a backend checks its own alias records slot by slot: an extra alias
+    /// on one slot never cancels a missing one on another.
+    pub aliases: BTreeMap<S, usize>,
+}
+
+impl<S> HoldRetirement<S> {
+    /// The MM's aliases over every slot.
+    pub fn alias_total(&self) -> usize {
+        self.aliases.values().sum()
+    }
 }
 
 /// The holds of every backing slot of one carrier, by slot id `S`.
@@ -177,14 +186,16 @@ impl<S: Copy + Ord, C: DrainContext> SlotHolds<S, C> {
         let mut plan = HoldRetirement {
             held: Vec::new(),
             released: Vec::new(),
-            aliases: 0,
+            aliases: BTreeMap::new(),
         };
         for &slot in self.by_mm.get(&mm).into_iter().flatten() {
             let Some(holds) = self.slots.get(&slot) else {
                 continue;
             };
             plan.held.push(slot);
-            plan.aliases += holds.aliases.get(&mm).copied().unwrap_or(0);
+            if let Some(&count) = holds.aliases.get(&mm) {
+                plan.aliases.insert(slot, count);
+            }
             if !holds.held_beyond(mm) {
                 plan.released.push(slot);
             }
@@ -391,78 +402,114 @@ mod tests {
         holds.check_invariants().unwrap();
     }
 
-    /// Every reachable state of two slots and three MMs under admit, alias
-    /// (at most one per MM and slot), unalias and retire, in every order:
-    /// the ledger keeps H1 to H3, and a slot is released by exactly the
-    /// retirement that drops its last hold, whatever kind of hold it was.
-    /// The reference is a plain set of holds.
-    #[test]
-    fn every_edit_order_releases_each_slot_exactly_when_its_last_hold_drops() {
+    /// The ledger's holds in the reference model's shape: per slot, the
+    /// admitted MMs, the alias count per MM, and the (MM, context) debts.
+    type Model = BTreeMap<u32, (BTreeSet<u64>, BTreeMap<u64, usize>, BTreeSet<(u64, u8)>)>;
+    fn project(holds: &SlotHolds<u32, Ctx>) -> Model {
+        holds
+            .slots
+            .iter()
+            .map(|(&slot, h)| {
+                (
+                    slot,
+                    (
+                        h.admitted.iter().map(|m| m.raw().get()).collect(),
+                        h.aliases.iter().map(|(m, c)| (m.raw().get(), *c)).collect(),
+                        h.drains.iter().map(|d| (d.0.raw().get(), d.1)).collect(),
+                    ),
+                )
+            })
+            .collect()
+    }
+    fn held(model: &Model, slot: u32) -> bool {
+        model
+            .get(&slot)
+            .is_some_and(|(a, b, c)| !a.is_empty() || !b.is_empty() || !c.is_empty())
+    }
+
+    /// Explore every reachable state of `slots` and MMs `1..=mms` under
+    /// admit, alias (up to `max_alias` per MM and slot), unalias (into any
+    /// of `contexts` contexts per MM), retire and forget, in every order.
+    /// Each reached ledger state must equal the reference model reached by
+    /// the same edits (checked before deduplication, so no ledger state
+    /// hides behind an equal model reached another way); the ledger keeps
+    /// H1 to H3; and each retirement's plan names exactly the slots whose
+    /// last hold it drops and the MM's exact alias count per slot.
+    fn explore(slots: &[u32], mms: u64, max_alias: usize, contexts: u8, forget: bool) -> usize {
         #[derive(Clone, Copy, Debug)]
         enum Edit {
             Admit(u32, u64),
             Alias(u32, u64),
-            Unalias(u32, u64),
+            Unalias(u32, u64, u8),
             Retire(u64),
+            Forget(u32),
         }
         let mut edits = Vec::new();
-        for slot in [1, 2] {
-            for m in 1..=3 {
+        for &slot in slots {
+            for m in 1..=mms {
                 edits.push(Edit::Admit(slot, m));
                 edits.push(Edit::Alias(slot, m));
-                edits.push(Edit::Unalias(slot, m));
+                for c in 0..contexts {
+                    edits.push(Edit::Unalias(slot, m, c));
+                }
+            }
+            if forget {
+                edits.push(Edit::Forget(slot));
             }
         }
-        for m in 1..=3 {
+        for m in 1..=mms {
             edits.push(Edit::Retire(m));
         }
-        // Reference model: per slot, (admitted MMs, alias counts, debt MMs).
-        type Model = BTreeMap<u32, (BTreeSet<u64>, BTreeMap<u64, usize>, BTreeSet<u64>)>;
-        fn held(model: &Model, slot: u32) -> bool {
-            let (a, b, c) = &model[&slot];
-            !a.is_empty() || !b.is_empty() || !c.is_empty()
-        }
-        let mut stack: Vec<(SlotHolds<u32, Ctx>, Model, BTreeSet<u64>)> = Vec::new();
-        let mut seen: BTreeSet<(Model, BTreeSet<u64>)> = BTreeSet::new();
         let mut start = SlotHolds::new();
         let mut model = Model::new();
-        for slot in [1, 2] {
+        for &slot in slots {
             start.register(slot).unwrap();
             model.insert(slot, Default::default());
         }
-        stack.push((start, model, BTreeSet::new()));
-        let mut visited = 0usize;
+        let mut stack: Vec<(SlotHolds<u32, Ctx>, Model, BTreeSet<u64>)> =
+            alloc::vec![(start, model, BTreeSet::new())];
+        let mut seen: BTreeSet<(Model, BTreeSet<u64>)> = BTreeSet::new();
+        seen.insert((stack[0].1.clone(), BTreeSet::new()));
         while let Some((holds, model, retired)) = stack.pop() {
-            if !seen.insert((model.clone(), retired.clone())) {
-                continue;
-            }
-            visited += 1;
-            holds.check_invariants().unwrap();
             for edit in &edits {
                 let mut holds = holds.clone();
                 let mut model = model.clone();
                 let mut retired = retired.clone();
                 match *edit {
-                    Edit::Admit(slot, m) | Edit::Alias(slot, m) | Edit::Unalias(slot, m)
+                    Edit::Admit(_, m) | Edit::Alias(_, m) | Edit::Unalias(_, m, _)
                         if retired.contains(&m) =>
                     {
-                        let _ = slot;
+                        continue;
+                    }
+                    Edit::Admit(slot, m) | Edit::Alias(slot, m) | Edit::Unalias(slot, m, _)
+                        if !model.contains_key(&slot) =>
+                    {
+                        let result = match *edit {
+                            Edit::Admit(..) => holds.admit(slot, mm(m)),
+                            Edit::Alias(..) => holds.alias(slot, mm(m)),
+                            _ => holds.unalias(slot, mm(m), Ctx(mm(m), 0)),
+                        };
+                        assert_eq!(result, Err(HoldError::UnknownSlot));
                         continue;
                     }
                     Edit::Admit(slot, m) => {
                         holds.admit(slot, mm(m)).unwrap();
                         model.get_mut(&slot).unwrap().0.insert(m);
                     }
-                    Edit::Alias(slot, m) if model[&slot].1.contains_key(&m) => continue,
+                    Edit::Alias(slot, m)
+                        if model[&slot].1.get(&m).copied().unwrap_or(0) >= max_alias =>
+                    {
+                        continue;
+                    }
                     Edit::Alias(slot, m) => {
                         holds.alias(slot, mm(m)).unwrap();
                         *model.get_mut(&slot).unwrap().1.entry(m).or_default() += 1;
                     }
-                    Edit::Unalias(slot, m) => {
+                    Edit::Unalias(slot, m, c) => {
                         let entry = model.get_mut(&slot).unwrap();
                         let Some(count) = entry.1.get_mut(&m) else {
                             assert_eq!(
-                                holds.unalias(slot, mm(m), Ctx(mm(m), 0)),
+                                holds.unalias(slot, mm(m), Ctx(mm(m), c)),
                                 Err(HoldError::AliasUnderflow)
                             );
                             continue;
@@ -471,30 +518,85 @@ mod tests {
                         if *count == 0 {
                             entry.1.remove(&m);
                         }
-                        entry.2.insert(m);
-                        holds.unalias(slot, mm(m), Ctx(mm(m), 0)).unwrap();
+                        entry.2.insert((m, c));
+                        holds.unalias(slot, mm(m), Ctx(mm(m), c)).unwrap();
+                    }
+                    Edit::Forget(slot) => {
+                        let Some(entry) = model.get(&slot) else {
+                            assert_eq!(holds.forget(slot), Err(HoldError::UnknownSlot));
+                            continue;
+                        };
+                        if !entry.1.is_empty() {
+                            assert_eq!(holds.forget(slot), Err(HoldError::StillAliased));
+                            continue;
+                        }
+                        // A slot leaves only once nothing holds it: a held
+                        // slot's forget is the caller's revoke, explored
+                        // through retirement instead.
+                        if held(&model, slot) {
+                            continue;
+                        }
+                        holds.forget(slot).unwrap();
+                        model.remove(&slot);
                     }
                     Edit::Retire(m) => {
                         if !retired.insert(m) {
                             continue;
                         }
                         let before: BTreeSet<u32> =
-                            [1, 2].into_iter().filter(|s| held(&model, *s)).collect();
+                            model.keys().copied().filter(|s| held(&model, *s)).collect();
+                        let aliases: BTreeMap<u32, usize> = model
+                            .iter()
+                            .filter_map(|(s, (_, b, _))| b.get(&m).map(|count| (*s, *count)))
+                            .collect();
                         for (a, b, c) in model.values_mut() {
                             a.remove(&m);
                             b.remove(&m);
-                            c.remove(&m);
+                            c.retain(|(owner, _)| *owner != m);
                         }
                         let expected: Vec<u32> =
                             before.into_iter().filter(|s| !held(&model, *s)).collect();
                         let plan = holds.retirement(mm(m));
                         assert_eq!(holds.retire(mm(m)), plan, "the plan is what commits");
                         assert_eq!(plan.released, expected, "{edit:?}");
+                        assert_eq!(plan.aliases, aliases, "{edit:?}");
                     }
                 }
-                stack.push((holds, model, retired));
+                // Every reached ledger state is checked, before the model
+                // state is deduplicated: no ledger state hides behind an
+                // equal model reached by another edit order.
+                assert_eq!(
+                    project(&holds),
+                    model,
+                    "{edit:?}: the ledger left the model"
+                );
+                holds.check_invariants().unwrap();
+                if seen.insert((model.clone(), retired.clone())) {
+                    stack.push((holds, model, retired));
+                }
             }
         }
+        seen.len()
+    }
+
+    /// Two slots and two MMs (an owner and an inheritor) with up to two
+    /// aliases each: every release shape across slots, including a forget,
+    /// with the per-MM index spanning both slots. (Two slots and three MMs
+    /// reach 274625 states, minutes in a debug build; the three-holder
+    /// shapes are explored on one slot below, and the cross-unmap of two
+    /// slots by two inheritors is the named case above.)
+    #[test]
+    fn every_edit_order_releases_each_slot_exactly_when_its_last_hold_drops() {
+        let visited = explore(&[1, 2], 2, 2, 1, true);
+        assert!(visited > 1_000, "explored {visited} states");
+    }
+
+    /// One slot and three MMs with up to two aliases each and two contexts:
+    /// multiplicity, so a count or a second debt never masks a release and
+    /// no third holder is missed.
+    #[test]
+    fn alias_and_drain_multiplicity_never_releases_a_slot_early() {
+        let visited = explore(&[1], 3, 2, 2, true);
         assert!(visited > 1_000, "explored {visited} states");
     }
 }
