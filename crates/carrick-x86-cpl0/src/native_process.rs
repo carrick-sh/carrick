@@ -19,7 +19,9 @@ use carrick_el1_abi::{
 };
 use carrick_el1_linux::mm_portal::production::GuestMetadataPin;
 use carrick_el1_linux::mm_portal::{LinuxForkPolicy, NativeForkPortal, UnpublishedEl1Child};
-use carrick_el1_linux::native_fork_refusal::{NativeForkStage, busy, refused};
+use carrick_el1_linux::native_fork_refusal::{
+    NativeForkStage, PublishRefusal, busy, refused, refused_publish,
+};
 use carrick_el1_linux::native_process_runtime::{
     ExecSuccessorSlot, NativeExecSuccessor, NativeFailure, NativeForkPreparation,
     NativeLifecycleResources, NativeProcessError, NativeProcessRegistry, NativeProcessRuntime,
@@ -601,6 +603,9 @@ impl Service {
             return Err(free(child_space, NativeProcessError::Exhausted));
         }
         custody.extend(plan.custody().iter().copied().map(PortalForkCustody::words));
+        // Sampled before publish locks the roots: a node bank demand names
+        // the capacity it found too small (#3085).
+        let nodes = owner.roots.node_capacity();
         let mut child = match owner.publish_fork(plan, live, self.worker()) {
             Ok(child) => {
                 let _ = child_space.keep();
@@ -616,11 +621,15 @@ impl Service {
                 if matches!(e, carrick_core::mm::transaction::MmError::Core) {
                     return Err(NativeProcessError::Quarantined);
                 }
-                return Err(abandon_loan(
-                    &loan,
-                    Some(live),
-                    refused(NativeForkStage::Publish, e),
-                ));
+                return Err(match refused_publish(e, nodes) {
+                    PublishRefusal::Refused(error) => abandon_loan(&loan, Some(live), error),
+                    // The bank is supplied with the loan returned and no
+                    // MM guard held; the fork then reruns against it.
+                    PublishRefusal::NodeBank(demand) => match return_loan(&loan, Some(live)) {
+                        Ok(()) => demand.supply(owner.roots, &carrick_el1::alloc::GLOBAL_ALLOCATOR),
+                        Err(error) => error,
+                    },
+                });
             }
         };
         let abort_published = |child: &mut UnpublishedEl1Child<X86Mmu>, err: NativeProcessError| {

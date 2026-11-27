@@ -30,7 +30,7 @@ use core::sync::atomic::Ordering;
 
 use super::common_entry;
 use super::mm_portal::{LinuxForkPolicy, NativeForkPortal, UnpublishedEl1Child};
-use super::native_fork_refusal::{NativeForkStage, refused};
+use super::native_fork_refusal::{NativeForkStage, PublishRefusal, refused, refused_publish};
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 use super::native_process_runtime::NativeResume;
 use super::native_process_runtime::{
@@ -2530,6 +2530,9 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
             ));
         }
         custody.extend_from_slice(plan.custody());
+        // Sampled before publish locks the roots: a node bank demand names
+        // the capacity it found too small (#3085).
+        let nodes = owner.roots.node_capacity();
         let mut child = match owner.publish_fork(plan, &*live, self.worker()) {
             Ok(child) => {
                 let _ = child_space.keep();
@@ -2542,13 +2545,25 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                         NativeServiceQuarantine::ForkPublishCore,
                     ));
                 }
-                return Err(abandon_loan(
-                    &self.crossing,
-                    self.worker(),
-                    &loan,
-                    Some(&*live),
-                    refused(NativeForkStage::Publish, e),
-                ));
+                return Err(match refused_publish(e, nodes) {
+                    PublishRefusal::Refused(error) => {
+                        abandon_loan(&self.crossing, self.worker(), &loan, Some(&*live), error)
+                    }
+                    // The bank is supplied with the loan returned and no
+                    // MM guard held; the fork then reruns against it.
+                    PublishRefusal::NodeBank(demand) => match abandon_loan(
+                        &self.crossing,
+                        self.worker(),
+                        &loan,
+                        Some(&*live),
+                        NativeProcessError::Busy,
+                    ) {
+                        NativeProcessError::Busy => {
+                            demand.supply(owner.roots, &carrick_el1::alloc::GLOBAL_ALLOCATOR)
+                        }
+                        unreturned => unreturned,
+                    },
+                });
             }
         };
         let completion = child.completion();
