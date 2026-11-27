@@ -35,17 +35,17 @@
  *     read of page 2 (the second resident run, past the hole) then faults
  *   19 as 14, then mprotect(PROT_READ|PROT_WRITE) over the whole range: pages
  *     0, 1 (the hole) and 2 take a write and read it back, then munmap
- *   20 (#2875) two live threads on two CPUs: a sibling thread reads a
- *     resident RW page and keeps reading it, so its CPU holds the
- *     translation, while the main thread mprotects it PROT_NONE and then
- *     sets a flag. The sibling's first read after it sees the flag (or any
- *     earlier one) must fault with SEGV_ACCERR at the page; the handler
- *     widens it back and its byte is still there (93 = the read after the
- *     flag did not fault: a stale translation; 94 = a wait timed out).
- *     The root may run on either CPU, so the sibling spins on one while the
- *     main thread runs on the other; Carrick's x86 ring does not yet serve
- *     getcpu(2) or sched_setaffinity(2) (#3131), so the placement itself is
- *     not checked
+ *   20 (#2875) two live threads: a sibling thread reads a resident RW page,
+ *     tells the main thread, and keeps reading it, while the main thread
+ *     mprotects it PROT_NONE and then sets a flag. A sibling read during or
+ *     after the change must fault with SEGV_ACCERR at the page: the fault
+ *     may come before the sibling sees the flag, and the handler does not
+ *     tell the two apart. The handler widens the page back and its byte is
+ *     still there (93 = the read after the flag did not fault: a stale
+ *     translation; 94 = a wait timed out). The two threads are not forced
+ *     onto two CPUs, and their placement is not checked: Carrick's x86 ring
+ *     does not yet serve getcpu(2) or sched_setaffinity(2) (#3131), so this
+ *     does not witness a cross-CPU invalidation
  *   21 (#3121) the root writes a private RW page, mprotects it PROT_READ and
  *     forks. The child widens it back to RW and writes it; the parent, after
  *     the child exits, still reads its own byte (99 if the child's write
@@ -54,9 +54,11 @@
  *     and forks. On Linux the child widens it back to RW and reads the
  *     parent's byte, and the parent, after the child exits, widens its own
  *     copy and still reads its byte (99 if the child's write reached it).
- *     Until #2875's slice B, Carrick refuses that fork: the refusal must be
- *     clean, so the parent then widens the page and reads its byte, and
- *     exits 120 + the fork's errno
+ *     Until #2875's slice B, Carrick refuses that fork, and the refusal must
+ *     be clean: wait4(-1, WNOHANG) is ECHILD (88 = a child was left), the
+ *     parent widens the page and reads its byte, and a second fork succeeds
+ *     (89 = it failed) and its child reads the byte and exits 7 (87 = other
+ *     status). The parent then exits 120 + the first fork's errno
  * The parent propagates the child's exit status. */
 
 /* rax = mmap(0, rsi, edx prot, r10 flags, -1, 0); r15 = base or exit errno */
@@ -214,9 +216,39 @@ fork_refused:
     neg %eax
     add $120, %eax
     mov %eax, %r13d
+    mov $-1, %rdi           /* wait4(-1, NULL, WNOHANG, NULL): no child was left */
+    xor %esi, %esi
+    mov $1, %edx
+    xor %r10d, %r10d
+    mov $61, %eax
+    syscall
+    cmp $-10, %rax          /* ECHILD */
+    mov $88, %edi
+    jne exit
     MPROTECT %r14, $0x1000, $1  /* the parent keeps its page and its byte */
     cmpb $0xa5, (%r14)
     jne bad
+    mov $57, %eax           /* a second fork, of the PROT_READ page, succeeds */
+    syscall
+    test %eax, %eax
+    mov $89, %edi
+    js exit
+    jnz 1f
+    cmpb $0xa5, (%r14)      /* and its child reads the parent's byte */
+    jne bad
+    mov $7, %edi
+    jmp exit
+1:  mov %eax, %edi
+    lea status(%rip), %rsi
+    xor %edx, %edx
+    xor %r10d, %r10d
+    mov $61, %eax
+    syscall
+    test %eax, %eax
+    js harness
+    cmpl $0x700, status(%rip)   /* the child exited 7 */
+    mov $87, %edi
+    jne exit
     mov %r13d, %edi
     jmp exit
 #endif
@@ -283,7 +315,7 @@ sibling:
     dec %r12
     jnz 1b
     jmp timed_out
-2:  movb (%rbx), %al        /* after the mprotect returned: must fault SEGV_ACCERR */
+2:  movb (%rbx), %al        /* the mprotect returned: if no read faulted yet, this must */
     mov $93, %edi
     jmp exit
 restorer:

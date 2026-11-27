@@ -9091,13 +9091,15 @@ fn production_mprotect_none_covers_a_sparse_resident_range() {
     );
 }
 
-/// #2875, two live threads, with the root schedulable on either vCPU: the
-/// sibling keeps reading a resident page, so its CPU holds a live
-/// translation, while the main thread mprotects it `PROT_NONE`. Once the
-/// mprotect has returned, the sibling's read must fault `SEGV_ACCERR` at the
-/// page (93 is a stale translation), and widening it back finds its byte.
-/// The x86 ring doesn't yet serve getcpu(2) or sched_setaffinity(2) (#3131),
-/// so the two threads' placement on different vCPUs is not forced or checked.
+/// #2875, two live threads, with the root schedulable on either vCPU: a
+/// sibling that has read a resident page keeps reading it while the main
+/// thread mprotects it `PROT_NONE`. A sibling read during or after the
+/// change must fault `SEGV_ACCERR` at the page (93: the read after the
+/// mprotect returned did not fault, a stale translation), and widening it
+/// back finds its byte. The fault may come before the mprotect returns; the
+/// handler does not tell the two apart. The x86 ring doesn't yet serve
+/// getcpu(2) or sched_setaffinity(2) (#3131), so the threads are not forced
+/// onto different vCPUs and this is not a cross-vCPU invalidation witness.
 #[test]
 fn production_mprotect_none_faults_a_spinning_sibling_thread_with_accerr() {
     let outcome = run_reservation_shape_on(20, kvm_pool_fixture::ROOT_AFFINITY_ANY);
@@ -9111,9 +9113,11 @@ fn production_mprotect_none_faults_a_spinning_sibling_thread_with_accerr() {
 
 /// #2875: forking a `PROT_NONE` private page. Until slice B (the fork arm
 /// of a no-access leaf, through #3061's core fork), Carrick refuses the fork
-/// with EFAULT; the refusal must be clean, so the parent then widens the page
-/// and still reads its byte (exit 120 + EFAULT; 92 if the byte is gone, 7 once
-/// slice B makes the fork succeed as on Linux).
+/// with EFAULT, and the refusal must be clean: `wait4(-1, WNOHANG)` is
+/// ECHILD (88 if a child was left), the parent widens the page and still
+/// reads its byte (92 if it is gone), and a second fork succeeds (89) and its
+/// child reads the byte and exits 7 (87 otherwise). Exit 120 + EFAULT; 7 once
+/// slice B makes the first fork succeed as on Linux.
 #[test]
 fn production_fork_of_a_prot_none_page_refuses_cleanly_and_keeps_the_parents_page() {
     let outcome = run_reservation_shape(22);
