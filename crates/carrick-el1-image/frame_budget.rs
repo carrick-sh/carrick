@@ -593,10 +593,14 @@ impl Frames {
                         .max(self.maximum("::complete_poll_array::"))
                     + write,
             ),
+            // Readiness is gathered beneath `gather_poll`, whose frame has
+            // returned before the answer's copyout runs (#3093): the
+            // completed copyout above charges only `poll`'s own frame.
             (
                 "ring poll readiness",
                 native
                     + self.qualified("El1PendingFamilies", "::poll::")
+                    + self.required("::gather_poll::")?
                     + self.sum(&[
                         "::resolve_poll::",
                         "::resolve_poll_with_host_readiness::",
@@ -1060,6 +1064,7 @@ mod tests {
             "x::prepare_mm::h0",
             "x::fork_child_context_boxed::h0",
             "x::wait_query::h0",
+            "x::gather_poll::h0",
             "x::dispatch::arm_native_service_exit::h0",
             "x::park_service::h0",
             "x::begin_service_inner::h0",
@@ -1161,6 +1166,20 @@ mod tests {
             let error = frames.check(16384, 288).unwrap_err();
             assert!(error.contains("native wait copy"), "{frame}: {error}");
         }
+    }
+
+    /// #3106: a poll gathers its readiness beneath `gather_poll`, which has
+    /// returned before the answer's copyout runs, so the gathering frame is
+    /// charged to readiness and never to the completed copyout.
+    #[test]
+    fn a_poll_gathers_readiness_in_a_frame_its_copyout_does_not_retain() {
+        let mut frames = small_frames();
+        frames
+            .0
+            .insert("x::El1PendingFamilies::gather_poll::h1".to_owned(), 12000);
+        let error = frames.check(16384, 288).unwrap_err();
+        assert!(error.contains("ring poll readiness"), "{error}");
+        assert!(!error.contains("ring completed copyout"), "{error}");
     }
 
     #[test]
