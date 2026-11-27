@@ -860,6 +860,8 @@ where
 pub struct SoftRootPublication {
     /// `CurrentTask[0]`'s loaded task (its kernel TID, 0: none).
     pub task_tid: u64,
+    /// `CurrentTask[0]`'s MM key: the root's kernel `MmId` (0: none).
+    pub mm_key: u64,
     /// `CurrentTask[0]`'s published lifecycle page (guest address, 0: none).
     pub lifecycle_page: u64,
     /// `CurrentTask[0]`'s published control slot (guest address, 0: none).
@@ -923,6 +925,7 @@ where
         )
     };
     let task_tid = task.execution.task.load(Ordering::Acquire);
+    let mm_key = task.mm.key.load(Ordering::Acquire);
     let lifecycle_page = task.metadata.lifecycle_page.load(Ordering::Acquire);
     let control_slot = task.metadata.control_slot.load(Ordering::Acquire);
     let inside = |gpa: u64, len: usize| {
@@ -952,6 +955,7 @@ where
         && carrick_kernel::dispatch::carrier_loop::OwnerWaitVenue::published().is_ok();
     Ok(SoftRootPublication {
         task_tid,
+        mm_key,
         lifecycle_page,
         control_slot,
         in_metadata_aperture,
@@ -1066,6 +1070,14 @@ where
 
     stamp_identity_page(&mut engine, &dispatcher, &root_ctx)
         .map_err(|e| format!("stamp identity page: {e}"))?;
+    // The engine names the root's own MM, as an HVF initial runner binds it
+    // (`admit_bound_mm`), before its first load: the MM ids come from one
+    // process-wide source, so a second soft run's root is not MM 1, and the
+    // owner BIND and every owner transfer authenticate against this id.
+    // The root's ASID is the fixed soft root ASID; its generation is the
+    // MM's, as on HVF without a process context.
+    let root_mm = root_ctx.shared().mm().id().raw();
+    engine.bind_task_snapshot_identity(root_mm, root_mm);
     engine
         .set_guest_thread_id((1u64 << 32) | 1u64)
         .map_err(|e| format!("stamp guest thread id: {e}"))?;

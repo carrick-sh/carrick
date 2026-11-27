@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use carrick_hal::GuestVmBackend as _;
 use carrick_softcpu_aarch64_host::{
     HostBlockRunner, SoftProcessRun, SoftSingleProcessConfig,
-    run_single_process_with_executor_and_setup, sample_el1_served,
+    run_single_process_with_executor_and_setup, sample_el1_served, sample_root_publication,
 };
 
 const CODE_VA: u64 = 0x0040_0000;
@@ -550,6 +550,59 @@ fn soft_root_exit_group_status_crosses_the_native_root_exit() {
     );
     assert_eq!(run.exit_code, 7);
     assert_root_served_in_ring(&run, &[NR_EXIT_GROUP]);
+}
+
+/// Two soft roots run one after the other in one process, and each BINDs
+/// its own MM as the owner of its memory at its first load. The kernel's MM
+/// ids come from one process-wide source, so the second root is never MM 1:
+/// the engine must name each root's own MM, and EL1's first-load BIND must
+/// admit it, or the root opens on the legacy venue (no owner) and can take
+/// no caught signal (#2814). Read at the first guest instruction, after the
+/// zone's BIND, through the engine's own user-memory authority and EL1's
+/// `CurrentTask` record.
+#[test]
+#[ignore = "requires CARRICK_A64_ELF pointing to the production EL1 ELF (native arm64 host)"]
+fn soft_root_second_run_in_one_process_binds_its_own_mm_as_owner() {
+    let _carrier_lock = lock_soft_carrier_test();
+    let el1 = production_el1();
+    let mut code = vec![movz(0, 0, 0)];
+    exit_with_x0(&mut code);
+    let elf = build_elf(&code, &[]);
+    let mut roots = Vec::new();
+    for path in ["/owner-first", "/owner-second"] {
+        let mut config = SoftSingleProcessConfig::new(&elf, path);
+        config.el1_elf_override = Some(&el1);
+        let bound = Arc::new(Mutex::new(None));
+        let bound_in_setup = Arc::clone(&bound);
+        let run = run_single_process_with_executor_and_setup(
+            &config,
+            HostBlockRunner::new().expect("native arm64 block runner"),
+            move |engine| {
+                let owner = engine.protections().owner().map(|handle| handle.mm().raw());
+                let root = sample_root_publication(engine)?.mm_key;
+                *bound_in_setup.lock().unwrap() = Some((owner, root));
+                Ok(())
+            },
+        )
+        .expect("the guest must run to exit on the production soft entry");
+        let (owner, root) = bound.lock().unwrap().expect("setup ran");
+        println!(
+            "{path}: exit={} owner_mm={owner:?} root_mm={root} census={:?} counted_enosys={:?}",
+            run.exit_code, run.reply_census, run.counted_enosys
+        );
+        assert_eq!(run.exit_code, 0, "{path}");
+        assert_ne!(root, 0, "{path}: EL1's CurrentTask names the root's MM");
+        assert_eq!(
+            owner,
+            Some(root),
+            "{path}: the first-load BIND must admit the root's own MM as its owner"
+        );
+        roots.push(root);
+    }
+    assert_ne!(
+        roots[0], roots[1],
+        "the second root is a new MM, so the witness covers an MM other than the first"
+    );
 }
 
 /// The soft root's owner cannot publish a caught signal's frame yet (its MM

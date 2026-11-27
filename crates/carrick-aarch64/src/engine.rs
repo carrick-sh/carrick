@@ -6024,8 +6024,18 @@ impl<V: Aarch64Vmm> ThreadedEngine for Aarch64EngineCore<V> {
                     slots,
                 )?,
             };
-            let Some(target) = target else {
-                return Ok(false);
+            let target = match (target, closed) {
+                (Ok(target), _) => target,
+                (Err(_), None) => return Ok(false),
+                // The first load has no other venue to fall back to: its
+                // refusal is the run's, with EL1's own answer.
+                (Err(refused), Some(token)) => {
+                    return Err(TrapError::Hypervisor(format!(
+                        "EL1 refused the first-load BIND of mm {} at root {:#x}: {refused:?}",
+                        token.mm().raw(),
+                        token.ttbr0()
+                    )));
+                }
             };
             if target.ttbr0() != ttbr0 || target.handle().mm() != mm {
                 return Err(TrapError::Hypervisor(
@@ -9030,7 +9040,7 @@ impl<V: Aarch64Vmm> Aarch64EngineCore<V> {
             let mm = carrick_el1_abi::ReservationMm::new(self.mm_generation)
                 .ok_or(TrapError::UnsupportedPlatform)?;
             crate::user_transfer::TransferTarget::bind(self, mm, ttbr0, custody.as_ref(), slots)?
-                .ok_or(TrapError::UnsupportedPlatform)?
+                .map_err(|_| TrapError::UnsupportedPlatform)?
         };
         let mut transfer = crate::user_transfer::OwnedUserTransfer::new(target, request)
             .ok_or_else(|| TrapError::Hypervisor("owner parent transfer range overflow".into()))?;

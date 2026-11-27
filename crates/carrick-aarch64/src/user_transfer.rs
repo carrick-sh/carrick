@@ -435,6 +435,11 @@ pub trait TransferCustody {
 
 pub type ErasedPhysicalCustody = dyn TransferCustody<Pin = Box<dyn TransferPin>>;
 
+/// EL1's portal refused a BIND, with the errno it answered. A refusal is
+/// EL1's verdict on the binding, never a transport failure: the BIND ran.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BindRefused(pub carrick_abi::LinuxErrno);
+
 /// The target binding comes from the admitted production MM and ASID owner.
 #[derive(Clone, Copy)]
 pub struct TransferTarget {
@@ -458,7 +463,7 @@ impl TransferTarget {
         ttbr0: u64,
         custody: &C,
         slots: &MmPortalSlots,
-    ) -> Result<Option<Self>, TrapError> {
+    ) -> Result<Result<Self, BindRefused>, TrapError> {
         Self::bind_with(engine, mm, ttbr0, custody, slots, None)
     }
     pub fn bind_closed<V: Aarch64Vmm, C: TransferCustody + ?Sized>(
@@ -466,7 +471,7 @@ impl TransferTarget {
         token: carrick_el1_abi::PortalClosedRootBind,
         custody: &C,
         slots: &MmPortalSlots,
-    ) -> Result<Option<Self>, TrapError> {
+    ) -> Result<Result<Self, BindRefused>, TrapError> {
         if token.carrier() != custody.carrier() {
             return Err(TrapError::Hypervisor(
                 "closed BIND carrier differs from the transfer custodian".into(),
@@ -488,7 +493,7 @@ impl TransferTarget {
         custody: &C,
         slots: &MmPortalSlots,
         closed: Option<carrick_el1_abi::PortalClosedRootBind>,
-    ) -> Result<Option<Self>, TrapError> {
+    ) -> Result<Result<Self, BindRefused>, TrapError> {
         let mut service = engine.transfer_service_loan()?;
         let region = carrick_el1_abi::get_el1_region_host_ptr();
         if region == 0
@@ -513,7 +518,10 @@ impl TransferTarget {
         let receipt = service.run_user(frame, &mut || false)?;
         carrick_observability::probes::hvpatch_el1_owner_bind_result(receipt.x[0]);
         if receipt.x[0] != 0 {
-            return Ok(None);
+            let errno = i32::try_from(receipt.x[0]).map_err(|_| {
+                TrapError::Hypervisor(format!("EL1 BIND answered errno {:#x}", receipt.x[0]))
+            })?;
+            return Ok(Err(BindRefused(carrick_abi::LinuxErrno::new(errno))));
         }
         let incarnation = NonZeroU64::new(receipt.x[3])
             .ok_or_else(|| TrapError::Hypervisor("EL1 bind returned zero incarnation".into()))?;
@@ -522,7 +530,7 @@ impl TransferTarget {
         let handle = unsafe {
             carrick_el1_abi::El1MmHandle::from_admitted_owner(custody.carrier(), mm, incarnation)
         };
-        Ok(Some(Self { handle, ttbr0 }))
+        Ok(Ok(Self { handle, ttbr0 }))
     }
 }
 
