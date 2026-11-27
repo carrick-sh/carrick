@@ -14,9 +14,11 @@
 # reaped the child, checks one inherited page (2), and exits 4; the parent
 # reaps it as the subreaper. So the MM that owned the replacements retires
 # before the last MM that maps them.
-# -DUNMAP (with -DGRANDCHILD): the grandchild munmaps the whole inherited
-# range before it exits, so its last hold on the replacements is the
-# unmap's drain debt, not an alias (#3127).
+# -DUNMAP (with -DGRANDCHILD): the grandchild stores 3 into every
+# inherited page, taking its own copy-on-write off the child's chunks, then
+# munmaps the range and exits. Its repoints unlink every alias it had into
+# those chunks, so its last hold on them is the drain debt the unlink left,
+# not an alias (#3127).
 #ifndef PAGES
 #define PAGES 4096
 #endif
@@ -140,6 +142,14 @@ grandchild:
     cmpb $2, (%r13)
     jne child_fail
 #ifdef UNMAP
+    xor %rcx, %rcx
+grandchild_store:
+    movb $3, (%r13, %rcx)
+    cmpb $3, (%r13, %rcx)
+    jne child_fail
+    add $4096, %rcx
+    cmp $(PAGES * 4096), %rcx
+    jb grandchild_store
     mov %r13, %rdi
     mov $(PAGES * 4096), %rsi
     mov $11, %rax
