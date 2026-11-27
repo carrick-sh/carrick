@@ -490,6 +490,7 @@ mod tests {
                             _ => holds.unalias(slot, mm(m), Ctx(mm(m), 0)),
                         };
                         assert_eq!(result, Err(HoldError::UnknownSlot));
+                        assert_eq!(project(&holds), model, "{edit:?}: a refusal moved");
                         continue;
                     }
                     Edit::Admit(slot, m) => {
@@ -512,6 +513,7 @@ mod tests {
                                 holds.unalias(slot, mm(m), Ctx(mm(m), c)),
                                 Err(HoldError::AliasUnderflow)
                             );
+                            assert_eq!(project(&holds), model, "{edit:?}: a refusal moved");
                             continue;
                         };
                         *count -= 1;
@@ -524,18 +526,18 @@ mod tests {
                     Edit::Forget(slot) => {
                         let Some(entry) = model.get(&slot) else {
                             assert_eq!(holds.forget(slot), Err(HoldError::UnknownSlot));
+                            assert_eq!(project(&holds), model, "{edit:?}: a refusal moved");
                             continue;
                         };
                         if !entry.1.is_empty() {
                             assert_eq!(holds.forget(slot), Err(HoldError::StillAliased));
+                            assert_eq!(project(&holds), model, "{edit:?}: a refusal moved");
                             continue;
                         }
-                        // A slot leaves only once nothing holds it: a held
-                        // slot's forget is the caller's revoke, explored
-                        // through retirement instead.
-                        if held(&model, slot) {
-                            continue;
-                        }
+                        // With no alias left the slot may leave (a revoke or
+                        // a rollback) even while admissions or drain debts
+                        // hold it: they go with it, and every MM index that
+                        // named it must drop it (H1).
                         holds.forget(slot).unwrap();
                         model.remove(&slot);
                     }
