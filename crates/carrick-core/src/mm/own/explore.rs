@@ -392,7 +392,8 @@ fn every_bounded_op_sequence_keeps_the_core_invariants() {
 // ---------------------------------------------------------------------------
 // PR 1a: MMs, their editor and their copy-on-write grants.
 //
-// The universe is two MMs and three replacement extents (two overlapping).
+// The universe is two MMs, arenas of two-grant chunks, and three chunk
+// extents (two overlapping) the shell may offer for any chunk demand.
 // The guest adversary may take or release either MM's editor at any step,
 // and the shell may offer any transition at any step, with any outstanding
 // ticket or proof, including one it was already refused. Payloads are
@@ -411,12 +412,15 @@ type GrantCore = CarrierCore<ExplorerVenue, u8, u8, u8>;
 struct GrantWorld {
     core: GrantCore,
     supplies: Vec<SupplyTicket>,
+    chunk_demands: Vec<ChunkDemand>,
     settle: Option<SettleProof>,
     /// Payloads handed to the core (`Published`) and not yet back.
     in_core: Vec<(MmKey, u8)>,
     next_payload: u8,
     /// Each MM was refused "not now" at a supply, and supplied since.
     busy_then_supplied: [bool; 2],
+    /// A supply was carved from a chunk an earlier supply mapped.
+    carved_from_chunk: bool,
     refused_busy: [bool; 2],
 }
 
@@ -430,7 +434,9 @@ impl Drop for GrantWorld {
 enum GrantOp {
     GuestHold(usize),
     GuestRelease(usize),
-    Supply(usize, usize),
+    Supply(usize),
+    AdmitChunk(usize, usize),
+    CancelChunk(usize),
     FinishSupply(usize, bool),
     BeginSettle(usize),
     Settle(u8),
@@ -439,7 +445,7 @@ enum GrantOp {
     RetireAll,
 }
 
-const GRANT_EXTENTS: [(u64, u64); 3] = [(0x10_000, 0x4000), (0x12_000, 0x4000), (0x20_000, 0x4000)];
+const CHUNK_EXTENTS: [(u64, u64); 3] = [(0x10_000, 0x8000), (0x14_000, 0x8000), (0x20_000, 0x8000)];
 
 fn mm_key(index: usize) -> MmKey {
     MmKey::new(NonZeroU64::new(index as u64 + 1).unwrap_or(NonZeroU64::MIN))
@@ -453,8 +459,12 @@ fn grant_ops(world: &GrantWorld) -> Vec<GrantOp> {
             GrantOp::GuestRelease(mm),
             GrantOp::BeginSettle(mm),
             GrantOp::Retire(mm),
+            GrantOp::Supply(mm),
         ]);
-        ops.extend((0..GRANT_EXTENTS.len()).map(|extent| GrantOp::Supply(mm, extent)));
+    }
+    for index in 0..world.chunk_demands.len() {
+        ops.extend((0..CHUNK_EXTENTS.len()).map(|chunk| GrantOp::AdmitChunk(index, chunk)));
+        ops.push(GrantOp::CancelChunk(index));
     }
     for index in 0..world.supplies.len() {
         ops.extend([
@@ -498,20 +508,26 @@ fn grant_step(world: &mut GrantWorld, op: GrantOp) -> Result<(), String> {
         GrantOp::GuestRelease(mm) => {
             world.core.guest_editor(mm_key(mm), false);
         }
-        GrantOp::Supply(mm, extent) => {
-            let (ipa, len) = GRANT_EXTENTS[extent];
+        GrantOp::Supply(mm) => {
             let excluded = ExcludedMm::claimed(mm_key(mm));
-            let demand = CowDemand {
-                page: 0x1000,
-                replacement: GpaExtent::new(ipa, len).ok_or("universe extent")?,
-            };
-            match world.core.supply_cow(&excluded, demand) {
-                Ok(ticket) => {
+            match world.core.supply_cow(&excluded, 0x1000) {
+                Ok(supply) => {
                     if before.0.editor(mm_key(mm)) == Some(MmEditor::Guest) {
                         return Err("supplied while the guest held the editor".into());
                     }
                     world.busy_then_supplied[mm] |= world.refused_busy[mm];
-                    world.supplies.push(ticket);
+                    match supply {
+                        CowSupply::Carved(ticket) => {
+                            world.carved_from_chunk = true;
+                            world.supplies.push(ticket);
+                        }
+                        CowSupply::NeedsChunk(demand) => {
+                            if demand.mm() != mm_key(mm) {
+                                return Err("a chunk demand named another MM".into());
+                            }
+                            world.chunk_demands.push(demand);
+                        }
+                    }
                 }
                 Err(MmRefusal::NotNow(NotNow::EditorRelease(key))) => {
                     if key != mm_key(mm) || world.core.editor(key) != Some(MmEditor::Guest) {
@@ -527,6 +543,32 @@ fn grant_step(world: &mut GrantWorld, op: GrantOp) -> Result<(), String> {
                         return Err("a refused supply changed the core".into());
                     }
                 }
+            }
+        }
+        GrantOp::AdmitChunk(index, chunk) => {
+            let demand = world.chunk_demands.remove(index);
+            let mm = demand.mm();
+            let (ipa, len) = CHUNK_EXTENTS[chunk];
+            let extent = GpaExtent::new(ipa, len).ok_or("universe extent")?;
+            match world.core.admit_chunk(demand, extent) {
+                Ok(ticket) => {
+                    if ticket.mm() != mm || !extent.contains(ticket.extent()) {
+                        return Err("a chunk's first grant is not its MM's, inside it".into());
+                    }
+                    world.supplies.push(ticket);
+                }
+                Err(refused) => {
+                    if world.core != before {
+                        return Err("a refused chunk changed the core".into());
+                    }
+                    world.chunk_demands.insert(index, refused.offered);
+                }
+            }
+        }
+        GrantOp::CancelChunk(index) => {
+            let demand = world.chunk_demands.remove(index);
+            if let Err(refused) = world.core.cancel_chunk(demand) {
+                world.chunk_demands.insert(index, refused.offered);
             }
         }
         GrantOp::FinishSupply(index, published) => {
@@ -658,6 +700,14 @@ fn reconcile_grants(world: &GrantWorld) -> Result<(), String> {
     if supplying != world.supplies.len() {
         return Err("an outstanding supply ticket and the core disagree".into());
     }
+    let chunking = core
+        .mms
+        .values()
+        .filter(|m| m.editor == MmEditor::Host(HostEdit::CowChunk))
+        .count();
+    if chunking != world.chunk_demands.len() {
+        return Err("an outstanding chunk demand and the core disagree".into());
+    }
     let settling = core
         .mms
         .values()
@@ -675,14 +725,20 @@ struct GrantsReached {
     two_provisioned_one_mm: bool,
     busy_then_supplied: bool,
     settled_while_other_supplies: bool,
+    carved_from_chunk: bool,
 }
 
 fn explore_grants(depth: usize) -> Result<(usize, GrantsReached), String> {
     // SAFETY: the explorer's cores are its own; no two share a carrier.
     let carrier = unsafe { CarrierId::assume_unique(NonZeroU64::MIN) };
+    let mut core = GrantCore::new(carrier);
+    core.set_cow_geometry(CowArenaGeometry::new(0x4000, 0x8000).ok_or("geometry")?)
+        .map_err(|refusal| format!("{refusal:?}"))?;
     let root = GrantWorld {
-        core: GrantCore::new(carrier),
+        core,
         supplies: Vec::new(),
+        chunk_demands: Vec::new(),
+        carved_from_chunk: false,
         settle: None,
         in_core: Vec::new(),
         next_payload: 1,
@@ -716,6 +772,7 @@ fn explore_grants(depth: usize) -> Result<(usize, GrantsReached), String> {
             reached.busy_then_supplied |= next.busy_then_supplied.iter().any(|&b| b);
             reached.settled_while_other_supplies |=
                 next.settle.is_some() && !next.supplies.is_empty();
+            reached.carved_from_chunk |= next.carved_from_chunk;
             if seen.insert(next.clone()) {
                 queue.push_back((next, next_trace));
             }
@@ -725,8 +782,9 @@ fn explore_grants(depth: usize) -> Result<(usize, GrantsReached), String> {
 }
 
 /// Busy once then supplied takes three transitions (hold, refused supply,
-/// release) plus the supply; two provisioned grants of one MM plus a
-/// settle against a second MM's supply need seven; two more leave room.
+/// release) plus the supply; two provisioned grants of one MM (a chunk
+/// demand, its admission, a finish, a carve, a finish) plus a settle
+/// against a second MM's supply need eight; one more leaves room.
 const GRANT_DEPTH: usize = 9;
 
 #[test]
@@ -737,7 +795,8 @@ fn every_bounded_grant_sequence_keeps_the_mm_and_grant_invariants() {
         reached.two_supplying
             && reached.two_provisioned_one_mm
             && reached.busy_then_supplied
-            && reached.settled_while_other_supplies,
+            && reached.settled_while_other_supplies
+            && reached.carved_from_chunk,
         "depth {GRANT_DEPTH} ({states} states) missed a shape: {reached:?}"
     );
     std::println!("explored {states} distinct grant states to depth {GRANT_DEPTH}: {reached:?}");

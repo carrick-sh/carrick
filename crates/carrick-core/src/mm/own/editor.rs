@@ -22,6 +22,8 @@ use super::mm::MmKey;
 pub enum HostEdit {
     /// A copy-on-write grant is being supplied; the grant is `Supplying`.
     CowSupply(GrantId),
+    /// The shell is mapping a chunk of the MM's replacement arena.
+    CowChunk,
     /// The MM's completed copy-on-write grants are being settled.
     Settle,
 }

@@ -49,7 +49,10 @@ mod grant;
 mod mm;
 
 pub use editor::{ExcludedMm, HostEdit, MmEditor, NotNow};
-pub use grant::{CowDemand, GrantId, GrantPayload, MmRefusal, SettleProof, Supplied, SupplyTicket};
+pub use grant::{
+    ChunkDemand, CowArenaGeometry, CowSupply, GrantId, GrantPayload, MmRefusal, SettleProof,
+    Supplied, SupplyTicket,
+};
 pub use mm::MmKey;
 #[cfg(all(test, feature = "loom"))]
 mod loom_models;
@@ -63,6 +66,8 @@ pub struct Holding {
     pub mappings: usize,
     pub extents: usize,
     pub grants: usize,
+    /// Replacement-arena chunks of MMs that never retired.
+    pub chunks: usize,
     /// MMs whose editor the shell or the guest still holds.
     pub editors: usize,
 }
@@ -388,6 +393,9 @@ pub struct CarrierCore<V: CoreVenue, M, B, G = ()> {
     mms: BTreeMap<MmKey, mm::MmRecord>,
     /// Copy-on-write grants, by replacement base (G1: they never overlap).
     grants: BTreeMap<u64, grant::CowGrantRecord<G>>,
+    /// The MMs' replacement arenas, by chunk base (G4).
+    chunks: BTreeMap<u64, grant::ChunkRecord>,
+    cow_geometry: grant::CowArenaGeometry,
     _venue: core::marker::PhantomData<fn() -> V>,
 }
 
@@ -430,6 +438,8 @@ impl<V: CoreVenue, M, B, G> CarrierCore<V, M, B, G> {
             next_grant: 1,
             mms: BTreeMap::new(),
             grants: BTreeMap::new(),
+            chunks: BTreeMap::new(),
+            cow_geometry: grant::CowArenaGeometry::PRODUCTION,
             _venue: core::marker::PhantomData,
         }
     }
@@ -872,12 +882,14 @@ impl<V: CoreVenue, M, B, G> CarrierCore<V, M, B, G> {
             || !self.mappings.is_empty()
             || !self.extents.is_empty()
             || !self.grants.is_empty()
+            || !self.chunks.is_empty()
             || editors != 0)
             .then_some(Holding {
                 state: self.state,
                 mappings: self.mappings.len(),
                 extents: self.extents.len(),
                 grants: self.grants.len(),
+                chunks: self.chunks.len(),
                 editors,
             })
     }
@@ -904,9 +916,10 @@ impl<V: CoreVenue, M, B, G> CarrierCore<V, M, B, G> {
         self.extents.clear();
         self.mms.clear();
         self.grants.clear();
+        self.chunks.clear();
     }
 
-    /// Check V1 to V4, G1 to G3 and the carve accounting (V5 and V6 hold by the
+    /// Check V1 to V4, G1 to G4 and the carve accounting (V5 and V6 hold by the
     /// transitions' types; the explorer checks V5 against the pins it holds).
     pub fn check_invariants(&self) -> Result<(), Violation> {
         let mut previous_end = None;
@@ -988,6 +1001,11 @@ pub enum Violation {
     GrantsOverlap,
     GrantWithoutMm,
     SupplyWithoutEditor,
+    ChunksOverlap,
+    ChunkShape,
+    ChunkWithoutMm,
+    ChunkRoom,
+    GrantOutsideChunk,
 }
 
 impl<V: CoreVenue, M, B, G> Drop for CarrierCore<V, M, B, G> {

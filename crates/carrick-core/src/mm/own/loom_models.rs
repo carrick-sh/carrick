@@ -188,14 +188,15 @@ fn a_cow_supply_is_busy_once_then_supplied_after_the_guest_editor_releases() {
             let shell = Arc::clone(&shell);
             thread::spawn(move || {
                 let excluded = ExcludedMm::claimed(mm);
-                let demand = CowDemand {
-                    page: 0x1000,
-                    replacement: extent(0x10_000, 0x4000),
-                };
                 let mut busy = 0;
                 loop {
-                    match shell.with(|core| core.supply_cow(&excluded, demand)) {
-                        Ok(ticket) => {
+                    match shell.with(|core| core.supply_cow(&excluded, 0x1000)) {
+                        Ok(CowSupply::Carved(_)) => panic!("the MM has no chunk yet"),
+                        Ok(CowSupply::NeedsChunk(demand)) => {
+                            // The chunk's backend map runs unlocked.
+                            let chunk = extent(0x200_000, demand.chunk_len());
+                            let ticket =
+                                shell.with(|core| core.admit_chunk(demand, chunk).unwrap());
                             shell.with(|core| {
                                 core.finish_supply_cow(ticket, Supplied::Published(7))
                                     .unwrap()
