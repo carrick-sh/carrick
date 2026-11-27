@@ -416,19 +416,19 @@ impl<'a, C: ThreadCpu, U: UserWord> Sched<'a, C, U> {
         Some(Served::Idle)
     }
 
-    /// All caller locks must be released before consuming the park ticket.
-    /// `timeout_result` belongs to any unrelated timed futex served by idle.
-    pub fn resume_after_object_park(
+    /// Consume the park ticket and owe the next thread's switch to the
+    /// entry ([`Sched::run_entry_switch`]): the resumed thread never runs
+    /// beneath the park site's frames (#3093). All caller locks must be
+    /// released.
+    pub fn defer_after_object_park(
         &mut self,
-        frame: &mut TrapFrame,
         mut parked: ObjectParked<'_, Aarch64ParkedContext>,
-        timeout_result: u64,
     ) -> Option<Served> {
         if !parked.matches(self.zone, self.slot) {
             return None;
         }
         self.record_handoff(parked.take_receipt());
-        Some(self.run_next(frame, timeout_result))
+        Some(self.defer_run_next(0))
     }
 
     /// Called at the adapter's re-entry before looking up its numeric fd.

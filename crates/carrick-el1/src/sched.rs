@@ -32,6 +32,9 @@ pub fn idle_wake_owed<C: Copy + Send + Sync + zerocopy::FromZeros>(
 #[path = "sched/object_wait.rs"]
 pub mod object_wait;
 
+#[path = "sched/entry_switch.rs"]
+pub mod entry_switch;
+
 /// The execution venue that owns an EL1 exit for the loaded slot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeEntryVenue {
@@ -535,7 +538,8 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         self.record_handoff(receipt);
         zone.clear_current(slot);
         zone.counters.el1_parks.fetch_add(1, Ordering::Relaxed);
-        Ok(Some(self.run_next(frame, timeout_result)))
+        // The next thread runs from the entry, never under this park (#3093).
+        Ok(Some(self.defer_run_next(timeout_result)))
     }
 
     /// The running thread parked (or exited in the zone): run the next
@@ -713,6 +717,9 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             // x0, rather than installing the scheduler's wake result.
             ResumeAction::RetrySavedSyscall | ResumeAction::RetrySyscall => None,
             ResumeAction::Left => {
+                // A resumed thread that parked again owed its switch to an
+                // entry; the loop that loaded it chooses again instead.
+                entry_switch::discharge(slot);
                 zone.cpu_leave_slot(slot, carrick_sched_core::CounterTick::new(self.cpu.now()));
                 self.leave_space();
                 return LoadResult::Left;

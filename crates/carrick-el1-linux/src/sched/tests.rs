@@ -2352,10 +2352,9 @@ fn el1_ipc_wait_cross_mm_resume_restores_arguments_and_owned_operation() {
             None,
         )
         .unwrap();
-    assert_eq!(
-        sched.resume_after_object_park(&mut frame, parked, 0),
-        SWITCHED
-    );
+    // The park owes its switch to the entry, which runs it (#3093).
+    assert_eq!(sched.defer_after_object_park(parked), Some(Served::Idle));
+    assert_eq!(sched.run_entry_switch(&mut frame), SWITCHED);
     assert_eq!(frame.x, b_ctx.x);
     assert_eq!(frame.elr, b_ctx.pc);
     assert_eq!(sched.cpu.ttbr, (TTBR_OTHER, TTBR_OTHER));
@@ -2391,10 +2390,9 @@ fn el1_ipc_wait_cross_mm_resume_restores_arguments_and_owned_operation() {
             None,
         )
         .unwrap();
-    assert_eq!(
-        sched.resume_after_object_park(&mut frame, parked, 0),
-        SWITCHED
-    );
+    // The park owes its switch to the entry, which runs it (#3093).
+    assert_eq!(sched.defer_after_object_park(parked), Some(Served::Idle));
+    assert_eq!(sched.run_entry_switch(&mut frame), SWITCHED);
     assert_eq!(frame.x, a_args);
     assert_eq!(frame.elr, 0x9000);
     assert_eq!(sched.cpu.ttbr, (TTBR_MM, TTBR_MM));
