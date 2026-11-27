@@ -3283,8 +3283,8 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .first()
             .ok_or_else(|| fail("owner grant backing identity"))?
             .1;
-        let mut extent =
-            BackingExtent::private(gpa, len as usize).map_err(|error| fail(error.to_string()))?;
+        let mut extent = BackingExtent::private_populated(gpa, len as usize)
+            .map_err(|error| fail(error.to_string()))?;
         if let Some(bytes) = bytes {
             extent
                 .initialize(0, &bytes)
