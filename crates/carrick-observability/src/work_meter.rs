@@ -156,6 +156,9 @@ pub enum WorkMetric {
     /// published: one IPI request to every other CPU running the edited MM.
     /// A fill of not-present entries needs none (#3105).
     CrossCpuShootdowns,
+    /// Hypervisor stage-2 page faults a run's vCPUs took (KVM `pf_taken`).
+    /// A first touch of a large-page window takes one per window (#3105).
+    HostStage2Faults,
     /// Soft CPU blocks planned from instruction bytes.
     SoftcpuBlockDecodes,
     /// Soft CPU native blocks emitted on translation misses.
@@ -165,7 +168,7 @@ pub enum WorkMetric {
 }
 
 impl WorkMetric {
-    pub const COUNT: usize = 63;
+    pub const COUNT: usize = 64;
     pub const ALL: [WorkMetric; Self::COUNT] = [
         Self::KernelDispatches,
         Self::KernelRedispatches,
@@ -227,6 +230,7 @@ impl WorkMetric {
         Self::InvalidationKicks,
         Self::InvalidationSteadyStateSharedWrites,
         Self::CrossCpuShootdowns,
+        Self::HostStage2Faults,
         Self::SoftcpuBlockDecodes,
         Self::SoftcpuBlockEmits,
         Self::SoftcpuCodePageWalks,

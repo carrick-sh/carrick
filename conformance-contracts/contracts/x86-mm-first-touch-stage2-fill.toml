@@ -1,0 +1,47 @@
+schema_version = 1
+id = "x86.mm.first-touch-stage2-fill"
+title = "An x86 first touch of a large-page window costs no hypervisor fault per page"
+guest_surfaces = ["vmm:kvm", "fault:first-touch", "kernel:stage2-mmu", "syscall:mmap"]
+semantic_authority = [
+  "Linux KVM API documentation (Documentation/virt/kvm/api.rst): KVM_GET_STATS_FD and its per-vCPU pf_taken counter",
+  "Linux transparent huge page documentation (Documentation/admin-guide/mm/transhuge.rst): MADV_HUGEPAGE on a 2 MiB-aligned anonymous mapping",
+  "native x86_64 Linux execution of the identical static fixture",
+]
+fixture = "carrick-cli::x86_kvm_run::mounted_static_x86_threads_first_touch_of_large_windows_takes_no_stage2_fault_per_page (x86_threads_first_touch.c with -DLARGE_ALIGN, four CLONE_VM threads released together by a futex, PAGES fresh private anonymous pages each from a 2 MiB boundary)"
+scale_points = [512, 1024, 2048]
+rationale = """
+The guest pays for its own first-touch fault in ring; the host must not add
+one hypervisor exit per fresh page on top. Every owner-grant window was a
+page-aligned host mapping at a page-aligned carrier GPA, so KVM filled its
+stage-2 table one 4 KiB entry per first touch: about 4,100 nested page
+faults for 4,096 touches (bpftrace on kvm:kvm_page_fault, #3105), about
+7.6 us each nested. Populating the host pages first (MADV_POPULATE_WRITE)
+removed none of them: the fault is KVM's lazy stage-2 fill, not a host page
+fault-in. A window of whole 2 MiB pages is now placed on a 2 MiB GPA
+boundary with a 2 MiB-aligned host mapping advised for huge pages, chosen
+together by BackingExtent::owner_window, so the hypervisor maps it with one
+large entry. Smaller and partial windows keep page placement and their
+per-page cost; KVM_PRE_FAULT_MEMORY was measured as the alternative and hung
+multi-threaded runs (#3105), so it is not used. The run's stage-2 faults are
+therefore bounded by a constant as the touched pages grow; a run must also
+have made every touched page a private leaf, so a run that faulted nothing
+cannot pass.
+"""
+
+[bindings]
+embed = [
+  "KVM production carrier: carrick-cli::x86_kvm_run::mounted_static_x86_threads_first_touch_of_large_windows_takes_no_stage2_fault_per_page",
+]
+
+[bindings.unresolved]
+docker = "Docker is unavailable on this x86 KVM worker; native x86_64 Linux runs of the exact ELF provide the local oracle."
+runtime_ratio = "The per-fault time also carries the exact-MM editor (#3105 item 2); the ratio is measured by paired A/B, not asserted here."
+vm_free = "The stage-2 fill is the hypervisor's; only a live KVM carrier observes it."
+
+[[structural_budgets]]
+kind = "affine"
+metric = "host_stage2_faults"
+base = 1024
+per_unit = 0
+layers = ["embed-structural"]
+rationale = "ExecutionWitness.host_stage2_faults sums KVM's pf_taken over the carrier's two vCPUs. The base covers the run's boot, image, stacks and page tables; 4 x 512 to 4 x 2048 first touches of 2 MiB-aligned heaps add about one fault per 2 MiB window."
