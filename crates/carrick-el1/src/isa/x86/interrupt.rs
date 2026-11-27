@@ -577,38 +577,54 @@ static OWED_RESCHED_RESENT: core::sync::atomic::AtomicU64 = core::sync::atomic::
 /// Reschedule IPIs that found the ICR busy by injection, for the census.
 #[cfg(feature = "test-support")]
 static RESCHED_BUSY_INJECTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// The CPU slot (plus one) whose next reschedule IPI finds the ICR busy,
-/// once; 0 when none is armed.
+/// Waits for this CPU's own ICR to go idle at a last-chance delivery
+/// point, for the census.
 #[cfg(feature = "test-support")]
-static RESCHED_BUSY_ARMED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static RESCHED_ICR_WAITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The CPU slot (plus one) whose next reschedule IPIs find the ICR busy.
+#[cfg(feature = "test-support")]
+static RESCHED_BUSY_CPU: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// How many more of that CPU's reschedule IPIs find the ICR busy.
+#[cfg(feature = "test-support")]
+static RESCHED_BUSY_LEFT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// Make this CPU's next reschedule IPI find its ICR busy, once (#3083
-/// witness); another CPU's sends never consume it. False when one is
-/// already armed, or this CPU has no binding.
+/// Make this CPU's next `times` reschedule IPI sends (first sends and
+/// resends alike) find its ICR busy (#3083 witness); another CPU's sends
+/// never consume them. False when some are still armed, or this CPU has no
+/// binding.
 #[cfg(feature = "test-support")]
-pub fn inject_resched_busy_once() -> bool {
+pub fn inject_resched_busy(times: u32) -> bool {
     let Some(binding) = super::context::current_cpu_binding() else {
         return false;
     };
-    RESCHED_BUSY_ARMED
-        .compare_exchange(0, binding.cpu_slot + 1, Ordering::AcqRel, Ordering::Acquire)
+    if RESCHED_BUSY_LEFT.load(Ordering::Acquire) != 0 {
+        return false;
+    }
+    RESCHED_BUSY_CPU.store(binding.cpu_slot + 1, Ordering::Release);
+    RESCHED_BUSY_LEFT
+        .compare_exchange(0, times, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
 }
 
-/// `(injected busy sends, owed IPIs resent)`, for the #3083 witness.
+/// `(injected busy sends, owed IPIs resent, waits for an idle ICR)`, for
+/// the #3083 witness.
 #[cfg(feature = "test-support")]
-pub fn resched_busy_census() -> (u64, u64) {
+pub fn resched_busy_census() -> (u64, u64, u64) {
     (
         RESCHED_BUSY_INJECTED.load(Ordering::Acquire),
         OWED_RESCHED_RESENT.load(Ordering::Acquire),
+        RESCHED_ICR_WAITS.load(Ordering::Acquire),
     )
 }
 
 fn send_resched_ipi(apic: interrupts::ApicId) -> Result<(), interrupts::IpiBusy> {
     #[cfg(feature = "test-support")]
     if let Some(binding) = super::context::current_cpu_binding()
-        && RESCHED_BUSY_ARMED
-            .compare_exchange(binding.cpu_slot + 1, 0, Ordering::AcqRel, Ordering::Acquire)
+        && RESCHED_BUSY_CPU.load(Ordering::Acquire) == binding.cpu_slot + 1
+        && RESCHED_BUSY_LEFT
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                left.checked_sub(1)
+            })
             .is_ok()
     {
         RESCHED_BUSY_INJECTED.fetch_add(1, Ordering::AcqRel);

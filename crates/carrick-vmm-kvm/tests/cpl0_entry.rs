@@ -4479,6 +4479,22 @@ fn production_resched_ipi_busy_once_is_resent_at_the_next_delivery_point() {
     );
 }
 
+/// #3083 on x86 CPL0: as above, but the IPI's resend at the hold's return
+/// to user finds the ICR busy too, and the sender then runs a syscall-free
+/// user loop, so that return is its last delivery point. It must wait for
+/// its own ICR to go idle there and send; an owed IPI left for a later
+/// syscall leaves the peer asleep through the loop and the census short
+/// (exit 93: not two busy sends, one resend and one idle-ICR wait).
+#[test]
+fn production_resched_ipi_busy_at_the_last_return_to_user_is_sent_before_it() {
+    bounded_contention_witness(
+        "production_resched_ipi_busy_at_the_last_return_to_user_is_sent_before_it",
+        "native_idle_peer_wake.S",
+        &["-DLAST_RETURN=1"],
+        "a scan hold whose IPI found the ICR busy through its last return to user",
+    );
+}
+
 /// #2321 on x86 CPL0: blocking wait4 on a production fork child that is
 /// already a zombie, with the pre-reap status copy contended once. An editor
 /// holder parks the caller once on the existing owner wait; a Busy copy is

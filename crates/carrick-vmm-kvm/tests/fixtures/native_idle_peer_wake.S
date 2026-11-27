@@ -25,6 +25,14 @@
  * syscall returned (and again once the hold is taken), does not show
  * exactly one busy send and one resend.
  *
+ * -DLAST_RETURN (#3083): as BUSY_RESCHED, but the IPI's resend at the
+ * hold's return to user finds the ICR busy too, and this CPU then runs a
+ * syscall-free loop: that return is the last delivery point before it.
+ * The peer is released before the hold, so no later syscall comes between
+ * the hold and the loop. The return must wait for this CPU's own ICR to go
+ * idle and send: the census right after the loop must read two busy sends,
+ * one resend and one idle-ICR wait (exit 93 otherwise).
+ *
  * Exit 7: the peer took the publication, and the ordered pass ran once.
  * 81: arming failed; 82: the peer never reached its stop; 83: the
  * publication failed; 84: releasing the peer failed; 90: the ordered pass
@@ -45,6 +53,18 @@
 #define INJECT_RESCHED_BUSY_CENSUS         0xfffffffffffffe5e
 #define POLL_LIMIT                         0x1000000
 
+#ifdef LAST_RETURN
+#define BUSY_RESCHED 1
+#define BUSY_INJECT     INJECT_RESCHED_BUSY_TWICE
+#define BUSY_AFTER_HOLD 0x0001000100000002
+#define BUSY_AT_END     0x0001000100000002
+#else
+#define BUSY_INJECT     INJECT_RESCHED_BUSY_ONCE
+#define BUSY_AFTER_HOLD 0x100000001
+#define BUSY_AT_END     0x100000001
+#endif
+#define INJECT_RESCHED_BUSY_TWICE          0xfffffffffffffe5f
+#define SPIN_USER                          0x1000000
 #ifdef BUSY_RESCHED
 #define AFTER_IDLE_READ 1
 #endif
@@ -74,10 +94,18 @@ reach_loop:
 reached:
 
 #ifdef BUSY_RESCHED
-    mov $INJECT_RESCHED_BUSY_ONCE, %rax
+    mov $BUSY_INJECT, %rax
     syscall
     test %rax, %rax
     jnz fail_publish
+#endif
+#ifdef LAST_RETURN
+    /* Release the peer first: it goes on only once the hold's vector is
+     * pending, and no syscall then follows the hold before the loop. */
+    mov $INJECT_ORDER_PEER_PUBLISHED, %rax
+    syscall
+    test %rax, %rax
+    jnz fail_release
 #endif
 #ifdef AFTER_IDLE_READ
     mov $INJECT_HOLD_PEER_SCAN, %rax
@@ -88,20 +116,31 @@ reached:
     test %rax, %rax
     jnz fail_publish
 
+#ifdef LAST_RETURN
+    /* A syscall-free user loop: no later delivery point than the hold's
+     * own return to user. */
+    mov $SPIN_USER, %r13
+spin_user:
+    pause
+    dec %r13
+    jnz spin_user
+#endif
 #ifdef BUSY_RESCHED
     /* The hold's own return to user is the next delivery point: by this
      * syscall's entry the busy IPI must already be resent, once. */
     mov $INJECT_RESCHED_BUSY_CENSUS, %rax
     syscall
-    mov $0x100000001, %rcx
+    mov $BUSY_AFTER_HOLD, %rcx
     cmp %rcx, %rax
     jne fail_busy_census
 #endif
 
+#ifndef LAST_RETURN
     mov $INJECT_ORDER_PEER_PUBLISHED, %rax
     syscall
     test %rax, %rax
     jnz fail_release
+#endif
 
     mov $POLL_LIMIT, %r13
 taken_loop:
@@ -128,7 +167,7 @@ taken:
 #ifdef BUSY_RESCHED
     mov $INJECT_RESCHED_BUSY_CENSUS, %rax
     syscall
-    mov $0x100000001, %rcx
+    mov $BUSY_AT_END, %rcx
     cmp %rcx, %rax
     jne fail_busy_census
 #endif
