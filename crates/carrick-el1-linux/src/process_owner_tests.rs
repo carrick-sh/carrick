@@ -913,7 +913,7 @@ fn competing_reap_keeps_original_any_and_group_query() {
             } else {
                 assert!(matches!(
                     selection,
-                    WaitWork::Other(WaitSelection::StillRunning(_))
+                    WaitWork::Other(other) if matches!(*other, WaitSelection::StillRunning(_))
                 ));
             }
         }

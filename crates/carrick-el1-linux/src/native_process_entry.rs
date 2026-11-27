@@ -24,14 +24,15 @@ impl<C, U> WaitStatusCopy<C, U> {
         &self.zombie
     }
     // The external copy may nest a descriptor transaction; keep scan/reap
-    // scratch in its caller off that chain.
+    // scratch in its caller off that chain. The boxed snapshot becomes the
+    // reap authorization without a copy on this stack.
     #[inline(never)]
     pub fn copy_with<E>(
-        self,
+        self: Box<Self>,
         copy: impl FnOnce(&Zombie<C, U, LinuxWaitStatus>) -> Result<(), E>,
     ) -> Result<CopiedWaitStatus<C, U>, E> {
         copy(&self.zombie)?;
-        Ok(CopiedWaitStatus(Box::new(self)))
+        Ok(CopiedWaitStatus(self))
     }
 }
 pub enum CopiedWaitOutcome<C, U, N: NativeProcessCustody> {
@@ -53,9 +54,13 @@ impl<C: Copy + Ord, U: Clone> CopiedWaitStatus<C, U> {
     }
 }
 /// Preserve shared readiness and enrollment tokens for every non-zombie result.
+///
+/// Both arms are boxed: a zombie snapshot is large, and the wait that holds
+/// this work runs beneath a resumed wait4's whole checkpoint chain on the
+/// EL1 stack (#3093). The work itself is a pointer there.
 pub enum WaitWork<C, U, N: NativeProcessCustody> {
-    Status(WaitStatusCopy<C, U>),
-    Other(GuestWaitSelection<C, U, N>),
+    Status(Box<WaitStatusCopy<C, U>>),
+    Other(Box<GuestWaitSelection<C, U, N>>),
 }
 pub fn scan_wait<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProcessFailure>(
     owner: &GuestProcessOwner<C, U, N, F>,
@@ -64,12 +69,12 @@ pub fn scan_wait<C: Copy + Ord, U: Clone, N: NativeProcessCustody, F: GuestProce
 ) -> Result<WaitWork<C, U, N>, GuestProcessError<N::Error>> {
     owner.precheck_wait(caller, query)?;
     Ok(match owner.scan_wait(caller, query)? {
-        WaitSelection::Exited(zombie) => WaitWork::Status(WaitStatusCopy {
+        WaitSelection::Exited(zombie) => WaitWork::Status(Box::new(WaitStatusCopy {
             caller,
             query,
             zombie,
-        }),
-        other => WaitWork::Other(other),
+        })),
+        other => WaitWork::Other(Box::new(other)),
     })
 }
 
