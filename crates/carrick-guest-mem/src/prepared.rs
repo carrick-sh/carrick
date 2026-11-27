@@ -31,6 +31,21 @@ pub enum UserMemoryVenue {
     Owner,
 }
 
+/// Who serves an admitted root's private file pages on first touch.
+///
+/// A delegated root's private file mapping is placed and leased into the
+/// root, and from then on only the owner's frame grant can supply its pages:
+/// the host retires its own backing. So a carrier answers `OwnerGrant` only
+/// when it serves that grant; every other carrier keeps such mappings on the
+/// host's eager venue, which the host can back and fault in itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrivateFileVenue {
+    /// The carrier's owner frame grant supplies each page from the source.
+    OwnerGrant,
+    /// The host copies the file in at mmap and serves the pages itself.
+    HostEager,
+}
+
 /// The public stream PREPARE request cannot exceed one existing transfer
 /// chunk. Atomic records need a separate socket-derived bound before they can
 /// enter this service; a large arbitrary vector is not that authority.
