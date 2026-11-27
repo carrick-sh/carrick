@@ -188,7 +188,7 @@ fn collect_object_wake<C: carrick_el1_abi::EntryContext>(
                 },
                 &passes,
             );
-            (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
+            passes.deliver(crate::el1_zone::resched_slot);
             owed
         }
         .map_err(|_| CollectFault::Ownership)?;
@@ -272,13 +272,11 @@ pub(crate) fn hand_back_carrier_completions(carrier: CarrierZoneRef<'_>) {
 fn hand_back_in_carrier(carrier: CarrierZoneRef<'_>, record: RecordRef) {
     {
         let passes = carrick_sched_core::OwedPasses::new();
-        let owed =
-            carrier
-                .zone()
-                .hand_back_to_owner(record, &mut |slot| carrier.resched(slot), &passes);
-        (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
-        owed
-    };
+        carrier
+            .zone()
+            .hand_back_to_owner(record, &mut |slot| carrier.resched(slot), &passes);
+        passes.deliver(|slot| carrier.resched(slot));
+    }
 }
 
 /// Sample a native member's host-readiness queue
@@ -367,7 +365,7 @@ pub(crate) fn notify_host_ready(carrier: Option<&CarrierZone>, record: RecordRef
                 },
                 &passes,
             );
-            (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
+            passes.deliver(crate::el1_zone::resched_slot);
             owed
         };
         // A refused notification leaves the epoch unmoved and the member
@@ -451,7 +449,7 @@ impl carrick_el1_abi::MetadataCompletionWake for MetadataCompletionWake {
                 },
                 &passes,
             );
-            (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
+            passes.deliver(crate::el1_zone::resched_slot);
             owed
         }
         .unwrap_or_else(|_| {
@@ -695,7 +693,7 @@ pub fn claim(record: RecordRef, seq: Option<u32>, kind: Handback) -> HostClaim {
             &|owned| crate::el1_zone::complete_object_wake(owned.zone(), owned),
             &passes,
         );
-        (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
+        passes.deliver(crate::el1_zone::resched_slot);
         owed
     };
     if let HostClaim::El1Held { slot } = outcome {
@@ -759,19 +757,17 @@ pub fn cancel(record: RecordRef) {
     let Some(zone) = zone_tables() else {
         return;
     };
-    match {
-        let passes = carrick_sched_core::OwedPasses::new();
-        let owed = zone.claim_for_host(
-            record,
-            None,
-            Handback::Cancelled,
-            &HostLockWait,
-            &|owned| crate::el1_zone::complete_object_wake(owned.zone(), owned),
-            &passes,
-        );
-        (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
-        owed
-    } {
+    let passes = carrick_sched_core::OwedPasses::new();
+    let owed = zone.claim_for_host(
+        record,
+        None,
+        Handback::Cancelled,
+        &HostLockWait,
+        &|owned| crate::el1_zone::complete_object_wake(owned.zone(), owned),
+        &passes,
+    );
+    passes.deliver(crate::el1_zone::resched_slot);
+    match owed {
         HostClaim::Claimed | HostClaim::AlreadyHost => {
             if zone.live(record).is_some() {
                 zone.free_record(record.id);
@@ -1048,7 +1044,7 @@ fn wake(zone: &ZoneTables, mm: u64, uaddr: u64, bitset: u32, count: u32) -> Zone
                 &mut |placement| placements.push(placement),
                 &passes,
             );
-            (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
+            passes.deliver(crate::el1_zone::resched_slot);
             owed
         };
     }
@@ -1419,7 +1415,7 @@ pub fn place_service(
     if deliver_placement({
         let passes = carrick_sched_core::OwedPasses::new();
         let owed = zone.place_from_host(record, &passes);
-        (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
+        passes.deliver(crate::el1_zone::resched_slot);
         owed
     }) {
         return true;
@@ -1573,7 +1569,7 @@ fn route_native_handback_in_zone(zone: &ZoneTables, record: RecordRef) -> bool {
     let Some(outcome) = ({
         let passes = carrick_sched_core::OwedPasses::new();
         let owed = zone.place_native_handback(record, &passes);
-        (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
+        passes.deliver(crate::el1_zone::resched_slot);
         owed
     }) else {
         return false;
@@ -1608,12 +1604,10 @@ fn route_first_entry_in_zone(zone: &ZoneTables, record: RecordRef) -> bool {
     let Some(custody) = zone.claim_first_entry_placement(record) else {
         return false;
     };
-    let custody = match {
-        let passes = carrick_sched_core::OwedPasses::new();
-        let owed = zone.place_first_entry(custody, &passes);
-        (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
-        owed
-    } {
+    let passes = carrick_sched_core::OwedPasses::new();
+    let owed = zone.place_first_entry(custody, &passes);
+    passes.deliver(crate::el1_zone::resched_slot);
+    let custody = match owed {
         Ok(placement) => return deliver_placement(Some(placement)),
         Err(custody) => custody,
     };
@@ -1646,7 +1640,7 @@ pub fn hand_back_wanted(slot: SlotId) {
     {
         let passes = carrick_sched_core::OwedPasses::new();
         let owed = zone.take_host_wanted(slot, &mut |record| wanted.push(record), &passes);
-        (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
+        passes.deliver(crate::el1_zone::resched_slot);
         owed
     };
     for record in wanted {
@@ -1675,7 +1669,7 @@ pub fn drain_to_host(slot: SlotId) {
             },
             &passes,
         );
-        (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
+        passes.deliver(crate::el1_zone::resched_slot);
         owed
     };
     for record in handed {
@@ -1702,18 +1696,16 @@ pub fn step_away_from_slot(slot: SlotId, driver: u64) -> Result<(), SlotLeaveRef
     deferred_capture_control::release_at_step_away(zone, slot, driver);
     let mut records = Vec::new();
     let mut placements = Vec::new();
-    if {
-        let passes = carrick_sched_core::OwedPasses::new();
-        let owed = zone.step_away(
-            slot,
-            driver,
-            &mut |record| records.push(record),
-            &mut |placement| placements.push(placement),
-            &passes,
-        );
-        (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
-        owed
-    } {
+    let passes = carrick_sched_core::OwedPasses::new();
+    let owed = zone.step_away(
+        slot,
+        driver,
+        &mut |record| records.push(record),
+        &mut |placement| placements.push(placement),
+        &passes,
+    );
+    passes.deliver(crate::el1_zone::resched_slot);
+    if owed {
         settle_vacated(
             zone,
             Some(slot),
@@ -1763,10 +1755,9 @@ pub fn come_back_to_slot(slot: SlotId, driver: u64) {
     if let Some(zone) = zone() {
         {
             let passes = carrick_sched_core::OwedPasses::new();
-            let owed = zone.step_back(slot, driver, &passes);
-            (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
-            owed
-        };
+            zone.step_back(slot, driver, &passes);
+            passes.deliver(crate::el1_zone::resched_slot);
+        }
     }
 }
 
@@ -1795,18 +1786,16 @@ pub fn leave_slot_in(
     refuse_ring_occupant(zone, slot, driver)?;
     let mut records = Vec::new();
     let mut placements = Vec::new();
-    if {
-        let passes = carrick_sched_core::OwedPasses::new();
-        let owed = zone.leave_slot(
-            slot,
-            driver,
-            &mut |record| records.push(record),
-            &mut |placement| placements.push(placement),
-            &passes,
-        );
-        (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
-        owed
-    } {
+    let passes = carrick_sched_core::OwedPasses::new();
+    let owed = zone.leave_slot(
+        slot,
+        driver,
+        &mut |record| records.push(record),
+        &mut |placement| placements.push(placement),
+        &passes,
+    );
+    passes.deliver(crate::el1_zone::resched_slot);
+    if owed {
         settle_vacated(
             zone,
             now,
@@ -1849,9 +1838,7 @@ fn settle_vacated(
             if deliver_placement({
                 let passes = carrick_sched_core::OwedPasses::new();
                 let owed = zone.place_from_host(record.id, &passes);
-                (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(
-                    passes,
-                );
+                passes.deliver(crate::el1_zone::resched_slot);
                 owed
             }) {
                 continue;
@@ -1859,9 +1846,7 @@ fn settle_vacated(
             if deliver_placement(fallback.and_then(|fallback| {
                 let passes = carrick_sched_core::OwedPasses::new();
                 let owed = zone.requeue_on(fallback, record.id, &passes);
-                (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(
-                    passes,
-                );
+                passes.deliver(crate::el1_zone::resched_slot);
                 owed
             })) {
                 continue;
@@ -2052,8 +2037,11 @@ pub mod first_entry_test_control {
                 self.0.elapsed() < std::time::Duration::from_secs(5)
             }
         }
-        super::zone_tables()?
-            .first_entry_links_clear_for_test(record, &Deadline(std::time::Instant::now()))
+        super::zone_tables()?.first_entry_links_clear_for_test(
+            record,
+            &Deadline(std::time::Instant::now()),
+            &carrick_sched_core::OwedPasses::new(),
+        )
     }
 }
 
@@ -2199,7 +2187,11 @@ pub mod deferred_capture_control {
         if zone.slot(slot).driver() != Some(driver)
             || !zone.slot(slot).is_live()
             || !zone.record_allows_slot(record.id, slot)
-            || !super::deliver_placement(zone.requeue_on(slot, record.id))
+            || !super::deliver_placement(zone.requeue_on(
+                slot,
+                record.id,
+                &carrick_sched_core::OwedPasses::new(),
+            ))
         {
             return;
         }
@@ -2317,7 +2309,7 @@ mod tests {
         let zone: &'static ZoneTables = Box::leak(heap_zone());
         let slot = SlotId::new(5);
         let next = SlotId::new(6);
-        zone.drive(slot, 7);
+        zone.drive(slot, 7, &carrick_sched_core::OwedPasses::new());
         zone.spaces.set_idle_ttbr(0x30000);
         let space = zone.spaces.publish_closed(4, 0x10000, 0x10000).unwrap();
         zone.spaces.open(space);
@@ -2337,7 +2329,7 @@ mod tests {
             assert_eq!(zone.slot(slot).driver(), Some(7));
             zone.release_space(slot);
             assert_eq!(step_away_from_slot(slot, 7), Ok(()));
-            zone.step_back(slot, 7);
+            zone.step_back(slot, 7, &carrick_sched_core::OwedPasses::new());
             assert_eq!(leave_slot(slot, 7, None), Ok(()));
         });
     }
@@ -2522,7 +2514,7 @@ mod tests {
         for count in [1, 8, 32] {
             let zone = heap_zone();
             let slot = SlotId::new(3);
-            zone.drive(slot, 7);
+            zone.drive(slot, 7, &carrick_sched_core::OwedPasses::new());
             let mut original = Vec::new();
             for tid in 1..=count {
                 let record = zone.alloc_record(identity(tid)).unwrap();
@@ -2534,12 +2526,16 @@ mod tests {
                         Some(seq),
                         Handback::Woken,
                         &HostLockWait,
-                        &|owned| crate::el1_zone::complete_object_wake(owned.zone(), owned)
+                        &|owned| crate::el1_zone::complete_object_wake(owned.zone(), owned),
+                        &carrick_sched_core::OwedPasses::new()
                     ),
                     HostClaim::Claimed,
                 );
                 original.push(zone.record_ref(record));
-                assert!(zone.requeue_on(slot, record).is_some());
+                assert!(
+                    zone.requeue_on(slot, record, &carrick_sched_core::OwedPasses::new())
+                        .is_some()
+                );
             }
             let mut records = Vec::new();
             let mut placements = Vec::new();
@@ -2548,6 +2544,7 @@ mod tests {
                 7,
                 &mut |record| records.push(record),
                 &mut |placement| placements.push(placement),
+                &carrick_sched_core::OwedPasses::new(),
             ));
             assert_eq!(records.len(), count as usize);
             assert!(placements.is_empty());
@@ -2561,9 +2558,14 @@ mod tests {
                     Claim::Host { .. }
                 ));
                 assert_eq!(
-                    zone.claim_for_host(old, None, Handback::Cancelled, &HostLockWait, &|owned| {
-                        crate::el1_zone::complete_object_wake(owned.zone(), owned)
-                    }),
+                    zone.claim_for_host(
+                        old,
+                        None,
+                        Handback::Cancelled,
+                        &HostLockWait,
+                        &|owned| { crate::el1_zone::complete_object_wake(owned.zone(), owned) },
+                        &carrick_sched_core::OwedPasses::new()
+                    ),
                     HostClaim::AlreadyHost,
                 );
                 zone.free_record(old.id);
@@ -2746,8 +2748,8 @@ mod tests {
             };
             let zone = heap_zone();
             let slot = SlotId::new(3);
-            zone.drive(slot, 1);
-            zone.publish_slot(slot, 7, None, 0);
+            zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+            zone.publish_slot(slot, 7, None, 0, &carrick_sched_core::OwedPasses::new());
             assert!(
                 zone.occupancy
                     .replace(carrick_sched_core::ExecutionSlot::zone(slot), 0, 7)
@@ -2889,7 +2891,8 @@ mod tests {
                         SlotId::new(slot as u8),
                         11,
                         &mut |_| panic!("completion is still transferring"),
-                        &mut |_| panic!("no queued record yet")
+                        &mut |_| panic!("no queued record yet"),
+                        &carrick_sched_core::OwedPasses::new()
                     ));
                 },
                 true,
@@ -2909,7 +2912,8 @@ mod tests {
                         slot,
                         11,
                         &mut |_| panic!("completion is still transferring"),
-                        &mut |_| panic!("no queued record yet")
+                        &mut |_| panic!("no queued record yet"),
+                        &carrick_sched_core::OwedPasses::new()
                     ));
                 },
                 true,
@@ -3040,8 +3044,18 @@ mod tests {
             if exception_owner {
                 // No vCPU was in the guest when the fault completion fired.
                 // Its returning driver is stopped at this idle boundary.
-                zone.drive(SlotId::new(SLOT as u8), 11);
-                zone.publish_slot(SlotId::new(SLOT as u8), 2, Some(0), 0);
+                zone.drive(
+                    SlotId::new(SLOT as u8),
+                    11,
+                    &carrick_sched_core::OwedPasses::new(),
+                );
+                zone.publish_slot(
+                    SlotId::new(SLOT as u8),
+                    2,
+                    Some(0),
+                    0,
+                    &carrick_sched_core::OwedPasses::new(),
+                );
                 let space = zone.spaces.publish_closed(2, 0x1000, 0).unwrap();
                 zone.spaces.open(space);
             }
@@ -3073,7 +3087,7 @@ mod tests {
                     }
                     claim => panic!("exception owner lost ring custody: {claim:?}"),
                 };
-                zone.step_back(slot, 11);
+                zone.step_back(slot, 11, &carrick_sched_core::OwedPasses::new());
                 // Returning idle entry publishes the driver and probes Held.
                 zone.drive_and_publish(
                     slot,
@@ -3081,12 +3095,13 @@ mod tests {
                     0,
                     Some(0),
                     carrick_sched_core::AffinitySource::UNBOUND,
+                    &carrick_sched_core::OwedPasses::new(),
                 );
                 assert!(matches!(zone.record(record).claim(), Claim::Queued { .. }));
                 assert!(!zone.head_needs_host(owner));
                 let selected = zone
-                    .switch_in_full(slot)
-                    .or_else(|| zone.steal(slot))
+                    .switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+                    .or_else(|| zone.steal(slot, &carrick_sched_core::OwedPasses::new()))
                     .unwrap();
                 assert_eq!(selected.record, record);
                 return;
@@ -3115,10 +3130,13 @@ mod tests {
     fn step_away_captures_exactly_the_queued_service_record() {
         let zone = heap_zone();
         let slot = SlotId::new(3);
-        zone.drive(slot, 7);
+        zone.drive(slot, 7, &carrick_sched_core::OwedPasses::new());
         let queued = zone.alloc_host_runnable(identity(1)).unwrap();
         let reference = zone.record_ref(queued);
-        assert!(zone.requeue_on(slot, queued).is_some());
+        assert!(
+            zone.requeue_on(slot, queued, &carrick_sched_core::OwedPasses::new())
+                .is_some()
+        );
         let mut records = Vec::new();
         let mut placements = Vec::new();
         assert!(zone.step_away(
@@ -3126,6 +3144,7 @@ mod tests {
             7,
             &mut |record| records.push(record),
             &mut |placement| placements.push(placement),
+            &carrick_sched_core::OwedPasses::new(),
         ));
         let mut batches = Vec::new();
         settle_vacated(
@@ -3148,10 +3167,10 @@ mod tests {
             for affinity in [0b01, 0b11] {
                 let zone = heap_zone();
                 let (away, other) = (SlotId::new(0), SlotId::new(1));
-                zone.drive(away, 7);
-                zone.drive(other, 8);
-                zone.publish_slot(away, 0, Some(0), 0);
-                zone.publish_slot(other, 0, Some(1), 0);
+                zone.drive(away, 7, &carrick_sched_core::OwedPasses::new());
+                zone.drive(other, 8, &carrick_sched_core::OwedPasses::new());
+                zone.publish_slot(away, 0, Some(0), 0, &carrick_sched_core::OwedPasses::new());
+                zone.publish_slot(other, 0, Some(1), 0, &carrick_sched_core::OwedPasses::new());
                 let record = zone
                     .alloc_host_runnable(ThreadIdentity {
                         affinity,
@@ -3159,7 +3178,10 @@ mod tests {
                     })
                     .unwrap();
                 let reference = zone.record_ref(record);
-                assert!(zone.requeue_on(away, record).is_some());
+                assert!(
+                    zone.requeue_on(away, record, &carrick_sched_core::OwedPasses::new())
+                        .is_some()
+                );
                 let mut captures = Vec::new();
                 let mut published = Vec::new();
                 for _ in 0..steps {
@@ -3170,6 +3192,7 @@ mod tests {
                         7,
                         &mut |record| records.push(record),
                         &mut |placement| placements.push(placement),
+                        &carrick_sched_core::OwedPasses::new(),
                     ));
                     settle_vacated(
                         &zone,
@@ -3187,12 +3210,15 @@ mod tests {
                     );
                     // An inline completion returns to the same actor; it need
                     // not pass through the executor's service-head take.
-                    zone.step_back(away, 7);
+                    zone.step_back(away, 7, &carrick_sched_core::OwedPasses::new());
                 }
                 assert_eq!(captures, [reference], "steps={steps} affinity={affinity}");
                 assert_eq!(zone.slot(away).queued(), 0);
                 assert_eq!(published, [reference]);
-                assert_eq!(zone.take_service_head(other), None);
+                assert_eq!(
+                    zone.take_service_head(other, &carrick_sched_core::OwedPasses::new()),
+                    None
+                );
                 zone.free_record(record);
             }
         }
@@ -3207,8 +3233,18 @@ mod tests {
             let zone = heap_zone();
             let slots = [SlotId::new(0), SlotId::new(1)];
             for (index, slot) in slots.into_iter().enumerate() {
-                zone.drive(slot, index as u64 + 1);
-                zone.publish_slot(slot, 0, Some(if index == 0 { 0 } else { peer_cpu }), 0);
+                zone.drive(
+                    slot,
+                    index as u64 + 1,
+                    &carrick_sched_core::OwedPasses::new(),
+                );
+                zone.publish_slot(
+                    slot,
+                    0,
+                    Some(if index == 0 { 0 } else { peer_cpu }),
+                    0,
+                    &carrick_sched_core::OwedPasses::new(),
+                );
             }
             let record = zone
                 .alloc_host_runnable(ThreadIdentity {
@@ -3217,7 +3253,10 @@ mod tests {
                 })
                 .unwrap();
             let reference = zone.record_ref(record);
-            assert!(zone.requeue_on(slots[0], record).is_some());
+            assert!(
+                zone.requeue_on(slots[0], record, &carrick_sched_core::OwedPasses::new())
+                    .is_some()
+            );
             let mut captures = Vec::new();
             let mut published = Vec::new();
             for turn in 0..8 {
@@ -3231,6 +3270,7 @@ mod tests {
                     driver,
                     &mut |record| records.push(record),
                     &mut |placement| placements.push(placement),
+                    &carrick_sched_core::OwedPasses::new(),
                 ));
                 settle_vacated(
                     &zone,
@@ -3240,7 +3280,7 @@ mod tests {
                     &mut |record| published.push(record),
                     &mut |records| captures.extend_from_slice(records),
                 );
-                zone.step_back(slot, driver);
+                zone.step_back(slot, driver, &carrick_sched_core::OwedPasses::new());
             }
             assert_eq!(captures, [reference], "peer_cpu={peer_cpu}");
             assert_eq!(published, [reference]);
@@ -3299,7 +3339,7 @@ mod tests {
             let context = thread(1);
             let zone: &'static ZoneTables = Box::leak(heap_zone());
             let slot = SlotId::new(0);
-            zone.drive(slot, 7);
+            zone.drive(slot, 7, &carrick_sched_core::OwedPasses::new());
             let mut outcome = HoldOutcome::NotHeld;
             let batches = captures(|| {
                 with_test_zone(zone, || {
@@ -3307,7 +3347,7 @@ mod tests {
                     // Before any step-away the workload may still be in its
                     // first run: nothing is held.
                     step_away_from_slot(slot, 7).expect("step away");
-                    zone.step_back(slot, 7);
+                    zone.step_back(slot, 7, &carrick_sched_core::OwedPasses::new());
                     assert!(place_service(
                         context.thread(),
                         crate::kernel::objects::ExecutionGeneration::from_raw(9)
@@ -3338,7 +3378,7 @@ mod tests {
             let context = thread(1);
             let zone: &'static ZoneTables = Box::leak(heap_zone());
             let slot = SlotId::new(0);
-            zone.drive(slot, 7);
+            zone.drive(slot, 7, &carrick_sched_core::OwedPasses::new());
             let mut outcome = HoldOutcome::NotHeld;
             let batches = captures(|| {
                 with_test_zone(zone, || {
@@ -3365,10 +3405,16 @@ mod tests {
             let context = thread(1);
             let zone: &'static ZoneTables = Box::leak(heap_zone());
             let (allowed, other) = (SlotId::new(0), SlotId::new(1));
-            zone.drive(allowed, 7);
-            zone.drive(other, 8);
-            zone.publish_slot(allowed, 0, Some(0), 0);
-            zone.publish_slot(other, 0, Some(1), 0);
+            zone.drive(allowed, 7, &carrick_sched_core::OwedPasses::new());
+            zone.drive(other, 8, &carrick_sched_core::OwedPasses::new());
+            zone.publish_slot(
+                allowed,
+                0,
+                Some(0),
+                0,
+                &carrick_sched_core::OwedPasses::new(),
+            );
+            zone.publish_slot(other, 0, Some(1), 0, &carrick_sched_core::OwedPasses::new());
             let place = || {
                 assert!(place_service(
                     context.thread(),
@@ -3381,10 +3427,10 @@ mod tests {
                 with_test_zone(zone, || {
                     let hold = arm(Duration::from_secs(10));
                     step_away_from_slot(other, 8).expect("step away");
-                    zone.step_back(other, 8);
+                    zone.step_back(other, 8, &carrick_sched_core::OwedPasses::new());
                     place();
                     step_away_from_slot(other, 8).expect("step away");
-                    zone.step_back(other, 8);
+                    zone.step_back(other, 8, &carrick_sched_core::OwedPasses::new());
                     stalled = hold.finish();
                 });
             });
@@ -3399,7 +3445,7 @@ mod tests {
                 with_test_zone(zone, || {
                     let hold = arm(Duration::from_secs(10));
                     step_away_from_slot(other, 8).expect("step away");
-                    zone.step_back(other, 8);
+                    zone.step_back(other, 8, &carrick_sched_core::OwedPasses::new());
                     place();
                     step_away_from_slot(allowed, 7).expect("step away");
                     released = hold.finish();
@@ -3439,17 +3485,17 @@ mod tests {
             let run = |held: bool| {
                 let zone: &'static ZoneTables = Box::leak(heap_zone());
                 let (away, live) = (SlotId::new(0), SlotId::new(1));
-                zone.drive(away, 7);
-                zone.drive(live, 8);
-                zone.publish_slot(away, 0, Some(0), 0);
-                zone.publish_slot(live, 0, Some(1), 0);
+                zone.drive(away, 7, &carrick_sched_core::OwedPasses::new());
+                zone.drive(live, 8, &carrick_sched_core::OwedPasses::new());
+                zone.publish_slot(away, 0, Some(0), 0, &carrick_sched_core::OwedPasses::new());
+                zone.publish_slot(live, 0, Some(1), 0, &carrick_sched_core::OwedPasses::new());
                 let mut record = None;
                 let batches = captures(|| {
                     with_test_zone(zone, || {
                         if held {
                             let hold = arm(Duration::from_secs(10));
                             step_away_from_slot(live, 8).expect("step away");
-                            zone.step_back(live, 8);
+                            zone.step_back(live, 8, &carrick_sched_core::OwedPasses::new());
                             assert!(place_service(context.thread(), generation));
                             assert_eq!(zone.slot(away).queued() + zone.slot(live).queued(), 0);
                             step_away_from_slot(away, 7).expect("step away");
@@ -3464,7 +3510,10 @@ mod tests {
                             // Production: the record is already queued on the
                             // slot whose driver steps away.
                             let id = zone.alloc_host_runnable(expected).unwrap();
-                            assert!(zone.requeue_on(away, id).is_some());
+                            assert!(
+                                zone.requeue_on(away, id, &carrick_sched_core::OwedPasses::new())
+                                    .is_some()
+                            );
                             record = Some(zone.record_ref(id));
                             step_away_from_slot(away, 7).expect("step away");
                         }
@@ -3481,7 +3530,10 @@ mod tests {
                 // with no remaining zone links, held or unheld. The host
                 // publisher can release this exact thread/generation row.
                 assert!(matches!(rec.claim(), Claim::Host { .. }));
-                assert_eq!(zone.take_service_head(live), None);
+                assert_eq!(
+                    zone.take_service_head(live, &carrick_sched_core::OwedPasses::new()),
+                    None
+                );
                 zone.free_record(record.id);
             };
             run(false);
@@ -3493,7 +3545,7 @@ mod tests {
             let context = thread(1);
             let zone: &'static ZoneTables = Box::leak(heap_zone());
             let slot = SlotId::new(0);
-            zone.drive(slot, 7);
+            zone.drive(slot, 7, &carrick_sched_core::OwedPasses::new());
             let mut outcome = HoldOutcome::NotHeld;
             let mut published = 0;
             let batches = captures(|| {
@@ -3502,7 +3554,7 @@ mod tests {
                     // Before any step-away the workload may still be in its
                     // first run: nothing is held.
                     step_away_from_slot(slot, 7).expect("step away");
-                    zone.step_back(slot, 7);
+                    zone.step_back(slot, 7, &carrick_sched_core::OwedPasses::new());
                     assert!(place_service(
                         context.thread(),
                         crate::kernel::objects::ExecutionGeneration::from_raw(9)
@@ -3524,10 +3576,13 @@ mod tests {
     fn deferred_capture_precedes_filter_and_releases_queue_authority() {
         let zone = heap_zone();
         let slot = SlotId::new(3);
-        zone.drive(slot, 7);
+        zone.drive(slot, 7, &carrick_sched_core::OwedPasses::new());
         let old_id = zone.alloc_host_runnable(identity(1)).unwrap();
         let old = zone.record_ref(old_id);
-        assert!(zone.requeue_on(slot, old_id).is_some());
+        assert!(
+            zone.requeue_on(slot, old_id, &carrick_sched_core::OwedPasses::new())
+                .is_some()
+        );
         let mut records = Vec::new();
         let mut placements = Vec::new();
         assert!(zone.leave_slot(
@@ -3535,6 +3590,7 @@ mod tests {
             7,
             &mut |record| records.push(record),
             &mut |placement| placements.push(placement),
+            &carrick_sched_core::OwedPasses::new(),
         ));
         let mut captured = Vec::new();
         let mut published = Vec::new();
@@ -3552,9 +3608,12 @@ mod tests {
                         false
                     }
                 }
-                let queue = zone.slot_lock(slot, &RefuseWait);
+                let passes = carrick_sched_core::OwedPasses::new();
+                let queue = zone.slot_lock(slot, &RefuseWait, &passes);
                 assert!(queue.is_some(), "capture retained queue authority");
                 drop(queue);
+                passes
+                    .deliver(|slot| panic!("no idle scan runs here, yet {slot:?} was owed a pass"));
                 captured.extend_from_slice(records);
                 assert_eq!(records, &[old]);
                 // The core evacuation has returned; the hook can retire and
@@ -3583,10 +3642,20 @@ mod tests {
         let mut published = Vec::new();
         for (cpu, mm) in [(0, 7), (1, 8)] {
             let slot = SlotId::new(cpu);
-            zone.drive(slot, u64::from(cpu) + 1);
-            zone.publish_slot(slot, 0, Some(u32::from(cpu)), 0);
+            zone.drive(
+                slot,
+                u64::from(cpu) + 1,
+                &carrick_sched_core::OwedPasses::new(),
+            );
+            zone.publish_slot(
+                slot,
+                0,
+                Some(u32::from(cpu)),
+                0,
+                &carrick_sched_core::OwedPasses::new(),
+            );
             zone.enter_guest(slot);
-            zone.enter_idle(slot, true);
+            zone.enter_idle(slot, true, &carrick_sched_core::OwedPasses::new());
             let id = zone
                 .alloc_record(ThreadIdentity {
                     mm,
@@ -3599,15 +3668,23 @@ mod tests {
                 .unwrap();
             let record = zone.record_ref(id);
             zone.publish_park(id, zone.next_seq(id));
-            zone.claim_for_host(record, None, Handback::Woken, &HostLockWait, &|owned| {
-                crate::el1_zone::complete_object_wake(owned.zone(), owned)
-            });
+            zone.claim_for_host(
+                record,
+                None,
+                Handback::Woken,
+                &HostLockWait,
+                &|owned| crate::el1_zone::complete_object_wake(owned.zone(), owned),
+                &carrick_sched_core::OwedPasses::new(),
+            );
             publish_handback_in_zone(&zone, record, &mut |record| published.push(record));
             assert!(
                 published.is_empty(),
                 "a Born wake cannot target a nonexistent host continuation"
             );
-            assert_eq!(zone.take_service_head(slot), Some(record));
+            assert_eq!(
+                zone.take_service_head(slot, &carrick_sched_core::OwedPasses::new()),
+                Some(record)
+            );
             assert_eq!(zone.live(record).unwrap().handback(), Some(Handback::Woken));
         }
     }
@@ -3618,10 +3695,20 @@ mod tests {
         let mut records = Vec::new();
         for (cpu, mm) in [(0, 7), (1, 8)] {
             let slot = SlotId::new(cpu);
-            zone.drive(slot, u64::from(cpu) + 1);
-            zone.publish_slot(slot, 0, Some(u32::from(cpu)), 0);
+            zone.drive(
+                slot,
+                u64::from(cpu) + 1,
+                &carrick_sched_core::OwedPasses::new(),
+            );
+            zone.publish_slot(
+                slot,
+                0,
+                Some(u32::from(cpu)),
+                0,
+                &carrick_sched_core::OwedPasses::new(),
+            );
             zone.enter_guest(slot);
-            zone.enter_idle(slot, true);
+            zone.enter_idle(slot, true, &carrick_sched_core::OwedPasses::new());
             let id = zone
                 .alloc_record(ThreadIdentity {
                     mm,
@@ -3634,9 +3721,14 @@ mod tests {
                 .unwrap();
             let record = zone.record_ref(id);
             zone.publish_park(id, zone.next_seq(id));
-            zone.claim_for_host(record, None, Handback::Resumed, &HostLockWait, &|owned| {
-                crate::el1_zone::complete_object_wake(owned.zone(), owned)
-            });
+            zone.claim_for_host(
+                record,
+                None,
+                Handback::Resumed,
+                &HostLockWait,
+                &|owned| crate::el1_zone::complete_object_wake(owned.zone(), owned),
+                &carrick_sched_core::OwedPasses::new(),
+            );
             records.push(record);
         }
         let mut published = Vec::new();
@@ -3654,7 +3746,10 @@ mod tests {
         );
         for (cpu, record) in records.iter().enumerate() {
             let slot = SlotId::new(cpu as u8);
-            assert_eq!(zone.take_service_head(slot), Some(*record));
+            assert_eq!(
+                zone.take_service_head(slot, &carrick_sched_core::OwedPasses::new()),
+                Some(*record)
+            );
         }
     }
 
@@ -3662,10 +3757,13 @@ mod tests {
     fn deferred_slot_handback_preserves_live_records() {
         let zone = heap_zone();
         let slot = SlotId::new(3);
-        zone.drive(slot, 7);
+        zone.drive(slot, 7, &carrick_sched_core::OwedPasses::new());
         let record = zone.alloc_host_runnable(identity(1)).unwrap();
         let expected = zone.record_ref(record);
-        assert!(zone.requeue_on(slot, record).is_some());
+        assert!(
+            zone.requeue_on(slot, record, &carrick_sched_core::OwedPasses::new())
+                .is_some()
+        );
         let mut records = Vec::new();
         let mut placements = Vec::new();
         assert!(zone.leave_slot(
@@ -3673,6 +3771,7 @@ mod tests {
             7,
             &mut |record| records.push(record),
             &mut |placement| placements.push(placement),
+            &carrick_sched_core::OwedPasses::new(),
         ));
         let mut published = Vec::new();
         settle_vacated(
