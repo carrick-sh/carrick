@@ -85,11 +85,15 @@ macro_rules! export_carrier {
             let code = <$personality as $crate::personality::Personality>::handle_page_fault(
                 frame, fpstate,
             );
-            // A resolved fault's return to user is the last-chance delivery
-            // point for the reschedule IPIs this CPU owes (#3083).
-            carrick_el1::isa::x86::interrupt::deliver_owed_resched_before_user(
-                carrick_el1::isa::x86::interrupt::UserReturn::PageFault,
-            );
+            // A resolved fault (0) returns to user: the last-chance delivery
+            // point for the reschedule IPIs this CPU owes (#3083). An
+            // unresolved one goes to its own report, which an APIC fault
+            // must not supersede.
+            if code == 0 {
+                carrick_el1::isa::x86::interrupt::deliver_owed_resched_before_user(
+                    carrick_el1::isa::x86::interrupt::UserReturn::PageFault,
+                );
+            }
             code
         }
 
