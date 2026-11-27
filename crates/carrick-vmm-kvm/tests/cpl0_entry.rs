@@ -4616,6 +4616,26 @@ fn production_resched_ipi_owed_by_an_idle_sender_with_a_stuck_icr_is_fatal() {
     );
 }
 
+/// #3083 item 2 (#3117) on x86 CPL0, deterministically: the other CPU's
+/// production idle scans meet this CPU's busy run-queue lock, with a worker
+/// queued behind it. The lock is released only once that CPU is published
+/// IdleWfi past its pre-HLT recheck, and this CPU then waits in its syscall
+/// with interrupts masked, so nothing else can hand the worker over. The
+/// release must owe the enrolled scan a pass, this CPU's venue must send it
+/// to that CPU, and its next scan must steal the worker, which then runs
+/// there. A release that owes nothing leaves the other CPU asleep past the
+/// worker: the bounded child reaches its bound. Exit 95: the scans never
+/// enrolled on the busy lock, so nothing was proven.
+#[test]
+fn production_idle_scan_on_a_busy_victim_lock_is_woken_by_its_release() {
+    bounded_contention_witness(
+        "production_idle_scan_on_a_busy_victim_lock_is_woken_by_its_release",
+        "native_busy_victim_steal.S",
+        &[],
+        "idle scan on a busy victim run-queue lock, released after its pre-HLT recheck",
+    );
+}
+
 /// #2321 on x86 CPL0: blocking wait4 on a production fork child that is
 /// already a zombie, with the pre-reap status copy contended once. An editor
 /// holder parks the caller once on the existing owner wait; a Busy copy is

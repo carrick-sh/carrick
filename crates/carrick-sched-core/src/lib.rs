@@ -4465,6 +4465,13 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         }
     }
 
+    /// Whether an idle scan is enrolled on `slot`'s held run-queue lock
+    /// (`SLOT_LOCK_SCAN_OWED`), so its release owes idle slots a pass. A
+    /// witness reads it to prove the contended scan happened (#3117).
+    pub fn scan_enrolled(&self, slot: SlotId) -> bool {
+        self.slot(slot).lock.load(Ordering::Acquire) & SLOT_LOCK_SCAN_OWED != 0
+    }
+
     /// An idle scan whose bounded spin on `slot`'s lock ran out: enrol on the
     /// holder's release ([`SLOT_LOCK_SCAN_OWED`]), then probe the lock once.
     /// Returns the guard if the lock was free at the enrolment or the probe;
