@@ -901,6 +901,11 @@ pub(crate) fn check_switch_venues(disassembly: &str) -> Result<(), String> {
         else {
             continue;
         };
+        // A branch to a label inside the caller itself (`<f+0x98>` from `f`)
+        // is control flow within that function, not a call into a switch.
+        if target.split_once('+').map_or(target, |(base, _)| base) == caller {
+            continue;
+        }
         if !SWITCHES.iter().any(|switch| target.starts_with(switch)) {
             continue;
         }
@@ -975,6 +980,28 @@ mod tests {
         let disassembly =
             format!("1000 <{entry}>:\n1000: bl 0x2000 <{tail}>\n2000 <{tail}>:\n2000: ret\n");
         assert_eq!(check_switch_venues(&disassembly), Ok(()));
+    }
+
+    /// A switch's own loop branches to a label inside itself
+    /// (`b <run_ready+0x98>`, #3117's owed-pass delivery in `run_ready`):
+    /// that is not a switch called outside an entry. A real call from a
+    /// switch into another switch is still measured.
+    #[test]
+    fn a_branch_inside_a_switch_is_not_a_switch_call() {
+        let run_ready = "carrick_el1::substrate::sched::Sched$LT$C$C$U$GT$::run_ready::h8";
+        let disassembly = format!(
+            "1000 <{run_ready}>:\n1000: b 0x1098 <{run_ready}+0x98>\n1098: bl 0x2000 <{IDLE}>\n\
+             2000 <{IDLE}>:\n2000: ret\n"
+        );
+        let error = check_switch_venues(&disassembly).unwrap_err();
+        assert!(!error.contains("+0x98"), "{error}");
+        assert!(error.contains(IDLE), "{error}");
+        let loop_only = format!(
+            "1000 <{run_ready}>:\n1000: b 0x1098 <{run_ready}+0x98>\n\
+             3000 <{IDLE}>:\n3000: ret\n4000 <x::h9>:\n4000: bl 0x3000 <{IDLE}>\n"
+        );
+        let error = check_switch_venues(&loop_only).unwrap_err();
+        assert!(!error.contains("+0x98"), "{error}");
     }
 
     #[test]
