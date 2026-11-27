@@ -2597,13 +2597,20 @@ impl Cpl0Carrier {
                 .ok_or_else(|| fail("lifecycle MM"))?;
             zone.spaces.open(space);
             let slot = SlotId::new(index as u8);
-            zone.drive(slot, index as u64 + 1);
+            // The vCPUs are stopped, so no idle scan can meet these locks
+            // (#3083): an owed pass is a broken invariant.
+            let passes = carrick_sched_core::OwedPasses::new();
+            zone.drive(slot, index as u64 + 1, &passes);
             zone.publish_slot_with_affinity(
                 slot,
                 binding.mm.raw(),
                 Some(index as u32),
                 carrick_sched_core::AffinitySource::UNBOUND,
+                &passes,
             );
+            passes
+                .expect_none()
+                .map_err(|_| fail("stopped lifecycle publication owed an idle-scan pass"))?;
             zone.enter_guest(slot);
             zone.install_space(slot, binding.mm.raw())
                 .ok_or_else(|| fail("lifecycle installed MM"))?;

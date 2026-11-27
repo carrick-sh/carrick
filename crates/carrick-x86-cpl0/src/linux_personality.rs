@@ -729,7 +729,17 @@ pub fn signal_irq_return(
             }
             // IRQ entry owns this running/home record: a refusal is a broken
             // invariant, never contention (#1100).
-            if !source.zone.requeue_preempted(slot, record).is_queued() {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let queued = source
+                .zone
+                .requeue_preempted(slot, record, &passes)
+                .is_queued();
+            carrick_el1::substrate::sched::object_wait::deliver_owed_passes(
+                source.zone,
+                slot,
+                passes,
+            );
+            if !queued {
                 fatal_boot!();
             }
             suspended = true;

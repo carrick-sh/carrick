@@ -1585,7 +1585,7 @@ const SLOT_LOCK_HELD: u32 = 1;
 const SLOT_LOCK_SCAN_OWED: u32 = 2;
 
 /// The idle slots that released run-queue locks owe another scan (#3083): a
-/// scan enrolled on a busy lock ([`SLOT_LOCK_SCAN_OWED`]) and its release
+/// scan enrolled on a busy lock (`SLOT_LOCK_SCAN_OWED`) and its release
 /// owes every idle slot an SGI, for a scan that already reached WFI. Every
 /// lock-taking zone operation takes one, and its caller delivers it in its
 /// own venue: folded into the [`WakeEffects`] it sends
@@ -1648,6 +1648,18 @@ impl OwedPasses {
             }
         }
     }
+
+    /// Consume the sink of a venue where no idle scan can run (stopped
+    /// vCPUs, a one-vCPU fixture), so nothing can be owed. `Err` names an
+    /// owed slot: a broken invariant the caller reports through its own
+    /// fatal or error path.
+    pub fn expect_none(self) -> Result<(), SlotId> {
+        let mut owed = None;
+        self.deliver(|slot| {
+            owed.get_or_insert(slot);
+        });
+        owed.map_or(Ok(()), Err)
+    }
 }
 
 impl Default for OwedPasses {
@@ -1668,7 +1680,7 @@ impl Drop for OwedPasses {
 
 /// A held slot run-queue lock. Its release is the one way the lock word is
 /// cleared, and it delivers what the word owes: a release that finds an
-/// idle scan enrolled ([`SLOT_LOCK_SCAN_OWED`]) owes idle slots a scan, into
+/// idle scan enrolled (`SLOT_LOCK_SCAN_OWED`) owes idle slots a scan, into
 /// the [`OwedPasses`] the lock was taken with.
 pub struct SlotGuard<'a, C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
     zone: &'a ZoneTables<C>,
@@ -3186,6 +3198,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// the queue. [`HostPlacement::resched`]: the slot runs a thread or
     /// sleeps in WFI and owes a reschedule; the caller delivers it in its own
     /// venue.
+    #[allow(clippy::too_many_arguments)]
     fn requeue_claimed(
         &self,
         slot: SlotId,
@@ -6692,6 +6705,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         self.claim_for_host_inner(r, rec, seq, kind, wait, completion, passes)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn claim_for_host_inner(
         &self,
         r: RecordRef,
