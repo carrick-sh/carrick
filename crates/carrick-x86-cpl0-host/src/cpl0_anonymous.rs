@@ -323,16 +323,9 @@ impl carrick_core::mm::own::CoreVenue for X86CoreVenue {
     }
 }
 
-/// A fresh core for a new carrier, with a carrier identity never used before
-/// in this process.
-pub(super) fn new_mm_core() -> X86MmCore {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT_CARRIER: AtomicU64 = AtomicU64::new(1);
-    let raw = NEXT_CARRIER.fetch_add(1, Ordering::Relaxed);
-    let raw = NonZeroU64::new(raw).unwrap_or(NonZeroU64::MAX);
-    // SAFETY: the counter is monotonic and never reused in this process, and
-    // a core never leaves its carrier's host custody.
-    X86MmCore::new(unsafe { carrick_core::mm::own::CarrierId::assume_unique(raw) })
+/// A fresh core for a new carrier, under the carrier VM's own identity.
+pub(super) fn new_mm_core(vm: crate::carrier_memory::CarrierVmId) -> X86MmCore {
+    X86MmCore::new(vm.carrier())
 }
 
 /// The core's view of the guest exclusion the shell holds.

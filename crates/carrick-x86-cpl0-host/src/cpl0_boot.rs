@@ -7469,6 +7469,7 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
                 )
                 .map_err(|error| fail(format!("boot stdio admission: {error:?}")))?;
         }
+        let mm_core = anonymous_owner::new_mm_core(memory.identity());
         Ok(Self(Cpl0HostCustody {
             _vm: memory,
             ram,
@@ -7494,7 +7495,7 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             exec_predecessors: exec_service::ExecPredecessorCustody::default(),
             root_exec_load: None,
             anonymous_pending: [None, None],
-            mm_core: anonymous_owner::new_mm_core(),
+            mm_core,
             native_backing_pending: std::collections::BTreeMap::new(),
             cancelled_backing_pending: Vec::new(),
             window_slots: std::collections::BTreeMap::new(),
