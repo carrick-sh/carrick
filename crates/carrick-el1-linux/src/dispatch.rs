@@ -869,7 +869,22 @@ pub fn dispatch_entry(
         }
     };
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-    let action = run_owed_entry_switch(frame, counters, action);
+    let action = {
+        let current_tasks =
+            unsafe { &*(EL1_CURRENT_TASKS_BASE as *const [CurrentTask; EL1_STACK_SLOTS as usize]) };
+        let zone = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
+        run_owed_entry_switch(
+            frame,
+            counters,
+            current_tasks,
+            Zone {
+                tables: zone,
+                cpu: &mut sched::HardwareCpu,
+                user: &sched::HardwareUserWord,
+            },
+            action,
+        )
+    };
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     return final_user_return(frame, action, arm_signal_user_return);
     #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
@@ -880,35 +895,124 @@ pub fn dispatch_entry(
 /// dispatch's frames have unwound: the next thread's resume runs beneath
 /// the entry alone, never beneath the park site. A park releases its slot
 /// as `Idle`; any other exit with a switch owed is a broken invariant.
-#[cfg(all(target_os = "none", target_arch = "aarch64"))]
-fn run_owed_entry_switch(frame: &mut TrapFrame, counters: &Counters, action: Action) -> Action {
+///
+/// The one entry tail: [`dispatch_entry`] calls it at EL1, and every host
+/// harness that stands in for the entry calls it after its dispatch.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+pub(crate) fn run_owed_entry_switch<C, U>(
+    frame: &mut TrapFrame,
+    counters: &Counters,
+    current_tasks: &[CurrentTask],
+    zone: Zone<'_, C, U>,
+    action: Action,
+) -> Action
+where
+    C: sched::ThreadCpu,
+    U: sched::UserWord,
+{
     let Some(slot) = SlotId::from_index(frame.slot as usize) else {
         return action;
     };
     if !sched::entry_switch::owed(slot) {
         return action;
     }
-    if action != Action::Idle {
-        invalid_completion(NativeInvariant::EntryBinding);
-    }
-    let current_tasks =
-        unsafe { &*(EL1_CURRENT_TASKS_BASE as *const [CurrentTask; EL1_STACK_SLOTS as usize]) };
     let Some(task) = current_tasks.get(frame.slot as usize) else {
         invalid_completion(NativeInvariant::EntryBinding);
     };
-    let zone = unsafe { &*(EL1_ZONE_BASE as *const ZoneTables) };
     let mut sched = sched::Sched {
         handoff: None,
-        zone,
+        zone: zone.tables,
         slot,
         task,
-        cpu: &mut sched::HardwareCpu,
-        user: &sched::HardwareUserWord,
+        cpu: zone.cpu,
+        user: zone.user,
         counters,
     };
-    match sched.run_entry_switch(frame) {
+    match run_owed_switch(&mut sched, frame, action == Action::Idle) {
+        None => action,
         Some(sched::Served::Returned { .. }) => Action::Served,
-        Some(sched::Served::Idle) | None => Action::Idle,
+        Some(sched::Served::Idle) => Action::Idle,
+    }
+}
+
+/// The scheduler-level step of [`run_owed_entry_switch`], for a harness
+/// that already holds the slot's [`sched::Sched`]: run the switch a park
+/// owed, once the dispatch that parked has returned. `released`: that
+/// dispatch answered `Idle`, the only exit a park may owe a switch on.
+/// `None`: nothing was owed.
+#[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
+pub(crate) fn run_owed_switch<C, U>(
+    sched: &mut sched::Sched<'_, C, U>,
+    frame: &mut TrapFrame,
+    released: bool,
+) -> Option<sched::Served>
+where
+    C: sched::ThreadCpu,
+    U: sched::UserWord,
+{
+    if !sched::entry_switch::owed(sched.slot) {
+        return None;
+    }
+    if !released {
+        invalid_completion(NativeInvariant::EntryBinding);
+    }
+    Some(sched.run_entry_switch(frame).unwrap_or(sched::Served::Idle))
+}
+
+/// [`run_owed_entry_switch`] for a host harness whose dispatch answers a
+/// [`CompletionRoute`](carrick_personality_linux::dispatch::CompletionRoute):
+/// a park's `Suspended` becomes the switched-in thread's `Served`.
+#[cfg(test)]
+pub(crate) fn run_owed_entry_route<C, U>(
+    frame: &mut TrapFrame,
+    counters: &Counters,
+    current_tasks: &[CurrentTask],
+    zone: Zone<'_, C, U>,
+    route: carrick_personality_linux::dispatch::CompletionRoute,
+) -> carrick_personality_linux::dispatch::CompletionRoute
+where
+    C: sched::ThreadCpu,
+    U: sched::UserWord,
+{
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    let action = match route {
+        CompletionRoute::Suspended => Action::Idle,
+        CompletionRoute::Served => Action::Served,
+        _ => Action::Forward,
+    };
+    match run_owed_entry_switch(frame, counters, current_tasks, zone, action) {
+        Action::Served if route == CompletionRoute::Suspended => CompletionRoute::Served,
+        _ => route,
+    }
+}
+
+/// [`run_owed_entry_route`] for a harness whose dispatch may refuse: a
+/// refusal owes nothing, and a refusal with a switch owed is the same broken
+/// invariant as any other non-`Idle` exit.
+#[cfg(test)]
+pub(crate) fn run_owed_entry_result<C, U, E>(
+    frame: &mut TrapFrame,
+    counters: &Counters,
+    current_tasks: &[CurrentTask],
+    zone: Zone<'_, C, U>,
+    completed: Result<carrick_personality_linux::dispatch::CompletionRoute, E>,
+) -> Result<carrick_personality_linux::dispatch::CompletionRoute, E>
+where
+    C: sched::ThreadCpu,
+    U: sched::UserWord,
+{
+    match completed {
+        Ok(route) => Ok(run_owed_entry_route(
+            frame,
+            counters,
+            current_tasks,
+            zone,
+            route,
+        )),
+        Err(error) => {
+            run_owed_entry_switch(frame, counters, current_tasks, zone, Action::Forward);
+            Err(error)
+        }
     }
 }
 

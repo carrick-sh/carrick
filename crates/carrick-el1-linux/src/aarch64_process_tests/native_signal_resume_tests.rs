@@ -218,27 +218,41 @@ fn retained_signal_copy(input_wait: bool, check_stale: bool) {
         } else {
             crate::file::SIMULATE_COPYOUT_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
         }
-        let route = crate::dispatch::dispatch_syscall_with_native(
-            &mut frame,
-            &counters,
-            core::slice::from_ref(&fixture.task),
-            &[],
-            &[],
-            &[],
-            &[],
-            &cache,
-            Some(crate::dispatch::Zone {
-                tables: fixture.zone,
-                cpu: &mut cpu,
-                user: &crate::sched::HardwareUserWord,
-            }),
-            None,
-            Some(&*fixture),
-            Some(&mut *entry),
-            Some(source),
-            None,
-            |_| core::ptr::null_mut(),
-        );
+        let route = {
+            let completed = crate::dispatch::dispatch_syscall_with_native(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&fixture.task),
+                &[],
+                &[],
+                &[],
+                &[],
+                &cache,
+                Some(crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &crate::sched::HardwareUserWord,
+                }),
+                None,
+                Some(&*fixture),
+                Some(&mut *entry),
+                Some(source),
+                None,
+                |_| core::ptr::null_mut(),
+            );
+            // The entry runs the switch a park owed it (#3093).
+            crate::dispatch::run_owed_entry_route(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&fixture.task),
+                crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &crate::sched::HardwareUserWord,
+                },
+                completed,
+            )
+        };
         crate::file::SIMULATE_COPYOUT_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
         assert_eq!(
             route,
@@ -2360,29 +2374,43 @@ fn arm_live_in_place_rewind_parked_and_resumed_rewinds_once() {
     let mut saved = Box::new(Aarch64ParkedContext::ZERO);
     crate::sched::ThreadCpu::save(&mut cpu, &frame, &mut saved);
     crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
-    let route = crate::dispatch::dispatch_arm_syscall_with_native_process(
-        &mut frame,
-        &counters,
-        core::slice::from_ref(&env.fixture.task),
-        &[],
-        &[],
-        &[],
-        &[],
-        &cache,
-        Some(crate::dispatch::Zone {
-            tables: env.fixture.zone,
-            cpu: &mut cpu,
-            user: &crate::sched::HardwareUserWord,
-        }),
-        None,
-        Some(env.fixture),
-        env.fixture.page,
-        env.fixture.control,
-        Aarch64EntryContext::saved(&saved),
-        env.ttbr0,
-        &mut env.service,
-        |_| core::ptr::null_mut(),
-    )
+    let route = {
+        let completed = crate::dispatch::dispatch_arm_syscall_with_native_process(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&env.fixture.task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &cache,
+            Some(crate::dispatch::Zone {
+                tables: env.fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            }),
+            None,
+            Some(env.fixture),
+            env.fixture.page,
+            env.fixture.control,
+            Aarch64EntryContext::saved(&saved),
+            env.ttbr0,
+            &mut env.service,
+            |_| core::ptr::null_mut(),
+        );
+        // The entry runs the switch a park owed it (#3093).
+        crate::dispatch::run_owed_entry_result(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&env.fixture.task),
+            crate::dispatch::Zone {
+                tables: env.fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            },
+            completed,
+        )
+    }
     .unwrap();
     crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
     let action = crate::dispatch::resolve_arm_process_route(
@@ -2922,29 +2950,43 @@ fn arm_sigreturn_deferred_signal_copy_keeps_resume_label() {
 
     let mut saved = Box::new(Aarch64ParkedContext::ZERO);
     crate::sched::ThreadCpu::save(&mut cpu, &frame, &mut saved);
-    let route = crate::dispatch::dispatch_arm_syscall_with_native_process(
-        &mut frame,
-        &counters,
-        task_slice,
-        &[],
-        &[],
-        &[],
-        &[],
-        &cache,
-        Some(crate::dispatch::Zone {
-            tables: env.fixture.zone,
-            cpu: &mut cpu,
-            user: &crate::sched::HardwareUserWord,
-        }),
-        None,
-        Some(env.fixture),
-        env.fixture.page,
-        env.fixture.control,
-        Aarch64EntryContext::saved(&saved),
-        env.ttbr0,
-        &mut env.service,
-        |_| core::ptr::null_mut(),
-    )
+    let route = {
+        let completed = crate::dispatch::dispatch_arm_syscall_with_native_process(
+            &mut frame,
+            &counters,
+            task_slice,
+            &[],
+            &[],
+            &[],
+            &[],
+            &cache,
+            Some(crate::dispatch::Zone {
+                tables: env.fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            }),
+            None,
+            Some(env.fixture),
+            env.fixture.page,
+            env.fixture.control,
+            Aarch64EntryContext::saved(&saved),
+            env.ttbr0,
+            &mut env.service,
+            |_| core::ptr::null_mut(),
+        );
+        // The entry runs the switch a park owed it (#3093).
+        crate::dispatch::run_owed_entry_result(
+            &mut frame,
+            &counters,
+            task_slice,
+            crate::dispatch::Zone {
+                tables: env.fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            },
+            completed,
+        )
+    }
     .unwrap();
     let sigreturn_action = crate::dispatch::resolve_arm_process_route(
         route,

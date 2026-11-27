@@ -8255,23 +8255,37 @@ mod tests {
         // host test reads process memory directly at a guest user VA.
         let byte = carrick_test_support::GuestUserBuffer::from_bytes(b"x");
         let mut frame = syscall(SYS_WRITE, wfd, byte.arg(), 1, A_SVC);
-        let action = crate::dispatch::dispatch_syscall_with_ipc(
-            &mut frame,
-            w.counters,
-            &tasks,
-            &[],
-            &[],
-            &[],
-            &[],
-            names,
-            Some(crate::dispatch::Zone {
-                tables: &w.zone,
-                cpu: &mut cpu,
-                user: &HardwareUserWord,
-            }),
-            Some(&venue),
-            |_| core::ptr::null_mut(),
-        );
+        let action = {
+            let completed = crate::dispatch::dispatch_syscall_with_ipc(
+                &mut frame,
+                w.counters,
+                &tasks,
+                &[],
+                &[],
+                &[],
+                &[],
+                names,
+                Some(crate::dispatch::Zone {
+                    tables: &w.zone,
+                    cpu: &mut cpu,
+                    user: &HardwareUserWord,
+                }),
+                Some(&venue),
+                |_| core::ptr::null_mut(),
+            );
+            // The entry runs the switch a park owed it (#3093).
+            crate::dispatch::run_owed_entry_switch(
+                &mut frame,
+                w.counters,
+                &tasks,
+                crate::dispatch::Zone {
+                    tables: &w.zone,
+                    cpu: &mut cpu,
+                    user: &HardwareUserWord,
+                },
+                completed,
+            )
+        };
         assert_eq!(action, carrick_el1_abi::Action::Served);
         assert_eq!(frame.x[0], 1);
         assert_eq!(w.counters.served[SYS_WRITE].load(Ordering::Relaxed), 1);
@@ -8306,23 +8320,37 @@ mod tests {
         let headers = carrick_test_support::GuestUserBuffer::from_values(&[byte.arg(), 1u64]);
         let mut frame = syscall(66, wfd, headers.arg(), 1, A_SVC);
         crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
-        let action = crate::dispatch::dispatch_syscall_with_ipc(
-            &mut frame,
-            w.counters,
-            &tasks,
-            &[],
-            &[],
-            &[],
-            &[],
-            names,
-            Some(crate::dispatch::Zone {
-                tables: &w.zone,
-                cpu: &mut cpu,
-                user: &HardwareUserWord,
-            }),
-            Some(&venue),
-            |_| core::ptr::null_mut(),
-        );
+        let action = {
+            let completed = crate::dispatch::dispatch_syscall_with_ipc(
+                &mut frame,
+                w.counters,
+                &tasks,
+                &[],
+                &[],
+                &[],
+                &[],
+                names,
+                Some(crate::dispatch::Zone {
+                    tables: &w.zone,
+                    cpu: &mut cpu,
+                    user: &HardwareUserWord,
+                }),
+                Some(&venue),
+                |_| core::ptr::null_mut(),
+            );
+            // The entry runs the switch a park owed it (#3093).
+            crate::dispatch::run_owed_entry_switch(
+                &mut frame,
+                w.counters,
+                &tasks,
+                crate::dispatch::Zone {
+                    tables: &w.zone,
+                    cpu: &mut cpu,
+                    user: &HardwareUserWord,
+                },
+                completed,
+            )
+        };
         crate::file::SIMULATE_COPY_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
         assert_eq!(action, carrick_el1_abi::Action::Forward);
         assert_eq!(frame.x[0], wfd as u64);
@@ -8336,23 +8364,37 @@ mod tests {
                 .unread_bytes(),
             0
         );
-        let action = crate::dispatch::dispatch_syscall_with_ipc(
-            &mut frame,
-            w.counters,
-            &tasks,
-            &[],
-            &[],
-            &[],
-            &[],
-            names,
-            Some(crate::dispatch::Zone {
-                tables: &w.zone,
-                cpu: &mut cpu,
-                user: &HardwareUserWord,
-            }),
-            Some(&venue),
-            |_| core::ptr::null_mut(),
-        );
+        let action = {
+            let completed = crate::dispatch::dispatch_syscall_with_ipc(
+                &mut frame,
+                w.counters,
+                &tasks,
+                &[],
+                &[],
+                &[],
+                &[],
+                names,
+                Some(crate::dispatch::Zone {
+                    tables: &w.zone,
+                    cpu: &mut cpu,
+                    user: &HardwareUserWord,
+                }),
+                Some(&venue),
+                |_| core::ptr::null_mut(),
+            );
+            // The entry runs the switch a park owed it (#3093).
+            crate::dispatch::run_owed_entry_switch(
+                &mut frame,
+                w.counters,
+                &tasks,
+                crate::dispatch::Zone {
+                    tables: &w.zone,
+                    cpu: &mut cpu,
+                    user: &HardwareUserWord,
+                },
+                completed,
+            )
+        };
         assert_eq!(action, carrick_el1_abi::Action::Served);
         assert_eq!(frame.x[0], 1);
         assert_eq!(w.counters.served[66].load(Ordering::Relaxed), 1);
@@ -8424,23 +8466,37 @@ mod tests {
             &*std::alloc::alloc_zeroed(Layout::new::<carrick_el1_abi::InotifyNameCache>()).cast()
         };
         let mut cpu = FakeCpu::default();
-        crate::dispatch::dispatch_syscall_with_ipc(
-            frame,
-            w.counters,
-            tasks,
-            &[],
-            &[],
-            &[],
-            &[],
-            names,
-            Some(crate::dispatch::Zone {
-                tables: &w.zone,
-                cpu: &mut cpu,
-                user: &HardwareUserWord,
-            }),
-            Some(&venue),
-            |_| core::ptr::null_mut(),
-        )
+        {
+            let completed = crate::dispatch::dispatch_syscall_with_ipc(
+                frame,
+                w.counters,
+                tasks,
+                &[],
+                &[],
+                &[],
+                &[],
+                names,
+                Some(crate::dispatch::Zone {
+                    tables: &w.zone,
+                    cpu: &mut cpu,
+                    user: &HardwareUserWord,
+                }),
+                Some(&venue),
+                |_| core::ptr::null_mut(),
+            );
+            // The entry runs the switch a park owed it (#3093).
+            crate::dispatch::run_owed_entry_switch(
+                frame,
+                w.counters,
+                tasks,
+                crate::dispatch::Zone {
+                    tables: &w.zone,
+                    cpu: &mut cpu,
+                    user: &HardwareUserWord,
+                },
+                completed,
+            )
+        }
     }
 
     /// A woken thread re-issues its SVC to resume the operation its record

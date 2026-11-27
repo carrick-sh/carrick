@@ -238,27 +238,41 @@ fn host_owned_signal_resume(pending_work: bool, inline_ack: bool, defer_race: bo
             )
             .unwrap();
         crate::file::SIMULATE_COPYOUT_FAULT.with(|fault| fault.store(true, Ordering::Relaxed));
-        let route = crate::dispatch::dispatch_syscall_with_native(
-            &mut frame,
-            &counters,
-            core::slice::from_ref(&fixture.task),
-            &[],
-            &[],
-            &[],
-            &[],
-            &cache,
-            Some(crate::dispatch::Zone {
-                tables: fixture.zone,
-                cpu: &mut cpu,
-                user: &crate::sched::HardwareUserWord,
-            }),
-            None,
-            Some(fixture),
-            Some(&mut *entry),
-            Some(source),
-            None,
-            |_| core::ptr::null_mut(),
-        );
+        let route = {
+            let completed = crate::dispatch::dispatch_syscall_with_native(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&fixture.task),
+                &[],
+                &[],
+                &[],
+                &[],
+                &cache,
+                Some(crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &crate::sched::HardwareUserWord,
+                }),
+                None,
+                Some(fixture),
+                Some(&mut *entry),
+                Some(source),
+                None,
+                |_| core::ptr::null_mut(),
+            );
+            // The entry runs the switch a park owed it (#3093).
+            crate::dispatch::run_owed_entry_route(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&fixture.task),
+                crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &crate::sched::HardwareUserWord,
+                },
+                completed,
+            )
+        };
         crate::file::SIMULATE_COPYOUT_FAULT.with(|fault| fault.store(false, Ordering::Relaxed));
         assert_eq!(
             route,

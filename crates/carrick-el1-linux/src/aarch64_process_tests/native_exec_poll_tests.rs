@@ -883,29 +883,43 @@ fn run_arm_fork_exec_child_socket_poll(become_ready: bool) {
             crossing,
         )
         .with_words(words);
-        let route = crate::dispatch::dispatch_arm_syscall_with_native_process(
-            &mut frame,
-            counters,
-            core::slice::from_ref(&fixture.task),
-            &[],
-            &[],
-            &[],
-            &[],
-            &names,
-            Some(crate::dispatch::Zone {
-                tables: fixture.zone,
-                cpu: &mut exit_cpu,
-                user: &crate::sched::HardwareUserWord,
-            }),
-            None,
-            Some(&TaskLifecycleVenue),
-            page_ref,
-            control_ref,
-            Aarch64EntryContext::saved(&saved),
-            succ_ttbr0,
-            &mut arm_service,
-            |_| core::ptr::null_mut(),
-        )
+        let route = {
+            let completed = crate::dispatch::dispatch_arm_syscall_with_native_process(
+                &mut frame,
+                counters,
+                core::slice::from_ref(&fixture.task),
+                &[],
+                &[],
+                &[],
+                &[],
+                &names,
+                Some(crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut exit_cpu,
+                    user: &crate::sched::HardwareUserWord,
+                }),
+                None,
+                Some(&TaskLifecycleVenue),
+                page_ref,
+                control_ref,
+                Aarch64EntryContext::saved(&saved),
+                succ_ttbr0,
+                &mut arm_service,
+                |_| core::ptr::null_mut(),
+            );
+            // The entry runs the switch a park owed it (#3093).
+            crate::dispatch::run_owed_entry_result(
+                &mut frame,
+                counters,
+                core::slice::from_ref(&fixture.task),
+                crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut exit_cpu,
+                    user: &crate::sched::HardwareUserWord,
+                },
+                completed,
+            )
+        }
         .unwrap();
         assert_eq!(
             route,

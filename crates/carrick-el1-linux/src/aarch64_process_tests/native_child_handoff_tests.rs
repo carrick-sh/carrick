@@ -684,29 +684,43 @@ fn fork_child_service_ack(
         .spaces
         .grant(fixture.zone.spaces.find(identity.mm).unwrap(), identity.mm)
         .unwrap();
-    let route = super::super::dispatch::dispatch_arm_syscall_with_native_process(
-        &mut frame,
-        &counters,
-        core::slice::from_ref(task),
-        &[],
-        &[],
-        &[],
-        &[],
-        &cache,
-        Some(crate::dispatch::Zone {
-            tables: fixture.zone,
-            cpu: &mut cpu,
-            user: &crate::sched::HardwareUserWord,
-        }),
-        None,
-        Some(fixture),
-        child_page,
-        child_control,
-        Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
-        grant.ttbr0,
-        &mut service,
-        |_| core::ptr::null_mut(),
-    )
+    let route = {
+        let completed = super::super::dispatch::dispatch_arm_syscall_with_native_process(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &cache,
+            Some(crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            }),
+            None,
+            Some(fixture),
+            child_page,
+            child_control,
+            Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
+            grant.ttbr0,
+            &mut service,
+            |_| core::ptr::null_mut(),
+        );
+        // The entry runs the switch a park owed it (#3093).
+        crate::dispatch::run_owed_entry_result(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(task),
+            crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            },
+            completed,
+        )
+    }
     .unwrap();
     assert!(matches!(
         route,
@@ -950,29 +964,43 @@ fn arm_native_wait_runs_ready_child_before_host_handoff() {
     frame.x[8] = 172; // getpid
     let counters = carrick_el1_abi::Counters::new();
     let cache = carrick_el1_abi::InotifyNameCache::new();
-    let route = super::super::dispatch::dispatch_arm_syscall_with_native_process(
-        &mut frame,
-        &counters,
-        core::slice::from_ref(&fixture.task),
-        &[],
-        &[],
-        &[],
-        &[],
-        &cache,
-        Some(crate::dispatch::Zone {
-            tables: fixture.zone,
-            cpu: &mut cpu,
-            user: &crate::sched::HardwareUserWord,
-        }),
-        None,
-        Some(fixture),
-        child_page,
-        child_control,
-        Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
-        grant.ttbr0,
-        &mut service,
-        |_| core::ptr::null_mut(),
-    )
+    let route = {
+        let completed = super::super::dispatch::dispatch_arm_syscall_with_native_process(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &cache,
+            Some(crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            }),
+            None,
+            Some(fixture),
+            child_page,
+            child_control,
+            Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
+            grant.ttbr0,
+            &mut service,
+            |_| core::ptr::null_mut(),
+        );
+        // The entry runs the switch a park owed it (#3093).
+        crate::dispatch::run_owed_entry_result(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            },
+            completed,
+        )
+    }
     .unwrap();
     assert!(matches!(
         route,
@@ -2119,29 +2147,43 @@ fn namespace_baseline(
                 .spaces
                 .grant(fixture.zone.spaces.find(identity.mm).unwrap(), identity.mm)
                 .unwrap();
-            let route = super::super::dispatch::dispatch_arm_syscall_with_native_process(
-                &mut frame,
-                &counters,
-                core::slice::from_ref(task),
-                &[],
-                &[],
-                &[],
-                &[],
-                &names,
-                Some(crate::dispatch::Zone {
-                    tables: fixture.zone,
-                    cpu: &mut cpu,
-                    user: &crate::sched::HardwareUserWord,
-                }),
-                None,
-                Some(fixture),
-                page,
-                control,
-                Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
-                grant.ttbr0,
-                service,
-                |_| core::ptr::null_mut(),
-            )
+            let route = {
+                let completed = super::super::dispatch::dispatch_arm_syscall_with_native_process(
+                    &mut frame,
+                    &counters,
+                    core::slice::from_ref(task),
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &names,
+                    Some(crate::dispatch::Zone {
+                        tables: fixture.zone,
+                        cpu: &mut cpu,
+                        user: &crate::sched::HardwareUserWord,
+                    }),
+                    None,
+                    Some(fixture),
+                    page,
+                    control,
+                    Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
+                    grant.ttbr0,
+                    service,
+                    |_| core::ptr::null_mut(),
+                );
+                // The entry runs the switch a park owed it (#3093).
+                crate::dispatch::run_owed_entry_result(
+                    &mut frame,
+                    &counters,
+                    core::slice::from_ref(task),
+                    crate::dispatch::Zone {
+                        tables: fixture.zone,
+                        cpu: &mut cpu,
+                        user: &crate::sched::HardwareUserWord,
+                    },
+                    completed,
+                )
+            }
             .unwrap();
             if nr == 78 {
                 // Readlink is now an exact native file service. Its full
@@ -2277,29 +2319,43 @@ fn forked_child_futex<T>(
         .spaces
         .grant(fixture.zone.spaces.find(child_mm).unwrap(), child_mm)
         .unwrap();
-    let route = super::super::dispatch::dispatch_arm_syscall_with_native_process(
-        &mut frame,
-        &counters,
-        core::slice::from_ref(task),
-        &[],
-        &[],
-        &[],
-        &[],
-        &names,
-        Some(crate::dispatch::Zone {
-            tables: fixture.zone,
-            cpu: &mut child_cpu,
-            user: &crate::sched::HardwareUserWord,
-        }),
-        None,
-        Some(fixture),
-        page,
-        control,
-        Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
-        grant.ttbr0,
-        &mut service,
-        |_| core::ptr::null_mut(),
-    )
+    let route = {
+        let completed = super::super::dispatch::dispatch_arm_syscall_with_native_process(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &names,
+            Some(crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut child_cpu,
+                user: &crate::sched::HardwareUserWord,
+            }),
+            None,
+            Some(fixture),
+            page,
+            control,
+            Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
+            grant.ttbr0,
+            &mut service,
+            |_| core::ptr::null_mut(),
+        );
+        // The entry runs the switch a park owed it (#3093).
+        crate::dispatch::run_owed_entry_result(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(task),
+            crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut child_cpu,
+                user: &crate::sched::HardwareUserWord,
+            },
+            completed,
+        )
+    }
     .unwrap();
     let action = match route {
         CompletionRoute::Forward => carrick_el1_abi::Action::Forward,

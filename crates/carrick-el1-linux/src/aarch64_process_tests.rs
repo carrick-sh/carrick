@@ -6479,29 +6479,43 @@ fn arm_owned_raw_exit_retires_only_one_of_two_live_threads() {
     let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
     let mut cpu = crate::sched::FakeCpu::default();
     let user = crate::sched::HardwareUserWord;
-    let route = super::dispatch::dispatch_arm_syscall_with_native_process(
-        &mut frame,
-        &counters,
-        core::slice::from_ref(&fixture.task),
-        &[],
-        &[],
-        &[],
-        &[],
-        &cache,
-        Some(crate::dispatch::Zone {
-            tables: fixture.zone,
-            cpu: &mut cpu,
-            user: &user,
-        }),
-        None,
-        Some(&*fixture),
-        fixture.page,
-        control,
-        Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
-        ttbr0,
-        &mut service,
-        |_| core::ptr::null_mut(),
-    )
+    let route = {
+        let completed = super::dispatch::dispatch_arm_syscall_with_native_process(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &cache,
+            Some(crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &user,
+            }),
+            None,
+            Some(&*fixture),
+            fixture.page,
+            control,
+            Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
+            ttbr0,
+            &mut service,
+            |_| core::ptr::null_mut(),
+        );
+        // The entry runs the switch a park owed it (#3093).
+        crate::dispatch::run_owed_entry_result(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &user,
+            },
+            completed,
+        )
+    }
     .unwrap();
     assert_eq!(
         route,
@@ -6571,29 +6585,43 @@ fn arm_call_with_cpu<X: ForkStockCrossing>(
     carrick_test_support::assert_guest_args(&frame.x[..6]);
     let counters = Box::new(carrick_el1_abi::Counters::new());
     let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
-    super::dispatch::dispatch_arm_syscall_with_native_process(
-        frame,
-        &counters,
-        core::slice::from_ref(&fixture.task),
-        &[],
-        &[],
-        &[],
-        &[],
-        &cache,
-        Some(crate::dispatch::Zone {
-            tables: fixture.zone,
-            cpu,
-            user: &crate::sched::HardwareUserWord,
-        }),
-        None,
-        Some(fixture),
-        fixture.page,
-        control,
-        Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
-        fixture_ttbr0(fixture),
-        service,
-        |_| core::ptr::null_mut(),
-    )
+    {
+        let completed = super::dispatch::dispatch_arm_syscall_with_native_process(
+            frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &cache,
+            Some(crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut *cpu,
+                user: &crate::sched::HardwareUserWord,
+            }),
+            None,
+            Some(fixture),
+            fixture.page,
+            control,
+            Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
+            fixture_ttbr0(fixture),
+            service,
+            |_| core::ptr::null_mut(),
+        );
+        // The entry runs the switch a park owed it (#3093).
+        crate::dispatch::run_owed_entry_result(
+            frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu,
+                user: &crate::sched::HardwareUserWord,
+            },
+            completed,
+        )
+    }
 }
 
 #[test]
@@ -9856,29 +9884,46 @@ fn arm_unadopted_exit_wakes_closing_owner_without_process_venue() {
         ttbr: (fixture_ttbr0(fixture), fixture_ttbr0(fixture)),
         ..Default::default()
     };
-    let route = super::dispatch::dispatch_syscall_with_native(
-        &mut frame,
-        &counters,
-        core::slice::from_ref(&fixture.task),
-        &[],
-        &[],
-        &[],
-        &[],
-        &cache,
-        Some(crate::dispatch::Zone {
-            tables: fixture.zone,
-            cpu: &mut cpu,
-            user: &crate::sched::HardwareUserWord,
-        }),
-        None,
-        Some(fixture),
-        None::<
-            &mut dyn carrick_personality_linux::lifecycle::ProcessNative<'_, Aarch64ParkedContext>,
-        >,
-        None,
-        None,
-        |_| core::ptr::null_mut(),
-    );
+    let route = {
+        let completed = super::dispatch::dispatch_syscall_with_native(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &cache,
+            Some(crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            }),
+            None,
+            Some(fixture),
+            None::<
+                &mut dyn carrick_personality_linux::lifecycle::ProcessNative<
+                    '_,
+                    Aarch64ParkedContext,
+                >,
+            >,
+            None,
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        // The entry runs the switch a park owed it (#3093).
+        crate::dispatch::run_owed_entry_route(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            },
+            completed,
+        )
+    };
     assert!(matches!(
         route,
         carrick_personality_linux::dispatch::CompletionRoute::Suspended
@@ -11197,29 +11242,46 @@ fn arm_concurrent_exit_group_loser_retires_and_wakes_owner() {
         ttbr: (fixture_ttbr0(fixture), fixture_ttbr0(fixture)),
         ..Default::default()
     };
-    let route = super::dispatch::dispatch_syscall_with_native(
-        &mut raw_exit_frame,
-        &counters,
-        core::slice::from_ref(&fixture.task),
-        &[],
-        &[],
-        &[],
-        &[],
-        &cache,
-        Some(crate::dispatch::Zone {
-            tables: fixture.zone,
-            cpu: &mut cpu,
-            user: &crate::sched::HardwareUserWord,
-        }),
-        None,
-        Some(fixture),
-        None::<
-            &mut dyn carrick_personality_linux::lifecycle::ProcessNative<'_, Aarch64ParkedContext>,
-        >,
-        None,
-        None,
-        |_| core::ptr::null_mut(),
-    );
+    let route = {
+        let completed = super::dispatch::dispatch_syscall_with_native(
+            &mut raw_exit_frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &cache,
+            Some(crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            }),
+            None,
+            Some(fixture),
+            None::<
+                &mut dyn carrick_personality_linux::lifecycle::ProcessNative<
+                    '_,
+                    Aarch64ParkedContext,
+                >,
+            >,
+            None,
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        // The entry runs the switch a park owed it (#3093).
+        crate::dispatch::run_owed_entry_route(
+            &mut raw_exit_frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            },
+            completed,
+        )
+    };
     assert!(matches!(
         route,
         carrick_personality_linux::dispatch::CompletionRoute::Suspended
@@ -11326,29 +11388,46 @@ fn arm_unadopted_exit_wakes_unplaceable_closing_owner_without_process_venue() {
     let counters = Box::new(carrick_el1_abi::Counters::new());
     let cache = Box::new(carrick_el1_abi::InotifyNameCache::new());
     let mut cpu = crate::sched::FakeCpu::default();
-    let route = super::dispatch::dispatch_syscall_with_native(
-        &mut frame,
-        &counters,
-        core::slice::from_ref(&fixture.task),
-        &[],
-        &[],
-        &[],
-        &[],
-        &cache,
-        Some(crate::dispatch::Zone {
-            tables: fixture.zone,
-            cpu: &mut cpu,
-            user: &crate::sched::HardwareUserWord,
-        }),
-        None,
-        Some(fixture),
-        None::<
-            &mut dyn carrick_personality_linux::lifecycle::ProcessNative<'_, Aarch64ParkedContext>,
-        >,
-        None,
-        None,
-        |_| core::ptr::null_mut(),
-    );
+    let route = {
+        let completed = super::dispatch::dispatch_syscall_with_native(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            &[],
+            &[],
+            &[],
+            &[],
+            &cache,
+            Some(crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            }),
+            None,
+            Some(fixture),
+            None::<
+                &mut dyn carrick_personality_linux::lifecycle::ProcessNative<
+                    '_,
+                    Aarch64ParkedContext,
+                >,
+            >,
+            None,
+            None,
+            |_| core::ptr::null_mut(),
+        );
+        // The entry runs the switch a park owed it (#3093).
+        crate::dispatch::run_owed_entry_route(
+            &mut frame,
+            &counters,
+            core::slice::from_ref(&fixture.task),
+            crate::dispatch::Zone {
+                tables: fixture.zone,
+                cpu: &mut cpu,
+                user: &crate::sched::HardwareUserWord,
+            },
+            completed,
+        )
+    };
     assert!(matches!(
         route,
         carrick_personality_linux::dispatch::CompletionRoute::Suspended
@@ -13491,27 +13570,41 @@ fn serial_host_native_children_close_descriptors_above_inherited_capacity() {
         frame.x[8] = nr;
         frame.x[0] = fd;
         carrick_test_support::assert_guest_args(&[fd, 0, 0]);
-        let route = super::dispatch::dispatch_syscall_with_native(
-            &mut frame,
-            &counters,
-            core::slice::from_ref(&task),
-            crossing.fd_map(),
-            &[],
-            crossing.open_table(),
-            &[],
-            &names,
-            Some(crate::dispatch::Zone {
-                tables: fixture.zone,
-                cpu: &mut cpu,
-                user: &crate::sched::HardwareUserWord,
-            }),
-            Some(&venue),
-            Some(&fixture),
-            Some(&mut entry),
-            Some(source),
-            None,
-            |_| core::ptr::null_mut(),
-        );
+        let route = {
+            let completed = super::dispatch::dispatch_syscall_with_native(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&task),
+                crossing.fd_map(),
+                &[],
+                crossing.open_table(),
+                &[],
+                &names,
+                Some(crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &crate::sched::HardwareUserWord,
+                }),
+                Some(&venue),
+                Some(&fixture),
+                Some(&mut entry),
+                Some(source),
+                None,
+                |_| core::ptr::null_mut(),
+            );
+            // The entry runs the switch a park owed it (#3093).
+            crate::dispatch::run_owed_entry_route(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&task),
+                crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &crate::sched::HardwareUserWord,
+                },
+                completed,
+            )
+        };
         let ret = frame.x[0] as i64;
         drop(entry);
         assert!(
@@ -14283,27 +14376,41 @@ fn native_descriptor_argument_witness(
         let route = loop {
             attempts += 1;
             assert!(attempts <= 3, "argument preparation must make progress");
-            let route = super::dispatch::dispatch_syscall_with_native(
-                &mut frame,
-                &counters,
-                core::slice::from_ref(&task),
-                crossing.fd_map(),
-                &[],
-                crossing.open_table(),
-                &[],
-                &names,
-                Some(crate::dispatch::Zone {
-                    tables: fixture.zone,
-                    cpu: &mut cpu,
-                    user: &crate::sched::HardwareUserWord,
-                }),
-                Some(&venue),
-                Some(fixture),
-                Some(&mut entry),
-                Some(source),
-                None,
-                |_| core::ptr::null_mut(),
-            );
+            let route = {
+                let completed = super::dispatch::dispatch_syscall_with_native(
+                    &mut frame,
+                    &counters,
+                    core::slice::from_ref(&task),
+                    crossing.fd_map(),
+                    &[],
+                    crossing.open_table(),
+                    &[],
+                    &names,
+                    Some(crate::dispatch::Zone {
+                        tables: fixture.zone,
+                        cpu: &mut cpu,
+                        user: &crate::sched::HardwareUserWord,
+                    }),
+                    Some(&venue),
+                    Some(fixture),
+                    Some(&mut entry),
+                    Some(source),
+                    None,
+                    |_| core::ptr::null_mut(),
+                );
+                // The entry runs the switch a park owed it (#3093).
+                crate::dispatch::run_owed_entry_route(
+                    &mut frame,
+                    &counters,
+                    core::slice::from_ref(&task),
+                    crate::dispatch::Zone {
+                        tables: fixture.zone,
+                        cpu: &mut cpu,
+                        user: &crate::sched::HardwareUserWord,
+                    },
+                    completed,
+                )
+            };
             if frame.elr != 0x4000 {
                 break route;
             }
@@ -16372,27 +16479,41 @@ fn serial_host_native_fork_two_children_pipe_buf_partial_write_and_sigpipe_epipe
         frame.x[1] = args[1];
         frame.x[2] = args[2];
         carrick_test_support::assert_guest_args(&args);
-        let route = super::dispatch::dispatch_syscall_with_native(
-            &mut frame,
-            &counters,
-            core::slice::from_ref(&task),
-            crossing.fd_map(),
-            &[],
-            crossing.open_table(),
-            &[],
-            &names,
-            Some(crate::dispatch::Zone {
-                tables: fixture.zone,
-                cpu: &mut cpu,
-                user: &crate::sched::HardwareUserWord,
-            }),
-            Some(&venue),
-            Some(&fixture),
-            Some(&mut entry),
-            Some(source),
-            None,
-            |_| core::ptr::null_mut(),
-        );
+        let route = {
+            let completed = super::dispatch::dispatch_syscall_with_native(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&task),
+                crossing.fd_map(),
+                &[],
+                crossing.open_table(),
+                &[],
+                &names,
+                Some(crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &crate::sched::HardwareUserWord,
+                }),
+                Some(&venue),
+                Some(&fixture),
+                Some(&mut entry),
+                Some(source),
+                None,
+                |_| core::ptr::null_mut(),
+            );
+            // The entry runs the switch a park owed it (#3093).
+            crate::dispatch::run_owed_entry_route(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&task),
+                crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &crate::sched::HardwareUserWord,
+                },
+                completed,
+            )
+        };
         (route, frame.x[0] as i64)
     };
 
@@ -18176,27 +18297,41 @@ fn futex_owner_wait_episode(
                 )
                 .unwrap();
         }
-        let route = crate::dispatch::dispatch_syscall_with_native(
-            &mut frame,
-            &counters,
-            core::slice::from_ref(&fixture.task),
-            &[],
-            &[],
-            &[],
-            &[],
-            &cache,
-            Some(crate::dispatch::Zone {
-                tables: fixture.zone,
-                cpu: &mut cpu,
-                user: &word,
-            }),
-            None,
-            Some(fixture),
-            Some(&mut *entry),
-            Some(source),
-            None,
-            |_| core::ptr::null_mut(),
-        );
+        let route = {
+            let completed = crate::dispatch::dispatch_syscall_with_native(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&fixture.task),
+                &[],
+                &[],
+                &[],
+                &[],
+                &cache,
+                Some(crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &word,
+                }),
+                None,
+                Some(fixture),
+                Some(&mut *entry),
+                Some(source),
+                None,
+                |_| core::ptr::null_mut(),
+            );
+            // The entry runs the switch a park owed it (#3093).
+            crate::dispatch::run_owed_entry_route(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&fixture.task),
+                crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &word,
+                },
+                completed,
+            )
+        };
         if mapping {
             crate::native_process_runtime::host_test_support::FUTEX_MAPPING
                 .with(|slot| slot.set(None));
@@ -18397,27 +18532,41 @@ fn futex_owner_wait_episode(
             .unwrap();
         if signal_during_owner {
             cpu.now = 101;
-            crate::dispatch::dispatch_syscall_with_native(
-                &mut frame,
-                &counters,
-                core::slice::from_ref(&fixture.task),
-                &[],
-                &[],
-                &[],
-                &[],
-                &cache,
-                Some(crate::dispatch::Zone {
-                    tables: fixture.zone,
-                    cpu: &mut cpu,
-                    user: &word,
-                }),
-                None,
-                Some(fixture),
-                Some(&mut *entry),
-                Some(source),
-                None,
-                |_| core::ptr::null_mut(),
-            );
+            {
+                let completed = crate::dispatch::dispatch_syscall_with_native(
+                    &mut frame,
+                    &counters,
+                    core::slice::from_ref(&fixture.task),
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &cache,
+                    Some(crate::dispatch::Zone {
+                        tables: fixture.zone,
+                        cpu: &mut cpu,
+                        user: &word,
+                    }),
+                    None,
+                    Some(fixture),
+                    Some(&mut *entry),
+                    Some(source),
+                    None,
+                    |_| core::ptr::null_mut(),
+                );
+                // The entry runs the switch a park owed it (#3093).
+                crate::dispatch::run_owed_entry_route(
+                    &mut frame,
+                    &counters,
+                    core::slice::from_ref(&fixture.task),
+                    crate::dispatch::Zone {
+                        tables: fixture.zone,
+                        cpu: &mut cpu,
+                        user: &word,
+                    },
+                    completed,
+                )
+            };
             assert_eq!(
                 frame.x[0] as i64, -4,
                 "signal during owner service interrupts the retained wait"
@@ -18491,27 +18640,41 @@ fn futex_owner_wait_episode(
                 &mut service,
             )
             .unwrap();
-        crate::dispatch::dispatch_syscall_with_native(
-            &mut frame,
-            &counters,
-            core::slice::from_ref(&fixture.task),
-            &[],
-            &[],
-            &[],
-            &[],
-            &cache,
-            Some(crate::dispatch::Zone {
-                tables: fixture.zone,
-                cpu: &mut cpu,
-                user: &word,
-            }),
-            None,
-            Some(fixture),
-            Some(&mut *entry),
-            Some(source),
-            None,
-            |_| core::ptr::null_mut(),
-        );
+        {
+            let completed = crate::dispatch::dispatch_syscall_with_native(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&fixture.task),
+                &[],
+                &[],
+                &[],
+                &[],
+                &cache,
+                Some(crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &word,
+                }),
+                None,
+                Some(fixture),
+                Some(&mut *entry),
+                Some(source),
+                None,
+                |_| core::ptr::null_mut(),
+            );
+            // The entry runs the switch a park owed it (#3093).
+            crate::dispatch::run_owed_entry_route(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&fixture.task),
+                crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &word,
+                },
+                completed,
+            )
+        };
         drop(entry);
         assert!(!runtime.has_relative_futex_wait_for_test(fixture.control.zone_record().unwrap()));
         crate::sched::ThreadCpu::load(&mut cpu, &mut frame, &retained);
@@ -18530,27 +18693,41 @@ fn futex_owner_wait_episode(
                 &mut service,
             )
             .unwrap();
-        crate::dispatch::dispatch_syscall_with_native(
-            &mut frame,
-            &counters,
-            core::slice::from_ref(&fixture.task),
-            &[],
-            &[],
-            &[],
-            &[],
-            &cache,
-            Some(crate::dispatch::Zone {
-                tables: fixture.zone,
-                cpu: &mut cpu,
-                user: &word,
-            }),
-            None,
-            Some(fixture),
-            Some(&mut *entry),
-            Some(source),
-            None,
-            |_| core::ptr::null_mut(),
-        );
+        {
+            let completed = crate::dispatch::dispatch_syscall_with_native(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&fixture.task),
+                &[],
+                &[],
+                &[],
+                &[],
+                &cache,
+                Some(crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &word,
+                }),
+                None,
+                Some(fixture),
+                Some(&mut *entry),
+                Some(source),
+                None,
+                |_| core::ptr::null_mut(),
+            );
+            // The entry runs the switch a park owed it (#3093).
+            crate::dispatch::run_owed_entry_route(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&fixture.task),
+                crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &word,
+                },
+                completed,
+            )
+        };
         drop(entry);
         assert_eq!(
             cpu.now,
@@ -19387,29 +19564,43 @@ fn with_arm_process_host_files_on<R>(
         frame.x[..6].copy_from_slice(&args);
         frame.x[8] = nr;
         let ArmCaller::Child(pid) = caller else {
-            let route = super::dispatch::dispatch_arm_syscall_with_native_process(
-                &mut frame,
-                &counters,
-                core::slice::from_ref(&fixture.task),
-                crossing.fd_map(),
-                &[],
-                crossing.open_table(),
-                &[],
-                &cache,
-                Some(crate::dispatch::Zone {
-                    tables: fixture.zone,
-                    cpu: &mut cpu,
-                    user: &crate::sched::HardwareUserWord,
-                }),
-                Some(&venue),
-                Some(fixture),
-                fixture.page,
-                fixture.control,
-                Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
-                ttbr0,
-                &mut service,
-                |_| core::ptr::null_mut(),
-            )
+            let route = {
+                let completed = super::dispatch::dispatch_arm_syscall_with_native_process(
+                    &mut frame,
+                    &counters,
+                    core::slice::from_ref(&fixture.task),
+                    crossing.fd_map(),
+                    &[],
+                    crossing.open_table(),
+                    &[],
+                    &cache,
+                    Some(crate::dispatch::Zone {
+                        tables: fixture.zone,
+                        cpu: &mut cpu,
+                        user: &crate::sched::HardwareUserWord,
+                    }),
+                    Some(&venue),
+                    Some(fixture),
+                    fixture.page,
+                    fixture.control,
+                    Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
+                    ttbr0,
+                    &mut service,
+                    |_| core::ptr::null_mut(),
+                );
+                // The entry runs the switch a park owed it (#3093).
+                crate::dispatch::run_owed_entry_result(
+                    &mut frame,
+                    &counters,
+                    core::slice::from_ref(&fixture.task),
+                    crate::dispatch::Zone {
+                        tables: fixture.zone,
+                        cpu: &mut cpu,
+                        user: &crate::sched::HardwareUserWord,
+                    },
+                    completed,
+                )
+            }
             .unwrap();
             if route == CompletionRoute::Suspended {
                 // Parked: no record runs until a switch selects one.
@@ -19491,27 +19682,41 @@ fn with_arm_process_host_files_on<R>(
         if boundary {
             fixture.task.linux.mark_pending_host_work();
         }
-        let route = crate::dispatch::dispatch_syscall_with_native(
-            &mut frame,
-            &counters,
-            core::slice::from_ref(&fixture.task),
-            crossing.fd_map(),
-            &[],
-            crossing.open_table(),
-            &[],
-            &cache,
-            Some(crate::dispatch::Zone {
-                tables: fixture.zone,
-                cpu: &mut cpu,
-                user: &crate::sched::HardwareUserWord,
-            }),
-            Some(&venue),
-            None,
-            Some(&mut *entry),
-            Some(source),
-            None,
-            |_| core::ptr::null_mut(),
-        );
+        let route = {
+            let completed = crate::dispatch::dispatch_syscall_with_native(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&fixture.task),
+                crossing.fd_map(),
+                &[],
+                crossing.open_table(),
+                &[],
+                &cache,
+                Some(crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &crate::sched::HardwareUserWord,
+                }),
+                Some(&venue),
+                None,
+                Some(&mut *entry),
+                Some(source),
+                None,
+                |_| core::ptr::null_mut(),
+            );
+            // The entry runs the switch a park owed it (#3093).
+            crate::dispatch::run_owed_entry_route(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&fixture.task),
+                crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &crate::sched::HardwareUserWord,
+                },
+                completed,
+            )
+        };
         drop(entry);
         if boundary && let Some(work) = fixture.task.linux.take_host_work_doorbell() {
             work.settled();
@@ -24675,27 +24880,41 @@ fn arm_root_shell_redirect_then_clone_serves_child_stdout_fstat_and_write() {
                 &mut service,
             )
             .unwrap();
-        let route = crate::dispatch::dispatch_syscall_with_native(
-            &mut frame,
-            &counters,
-            core::slice::from_ref(&fixture.task),
-            crossing.fd_map(),
-            &[],
-            crossing.open_table(),
-            &[],
-            &cache,
-            Some(crate::dispatch::Zone {
-                tables: fixture.zone,
-                cpu: &mut cpu,
-                user: &crate::sched::HardwareUserWord,
-            }),
-            Some(&venue),
-            None,
-            Some(&mut *entry),
-            Some(source),
-            None,
-            |_| core::ptr::null_mut(),
-        );
+        let route = {
+            let completed = crate::dispatch::dispatch_syscall_with_native(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&fixture.task),
+                crossing.fd_map(),
+                &[],
+                crossing.open_table(),
+                &[],
+                &cache,
+                Some(crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &crate::sched::HardwareUserWord,
+                }),
+                Some(&venue),
+                None,
+                Some(&mut *entry),
+                Some(source),
+                None,
+                |_| core::ptr::null_mut(),
+            );
+            // The entry runs the switch a park owed it (#3093).
+            crate::dispatch::run_owed_entry_route(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&fixture.task),
+                crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &crate::sched::HardwareUserWord,
+                },
+                completed,
+            )
+        };
         drop(entry);
         assert_eq!(
             route,
@@ -24883,27 +25102,41 @@ fn arm_two_live_processes_dup_and_close_isolate_tables() {
         let mut entry = runtime
             .enter(source, &fixture.task, ctx, &mut service)
             .unwrap();
-        let route = crate::dispatch::dispatch_syscall_with_native(
-            &mut frame,
-            &counters,
-            core::slice::from_ref(&fixture.task),
-            crossing.fd_map(),
-            &[],
-            crossing.open_table(),
-            &[],
-            &cache,
-            Some(crate::dispatch::Zone {
-                tables: fixture.zone,
-                cpu: &mut cpu,
-                user: &crate::sched::HardwareUserWord,
-            }),
-            Some(&venue),
-            Some(fixture),
-            Some(&mut entry),
-            Some(source),
-            None,
-            |_| core::ptr::null_mut(),
-        );
+        let route = {
+            let completed = crate::dispatch::dispatch_syscall_with_native(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&fixture.task),
+                crossing.fd_map(),
+                &[],
+                crossing.open_table(),
+                &[],
+                &cache,
+                Some(crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &crate::sched::HardwareUserWord,
+                }),
+                Some(&venue),
+                Some(fixture),
+                Some(&mut entry),
+                Some(source),
+                None,
+                |_| core::ptr::null_mut(),
+            );
+            // The entry runs the switch a park owed it (#3093).
+            crate::dispatch::run_owed_entry_route(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&fixture.task),
+                crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &crate::sched::HardwareUserWord,
+                },
+                completed,
+            )
+        };
         drop(entry);
         (route, frame.x[0] as i64)
     };

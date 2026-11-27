@@ -195,25 +195,39 @@ impl World {
         frame.x[8] = nr as u64;
         frame.slot = SLOT_IDX as u64;
         frame.esr = 0x5600_0000;
-        dispatch_syscall_with_lifecycle(
-            frame,
-            &self.counters,
-            &self.tasks,
-            &[],
-            &[],
-            &[],
-            &[],
-            &InotifyNameCache::new(),
-            Some(Zone {
-                tables: &self.zone,
-                cpu: &mut self.cpu,
-                user: &HardwareUserWord,
-            }),
-            None,
-            Some(&*self.venue),
-            None,
-            |_| core::ptr::null_mut(),
-        )
+        {
+            let completed = dispatch_syscall_with_lifecycle(
+                frame,
+                &self.counters,
+                &self.tasks,
+                &[],
+                &[],
+                &[],
+                &[],
+                &InotifyNameCache::new(),
+                Some(crate::dispatch::Zone {
+                    tables: &self.zone,
+                    cpu: &mut self.cpu,
+                    user: &HardwareUserWord,
+                }),
+                None,
+                Some(&*self.venue),
+                None,
+                |_| core::ptr::null_mut(),
+            );
+            // The entry runs the switch a park owed it (#3093).
+            crate::dispatch::run_owed_entry_switch(
+                frame,
+                &self.counters,
+                &self.tasks,
+                crate::dispatch::Zone {
+                    tables: &self.zone,
+                    cpu: &mut self.cpu,
+                    user: &HardwareUserWord,
+                },
+                completed,
+            )
+        }
     }
 
     /// glibc's `pthread_join` wait on the CLEARTID `word` (shared
@@ -3372,27 +3386,41 @@ fn arm_dispatch_consumes_native_run_failure_before_return() {
     };
     frame.x[8] = 94;
     let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        crate::dispatch::dispatch_syscall_with_native(
-            &mut frame,
-            &w.counters,
-            &w.tasks,
-            &[],
-            &[],
-            &[],
-            &[],
-            &InotifyNameCache::new(),
-            Some(Zone {
-                tables: &w.zone,
-                cpu: &mut w.cpu,
-                user: &HardwareUserWord,
-            }),
-            None,
-            Some(&*w.venue),
-            Some(&mut failed),
-            None,
-            None,
-            |_| core::ptr::null_mut(),
-        )
+        {
+            let completed = crate::dispatch::dispatch_syscall_with_native(
+                &mut frame,
+                &w.counters,
+                &w.tasks,
+                &[],
+                &[],
+                &[],
+                &[],
+                &InotifyNameCache::new(),
+                Some(crate::dispatch::Zone {
+                    tables: &w.zone,
+                    cpu: &mut w.cpu,
+                    user: &HardwareUserWord,
+                }),
+                None,
+                Some(&*w.venue),
+                Some(&mut failed),
+                None,
+                None,
+                |_| core::ptr::null_mut(),
+            );
+            // The entry runs the switch a park owed it (#3093).
+            crate::dispatch::run_owed_entry_route(
+                &mut frame,
+                &w.counters,
+                &w.tasks,
+                crate::dispatch::Zone {
+                    tables: &w.zone,
+                    cpu: &mut w.cpu,
+                    user: &HardwareUserWord,
+                },
+                completed,
+            )
+        }
     }));
     let payload = stopped.expect_err("ARM must consume the terminal failure before returning Idle");
     let failure = payload
