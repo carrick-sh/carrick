@@ -369,6 +369,30 @@ pub fn refused_prepare(
 pub fn observe_process_error(
     error: super::native_process_runtime::NativeProcessError,
 ) -> super::native_process_runtime::NativeProcessError {
+    // DIAGNOSTICS ONLY (#3085 discovery, never lands): name the refusal
+    // behind an x86 fork EFAULT through the fatal port.
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    if error.failure() == Ok(super::native_process_runtime::NativeFailure::Fault) {
+        use core::fmt::Write;
+        let (stage, cause) = match error {
+            super::native_process_runtime::NativeProcessError::ForkRefused(refusal) => {
+                let mut stage = carrick_el1_abi::NativeDiagnostic::new();
+                let _ = write!(stage, "{:?}", refusal.stage);
+                (stage, refusal.cause)
+            }
+            _ => (
+                carrick_el1_abi::NativeDiagnostic::new(),
+                NativeForkCause::Busy,
+            ),
+        };
+        let mut report =
+            carrick_el1_abi::PanicReport::new(stage.message().unwrap_or("plain-fault"), 3085, 0);
+        let _ = write!(report.message_writer(), "{cause:?} {error:?}");
+        carrick_el1::isa::x86::transport::publish_fatal_report(
+            carrick_el1_abi::PanicReportKind::FatalSite,
+            &report,
+        );
+    }
     observe_process_error_with(error, emit)
 }
 
