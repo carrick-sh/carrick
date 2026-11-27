@@ -823,10 +823,15 @@ impl Frames {
 
 /// The scheduler's switch: it loads the next thread and runs that thread's
 /// resume (a wait4 checkpoint, a signal delivery) on the current stack.
-const SWITCHES: [&str; 3] = [
+/// The entry tail that runs an owed switch is a switch too: a park that
+/// called it directly would nest the resumed thread beneath its own frames
+/// exactly as a direct `run_next` would.
+const SWITCHES: [&str; 5] = [
     "carrick_el1::substrate::sched::Sched$LT$C$C$U$GT$::run_next::",
     "carrick_el1::substrate::sched::Sched$LT$C$C$U$GT$::run_ready::",
     "carrick_el1::substrate::sched::Sched$LT$C$C$U$GT$::idle::",
+    "carrick_el1::substrate::sched::Sched$LT$C$C$U$GT$::run_entry_switch::",
+    "carrick_el1_linux::dispatch::run_owed_entry_switch::",
 ];
 
 /// The only frames that may call a [`SWITCHES`] function: the scheduler's
@@ -931,6 +936,29 @@ mod tests {
             assert!(error.contains("outside an entry"), "{error}");
             assert!(error.contains("IpcExecution"), "{error}");
         }
+    }
+
+    /// #3106 pre-review: a park that called the entry tail itself, rather
+    /// than returning its owed switch to the entry, must be refused too.
+    #[test]
+    fn a_park_site_that_runs_the_entry_tail_is_refused() {
+        let park = "_$LT$carrick_el1..substrate..sched..Sched$LT$C$C$U$GT$$u20$as$u20$\
+                    carrick_el1_linux..ipc..execution..IpcExecution$GT$::park::h4";
+        for tail in [
+            "carrick_el1::substrate::sched::Sched$LT$C$C$U$GT$::run_entry_switch::h5",
+            "carrick_el1_linux::dispatch::run_owed_entry_switch::h6",
+        ] {
+            let disassembly =
+                format!("1000 <{park}>:\n1000: bl 0x2000 <{tail}>\n2000 <{tail}>:\n2000: ret\n");
+            let error = check_switch_venues(&disassembly).unwrap_err();
+            assert!(error.contains("outside an entry"), "{error}");
+            assert!(error.contains(tail), "{error}");
+        }
+        let entry = "carrick_el1_linux::dispatch::dispatch_entry::h7";
+        let tail = "carrick_el1_linux::dispatch::run_owed_entry_switch::h6";
+        let disassembly =
+            format!("1000 <{entry}>:\n1000: bl 0x2000 <{tail}>\n2000 <{tail}>:\n2000: ret\n");
+        assert_eq!(check_switch_venues(&disassembly), Ok(()));
     }
 
     #[test]
