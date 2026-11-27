@@ -2399,22 +2399,23 @@ impl Executor<'_> {
                 }
                 let any_el0 = edit.readable || edit.writable || edit.executable;
                 if el1_cow(descriptor) {
-                    let Some(ceiling) = edit.cow_ceiling else {
-                        return Err(DescriptorRefusal::CowArmed);
-                    };
-                    if (any_el0 && !ceiling.readable)
-                        || (edit.writable && !ceiling.writable)
-                        || (edit.executable
-                            && (!ceiling.executable || descriptor & SW_EL1_MAY_EXEC == 0))
-                    {
-                        return Err(DescriptorRefusal::PermissionWidening);
-                    }
-                    let (ap, uxn) = if !any_el0 {
+                    let cow = crate::aarch64::cow_armed_protection(
+                        edit.readable,
+                        edit.writable,
+                        edit.executable,
+                        edit.cow_ceiling,
+                        descriptor & SW_EL1_MAY_EXEC != 0,
+                    )?;
+                    let (ap, uxn) = if !cow.user {
                         (AP_PRIV_RO, UXN)
                     } else {
-                        (AP_RO, if edit.executable { 0 } else { UXN })
+                        (AP_RO, if cow.executable { 0 } else { UXN })
                     };
-                    let may_write = if edit.writable { SW_EL1_MAY_WRITE } else { 0 };
+                    let may_write = if cow.write_intent {
+                        SW_EL1_MAY_WRITE
+                    } else {
+                        0
+                    };
                     return Ok((descriptor & !AP_MASK & !UXN & !SW_EL1_MAY_WRITE)
                         | ap
                         | uxn
