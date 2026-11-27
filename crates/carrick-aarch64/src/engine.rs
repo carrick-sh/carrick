@@ -4292,19 +4292,40 @@ impl<V: Aarch64Vmm> GuestMemory for Aarch64EngineCore<V> {
         }
     }
 
-    /// Scrub the physical backing of `[address, address+len)`, BYPASSING the
-    /// PROT_NONE check — used to clear a reused/`munmap`'d region whose stale bytes
-    /// must never resurface after a later `mprotect` makes it readable.
+    /// Scrub the physical backing a pending root retirement releases, where
+    /// that backing lives: whoever holds this MM's bytes scrubs them.
+    /// - An admitted owner holds them: its portal maintenance scrubs the
+    ///   exact request (generic raw zeroing cannot select owner frames).
+    /// - Otherwise the host holds them (a carrier whose root is delegated
+    ///   but never owner-admitted, such as the soft carrier): the request's
+    ///   exact range is zeroed through the host's own backing, as a
+    ///   host-setup retirement is.
     fn zero_pending_backing(
         &mut self,
         pending: carrick_el1_abi::ReservationRequest,
     ) -> Result<(), MemoryError> {
-        let handle = self.protections.owner().ok_or(MemoryError::Unsupported)?;
-        if handle.mm().raw() != self.mm_generation {
+        if pending.mm.raw() != self.mm_generation
+            || pending.operation != carrick_el1_abi::ReservationOperation::Retire
+        {
             return Err(MemoryError::Unsupported);
         }
-        crate::user_transfer::scrub_pending_backing(self, handle, pending)
-            .map_err(|error| MemoryError::HostMap(error.to_string()))
+        match self.protections.owner() {
+            Some(handle) => {
+                if handle.mm() != pending.mm {
+                    return Err(MemoryError::Unsupported);
+                }
+                crate::user_transfer::scrub_pending_backing(self, handle, pending)
+                    .map_err(|error| MemoryError::HostMap(error.to_string()))
+            }
+            None => {
+                let range = pending.range;
+                let len = usize::try_from(range.len()).map_err(|_| MemoryError::OutOfBounds {
+                    address: range.start(),
+                    length: usize::MAX,
+                })?;
+                self.zero_backing(range.start(), len)
+            }
+        }
     }
 
     fn zero_backing(&mut self, address: u64, len: usize) -> Result<(), MemoryError> {
