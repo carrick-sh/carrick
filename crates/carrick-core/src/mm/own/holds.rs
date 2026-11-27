@@ -491,6 +491,7 @@ mod tests {
                         };
                         assert_eq!(result, Err(HoldError::UnknownSlot));
                         assert_eq!(project(&holds), model, "{edit:?}: a refusal moved");
+                        holds.check_invariants().unwrap();
                         continue;
                     }
                     Edit::Admit(slot, m) => {
@@ -514,6 +515,7 @@ mod tests {
                                 Err(HoldError::AliasUnderflow)
                             );
                             assert_eq!(project(&holds), model, "{edit:?}: a refusal moved");
+                            holds.check_invariants().unwrap();
                             continue;
                         };
                         *count -= 1;
@@ -527,11 +529,13 @@ mod tests {
                         let Some(entry) = model.get(&slot) else {
                             assert_eq!(holds.forget(slot), Err(HoldError::UnknownSlot));
                             assert_eq!(project(&holds), model, "{edit:?}: a refusal moved");
+                            holds.check_invariants().unwrap();
                             continue;
                         };
                         if !entry.1.is_empty() {
                             assert_eq!(holds.forget(slot), Err(HoldError::StillAliased));
                             assert_eq!(project(&holds), model, "{edit:?}: a refusal moved");
+                            holds.check_invariants().unwrap();
                             continue;
                         }
                         // With no alias left the slot may leave (a revoke or
