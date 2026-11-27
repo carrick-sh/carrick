@@ -203,7 +203,7 @@ pub mod hardware {
     unsafe fn send_ipi(apic_id: ApicId, vector: u8) -> Result<(), IpiBusy> {
         // A busy command is not a delivered wake. Return owned work to the
         // caller instead of spinning with IF masked or dropping the command.
-        if unsafe { core::ptr::read_volatile((LAPIC_VA + 0x300) as *const u32) } & (1 << 12) != 0 {
+        if unsafe { icr_busy() } {
             return Err(IpiBusy);
         }
         unsafe {
@@ -211,6 +211,18 @@ pub mod hardware {
             crate::isa::x86::interrupts::hardware::write(0x300, u32::from(vector));
         }
         Ok(())
+    }
+    /// Whether this CPU's xAPIC is still sending its previous IPI (ICR
+    /// delivery status, bit 12: "send pending"). This kernel drives the
+    /// local APIC in xAPIC (MMIO) mode only; x2APIC has no such bit (its
+    /// ICR write is accepted at once), so an x2APIC path would read idle
+    /// here and never wait.
+    ///
+    /// # Safety
+    /// CPL0 on this CPU, with its local APIC mapped at `LAPIC_VA`.
+    pub unsafe fn icr_busy() -> bool {
+        let icr = unsafe { core::ptr::read_volatile((LAPIC_VA + 0x300) as *const u32) };
+        icr & (1 << 12) != 0
     }
     /// # Safety
     /// Caller owns a published wake and names a retained APIC destination.

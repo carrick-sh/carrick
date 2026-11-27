@@ -542,10 +542,11 @@ pub enum ReschedSend {
     /// The local APIC accepted the command.
     Sent,
     /// The local APIC was still sending this CPU's previous IPI (ICR
-    /// delivery status busy). That is contention, "not now": the IPI is
-    /// owed in this CPU's binding ([`CpuBinding::owed_resched`]) and sent
-    /// again at this CPU's next delivery point
-    /// ([`deliver_owed_resched`]). Nothing for the caller to do.
+    /// delivery status busy). That is "not now": the IPI is owed in this
+    /// CPU's binding ([`CpuBinding::owed_resched`]) and sent again at its
+    /// next delivery point ([`deliver_owed_resched`]), at the latest before
+    /// it returns to user ([`deliver_owed_resched_before_user`]). Nothing
+    /// for the caller to do.
     ///
     /// [`CpuBinding::owed_resched`]: super::context::native::CpuBinding::owed_resched
     Owed,
@@ -646,10 +647,12 @@ fn owe_resched(binding: &super::context::native::CpuBinding, slot: carrick_sched
 }
 
 /// Resend, once each, the reschedule IPIs this CPU owes ([`ReschedSend::Owed`]).
-/// Called at every delivery point of this CPU: its next reschedule send,
-/// each idle pass (before its reads, and before HLT), every return to user
-/// and every interrupt. True when none is owed any more; an IPI that finds
-/// the ICR busy again stays owed for the next point, never spun on.
+/// Called at every delivery point of this CPU short of a return to user:
+/// its next reschedule send, each idle pass (before its reads, and before
+/// HLT) and every interrupt that returns to the kernel. True when none is
+/// owed any more; an IPI that finds the ICR busy again stays owed for the
+/// next point, never waited on. A return to user is the last-chance point
+/// ([`deliver_owed_resched_before_user`]).
 #[must_use]
 pub fn deliver_owed_resched() -> bool {
     let Some(binding) = super::context::current_cpu_binding() else {
@@ -687,6 +690,46 @@ pub fn deliver_owed_resched() -> bool {
         }
     }
     clear
+}
+
+/// How long this CPU's own ICR may stay busy before its local APIC counts
+/// as broken. The delivery-status bit is a hardware handshake that clears
+/// once the APIC has handed the previous IPI to the interconnect, a few
+/// bus cycles; the SDM gives no number. One millisecond is orders of
+/// magnitude past it, so reaching it is a broken invariant, never
+/// contention.
+const ICR_IDLE_BOUND_NS: u128 = 1_000_000;
+
+/// The last-chance delivery point (#3083): this CPU returns to user, and
+/// may then run with no later kernel entry (a syscall-free loop, no timer
+/// armed). Resend what it owes as [`deliver_owed_resched`] does; an IPI
+/// whose ICR is still busy is not left owed past this point, but waits
+/// for this CPU's own ICR to go idle (an ISA mechanic, how an x86 kernel
+/// sends an IPI: no software holder to enrol on, and a timer retry would
+/// be polling) and is then sent. An ICR busy past [`ICR_IDLE_BOUND_NS`] is
+/// a broken local APIC: fatal.
+pub fn deliver_owed_resched_before_user() {
+    while !deliver_owed_resched() {
+        wait_icr_idle();
+    }
+}
+
+fn wait_icr_idle() {
+    #[cfg(feature = "test-support")]
+    RESCHED_ICR_WAITS.fetch_add(1, Ordering::AcqRel);
+    let Some(hz) = tsc_frequency() else {
+        super::fatal_entry_binding();
+    };
+    let bound = u128::from(hz.get()) * ICR_IDLE_BOUND_NS / 1_000_000_000;
+    let start = read_tsc();
+    // SAFETY: CPL0 on this CPU, with its local APIC mapped.
+    while unsafe { interrupts::hardware::icr_busy() } {
+        if u128::from(read_tsc().wrapping_sub(start)) > bound {
+            // A local APIC that never finishes its own send is broken.
+            super::fatal_entry_binding();
+        }
+        core::hint::spin_loop();
+    }
 }
 
 /// Query the TSC frequency from architectural CPUID or the exact KVM binding.
