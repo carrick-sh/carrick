@@ -164,7 +164,7 @@ pub unsafe fn carrier_receive_irq<P: Personality>(
     if frame.cs & 3 == 3 {
         interrupt::deliver_owed_resched_before_user(interrupt::UserReturn::Interrupt);
     } else {
-        let _ = interrupt::deliver_owed_resched();
+        let _ = interrupt::deliver_owed_resched(interrupt::DeliveryPoint::KernelInterrupt);
     }
     if frame.cs & 3 == 3 && interrupt::check_user_return_generation().is_err() {
         // SAFETY: generation mismatch on user return must notify fatal doorbell and halt.

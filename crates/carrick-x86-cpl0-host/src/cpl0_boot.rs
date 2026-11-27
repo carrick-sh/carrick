@@ -8481,6 +8481,7 @@ fn bootstrap_cpu_binding(index: usize, scheduler_witness: u64) -> CpuBinding {
         file_region: carrick_el1_abi::FileRegionBinding::UNPUBLISHED,
         cr4_snapshot: AtomicU64::new(0),
         owed_resched: core::array::from_fn(|_| AtomicU64::new(0)),
+        icr_failing_since: AtomicU64::new(0),
     }
 }
 
