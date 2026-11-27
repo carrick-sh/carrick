@@ -581,16 +581,35 @@ fn mounted_static_x86_sigign_fork_rounds_beyond_lifecycle_stock() {
     fork_rounds_beyond_stock(&["-DAUTOREAP", "-DIGNORE_SIGCHLD"]);
 }
 
+/// The carrier's memslot counts for one run (#3099).
+#[derive(Debug)]
+struct Memslots {
+    /// The most memslots held at once.
+    peak: u64,
+    /// The memslots still held when the run ended.
+    live: u64,
+}
+
 /// Run `x86_fork_cow_pages.S` with `pages` COW faults in the fork child
-/// and return the run's peak memslot count. The output and exit status
-/// must match native: the child's stores stay private and none is lost.
-fn fork_child_cow_pages(pages: u64, run_id: &str, deadline: Duration) -> Option<u64> {
+/// (and the fixture's `extra` defines) and return the run's memslot
+/// counts. The output and exit status must match native: the child's
+/// stores stay private and none is lost.
+fn fork_child_cow_pages_with(
+    pages: u64,
+    extra: &[&str],
+    run_id: &str,
+    deadline: Duration,
+) -> Option<Memslots> {
     if skip_without_kvm() {
         return None;
     }
     let dir = tempfile::tempdir().unwrap();
     let elf = dir.path().join("fork-cow-pages");
-    compile_assembly_with_flags("x86_fork_cow_pages.S", &elf, &[&format!("-DPAGES={pages}")]);
+    let pages_flag = format!("-DPAGES={pages}");
+    let flags: Vec<&str> = core::iter::once(pages_flag.as_str())
+        .chain(extra.iter().copied())
+        .collect();
+    compile_assembly_with_flags("x86_fork_cow_pages.S", &elf, &flags);
     let native = Command::new(&elf)
         .timeout(Duration::from_secs(60))
         .output()
@@ -621,28 +640,73 @@ fn fork_child_cow_pages(pages: u64, run_id: &str, deadline: Duration) -> Option<
             .expect("fork COW pages stdout"),
     )
     .unwrap();
-    // A missing count is a failure, never a pass: the 4096-page row must
-    // observe the carrier's real peak.
-    Some(
-        report["report"]["execution_witness"]["peak_memslots"]
+    // A missing count is a failure, never a pass: the rows must observe
+    // the carrier's real counts.
+    let witness = &report["report"]["execution_witness"];
+    Some(Memslots {
+        peak: witness["peak_memslots"]
             .as_u64()
             .expect("execution witness reports peak_memslots"),
-    )
+        live: witness["live_memslots"]
+            .as_u64()
+            .expect("execution witness reports live_memslots"),
+    })
+}
+
+fn fork_child_cow_pages(pages: u64, run_id: &str, deadline: Duration) -> Option<Memslots> {
+    fork_child_cow_pages_with(pages, &[], run_id, deadline)
 }
 
 /// #3099: a COW replacement is carved from its MM's arena, so a fork child
-/// taking 4096 COW faults costs about 4096 / 128 chunk memslots, never one
-/// memslot per page. The bound leaves room for the carrier's own slots and
-/// every other grant the run makes (a COW-free run peaks well below it).
+/// taking 4096 COW faults costs 4096 / 128 = 32 chunk memslots, never one
+/// memslot per page. Against a 128-page run (one chunk), the 4096-page
+/// run may peak at most 31 chunk slots higher, plus the parent's own extra
+/// anonymous slots for its larger mapping, which both runs still hold at
+/// the end (the `live` difference).
 #[test]
 fn mounted_static_x86_fork_child_cow_pages_share_arena_memslots() {
-    let Some(peak) = fork_child_cow_pages(4096, "x86-fork-cow-arena", Duration::from_secs(30))
+    let Some(one) = fork_child_cow_pages(128, "x86-fork-cow-arena-1", Duration::from_secs(30))
     else {
         return;
     };
+    let many =
+        fork_child_cow_pages(4096, "x86-fork-cow-arena-32", Duration::from_secs(30)).expect("kvm");
+    let extra = many.peak.saturating_sub(one.peak);
+    let parent = many.live.saturating_sub(one.live);
+    eprintln!("#3099 memslots: 128 pages {one:?}, 4096 pages {many:?}");
     assert!(
-        peak < 4096 / 2,
-        "4096 COW pages held {peak} memslots at once: one per page, not one per 2 MiB chunk"
+        extra <= 31 + parent,
+        "4096 COW pages peaked {extra} memslots above a 128-page run ({one:?} vs {many:?}): \
+         more than one per 2 MiB chunk"
+    );
+}
+
+/// #3099: a chunk retires with the last MM that maps it. The child that
+/// owns the replacements forks a grandchild, which inherits all of them,
+/// and exits first; the grandchild exits after it. By the end of the run
+/// the carrier must hold no more memslots than the same run without a
+/// grandchild: an orphaned chunk (its owner retired, its inheritor too)
+/// must not stay registered.
+#[test]
+fn mounted_static_x86_fork_cow_arena_chunks_retire_with_their_last_inheritor() {
+    let Some(plain) = fork_child_cow_pages(4096, "x86-fork-cow-plain", Duration::from_secs(30))
+    else {
+        return;
+    };
+    let inherited = fork_child_cow_pages_with(
+        4096,
+        &["-DGRANDCHILD"],
+        "x86-fork-cow-grandchild",
+        Duration::from_secs(30),
+    )
+    .expect("kvm");
+    eprintln!("#3099 memslots: plain {plain:?}, grandchild {inherited:?}");
+    assert!(
+        inherited.live <= plain.live,
+        "the grandchild run ended holding {} memslots against {} without it: \
+         chunks outlived both the MM that owned them and the MM that inherited them",
+        inherited.live,
+        plain.live
     );
 }
 

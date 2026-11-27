@@ -561,6 +561,10 @@ pub struct ExecutionWitness {
     /// The most backend memslots the carrier held at once (KVM; #3099).
     #[serde(default)]
     pub peak_memslots: u64,
+    /// The memslots the carrier still held when the run ended (KVM; #3099):
+    /// a retired MM's arena chunks must be gone by then.
+    #[serde(default)]
+    pub live_memslots: u64,
     /// Last refused fork admission, including quarantine at that boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_admission_refusal: Option<ForkAdmissionRefusal>,

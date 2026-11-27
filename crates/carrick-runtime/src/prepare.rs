@@ -1082,6 +1082,7 @@ fn run_prepared_kvm_pool_with_debug(
         guest_refusal_families: count_family(refusal_families),
         fork_admission_refusal: physical.fork_admission_refusal()?,
         peak_memslots: physical.peak_memslots()?,
+        live_memslots: physical.live_memslots()?,
         fork_stock_families: physical
             .fork_stock_counters()?
             .families()
