@@ -1350,7 +1350,8 @@ fn production_anonymous_caught_signal_returns_and_reexecutes() {
 /// interrupted munmap's operation is still on the record while the handler
 /// borrows execution. The deferred frame copy is "not now": it must park on
 /// the editor's release (the second counted park), then deliver the handler
-/// once, and munmap re-executes. Before the fix the park found the record's
+/// once with munmap's operation back on the record (the handler reads it),
+/// and munmap re-executes. Before the fix the park found the record's
 /// operation slot occupied, quarantined the service (`OwnerWaitParkRefused`)
 /// and the scheduler raised `fatal_boot` at its signal-return checkpoint.
 #[test]
@@ -1362,6 +1363,7 @@ fn run_anonymous_caught_signal_probe(frame_held: bool) {
     const INJECT_CAUGHT_SIGNAL_ON_PARK: u64 = 0xffff_ffff_ffff_fe17;
     const INJECT_CAUGHT_SIGNAL_ON_PARK_FRAME_HELD: u64 = 0xffff_ffff_ffff_fe55;
     const INJECT_WAIT_PARK_CENSUS: u64 = 0xffff_ffff_ffff_fe13;
+    const INJECT_OPERATION_TOKEN_ACTIVE: u64 = 0xffff_ffff_ffff_fe54;
     const IMAGE_BASE: u64 = 0x0040_00b0;
 
     let mut code = Vec::new();
@@ -1462,6 +1464,14 @@ fn run_anonymous_caught_signal_probe(frame_held: bool) {
     code.extend_from_slice(&0_u64.to_le_bytes());
     code.extend_from_slice(&[0x48, 0x8b, 0x00]); // mov rax,[rax]
     append_result_check(&mut code, &mut failures, 1);
+    // The handler saw the interrupted munmap's operation on its record; a
+    // miss exits 11, apart from every other check.
+    code.extend_from_slice(&[0x48, 0xb8]); // movabs rax,operation word
+    let check_operation_pointer = code.len();
+    code.extend_from_slice(&0_u64.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0x8b, 0x00]); // mov rax,[rax]
+    let mut operation_failures = Vec::new();
+    append_result_check(&mut code, &mut operation_failures, 1);
     // The munmap's park, and with the frame held the frame copy's own park.
     append_mov(&mut code, &[0x48, 0xb8], INJECT_WAIT_PARK_CENSUS);
     code.extend_from_slice(&[0x0f, 0x05]);
@@ -1477,8 +1487,26 @@ fn run_anonymous_caught_signal_probe(frame_held: bool) {
         let delta = i32::try_from(failure - (branch + 4)).unwrap();
         code[branch..branch + 4].copy_from_slice(&delta.to_le_bytes());
     }
+    let operation_failure = code.len();
+    append_mov(&mut code, &[0x48, 0xbf], 11);
+    append_mov(&mut code, &[0x48, 0xb8], 231);
+    code.extend_from_slice(&[0x0f, 0x05, 0x0f, 0x0b]);
+    for branch in operation_failures {
+        let delta = i32::try_from(operation_failure - (branch + 4)).unwrap();
+        code[branch..branch + 4].copy_from_slice(&delta.to_le_bytes());
+    }
 
     let handler = IMAGE_BASE + code.len() as u64;
+    // The handler first records whether the interrupted munmap's operation
+    // is on its record while it borrows execution. With the frame held, the
+    // park moved that operation into the retained delivery, so a 1 here
+    // proves the rerun put it back (#3043).
+    append_mov(&mut code, &[0x48, 0xb8], INJECT_OPERATION_TOKEN_ACTIVE);
+    code.extend_from_slice(&[0x0f, 0x05]);
+    code.extend_from_slice(&[0x48, 0xba]); // movabs rdx,operation word
+    let handler_operation_pointer = code.len();
+    code.extend_from_slice(&0_u64.to_le_bytes());
+    code.extend_from_slice(&[0x48, 0x89, 0x02]); // mov [rdx],rax
     code.extend_from_slice(&[0x48, 0xb8]); // movabs rax,handler count
     let handler_count_pointer = code.len();
     code.extend_from_slice(&0_u64.to_le_bytes());
@@ -1491,10 +1519,16 @@ fn run_anonymous_caught_signal_probe(frame_held: bool) {
     }
     let handler_count = IMAGE_BASE + code.len() as u64;
     code.extend_from_slice(&0_u64.to_le_bytes());
+    let handler_operation = IMAGE_BASE + code.len() as u64;
+    code.extend_from_slice(&u64::MAX.to_le_bytes());
     code[check_count_pointer..check_count_pointer + 8]
         .copy_from_slice(&handler_count.to_le_bytes());
     code[handler_count_pointer..handler_count_pointer + 8]
         .copy_from_slice(&handler_count.to_le_bytes());
+    code[check_operation_pointer..check_operation_pointer + 8]
+        .copy_from_slice(&handler_operation.to_le_bytes());
+    code[handler_operation_pointer..handler_operation_pointer + 8]
+        .copy_from_slice(&handler_operation.to_le_bytes());
     let action = IMAGE_BASE + code.len() as u64;
     code.extend_from_slice(&handler.to_le_bytes());
     code.extend_from_slice(&0x0c00_0000_u64.to_le_bytes()); // SA_RESTORER | SA_ONSTACK
@@ -1526,7 +1560,7 @@ fn run_anonymous_caught_signal_probe(frame_held: bool) {
     assert_eq!(
         outcome.run.exit_code,
         7,
-        "frame_held={frame_held}: caught signal must deliver once and replay munmap without EINTR: {}",
+        "frame_held={frame_held}: caught signal must deliver once, with munmap's operation on its record (exit 11 if not), and replay munmap without EINTR: {}",
         String::from_utf8_lossy(&outcome.run.stderr)
     );
     assert_eq!(outcome.run.terminating_signal, None);
