@@ -1900,6 +1900,16 @@ fn mounted_static_x86_threads_first_touch_of_large_windows_takes_no_stage2_fault
             _ => None,
         })
         .expect("an affine host_stage2_faults budget");
+    // The hypervisor maps a window with one large entry only when the host
+    // backs it with a huge page; a host with transparent huge pages off
+    // cannot show the effect, so say so rather than report a regression.
+    let thp =
+        std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled").unwrap_or_default();
+    assert!(
+        !thp.contains("[never]"),
+        "prerequisite: this host has transparent huge pages off ({thp:?}); \
+         large-page windows cannot reduce stage-2 faults here"
+    );
     let dir = tempfile::tempdir().unwrap();
     let mut observed = Vec::new();
     for pages in [512u64, 1024, 2048] {
@@ -1954,6 +1964,16 @@ fn mounted_static_x86_threads_first_touch_of_large_windows_takes_no_stage2_fault
         assert!(
             private_pages >= 4 * pages,
             "{pages} pages per thread made only {private_pages} private pages"
+        );
+        // The mechanism happened: each thread's aligned heap was granted as
+        // whole 2 MiB windows placed on large host pages.
+        let large_windows = witness["large_page_windows"]
+            .as_u64()
+            .expect("the KVM run reports its large-page windows");
+        assert!(
+            large_windows >= 4 * (pages / 512),
+            "{pages} pages per thread from 2 MiB boundaries made only \
+             {large_windows} large-page windows"
         );
         observed.push((pages, faults));
     }
