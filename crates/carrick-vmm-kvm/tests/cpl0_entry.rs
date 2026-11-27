@@ -3015,6 +3015,122 @@ fn stopped_cpl3_cpu_drops_a_retired_translation_before_its_next_load() {
     );
 }
 
+/// Boot an editor and a reader on one root, warm the reader's translation of
+/// the old page, stop the reader at CPL3 just before its next load of that
+/// page, then retire the page on the editor. The editor's rendezvous skips
+/// the stopped reader, so the reader is left owing the generation. Returns the
+/// carrier, the owed generation and the reader's KICK count before reentry.
+fn stopped_reader_owing_a_retirement() -> (Cpl0Carrier, u64, u64) {
+    let mut editor = Vec::new();
+    for phase in [2_u64, 3] {
+        editor.extend_from_slice(&[0x48, 0xbf]); // mov rdi, phase
+        editor.extend_from_slice(&phase.to_le_bytes());
+        editor.extend_from_slice(&[0x48, 0xb8]); // mov rax, fixture edit
+        editor.extend_from_slice(&OBSERVE_RETIRE_REPOINT.to_le_bytes());
+        editor.extend_from_slice(&[0x0f, 0x05, 0x48, 0x89, 0xc7, 0x48, 0xb8]);
+        editor.extend_from_slice(&OBSERVE_NATIVE.to_le_bytes());
+        editor.extend_from_slice(&[0x0f, 0x05]);
+    }
+    editor.extend_from_slice(&[0x0f, 0x0b]);
+    let mut reader = vec![0xa0]; // mov al, [0x37000]
+    reader.extend_from_slice(&0x3_7000_u64.to_le_bytes());
+    reader.push(0xa2); // mov [0x40000], al
+    reader.extend_from_slice(&0x4_0000_u64.to_le_bytes());
+    reader.extend_from_slice(&[0xeb, 0xec]); // repeat the 20-byte load/store loop
+
+    let mut carrier =
+        Cpl0Carrier::boot_with_interrupts(physical_inventory(), &image(), [&editor, &reader])
+            .expect("two native KVM CPUs with one retained page-table root");
+    carrier.fixture_share_root(1, 0).expect("same MM root");
+    carrier.fixture_write_backing_byte(0xd1_1000, 0x11).unwrap();
+    assert_eq!(carrier.observe(0).expect("prepare old page").result, 1);
+    carrier
+        .fixture_stop_after_user_value(1, 0x4_0000, 0x11)
+        .expect("reader warmed its old translation");
+    carrier
+        .fixture_stop_before_user_rip(1, carrick_vmm_kvm::cpl0_boot::USER_CODE + 0x1000)
+        .expect("next user instruction is the stale-page load");
+    let checks_before = carrier.fixture_kick_generation_checks(1).unwrap();
+    carrier.fixture_write_backing_byte(0x4_0000, 0).unwrap();
+    assert_eq!(carrier.observe(0).expect("retire old page").result, 1);
+    let [(root, generation, ack), _] = carrier.fixture_shootdown_state();
+    assert_eq!(root, 0x60_0000, "retirement must name the shared root");
+    assert_ne!(generation, 0, "retirement must publish a generation");
+    assert!(ack[1] < generation, "stopped CPU must still owe its drain");
+    assert!(carrier.fixture_shootdown_served(0, 1).unwrap() < generation);
+    (carrier, generation, checks_before)
+}
+
+/// #3076: a CPL3 CPU that stopped while delivering an accepted interrupt,
+/// with shootdown debt, reenters through the production run admission. The
+/// interrupt enters CPL0 first; the queued KICK settles the debt before the
+/// next user instruction, so the stale-page load faults. The admission
+/// refused this stop as a carrier fatal before.
+#[test]
+fn stopped_cpl3_cpu_delivering_an_interrupt_settles_shootdown_debt_before_user_code() {
+    use carrick_vmm_kvm::cpl0_boot::{PendingEvent, StoppedCpu};
+    use carrick_x86::interrupts::RESCHED_VECTOR;
+    let (mut carrier, generation, checks_before) = stopped_reader_owing_a_retirement();
+    let pending_before = carrier.fixture_pending_irqs(1).unwrap();
+    carrier
+        .fixture_stop_delivering_interrupt(1, RESCHED_VECTOR)
+        .expect("reader stopped mid-delivery of RESCHED");
+    assert_eq!(
+        carrier.fixture_stopped_cpu(1).unwrap(),
+        StoppedCpu::UserEventPending {
+            event: PendingEvent::Interrupt {
+                vector: RESCHED_VECTOR
+            },
+            rip: carrick_vmm_kvm::cpl0_boot::USER_CODE + 0x1000,
+        }
+    );
+    carrier
+        .fixture_run_until_user_fault(1, carrick_vmm_kvm::cpl0_boot::USER_CODE + 0x1000, 0x3_7000)
+        .expect("reentry delivers the interrupt, then KICK, then the load faults");
+    let pending = carrier.fixture_pending_irqs(1).unwrap();
+    assert_eq!(pending_before & 4, 0, "RESCHED was not pending before");
+    assert_ne!(pending & 4, 0, "the in-flight RESCHED was delivered");
+    assert_ne!(pending & 2, 0, "the queued KICK was taken");
+    assert_eq!(carrier.fixture_shootdown_served(0, 1).unwrap(), generation);
+    assert!(carrier.fixture_shootdown_state()[0].2[1] >= generation);
+    assert_eq!(
+        carrier.fixture_kick_generation_checks(1).unwrap(),
+        checks_before + 1,
+        "exactly one reentry KICK settled the debt"
+    );
+}
+
+/// #3076: a CPL3 CPU stopped in a MOV SS interrupt shadow, with shootdown
+/// debt, reenters through the production run admission. The editor has
+/// already returned, so the shadowed instruction must not run on the stale
+/// translation: the admission ends the shadow and the queued KICK settles the
+/// debt first, so the load faults. The admission refused this stop as a
+/// carrier fatal before.
+#[test]
+fn stopped_cpl3_cpu_in_an_interrupt_shadow_settles_shootdown_debt_before_user_code() {
+    use carrick_vmm_kvm::cpl0_boot::StoppedCpu;
+    let (mut carrier, generation, checks_before) = stopped_reader_owing_a_retirement();
+    carrier
+        .fixture_stop_in_mov_ss_shadow(1)
+        .expect("reader stopped in a MOV SS shadow");
+    assert_eq!(
+        carrier.fixture_stopped_cpu(1).unwrap(),
+        StoppedCpu::UserShadowed {
+            rip: carrick_vmm_kvm::cpl0_boot::USER_CODE + 0x1000,
+        }
+    );
+    carrier
+        .fixture_run_until_user_fault(1, carrick_vmm_kvm::cpl0_boot::USER_CODE + 0x1000, 0x3_7000)
+        .expect("reentry takes KICK before the shadowed load, which faults");
+    assert_ne!(carrier.fixture_pending_irqs(1).unwrap() & 2, 0);
+    assert_eq!(carrier.fixture_shootdown_served(0, 1).unwrap(), generation);
+    assert!(carrier.fixture_shootdown_state()[0].2[1] >= generation);
+    assert_eq!(
+        carrier.fixture_kick_generation_checks(1).unwrap(),
+        checks_before + 1
+    );
+}
+
 #[test]
 fn two_running_vcpus_drop_stale_translation_on_shootdown() {
     let mut editor = Vec::new();
