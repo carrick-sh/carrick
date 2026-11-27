@@ -4290,28 +4290,8 @@ impl<
         // #3093: the gathering frame (the zone's scheduler view, the owner
         // copy, host readiness) has returned before the answer's copyout
         // descends into the owner's write.
-        match self.gather_poll() {
-            PollAnswer::Done(completion) => completion,
-            PollAnswer::Ring {
-                task,
-                output,
-                diagnostic,
-            } => complete_ring_poll_output(self.process.as_deref_mut(), task, output, diagnostic),
-            PollAnswer::Array {
-                task,
-                address,
-                pollfds,
-                result,
-                diagnostic,
-            } => complete_poll_array(
-                self.process.as_deref_mut(),
-                task,
-                address,
-                &pollfds,
-                result,
-                diagnostic,
-            ),
-        }
+        let answer = self.gather_poll();
+        self.complete_poll_answer(answer)
     }
     fn descriptor(&mut self) -> FamilyCompletion {
         if self.native_descriptor_owner() {
@@ -6098,105 +6078,6 @@ impl<
         Ok(new_fd)
     }
 
-    #[inline(never)]
-    fn ipc_transfer_native(&mut self) -> FamilyCompletion {
-        let Some(venue) = self.ipc else {
-            let ordinal = self.frame.canonical_ordinal().raw();
-            self.note_epoll_leave(ordinal, carrick_el1_abi::IpcLeave::EpollNoVenue);
-            return FamilyCompletion::Forward;
-        };
-        let (Some(source), Some(task)) = (
-            self.record_source(),
-            self.current_tasks.get(self.frame.task_index()),
-        ) else {
-            let ordinal = self.frame.canonical_ordinal().raw();
-            self.note_epoll_leave(ordinal, carrick_el1_abi::IpcLeave::EpollNoExecution);
-            return FamilyCompletion::Forward;
-        };
-        let counters = self.counters;
-        let orig_arg0 = self.frame.argument(0).unwrap_or(0);
-        let arguments = core::array::from_fn(|i| self.frame.argument(i).unwrap_or(0));
-        let ordinal = self.frame.canonical_ordinal();
-        let pc = self.frame.arm_frame_ref().map_or(0, |frame| frame.elr);
-        if let Some(process) = self.process.as_deref_mut() {
-            process.prepare_object_park();
-        }
-        let presented = self.process.as_deref().map(|owner| owner.binding());
-        let expected = Some(crate::common_entry::execution_binding(task));
-        let mut native_handoff = None;
-        let mut exec = ipc::NativeIpcExecution {
-            source,
-            task,
-            counters,
-            handoff: &mut native_handoff,
-            frame: core::marker::PhantomData,
-        };
-        let mut user = file::OwnerCopy {
-            inner: file::DiagnosedCopy {
-                inner: file::ValidatedCopy {
-                    task,
-                    validator: &file::HardwareValidator,
-                },
-                diagnostic: file::CopyDiagnostic {
-                    counters,
-                    ordinal,
-                    arguments,
-                    pc,
-                    presented,
-                    expected,
-                },
-            },
-            owner: self.process.as_deref_mut(),
-            wait: None,
-            input_wait: None,
-        };
-        let mut output = None;
-        let mut sigpipe_owed = false;
-        let disposition = if ordinal.raw() == 73
-            || carrick_personality_linux::dispatch::select_ordinal(ordinal)
-        {
-            ipc::serve_single_zone_ppoll(&mut exec, &mut *self.frame, venue, &mut user, &mut output)
-        } else {
-            let (disposition, owed) = ipc::serve_ipc_with_signals(
-                &mut exec,
-                &mut *self.frame,
-                venue,
-                &mut user,
-                presented.is_some(),
-                &mut || false,
-            );
-            sigpipe_owed = owed;
-            disposition
-        };
-        let input_wait = user.input_wait.take();
-        if let Some(receipt) = native_handoff
-            && let Some(process) = self.process.as_deref_mut()
-        {
-            process.store_handoff_receipt(receipt);
-        }
-        if let Some(request) = input_wait {
-            return self.ipc_input_wait(request);
-        }
-        if let Some(output) = output {
-            return complete_ring_poll_output(
-                self.process.as_deref_mut(),
-                task,
-                output,
-                (self.counters, ordinal, arguments, pc),
-            );
-        }
-        if sigpipe_owed {
-            raise_native_sigpipe(self.process.as_deref_mut());
-        }
-        let result = self.frame.result().0 as i64;
-        carrick_personality_linux::dispatch::transfer_effect(
-            &task.linux,
-            orig_arg0,
-            result,
-            disposition,
-        )
-    }
-
     /// Metadata snapshots retain the exact description until object work is
     /// complete, then release all locks and the pin before owner copyout.
     #[inline(never)]
@@ -7174,6 +7055,140 @@ impl<
     Context: DispatchContext,
 > El1PendingFamilies<'a, 'ipc, F, C, U, G, Context>
 {
+    /// The native IPC venue's transfer: gather, then run any poll answer's
+    /// copyout once the gathering frame has returned (#3093).
+    fn ipc_transfer_native(&mut self) -> FamilyCompletion {
+        let answer = self.gather_native_ipc();
+        self.complete_poll_answer(answer)
+    }
+
+    /// Run a gathered poll answer's copyout, beneath this frame alone.
+    fn complete_poll_answer(&mut self, answer: PollAnswer<'a>) -> FamilyCompletion {
+        match answer {
+            PollAnswer::Done(completion) => completion,
+            PollAnswer::Ring {
+                task,
+                output,
+                diagnostic,
+            } => complete_ring_poll_output(self.process.as_deref_mut(), task, output, diagnostic),
+            PollAnswer::Array {
+                task,
+                address,
+                pollfds,
+                result,
+                diagnostic,
+            } => complete_poll_array(
+                self.process.as_deref_mut(),
+                task,
+                address,
+                &pollfds,
+                result,
+                diagnostic,
+            ),
+        }
+    }
+
+    /// The native IPC venue's work, up to, never including, a poll
+    /// answer's copyout: its owner copy and execution view return first.
+    #[inline(never)]
+    fn gather_native_ipc(&mut self) -> PollAnswer<'a> {
+        let current_tasks: &'a [CurrentTask] = self.current_tasks;
+        let Some(venue) = self.ipc else {
+            let ordinal = self.frame.canonical_ordinal().raw();
+            self.note_epoll_leave(ordinal, carrick_el1_abi::IpcLeave::EpollNoVenue);
+            return PollAnswer::Done(FamilyCompletion::Forward);
+        };
+        let (Some(source), Some(task)) = (
+            self.record_source(),
+            current_tasks.get(self.frame.task_index()),
+        ) else {
+            let ordinal = self.frame.canonical_ordinal().raw();
+            self.note_epoll_leave(ordinal, carrick_el1_abi::IpcLeave::EpollNoExecution);
+            return PollAnswer::Done(FamilyCompletion::Forward);
+        };
+        let counters = self.counters;
+        let orig_arg0 = self.frame.argument(0).unwrap_or(0);
+        let arguments = core::array::from_fn(|i| self.frame.argument(i).unwrap_or(0));
+        let ordinal = self.frame.canonical_ordinal();
+        let pc = self.frame.arm_frame_ref().map_or(0, |frame| frame.elr);
+        if let Some(process) = self.process.as_deref_mut() {
+            process.prepare_object_park();
+        }
+        let presented = self.process.as_deref().map(|owner| owner.binding());
+        let expected = Some(crate::common_entry::execution_binding(task));
+        let mut native_handoff = None;
+        let mut exec = ipc::NativeIpcExecution {
+            source,
+            task,
+            counters,
+            handoff: &mut native_handoff,
+            frame: core::marker::PhantomData,
+        };
+        let mut user = file::OwnerCopy {
+            inner: file::DiagnosedCopy {
+                inner: file::ValidatedCopy {
+                    task,
+                    validator: &file::HardwareValidator,
+                },
+                diagnostic: file::CopyDiagnostic {
+                    counters,
+                    ordinal,
+                    arguments,
+                    pc,
+                    presented,
+                    expected,
+                },
+            },
+            owner: self.process.as_deref_mut(),
+            wait: None,
+            input_wait: None,
+        };
+        let mut output = None;
+        let mut sigpipe_owed = false;
+        let disposition = if ordinal.raw() == 73
+            || carrick_personality_linux::dispatch::select_ordinal(ordinal)
+        {
+            ipc::serve_single_zone_ppoll(&mut exec, &mut *self.frame, venue, &mut user, &mut output)
+        } else {
+            let (disposition, owed) = ipc::serve_ipc_with_signals(
+                &mut exec,
+                &mut *self.frame,
+                venue,
+                &mut user,
+                presented.is_some(),
+                &mut || false,
+            );
+            sigpipe_owed = owed;
+            disposition
+        };
+        let input_wait = user.input_wait.take();
+        if let Some(receipt) = native_handoff
+            && let Some(process) = self.process.as_deref_mut()
+        {
+            process.store_handoff_receipt(receipt);
+        }
+        if let Some(request) = input_wait {
+            return PollAnswer::Done(self.ipc_input_wait(request));
+        }
+        if let Some(output) = output {
+            return PollAnswer::Ring {
+                task,
+                output,
+                diagnostic: (self.counters, ordinal, arguments, pc),
+            };
+        }
+        if sigpipe_owed {
+            raise_native_sigpipe(self.process.as_deref_mut());
+        }
+        let result = self.frame.result().0 as i64;
+        PollAnswer::Done(carrick_personality_linux::dispatch::transfer_effect(
+            &task.linux,
+            orig_arg0,
+            result,
+            disposition,
+        ))
+    }
+
     /// Gather a poll's answer: everything up to, never including, its
     /// copyout. Never inlined, so its frame is not live beneath the copyout
     /// that [`PendingFamilies::poll`] runs once it returns.
@@ -7400,7 +7415,7 @@ impl<
 
     fn ipc_poll_transfer(&mut self) -> PollAnswer<'a> {
         if !self.frame.arm_scheduler() {
-            return PollAnswer::Done(self.ipc_transfer_native());
+            return self.gather_native_ipc();
         }
         let Some(venue) = self.ipc else {
             return PollAnswer::Done(FamilyCompletion::Forward);

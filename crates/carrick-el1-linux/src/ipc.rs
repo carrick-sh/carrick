@@ -3186,7 +3186,8 @@ mod tests {
         venue: &IpcVenue<'_>,
         user: &mut M,
     ) -> IpcServed {
-        serve_ipc_with_signals(sched, frame, venue, user, false, &mut || false).0
+        let served = super::serve_ipc(sched, frame, venue, user);
+        at_entry(sched, frame, served)
     }
     fn serve_single_zone_ppoll<M: UserCopy>(
         sched: &mut Sched<'_, FakeCpu, HardwareUserWord>,
