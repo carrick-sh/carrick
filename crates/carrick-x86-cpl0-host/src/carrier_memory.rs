@@ -397,17 +397,19 @@ pub struct BackingHandle {
     ::core::cmp::PartialEq,
     ::core::cmp::Eq,
 )]
-pub struct CarrierVmId(NonZeroU64);
+pub struct CarrierVmId(carrick_core::mm::own::CarrierId);
 impl CarrierVmId {
+    /// One identity for the VM and its memory-ownership core (#3061).
     fn allocate() -> Result<Self, MemoryError> {
-        static CARRIERS: carrick_sched_core::process::identity_allocator::SerialAllocator =
-            carrick_sched_core::process::identity_allocator::SerialAllocator::new();
-        CARRIERS
-            .allocate()
+        carrick_core::mm::own::CarrierId::allocate()
             .map(Self)
             .ok_or_else(|| error("carrier identity exhausted"))
     }
     pub fn nonzero(self) -> NonZeroU64 {
+        self.0.raw()
+    }
+    /// The carrier's memory-ownership core identity.
+    pub fn carrier(self) -> carrick_core::mm::own::CarrierId {
         self.0
     }
 }
