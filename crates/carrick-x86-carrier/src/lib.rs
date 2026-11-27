@@ -82,7 +82,13 @@ macro_rules! export_carrier {
             frame: &mut $crate::entry::PageFaultStack,
             fpstate: &$crate::entry::XsaveArea,
         ) -> u64 {
-            <$personality as $crate::personality::Personality>::handle_page_fault(frame, fpstate)
+            let code = <$personality as $crate::personality::Personality>::handle_page_fault(
+                frame, fpstate,
+            );
+            // A resolved fault's return to user is a delivery point for the
+            // reschedule IPIs this CPU owes after a busy ICR (#3083).
+            let _ = carrick_el1::isa::x86::interrupt::deliver_owed_resched();
+            code
         }
 
         #[cfg(all(target_os = "none", target_arch = "x86_64"))]

@@ -21,8 +21,9 @@
  * reschedule IPI finds this CPU's ICR busy, once, by injection. A busy
  * ICR is "not now": the IPI is owed by this CPU and resent at its next
  * delivery point (here, the hold's own return to user), so the peer still
- * gets its only wake. Exit 93: the peer took the hold, but the census does
- * not show exactly one busy send and one resend.
+ * gets its only wake. Exit 93: the census, read right after the busy send's
+ * syscall returned (and again once the hold is taken), does not show
+ * exactly one busy send and one resend.
  *
  * Exit 7: the peer took the publication, and the ordered pass ran once.
  * 81: arming failed; 82: the peer never reached its stop; 83: the
@@ -86,6 +87,16 @@ reached:
     syscall
     test %rax, %rax
     jnz fail_publish
+
+#ifdef BUSY_RESCHED
+    /* The hold's own return to user is the next delivery point: by this
+     * syscall's entry the busy IPI must already be resent, once. */
+    mov $INJECT_RESCHED_BUSY_CENSUS, %rax
+    syscall
+    mov $0x100000001, %rcx
+    cmp %rcx, %rax
+    jne fail_busy_census
+#endif
 
     mov $INJECT_ORDER_PEER_PUBLISHED, %rax
     syscall
