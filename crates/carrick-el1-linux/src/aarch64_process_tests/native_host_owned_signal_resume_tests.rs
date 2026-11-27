@@ -90,11 +90,19 @@ fn host_owned_signal_resume(pending_work: bool, inline_ack: bool, defer_race: bo
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, owner_record)
+            .requeue_preempted(
+                fixture.slot,
+                owner_record,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         peer.id
     );
     run_as(fixture, 42, 12, 102, peer_control);
@@ -117,11 +125,19 @@ fn host_owned_signal_resume(pending_work: bool, inline_ack: bool, defer_race: bo
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, peer.id)
+            .requeue_preempted(
+                fixture.slot,
+                peer.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         owner_record
     );
     run_as_leader(fixture);
@@ -296,7 +312,11 @@ fn host_owned_signal_resume(pending_work: bool, inline_ack: bool, defer_race: bo
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, peer_record)
+            .requeue_preempted(
+                fixture.slot,
+                peer_record,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     crate::native_process_runtime::host_test_support::observe_return_copyouts();
@@ -350,7 +370,11 @@ fn host_owned_signal_resume(pending_work: bool, inline_ack: bool, defer_race: bo
     let mut service = fixture.process_service();
     if defer_race {
         assert_eq!(
-            fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+            fixture
+                .zone
+                .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record,
             member.id
         );
         run_as_leader(fixture);
@@ -521,7 +545,11 @@ fn host_owned_signal_resume(pending_work: bool, inline_ack: bool, defer_race: bo
             assert!(
                 fixture
                     .zone
-                    .requeue_preempted(fixture.slot, peer_record)
+                    .requeue_preempted(
+                        fixture.slot,
+                        peer_record,
+                        &carrick_sched_core::OwedPasses::new()
+                    )
                     .is_queued()
             );
         }
@@ -634,11 +662,19 @@ fn arm_woken_sigsuspend_inline_carrier_ack_preserves_eintr() {
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, owner_record)
+            .requeue_preempted(
+                fixture.slot,
+                owner_record,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         peer.id
     );
     run_as(fixture, 42, 12, 102, peer_control);
@@ -660,11 +696,19 @@ fn arm_woken_sigsuspend_inline_carrier_ack_preserves_eintr() {
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, peer.id)
+            .requeue_preempted(
+                fixture.slot,
+                peer.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         owner_record
     );
     run_as_leader(fixture);
@@ -772,16 +816,27 @@ fn arm_woken_sigsuspend_inline_carrier_ack_preserves_eintr() {
     );
     // Rotate `peer` behind the freshly woken `owner_record`: `[owner_record, peer]`.
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         peer.id
     );
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, peer.id)
+            .requeue_preempted(
+                fixture.slot,
+                peer.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
-    let switched = fixture.zone.switch_in_full(fixture.slot).unwrap();
+    let switched = fixture
+        .zone
+        .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     assert_eq!(switched.record, owner_record);
     assert_eq!(switched.result, Some(0));
 

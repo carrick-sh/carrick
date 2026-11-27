@@ -2057,8 +2057,8 @@ mod tests {
         task.mm.key.store(1, Ordering::Release);
         task.mm.thread_generation.store(101, Ordering::Release);
         let slot = SlotId::new(0);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         let record = zone
             .current_or_new(
                 slot,

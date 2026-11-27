@@ -130,10 +130,16 @@ fn deferred_control_handback(registered: bool, checkpoint: bool) {
         .unwrap();
     let members = [clone_thread(root, 42), clone_thread(root, 43)];
     let slot = SlotId::new(1);
-    fixture.zone.drive(slot, 2);
     fixture
         .zone
-        .publish_slot(slot, fixture.leader.mm, Some(1), 3);
+        .drive(slot, 2, &carrick_sched_core::OwedPasses::new());
+    fixture.zone.publish_slot(
+        slot,
+        fixture.leader.mm,
+        Some(1),
+        3,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     fixture.zone.enter_guest(slot);
     fixture.zone.install_space(slot, fixture.leader.mm).unwrap();
     let mut records = Vec::new();
@@ -265,7 +271,14 @@ fn deferred_control_handback(registered: bool, checkpoint: bool) {
         &mut carrick_sched_core::WakeEffects::default(),
     );
     drop(guard);
-    assert_eq!(fixture.zone.switch_in_full(slot).unwrap().record, record.id);
+    assert_eq!(
+        fixture
+            .zone
+            .switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
+        record.id
+    );
     assert!(matches!(
         fixture.zone.record(record.id).claim(),
         Claim::OnCpu { .. }
@@ -371,8 +384,14 @@ fn deferred_control_handback(registered: bool, checkpoint: bool) {
     }
     carrick_el1_abi::record_el1_region_host_ptr(fixture.region.ptr.as_ptr() as usize);
     let _clear = ClearAperture;
-    fixture.zone.leave_guest(fixture.slot, &ShortLockSpin);
-    fixture.zone.leave_guest(slot, &ShortLockSpin);
+    fixture.zone.leave_guest(
+        fixture.slot,
+        &ShortLockSpin,
+        &carrick_sched_core::OwedPasses::new(),
+    );
+    fixture
+        .zone
+        .leave_guest(slot, &ShortLockSpin, &carrick_sched_core::OwedPasses::new());
     // The production host adapter issues this one control wake per member.
     // The OnCpu target defers to its slot; the other target can run now.
     carrick_kernel::el1_zone::with_test_zone(fixture.zone, || {
@@ -494,7 +513,10 @@ fn deferred_control_handback(registered: bool, checkpoint: bool) {
     // publishing the exact retirement receipt, as the runtime exit path does.
     let mut service_records = Vec::new();
     for slot in [fixture.slot, slot] {
-        while let Some(ready) = fixture.zone.take_service_head(slot) {
+        while let Some(ready) = fixture
+            .zone
+            .take_service_head(slot, &carrick_sched_core::OwedPasses::new())
+        {
             service_records.push(ready);
             assert!(service_records.len() <= members.len());
         }
@@ -660,10 +682,16 @@ fn entryless_host_loaded_member_leaves_through_host(mode: EntrylessReturn) {
     assert!(control.publish_visible_tid(member.thread().key().tid.raw() as u32));
     assert_eq!(control.entry(), None, "host clone control");
     let slot = SlotId::new(1);
-    fixture.zone.drive(slot, 2);
     fixture
         .zone
-        .publish_slot(slot, fixture.leader.mm, Some(1), 3);
+        .drive(slot, 2, &carrick_sched_core::OwedPasses::new());
+    fixture.zone.publish_slot(
+        slot,
+        fixture.leader.mm,
+        Some(1),
+        3,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     fixture.zone.enter_guest(slot);
     fixture.zone.install_space(slot, fixture.leader.mm).unwrap();
     let as_member = || {
@@ -868,7 +896,9 @@ fn entryless_host_loaded_member_leaves_through_host(mode: EntrylessReturn) {
     );
     // The executor retires the exact thread on the host and publishes its
     // receipt, as the runtime's exit path does.
-    fixture.zone.leave_guest(slot, &ShortLockSpin);
+    fixture
+        .zone
+        .leave_guest(slot, &ShortLockSpin, &carrick_sched_core::OwedPasses::new());
     kernel.exit_thread(member, None).unwrap();
     let birth =
         carrick_kernel::kernel::host_birth_identity(member.task().key(), member.thread().key())
@@ -946,10 +976,16 @@ fn serial_host_adopted_fault_checkpoint_transfers_terminal_custody() {
     scheduler.make_runnable(sibling.thread().key()).unwrap();
     let running = scheduler.try_take(&executor).unwrap().unwrap();
     let slot = SlotId::new(1);
-    fixture.zone.drive(slot, 2);
     fixture
         .zone
-        .publish_slot(slot, fixture.leader.mm, Some(1), 3);
+        .drive(slot, 2, &carrick_sched_core::OwedPasses::new());
+    fixture.zone.publish_slot(
+        slot,
+        fixture.leader.mm,
+        Some(1),
+        3,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     fixture.zone.enter_guest(slot);
     fixture.zone.install_space(slot, fixture.leader.mm).unwrap();
     run_as(
@@ -1054,8 +1090,12 @@ fn serial_host_adopted_fault_checkpoint_transfers_terminal_custody() {
         .unwrap();
     let selected = fixture
         .zone
-        .switch_in_full(slot)
-        .or_else(|| fixture.zone.steal(slot));
+        .switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+        .or_else(|| {
+            fixture
+                .zone
+                .steal(slot, &carrick_sched_core::OwedPasses::new())
+        });
     assert_eq!(
         selected.map(|selected| selected.record),
         Some(record.id),
@@ -1101,7 +1141,7 @@ fn serial_host_adopted_fault_checkpoint_transfers_terminal_custody() {
     );
     let ready = fixture
         .zone
-        .take_service_head(slot)
+        .take_service_head(slot, &carrick_sched_core::OwedPasses::new())
         .expect("exact terminal host handback");
     assert_eq!(ready, record);
     let terminal = carrick_kernel::el1_zone::with_test_zone(fixture.zone, || {

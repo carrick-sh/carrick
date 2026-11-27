@@ -534,7 +534,13 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
     frame.x[0] = 17;
     arm_call_with_cpu(fixture, fixture.control, &mut service, &mut frame, &mut cpu).unwrap();
     assert!((frame.x[0] as i64) > 0);
-    fixture.zone.publish_slot(fixture.slot, 0, None, 0);
+    fixture.zone.publish_slot(
+        fixture.slot,
+        0,
+        None,
+        0,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     fixture.task.mm.key.store(0, Ordering::Release);
     let counters = carrick_el1_abi::Counters::new();
     let mut handoff = None;
@@ -2020,7 +2026,13 @@ fn composed_native_supply_with_prepared(
     frame.x[0] = 17;
     arm_call_with_cpu(fixture, fixture.control, &mut service, &mut frame, &mut cpu).unwrap();
     assert!((frame.x[0] as i64) > 0);
-    fixture.zone.publish_slot(fixture.slot, 0, None, 0);
+    fixture.zone.publish_slot(
+        fixture.slot,
+        0,
+        None,
+        0,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     fixture.task.mm.key.store(0, Ordering::Release);
     let counters = carrick_el1_abi::Counters::new();
     let mut handoff = None;
@@ -4060,8 +4072,16 @@ fn arm_two_live_threads_wait_for_sibling_first_touch_publication() {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     fixture.zone.spaces.set_idle_ttbr(0x30000);
     let sibling_slot = SlotId::new(1);
-    fixture.zone.drive(sibling_slot, 1);
-    fixture.zone.publish_slot(sibling_slot, 1, Some(1), 2);
+    fixture
+        .zone
+        .drive(sibling_slot, 1, &carrick_sched_core::OwedPasses::new());
+    fixture.zone.publish_slot(
+        sibling_slot,
+        1,
+        Some(1),
+        2,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     fixture.zone.enter_guest(sibling_slot);
     fixture.zone.install_space(sibling_slot, 1).unwrap();
     let (_, sibling) =
@@ -4324,6 +4344,7 @@ fn arm_two_live_threads_wait_for_sibling_first_touch_publication() {
                     fixture.slot,
                     record,
                     &carrick_sched_core::ShortLockSpin,
+                    &carrick_sched_core::OwedPasses::new(),
                 ),
                 carrick_sched_core::CurrentRelease::Released
             );
@@ -4619,8 +4640,16 @@ fn arm_host_born_fault_waiter_cancels_cleanly_on_exit_group_kill_and_sibling_exe
 
             let mm_key = fixture.task.mm.key.load(Ordering::Acquire);
             let waiter_slot = SlotId::new(1);
-            fixture.zone.drive(waiter_slot, 1);
-            fixture.zone.publish_slot(waiter_slot, 1, Some(1), 2);
+            fixture
+                .zone
+                .drive(waiter_slot, 1, &carrick_sched_core::OwedPasses::new());
+            fixture.zone.publish_slot(
+                waiter_slot,
+                1,
+                Some(1),
+                2,
+                &carrick_sched_core::OwedPasses::new(),
+            );
             fixture.zone.enter_guest(waiter_slot);
             fixture.zone.install_space(waiter_slot, mm_key).unwrap();
             let waiter_control = host_born_sibling(fixture, 42);
@@ -4951,7 +4980,8 @@ fn arm_host_born_fault_waiter_cancels_cleanly_on_exit_group_kill_and_sibling_exe
                             &|owned| crate::sched::object_wait::deliver_host_completion(
                                 owned.zone(),
                                 owned
-                            )
+                            ),
+                            &carrick_sched_core::OwedPasses::new()
                         ),
                         carrick_sched_core::HostClaim::Claimed
                     );
@@ -5011,7 +5041,8 @@ fn arm_host_born_fault_waiter_cancels_cleanly_on_exit_group_kill_and_sibling_exe
                             &|owned| crate::sched::object_wait::deliver_host_completion(
                                 owned.zone(),
                                 owned
-                            )
+                            ),
+                            &carrick_sched_core::OwedPasses::new()
                         ),
                         carrick_sched_core::HostClaim::Claimed
                     );
@@ -5112,6 +5143,7 @@ fn arm_host_born_fault_waiter_cancels_cleanly_on_exit_group_kill_and_sibling_exe
                             true,
                             &mut |_| panic!("exec leader must be placed in guest"),
                             &mut |_| {},
+                            &carrick_sched_core::OwedPasses::new(),
                         ),
                         1
                     );
@@ -5211,8 +5243,16 @@ fn arm_clone_tid_output_waits_for_sibling_in_flight_grant_publication() {
 
     let mm_key = fixture.task.mm.key.load(Ordering::Acquire);
     let sibling_slot = SlotId::new(1);
-    fixture.zone.drive(sibling_slot, 1);
-    fixture.zone.publish_slot(sibling_slot, 1, Some(1), 2);
+    fixture
+        .zone
+        .drive(sibling_slot, 1, &carrick_sched_core::OwedPasses::new());
+    fixture.zone.publish_slot(
+        sibling_slot,
+        1,
+        Some(1),
+        2,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     fixture.zone.enter_guest(sibling_slot);
     fixture.zone.install_space(sibling_slot, mm_key).unwrap();
     let _sibling_control = host_born_sibling(fixture, 42);
@@ -5461,9 +5501,12 @@ fn arm_clone_tid_output_waits_for_sibling_in_flight_grant_publication() {
     let record = fixture.zone.slot(fixture.slot).current().unwrap();
     assert!(!fixture.zone.record(record).has_object_operation());
     assert_eq!(
-        fixture
-            .zone
-            .release_current(fixture.slot, record, &carrick_sched_core::ShortLockSpin,),
+        fixture.zone.release_current(
+            fixture.slot,
+            record,
+            &carrick_sched_core::ShortLockSpin,
+            &carrick_sched_core::OwedPasses::new(),
+        ),
         carrick_sched_core::CurrentRelease::Released
     );
     fixture.zone.release_space(sibling_slot);
@@ -5787,8 +5830,16 @@ fn declined_fault_owner_wait_parks_on_owner_and_reruns_with_retained_fault() {
     let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
     fixture.zone.spaces.set_idle_ttbr(0x30000);
     let sibling_slot = SlotId::new(1);
-    fixture.zone.drive(sibling_slot, 1);
-    fixture.zone.publish_slot(sibling_slot, 1, Some(1), 2);
+    fixture
+        .zone
+        .drive(sibling_slot, 1, &carrick_sched_core::OwedPasses::new());
+    fixture.zone.publish_slot(
+        sibling_slot,
+        1,
+        Some(1),
+        2,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     fixture.zone.enter_guest(sibling_slot);
     fixture.zone.install_space(sibling_slot, 1).unwrap();
     let (_, sibling) =
@@ -5981,9 +6032,12 @@ fn declined_fault_owner_wait_parks_on_owner_and_reruns_with_retained_fault() {
         "the retained fault survives the wait for the rerun to deliver"
     );
     assert_eq!(
-        fixture
-            .zone
-            .release_current(fixture.slot, record, &carrick_sched_core::ShortLockSpin,),
+        fixture.zone.release_current(
+            fixture.slot,
+            record,
+            &carrick_sched_core::ShortLockSpin,
+            &carrick_sched_core::OwedPasses::new(),
+        ),
         carrick_sched_core::CurrentRelease::Released
     );
 }

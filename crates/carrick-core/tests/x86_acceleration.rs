@@ -2217,8 +2217,8 @@ fn x4_shared_wait_records() {
     // 4. ZoneTables object wait records, exact generations, one-winner wake/cancel
     let wait = TestLockWait;
     let mm = 7;
-    zone.drive(slot, 3);
-    zone.publish_slot(slot, mm, None, 0);
+    zone.drive(slot, 3, &carrick_sched_core::OwedPasses::new());
+    zone.publish_slot(slot, mm, None, 0, &carrick_sched_core::OwedPasses::new());
     let here = ExecutionSlot::zone(slot);
     zone.occupancy.vacate_any(here);
     assert!(zone.occupancy.replace(here, 0, mm));
@@ -2357,7 +2357,9 @@ fn x4_shared_wait_records() {
     assert_eq!(report.queued, 1);
 
     // Switch in the woken record
-    let switched = zone.switch_in_full(slot).unwrap();
+    let switched = zone
+        .switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     assert_eq!(switched.record, record);
     assert_eq!(zone.slot(slot).current(), Some(record));
 
