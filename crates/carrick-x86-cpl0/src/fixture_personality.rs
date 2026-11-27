@@ -714,6 +714,7 @@ impl Personality for FixturePersonality {
                             user: true,
                         },
                         ceiling: None,
+                        absent: carrick_guest_arch::AbsentLeaves::Refuse,
                     },
                 );
                 frame.rax = match receipt {

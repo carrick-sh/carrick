@@ -487,6 +487,19 @@ pub struct EditCeiling {
     pub executable: bool,
 }
 
+/// What a `Protect` does at a page with no descriptor (#3073). Only the
+/// caller knows whether such a page is mapped, so it says so here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AbsentLeaves {
+    /// Refuse the edit: the caller has not proved the range is mapped, so a
+    /// page with no descriptor may be unmapped VA (mprotect(2) `ENOMEM`).
+    Refuse,
+    /// Skip the page: the reservation owner has proved the whole range is
+    /// mapped and commits the new protection in its own metadata, which a
+    /// lazy page's first touch maps from.
+    Lazy,
+}
+
 /// Host-authenticated output backing, never inferred from a page-table word.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EditBacking {
@@ -537,6 +550,7 @@ pub enum EditOperation {
         /// The edited mapping's ceiling; `None` when the caller has no
         /// reservation owner (only the leaves' own tags authorize).
         ceiling: Option<EditCeiling>,
+        absent: AbsentLeaves,
     },
     ArmCow {
         kernel_only: bool,

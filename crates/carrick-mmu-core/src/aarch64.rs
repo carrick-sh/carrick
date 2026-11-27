@@ -750,6 +750,7 @@ pub struct GuestLeafPublication {
     pub executable: bool,
 }
 
+pub use carrick_guest_arch::AbsentLeaves;
 /// Mapping protection ceiling (`VM_MAY*`) authorizing a COW-armed private leaf
 /// permission edit when `SW_EL1_MAY_WRITE` carries current write intent. On
 /// AArch64 an execute grant still needs `SW_EL1_MAY_EXEC`: the frame must
@@ -767,6 +768,9 @@ pub struct GuestPermissionEdit {
     /// The edited mapping's ceiling, from its reservation owner: it
     /// authorizes a COW-armed AArch64 leaf's edit, and an x86 execute grant.
     pub cow_ceiling: Option<GuestPermissionCeiling>,
+    /// Whether a page with no descriptor in the range is a lazy page of a
+    /// range its reservation owner proved mapped, or must refuse the edit.
+    pub absent: AbsentLeaves,
 }
 
 /// Why EL1 could not own a requested resident-anonymous protection edit.
@@ -11349,6 +11353,7 @@ mod tests {
                         writable,
                         executable: false,
                         cow_ceiling: None,
+                        absent: crate::aarch64::AbsentLeaves::Refuse,
                     },
                 )
             }
@@ -11391,6 +11396,7 @@ mod tests {
                         writable: true,
                         executable: true,
                         cow_ceiling: None,
+                        absent: crate::aarch64::AbsentLeaves::Refuse,
                     },
                 )
             },
@@ -11440,6 +11446,7 @@ mod tests {
                         writable: false,
                         executable: false,
                         cow_ceiling: None,
+                        absent: crate::aarch64::AbsentLeaves::Refuse,
                     },
                 )
             },
@@ -11470,6 +11477,7 @@ mod tests {
                         writable: true,
                         executable: false,
                         cow_ceiling: None,
+                        absent: crate::aarch64::AbsentLeaves::Refuse,
                     },
                 )
             },
@@ -11845,6 +11853,7 @@ mod tests {
             writable: false,
             executable: false,
             cow_ceiling: None,
+            absent: crate::aarch64::AbsentLeaves::Refuse,
         })
         .expect("RW to RO");
         for page in 0..3 {
@@ -11871,6 +11880,7 @@ mod tests {
             writable: false,
             executable: false,
             cow_ceiling: None,
+            absent: crate::aarch64::AbsentLeaves::Refuse,
         })
         .expect("RO to PROT_NONE");
         for page in 0..3 {
@@ -11889,6 +11899,7 @@ mod tests {
             writable: true,
             executable: false,
             cow_ceiling: None,
+            absent: crate::aarch64::AbsentLeaves::Refuse,
         })
         .expect("PROT_NONE to RW");
         assert!(
@@ -11908,6 +11919,7 @@ mod tests {
                 writable: true,
                 executable: true,
                 cow_ceiling: None,
+                absent: crate::aarch64::AbsentLeaves::Refuse,
             }),
             Err(GuestPermissionEditError::PermissionWidening)
         );
@@ -12173,6 +12185,7 @@ mod tests {
                     writable,
                     executable: false,
                     cow_ceiling: None,
+                    absent: crate::aarch64::AbsentLeaves::Refuse,
                 })
                 .expect("permission edit must stay inside the target range");
         }
@@ -12416,6 +12429,7 @@ mod tests {
                         writable: true,
                         executable: false,
                         cow_ceiling: None,
+                        absent: crate::aarch64::AbsentLeaves::Refuse,
                     },
                 )
             },
@@ -12441,6 +12455,7 @@ mod tests {
                         writable: true,
                         executable: false,
                         cow_ceiling: ro_ceiling,
+                        absent: crate::aarch64::AbsentLeaves::Refuse,
                     },
                 )
             },
@@ -12461,6 +12476,7 @@ mod tests {
                         writable: false,
                         executable: false,
                         cow_ceiling: ro_ceiling,
+                        absent: crate::aarch64::AbsentLeaves::Refuse,
                     },
                 )
             },
@@ -12488,6 +12504,7 @@ mod tests {
                             writable: true,
                             executable: false,
                         }),
+                        absent: crate::aarch64::AbsentLeaves::Refuse,
                     },
                 )
             },
@@ -12779,6 +12796,7 @@ mod tests {
                 writable: false,
                 executable: false,
                 cow_ceiling: None,
+                absent: crate::aarch64::AbsentLeaves::Refuse,
             };
             assert_eq!(
                 unsafe {
@@ -12918,6 +12936,7 @@ mod tests {
                         writable: false,
                         executable: false,
                         cow_ceiling: None,
+                        absent: crate::aarch64::AbsentLeaves::Refuse,
                     },
                 )
             },
@@ -12975,6 +12994,7 @@ mod tests {
                         writable: true,
                         executable: false,
                         cow_ceiling: None,
+                        absent: crate::aarch64::AbsentLeaves::Refuse,
                     },
                 )
             },
@@ -13049,6 +13069,7 @@ mod tests {
                     writable,
                     executable: false,
                     cow_ceiling: None,
+                    absent: crate::aarch64::AbsentLeaves::Refuse,
                 };
                 assert_eq!(
                     unsafe {

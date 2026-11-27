@@ -2364,6 +2364,7 @@ fn serve_delegated_anonymous_attempt<
                 writable: request.protection.bits() & PROT_WRITE != 0,
                 executable: request.protection.bits() & PROT_EXEC != 0,
                 cow_ceiling: None,
+                absent: carrick_mmu_core::aarch64::AbsentLeaves::Refuse,
             };
             match editor.protect_window_and_invalidate(
                 carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
@@ -2382,17 +2383,22 @@ fn serve_delegated_anonymous_attempt<
         | (Prepare, RangeBacking::Prepared, Some((start, run_len)))
             if request.operation == Protect || adopts_stock =>
         {
-            let cow_ceiling = if request.operation == Protect {
+            // An mprotect's request covers mapped VA only (the root refused an
+            // unmapped page), and the root commits its protection for every
+            // page, so a page with no descriptor is a lazy page (#3073). A
+            // stock adoption has no such proof and stays exact.
+            let (cow_ceiling, absent) = if request.operation == Protect {
                 let Some(ceiling) = model.protection_ceiling(request.range) else {
                     return refuse(pending, &mut model, Leave::RootUnavailable);
                 };
-                Some(GuestPermissionCeiling {
+                let ceiling = GuestPermissionCeiling {
                     readable: ceiling.bits() & PROT_READ != 0,
                     writable: ceiling.bits() & PROT_WRITE != 0,
                     executable: ceiling.bits() & PROT_EXEC != 0,
-                })
+                };
+                (Some(ceiling), carrick_mmu_core::aarch64::AbsentLeaves::Lazy)
             } else {
-                None
+                (None, carrick_mmu_core::aarch64::AbsentLeaves::Refuse)
             };
             let edit = GuestPermissionEdit {
                 va: start,
@@ -2401,6 +2407,7 @@ fn serve_delegated_anonymous_attempt<
                 writable: request.protection.bits() & PROT_WRITE != 0,
                 executable: request.protection.bits() & PROT_EXEC != 0,
                 cow_ceiling,
+                absent,
             };
             match editor.protect_and_invalidate(
                 carrick_guest_arch::AddressSpaceRegister::from_register(grant.ttbr0),
@@ -2656,6 +2663,7 @@ pub fn try_serve_mprotect<E: AnonymousPermissionEditor>(
         writable: prot & PROT_WRITE != 0,
         executable: prot & PROT_EXEC != 0,
         cow_ceiling: None,
+        absent: carrick_mmu_core::aarch64::AbsentLeaves::Refuse,
     };
     let Some(generation) = AnonymousEditGeneration::resident() else {
         return MprotectDisposition::Forward;
@@ -2917,6 +2925,7 @@ mod tests {
                     writable: false,
                     executable: false,
                     cow_ceiling: None,
+                    absent: carrick_mmu_core::aarch64::AbsentLeaves::Refuse,
                 }
             )]
         );
@@ -4536,6 +4545,7 @@ mod tests {
                                 writable: true,
                                 executable: true,
                             }),
+                            absent: carrick_mmu_core::aarch64::AbsentLeaves::Lazy,
                         }
                     ),
                     Call::Probe(task.ttbr0, ARENA + 0x2000, 0x2000),
@@ -5228,6 +5238,7 @@ mod tests {
                             writable: false,
                             executable: false,
                             cow_ceiling: None,
+                            absent: carrick_mmu_core::aarch64::AbsentLeaves::Refuse,
                         }
                     ),
                 ]
@@ -5309,6 +5320,7 @@ mod tests {
                         writable: true,
                         executable: false,
                         cow_ceiling: None,
+                        absent: carrick_mmu_core::aarch64::AbsentLeaves::Refuse,
                     }
                 )]
             );
@@ -5341,6 +5353,7 @@ mod tests {
                         writable: true,
                         executable: false,
                         cow_ceiling: None,
+                        absent: carrick_mmu_core::aarch64::AbsentLeaves::Refuse,
                     }
                 )]
             );
@@ -5407,6 +5420,7 @@ mod tests {
                                 writable: true,
                                 executable: true,
                             }),
+                            absent: carrick_mmu_core::aarch64::AbsentLeaves::Lazy,
                         }
                     )]
                 );

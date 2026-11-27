@@ -180,6 +180,7 @@ fn permission_transition_rounds_preserve_separate_signal_stack_owner_writes() {
                         writable: false,
                         executable: false,
                         cow_ceiling: None,
+                        absent: carrick_mmu_core::aarch64::AbsentLeaves::Refuse,
                     },
                 )
             }
@@ -244,6 +245,7 @@ fn permission_transition_rounds_preserve_separate_signal_stack_owner_writes() {
                         writable: true,
                         executable: false,
                         cow_ceiling: None,
+                        absent: carrick_mmu_core::aarch64::AbsentLeaves::Refuse,
                     },
                 )
             }
