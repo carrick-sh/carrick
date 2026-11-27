@@ -2399,6 +2399,142 @@ fn x86_abort_retires_object_parked_member() {
     >(words, ClosingObjectParkCause::Abort);
 }
 
+/// #3081: a sibling parked in `nanosleep` while its leader calls
+/// `exit_group`. Linux ends every thread of the group, whatever it is
+/// blocked in. The close must wake the sleeper (on main it stayed parked
+/// until its deadline: a long sleep held the run open), and its owner entry
+/// must end the sleep rather than park it again on the same deadline.
+fn exit_group_ends_member_sleeping_on_its_signal_channel_for<
+    C: ProcessContext + 'static,
+    B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
+>(
+    make_words: fn(AddressContext<RootGpa>) -> C,
+) {
+    use carrick_personality_linux::signal::{ProcessSignals, SignalOutcome};
+    use carrick_personality_linux::sleep::{SleepDeadline, SleepRequest};
+    use carrick_sched_core::Claim;
+
+    let fixture = native_exec_fixture_for::<C, B>(make_words);
+    let sibling = add_signal_sibling(&fixture, None, false);
+    assert!(fixture.zone.mark_native_owned(sibling.record.id));
+    assert_eq!(fixture.page.live(), 2);
+
+    // The sibling sleeps for an hour: no deadline can end it in this test.
+    {
+        let mut service = fixture.service();
+        service.waker_slot = sibling.slot;
+        let mut member = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: sibling.slot,
+                },
+                sibling.task,
+                fixture.address,
+                &(fixture.make_words)(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        let outcome = member.clock_sleep(SleepRequest {
+            deadline: SleepDeadline::Relative(3_600_000_000_000),
+            remaining: None,
+        });
+        assert!(
+            matches!(outcome, Ok(SignalOutcome::Transferred { .. })),
+            "the sibling's sleep must park"
+        );
+        assert!(member.take_run_failure().is_none());
+        assert!(member.take_handoff_receipt().is_some());
+    }
+    assert!(matches!(
+        fixture.zone.record(sibling.record.id).claim(),
+        Claim::Parked { .. }
+    ));
+
+    {
+        let mut service = fixture.service();
+        let mut root = fixture
+            .runtime
+            .enter_registered(
+                fixture.registry,
+                BornInZoneSource {
+                    zone: fixture.zone,
+                    slot: fixture.slot,
+                },
+                fixture.task,
+                fixture.address,
+                &(fixture.make_words)(fixture.address),
+                &mut service,
+            )
+            .unwrap();
+        assert!(matches!(
+            root.exit_group(7),
+            LifecycleOutcome::Transferred { .. }
+        ));
+        assert!(root.take_run_failure().is_none());
+        assert!(root.take_handoff_receipt().is_some());
+    }
+
+    let claim = fixture.zone.record(sibling.record.id).claim();
+    let Claim::Queued { slot, .. } = claim else {
+        panic!("exit_group must wake the member sleeping on its signal channel, got {claim:?}");
+    };
+    assert_eq!(
+        fixture.zone.switch_in_full(slot).unwrap().record,
+        sibling.record.id
+    );
+    let saved = unsafe { fixture.runtime.record_binding(sibling.record) }
+        .unwrap()
+        .words;
+    let mut service = fixture.service();
+    service.waker_slot = slot;
+    let mut member = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            BornInZoneSource {
+                zone: fixture.zone,
+                slot,
+            },
+            sibling.task,
+            fixture.address,
+            &saved,
+            &mut service,
+        )
+        .unwrap();
+    // The woken sleep's decision ends it: it answers (the checkpoint then
+    // retires the member before user mode) instead of parking again.
+    let resumed = member.resume_pending_wait();
+    assert!(
+        matches!(resumed, Some(LifecycleOutcome::Returned { .. })),
+        "the closing group's sleeper must end its sleep, not park again"
+    );
+    assert!(member.take_run_failure().is_none());
+    drop(member);
+    assert!(!matches!(
+        fixture.zone.record(sibling.record.id).claim(),
+        Claim::Parked { .. }
+    ));
+}
+
+#[test]
+fn arm_exit_group_ends_member_sleeping_on_its_signal_channel() {
+    exit_group_ends_member_sleeping_on_its_signal_channel_for::<
+        carrick_el1_abi::Aarch64ParkedContext,
+        carrick_mmu_core::owner_mmu::Aarch64Mmu,
+    >(arm_words);
+}
+
+#[test]
+fn x86_exit_group_ends_member_sleeping_on_its_signal_channel() {
+    exit_group_ends_member_sleeping_on_its_signal_channel_for::<
+        ParkedContextWords,
+        carrick_mmu_core::x86::owner_mmu::X86Mmu,
+    >(words);
+}
+
 fn closing_before_fault_service_publication_withdraws_selection_for<
     C: ProcessContext + 'static,
     B: carrick_mmu_core::owner_mmu::OwnerForkMmu,
