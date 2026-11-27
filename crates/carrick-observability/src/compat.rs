@@ -469,6 +469,10 @@ impl CompatReporter {
             distinct_unknown_syscall_flags: unknown_syscall_flags.len() as u64,
             unknown_syscall_flag_invocations: unknown_flag_invocations,
             fast_path_blind_spots: fast_path_blind_spots.len() as u64,
+            // Folded in by the carrier from the ring's counters
+            // (`CompatReport::set_ring_refusals`).
+            distinct_ring_refused_syscalls: 0,
+            ring_refused_invocations: 0,
         };
 
         CompatReport {
@@ -485,6 +489,7 @@ impl CompatReporter {
             dropped_rewrite_events: rewrite_diagnostics.dropped_events,
             fast_path_blind_spots,
             execution_witness: None,
+            ring_refused_syscalls: Vec::new(),
         }
     }
 
@@ -524,6 +529,12 @@ pub struct CompatReport {
     pub dropped_rewrite_events: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fast_path_blind_spots: Vec<String>,
+    /// Syscalls the guest ring answered with a counted ENOSYS (unrouted, or
+    /// refused by the crossing table or the carrier venue) without entering
+    /// host dispatch, by canonical number and caller (#3152). Host-dispatch
+    /// gaps are `unhandled_syscalls` and `deferred_syscalls`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ring_refused_syscalls: Vec<RingRefusalCount>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
@@ -649,9 +660,29 @@ pub struct CompatSummary {
     pub unknown_syscall_flag_invocations: u64,
     #[serde(default)]
     pub fast_path_blind_spots: u64,
+    /// Distinct (canonical syscall, caller) rows the ring refused.
+    #[serde(default)]
+    pub distinct_ring_refused_syscalls: u64,
+    #[serde(default)]
+    pub ring_refused_invocations: u64,
 }
 
 impl CompatReport {
+    /// Fold the guest ring's counted refusals into the report: a run whose
+    /// only gap the ring answered must not read as a clean run.
+    pub fn set_ring_refusals(&mut self, mut rows: Vec<RingRefusalCount>) {
+        rows.retain(|row| row.count != 0);
+        rows.sort_by(|a, b| {
+            b.count
+                .cmp(&a.count)
+                .then_with(|| a.number.cmp(&b.number))
+                .then_with(|| a.caller.cmp(&b.caller))
+        });
+        self.summary.distinct_ring_refused_syscalls = rows.len() as u64;
+        self.summary.ring_refused_invocations = rows.iter().map(|row| row.count).sum();
+        self.ring_refused_syscalls = rows;
+    }
+
     pub fn render(&self, format: CompatReportFormat) -> Result<String, CompatReportRenderError> {
         match format {
             CompatReportFormat::Json => Ok(serde_json::to_string_pretty(self)?),
@@ -671,6 +702,10 @@ impl CompatReport {
         out.push_str(&format!(
             "  unhandled syscalls: {} distinct, {} invocations\n",
             s.distinct_unhandled_syscalls, s.unhandled_syscall_invocations,
+        ));
+        out.push_str(&format!(
+            "  ring-refused syscalls: {} distinct, {} invocations\n",
+            s.distinct_ring_refused_syscalls, s.ring_refused_invocations,
         ));
         out.push_str(&format!(
             "  deferred syscalls (recognised, not yet emulated): {} distinct, {} invocations\n",
@@ -709,6 +744,11 @@ impl CompatReport {
             ));
         }
         render_section(&mut out, "Unhandled syscalls", &self.unhandled_syscalls);
+        render_section(
+            &mut out,
+            "Ring-refused syscalls (counted ENOSYS in the guest ring)",
+            &self.ring_refused_syscalls,
+        );
         render_section(
             &mut out,
             "Deferred syscalls (recognised, not yet emulated, top by call count)",
@@ -879,6 +919,41 @@ pub struct SignalCount {
 pub enum CompatReportRenderError {
     #[error("failed to serialize compatibility report: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+/// One syscall the guest ring refused, for one caller class.
+#[derive(Debug, Clone, PartialEq, Eq, ::serde::Serialize, ::serde::Deserialize)]
+pub struct RingRefusalCount {
+    /// Canonical (aarch64-numbered) syscall, as the other sections use.
+    pub number: u64,
+    /// The guest ISA's own syscall number.
+    pub native: u64,
+    pub name: String,
+    pub caller: RingRefusalCaller,
+    pub count: u64,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ::serde::Serialize, ::serde::Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RingRefusalCaller {
+    Root,
+    NativeChild,
+}
+
+impl std::fmt::Display for RingRefusalCount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let caller = match self.caller {
+            RingRefusalCaller::Root => "root",
+            RingRefusalCaller::NativeChild => "native child",
+        };
+        write!(
+            f,
+            "{} ({}, native {}) x{} [{caller}]",
+            self.name, self.number, self.native, self.count
+        )
+    }
 }
 
 impl std::fmt::Display for SyscallCount {

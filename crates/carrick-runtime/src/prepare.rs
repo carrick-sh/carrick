@@ -1057,6 +1057,10 @@ fn run_prepared_kvm_pool_with_debug(
     let (forward_families, refusal_families) = stats.snapshot()?;
     let host_forwards = forward_families.values().sum();
     let mut report = reporter.snapshot();
+    report.set_ring_refusals(crate::el1_census::ring_refusals(
+        &physical.syscall_counters()?,
+        carrick_spec::syscall_census::CensusIsa::X86_64,
+    ));
     report.execution_witness = Some(crate::compat::ExecutionWitness {
         backend: "kvm-x86-cpl0".to_owned(),
         guest_entries,
