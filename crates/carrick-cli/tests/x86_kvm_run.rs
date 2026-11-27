@@ -3233,6 +3233,43 @@ fn compare_mounted_binary_with_native(
     assert!(run.stderr.is_empty());
 }
 
+/// Run a native oracle with stdin at /dev/null, bounded by `deadline`.
+fn output_with_null_stdin(
+    mut command: std::process::Command,
+    deadline: Duration,
+    what: &str,
+) -> std::process::Output {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn {what}: {error}"));
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let out = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let err = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let status = match child.wait_timeout(deadline).unwrap() {
+        Some(status) => status,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{what} did not exit within {deadline:?}");
+        }
+    };
+    std::process::Output {
+        status,
+        stdout: out.join().unwrap().unwrap(),
+        stderr: err.join().unwrap().unwrap(),
+    }
+}
+
 fn run_mounted_binary(elf: &std::path::Path, run_id: &str, json: bool) -> std::process::Output {
     run_mounted_binary_with_capture(elf, run_id, json).0
 }
@@ -3372,8 +3409,11 @@ fn run_mounted_binary_within(
         command.args(["--volume", volume]);
     }
     command.arg("x86-kvm-hello:latest");
+    // The guest's stdin is /dev/null whatever the harness's stdin is, so a
+    // fixture that observes fd 0 sees what its native oracle sees.
     command
         .process_group(0)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command
@@ -5137,10 +5177,15 @@ fn mounted_static_x86_root_select_host_descriptors_match_native() {
     let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/x86_root_select_host.c");
     x86_process_entry::compile_static_fixture(&source, &elf, &[]);
-    let native = Command::new(&elf)
-        .timeout(Duration::from_secs(10))
-        .output()
-        .expect("run native root-select-host oracle");
+    // The fixture selects on stdin, so the oracle's stdin is /dev/null, as
+    // the guest's is. `assert_cmd` gives the oracle a pipe it closes only
+    // once its wait begins: a select that ran before that saw an idle pipe,
+    // and the verdict followed host load.
+    let native = output_with_null_stdin(
+        std::process::Command::new(&elf),
+        Duration::from_secs(10),
+        "native root-select-host oracle",
+    );
     let native_stdout = String::from_utf8_lossy(&native.stdout);
     assert_eq!(
         native.status.code(),
