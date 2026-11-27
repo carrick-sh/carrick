@@ -11,8 +11,11 @@
  * image holds the MM's real editor across that copy's first settlement
  * crossing (INJECT_HOLD_EDITOR_AT_COPY_COW_SETTLE) and drops it through
  * the editor's own release only once the reading leader is parked. Polls
- * and futex waits have no bound and no deadline: the test's watchdog
- * bounds a run that hangs. No sleeps.
+ * have no bound. The worker's futex waits time out only to re-check their
+ * word (5 s on its go word, and a 1 ms park while it moves off the
+ * leader's CPU), so no ordering rests on a timeout: the hold, the release
+ * and the census are ordered by events. The test's watchdog bounds a run
+ * that hangs.
  *
  * Leader: make two private pages P and Q resident; fork a child that blocks
  * on a pipe (so both stay copy-on-write, two live processes); clone a
