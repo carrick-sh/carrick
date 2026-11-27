@@ -20,7 +20,7 @@ use carrick_x86::cpl0_entry::ShootdownTable;
 use carrick_x86::{GuestCpuidView, SegmentDescriptor, SegmentDpl, X86Reg, X86Seg, X86Vcpu};
 use carrick_x86_cpl0_host::carrier_cpu::{CarrierCpuBackend, FixtureWatchdog};
 use carrick_x86_cpl0_host::cpl0_boot::{
-    META_GPA, ProductionMemberCpu, SHOOTDOWN_OFFSET, fail, run_production_member,
+    META_GPA, ProductionMemberCpu, SHOOTDOWN_OFFSET, StoppedCpu, fail, run_production_member,
 };
 use carrick_x86_cpl0_host::guest_ram::GuestRam;
 
@@ -115,16 +115,18 @@ impl SoftCpuBackend {
 }
 
 impl ProductionMemberCpu for SoftCpuBackend {
-    fn stopped_cpl(&self) -> Result<u8, TrapError> {
-        Ok(self.runner.machine().context().cpl)
-    }
-
-    fn stopped_at_interruptible_user(&self) -> Result<bool, TrapError> {
+    fn stopped(&self) -> Result<StoppedCpu, TrapError> {
+        // The soft CPU delivers an event in one step between blocks, so a
+        // stopped soft CPU never has one in flight.
         let ctx = self.runner.machine().context();
-        Ok(ctx.cpl == 3
-            && ctx.cs.selector & 3 == 3
-            && ctx.rflags & (1 << 9) != 0
-            && !ctx.interrupt_shadow)
+        Ok(StoppedCpu::classify(
+            ctx.cpl,
+            ctx.cs.selector,
+            ctx.rip,
+            ctx.rflags,
+            ctx.interrupt_shadow,
+            None,
+        ))
     }
 
     fn queue_reentry_kick(&mut self) -> Result<(), TrapError> {
