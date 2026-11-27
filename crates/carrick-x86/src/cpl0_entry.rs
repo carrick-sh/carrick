@@ -437,6 +437,11 @@ pub struct CpuBinding {
     /// never fatal: the sender resends each once at its next delivery point
     /// (its next send, an idle pass, a return to user, an interrupt).
     pub owed_resched: [AtomicU64; carrick_sched_core::ZONE_SLOT_WORDS],
+    /// The bound clock's reading at the start of the first ICR operation
+    /// of this CPU that found its ICR busy since the APIC last accepted one
+    /// of its commands; zero for none (#3083). An ICR operation that fails
+    /// having started more than the bound past it is a broken local APIC.
+    pub icr_failing_since: AtomicU64,
 }
 const _: () = {
     assert!(core::mem::offset_of!(CpuBinding, kernel_stack) == 0);
