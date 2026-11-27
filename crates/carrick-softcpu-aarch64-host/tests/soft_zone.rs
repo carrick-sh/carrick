@@ -814,7 +814,9 @@ const NR_MADVISE: u16 = 233;
 /// 4-page `/data` `MAP_PRIVATE` read-write, where page `i` begins with the
 /// word `1 << i`, then:
 /// - dirties page 0 and `madvise(MADV_DONTNEED)`s it: the load sees 1 again;
-/// - `mprotect`s page 1 to `PROT_NONE` and back to `PROT_READ`: it loads 2;
+/// - `mprotect`s page 1 to `PROT_NONE` and back to `PROT_READ | PROT_WRITE`:
+///   it loads 2, and the row is one mapping again (a range spanning split
+///   mappings is EFAULT to `mremap`, as on Linux);
 /// - grows the 3 pages to 4 in place with `mremap` (no `MREMAP_MAYMOVE`):
 ///   page 2 of the grown row still loads 4;
 /// - maps anonymous memory `MAP_FIXED` over page 1: it loads 0;
@@ -866,8 +868,9 @@ fn soft_root_private_file_row_survives_its_edits_on_the_host() {
     code.push(mov(23, 0));
     code.push(ldr(9, 19, 0));
     code.push(add(23, 23, 9));
-    // mprotect(x19 + page, page, PROT_NONE), then PROT_READ; load page 1.
-    for prot in [0, 1] {
+    // mprotect(x19 + page, page, PROT_NONE), then PROT_READ | PROT_WRITE;
+    // load page 1.
+    for prot in [0, 3] {
         code.push(add(0, 19, 10));
         code.push(mov(1, 10));
         code.push(movz(2, prot, 0));

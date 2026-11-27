@@ -2884,10 +2884,22 @@ fn soft_reservation_backing_retains_the_carrier_region_past_its_engine() {
     let backing = provider
         .address_space_backing()
         .expect("the live carrier has a publication backing");
+    let generation = backing
+        .region()
+        .expect("the live carrier's region")
+        .reservations
+        .storage_generation();
     drop(provider);
     drop(run);
     let region = backing
         .region()
         .expect("the backing still names its retained carrier region");
     assert_eq!(region.carrier, carrier);
+    // Read through the retained mapping itself: the carrier's reservation
+    // table is still mapped, with the storage generation it had.
+    assert_eq!(
+        region.reservations.storage_generation(),
+        generation,
+        "the retained reservation table is readable past the engine"
+    );
 }
