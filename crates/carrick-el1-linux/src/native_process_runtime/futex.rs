@@ -220,11 +220,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Fu
             return Some(returned(carrick_syscall_abi::LINUX_EINTR.guest_retval()));
         }
         zone.set_deadline(record, wait.deadline.map_or(0, CounterTick::raw));
-        let receipt = carrick_core::entry::publish_handoff_park(
-            start,
-            &guard,
-            carrick_core_abi::EntryRecordGeneration(sequence),
-        );
+        let receipt = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = carrick_core::entry::publish_handoff_park(
+                start,
+                &guard,
+                carrick_core_abi::EntryRecordGeneration(sequence),
+                &passes,
+            );
+            self.entry.service.send_owed_passes(passes);
+            owed
+        };
         drop(guard);
         let Some(receipt) = receipt else {
             return Some(
