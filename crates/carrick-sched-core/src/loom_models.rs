@@ -872,3 +872,61 @@ fn migration_and_idle_scan_never_lose_the_queued_thread() {
         );
     });
 }
+
+/// #3083: an idle scan that finds a victim's run-queue lock busy must not
+/// read the victim's queue as empty. `steal_from` takes the victim's lock
+/// with a bounded spin and returns `None` when the spin runs out, so the
+/// scan reports nothing to steal and its `enter_idle(_, true)` sleeps while
+/// the victim's thread stays queued. The holder here only takes and drops
+/// the lock (any short critical section on the victim: a waker's push, a
+/// peer thief's steal), so it owes the thief nothing. Contention is "not
+/// now": the scan must stay owed, never end empty.
+#[test]
+fn busy_victim_lock_never_lets_an_idle_scan_sleep_past_its_thread() {
+    model(|| {
+        let zone = zone();
+        let thief = SlotId::new(1);
+        for (slot, cpu) in [(SLOT, 0u32), (thief, 1u32)] {
+            zone.drive(slot, u64::from(slot.raw()) + 1);
+            zone.publish_slot(slot, 7, Some(cpu), 0);
+            let here = ExecutionSlot::zone(slot);
+            zone.occupancy.vacate_any(here);
+            assert!(zone.occupancy.replace(here, 0, 7));
+            zone.enter_guest(slot);
+        }
+        let record = zone
+            .alloc_record(ThreadIdentity {
+                tid: 2,
+                serial: 20,
+                mm: 7,
+                file_table: 1,
+                generation: 1,
+                lifecycle_page: 0,
+                control_slot: 0,
+                affinity_source: crate::AffinitySource::UNBOUND,
+                affinity: 0,
+            })
+            .unwrap();
+        assert!(zone.requeue_preempted(SLOT, record).is_queued());
+        let holder_zone = zone.clone();
+        let holder = thread::spawn(move || {
+            drop(holder_zone.slot_lock(SLOT, &SpinForever));
+        });
+        let scan_zone = zone.clone();
+        let scanner = thread::spawn(move || {
+            if scan_zone.take_idle_work(thief).is_some() {
+                return false;
+            }
+            scan_zone.enter_idle(thief, true)
+        });
+        holder.join().unwrap();
+        let sleeping = scanner.join().unwrap();
+        // A scan that gave up on the busy lock is owed another pass by its
+        // release: at least the reschedule its pre-WFI recheck reads.
+        assert!(
+            !sleeping || zone.take_resched(thief),
+            "the idle slot sleeps after a busy victim lock, owed no pass, while {:?} waits on slot 0",
+            zone.record(record).claim()
+        );
+    });
+}
