@@ -24,6 +24,29 @@ pub enum WindowKind {
     Shared,
 }
 
+const PAGE_BYTES: usize = 4096;
+
+/// The host alignment of a window's mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostPlacement {
+    /// Any 4 KiB-aligned host address.
+    Page,
+    /// A 2 MiB-aligned host address, advised for transparent huge pages.
+    LargePage,
+}
+
+impl HostPlacement {
+    /// The bytes of one large host page (x86 2 MiB).
+    pub const LARGE_PAGE_BYTES: u64 = 2 << 20;
+
+    fn align(self) -> usize {
+        match self {
+            Self::Page => PAGE_BYTES,
+            Self::LargePage => Self::LARGE_PAGE_BYTES as usize,
+        }
+    }
+}
+
 /// A `Send` descriptor of one host-backed guest window, used to hand a
 /// `clone(CLONE_THREAD)` sibling a view of the SAME backing across host threads.
 #[derive(Debug, Clone, Copy)]
@@ -91,6 +114,21 @@ impl GuestRam {
     }
 
     pub fn add_window(&mut self, base: u64, len: usize, kind: WindowKind) -> Result<(), OsError> {
+        self.add_window_placed(base, len, kind, HostPlacement::Page)
+    }
+
+    /// Add a window whose host mapping has the given placement. A
+    /// [`HostPlacement::LargePage`] window starts on a 2 MiB host boundary
+    /// and is advised for transparent huge pages, so a hypervisor that
+    /// backs a 2 MiB-aligned guest-physical range with it can map the range
+    /// with one large stage-2 entry instead of one entry per 4 KiB page.
+    pub fn add_window_placed(
+        &mut self,
+        base: u64,
+        len: usize,
+        kind: WindowKind,
+        placement: HostPlacement,
+    ) -> Result<(), OsError> {
         if len == 0 {
             return Ok(());
         }
@@ -111,21 +149,49 @@ impl GuestRam {
             WindowKind::Private => libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
             WindowKind::Shared => libc::MAP_SHARED | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
         };
-        let host = unsafe {
+        let align = placement.align();
+        // A large-page window over-maps by its alignment and trims both
+        // ends, so the kept range starts on the boundary on every host.
+        let span = len
+            .checked_add(align - PAGE_BYTES)
+            .ok_or_else(|| OsError::new(format!("guest_ram: window 0x{base:x}+{len} overflows")))?;
+        let mapped = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                len,
+                span,
                 libc::PROT_READ | libc::PROT_WRITE,
                 mmap_flags,
                 -1,
                 0,
             )
         };
-        if host == libc::MAP_FAILED {
+        if mapped == libc::MAP_FAILED {
             return Err(OsError::new(format!(
                 "guest_ram: guest RAM mmap failed for 0x{base:x}+{len}"
             )));
         }
+        let start = mapped as usize;
+        let host = start.next_multiple_of(align);
+        let head = host - start;
+        let tail = span - head - len;
+        // SAFETY: both trims name parts of the mapping made just above that
+        // lie outside the kept `host..host + len`.
+        unsafe {
+            if head != 0 {
+                libc::munmap(mapped, head);
+            }
+            if tail != 0 {
+                libc::munmap((host + len) as *mut libc::c_void, tail);
+            }
+        }
+        #[cfg(target_os = "linux")]
+        if placement == HostPlacement::LargePage {
+            // Advice only: a host without transparent huge pages keeps
+            // 4 KiB pages, which is correct and only slower.
+            // SAFETY: the kept range is the live mapping this window owns.
+            unsafe { libc::madvise(host as *mut libc::c_void, len, libc::MADV_HUGEPAGE) };
+        }
+        let host = host as *mut libc::c_void;
         self.windows
             .write()
             .unwrap_or_else(|e| e.into_inner())

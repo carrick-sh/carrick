@@ -3351,13 +3351,10 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             // normal backing-fault signal; EOF is not a carrier invariant.
             return Ok(Ok(BackingPreparation::FilePastEnd));
         }
-        let gpa = self.anonymous_next_gpa;
         let len = publication_len.next_multiple_of(4096);
-        self.anonymous_next_gpa = FrameGpa::new(
-            gpa.raw()
-                .checked_add(len)
-                .ok_or_else(|| fail("owner grant GPA exhausted"))?,
-        );
+        let mut extent = BackingExtent::owner_window(&mut self.anonymous_next_gpa, len as usize)
+            .map_err(|error| fail(error.to_string()))?;
+        let gpa = extent.base;
         let (mut inventory, grants) = InitialInventory::stage(
             Arc::clone(&self.initial_rollback_fault),
             Arc::clone(&self.frame_inventory),
@@ -3371,8 +3368,6 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .first()
             .ok_or_else(|| fail("owner grant backing identity"))?
             .1;
-        let mut extent =
-            BackingExtent::private(gpa, len as usize).map_err(|error| fail(error.to_string()))?;
         if let Some(bytes) = bytes {
             extent
                 .initialize(0, &bytes)
