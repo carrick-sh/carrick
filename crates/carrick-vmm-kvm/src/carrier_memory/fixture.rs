@@ -497,7 +497,12 @@ fn publish_fixture(
             txn.op, receipt.outcome
         ))
     })?;
-    memory.publish(&txn, publication, &mut inventory)?;
+    memory.publish(
+        &txn,
+        publication,
+        SettlementCustody::EditorHeld,
+        &mut inventory,
+    )?;
     *next += u64::from(publication.tables_linked) * PAGE;
     Ok(())
 }

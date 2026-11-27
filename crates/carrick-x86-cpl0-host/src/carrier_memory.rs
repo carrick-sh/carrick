@@ -29,6 +29,27 @@ pub struct CarrierMemoryRegion {
     pub userspace_addr: u64,
 }
 
+/// Who may have edited a guest publication's leaves between its guest edit
+/// and the host's settlement ([`CarrierMemory::publish`]).
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub enum SettlementCustody {
+    /// The MM's editor was held from the guest edit through this settlement
+    /// (the initial image, a closed exec successor): the leaves are exactly
+    /// the edit's.
+    EditorHeld,
+    /// The editor was released before this settlement (an owner grant's
+    /// first touch, #2766; a COW replacement the guest published before it
+    /// crossed, #2875): a sibling thread's `mprotect` may already have
+    /// re-protected the leaves.
+    EditorReleased,
+}
+
 pub trait CarrierMemoryIo: Send + Sync + 'static {
     fn carrier_slot_limit(&self) -> Result<u32, carrick_hal::OsError>;
     /// Register a user memory region in the carrier.
@@ -1771,13 +1792,16 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
     }
 
     /// Consume a guest-owned publication after the exact-MM edit and local
-    /// drain. The caller keeps the editor and entry exclusion until this
-    /// record, N1 inventory and subsequent cross-CPU drain have settled.
+    /// drain. `custody` says whether the MM's editor was held from that edit
+    /// through this settlement, and so who may have edited the leaves in
+    /// between. The caller keeps entry exclusion until this record, N1
+    /// inventory and subsequent cross-CPU drain have settled.
     /// This method never plans, applies or undoes a guest descriptor.
     pub fn publish<I: InventoryTransaction>(
         &mut self,
         txn: &DescriptorTxn<'_>,
         publication: GuestMmuPublication,
+        custody: SettlementCustody,
         inventory: &mut I,
     ) -> Result<GuestMmuPublication, MemoryError> {
         self.admit()?;
@@ -1796,7 +1820,7 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
             self.quarantined = true;
             return Err(error("guest MMU publication transaction identity mismatch"));
         }
-        if !self.guest_postcondition(txn) {
+        if !self.guest_postcondition(txn, custody) {
             self.quarantined = true;
             return Err(error("guest MMU publication live descriptor mismatch"));
         }
@@ -1851,7 +1875,7 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
 
     /// Read the terminal graph after the guest edit. Only bounded terminal
     /// leaves in the edited span are visited; unrelated branches cost nothing.
-    fn guest_postcondition(&self, txn: &DescriptorTxn<'_>) -> bool {
+    fn guest_postcondition(&self, txn: &DescriptorTxn<'_>, custody: SettlementCustody) -> bool {
         let span = txn.op.span();
         let Some(end) = span.end() else {
             return false;
@@ -1922,18 +1946,29 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
                     } else {
                         present != prepared
                     };
-                    // A Prepare owns the leaf's physical custody: its frame
-                    // (checked above), PRIVATE, residency and the user bit.
-                    // Its permissions are owned by the mapping's latest
-                    // protection, and the ring has released the editor
-                    // before this settlement, so a sibling's `mprotect` may
-                    // already have rewritten WRITE, NX and the MAY_WRITE /
-                    // MAY_EXEC ceiling of these very leaves (#2766). That
-                    // edit is legal and settles through its own Protect
-                    // postcondition; judging it here against the Prepare's
-                    // requested permissions read a later owner's state as a
-                    // broken guest and quarantined the carrier.
-                    state && entry & PRIVATE != 0 && (entry & USER != 0) == permissions.user
+                    // A Prepare always owns the leaf's physical custody: its
+                    // frame (checked above), PRIVATE, residency and the user
+                    // bit.
+                    let owned =
+                        state && entry & PRIVATE != 0 && (entry & USER != 0) == permissions.user;
+                    owned
+                        && match custody {
+                            // Nobody else could edit these leaves: they carry
+                            // exactly the Prepare's permissions and ceiling.
+                            SettlementCustody::EditorHeld => {
+                                (entry & MAY_WRITE != 0) == permissions.writable
+                                    && (entry & MAY_EXEC != 0) == permissions.executable
+                                    && Self::matches_permissions(entry, permissions)
+                            }
+                            // The ring released the editor before this
+                            // settlement, so a sibling's legal `mprotect` may
+                            // already have rewritten WRITE, NX and the
+                            // MAY_WRITE / MAY_EXEC ceiling (#2766). Those
+                            // belong to the mapping's latest protection, not
+                            // to this Prepare; the leaf must still hold a
+                            // protection inside its own ceiling.
+                            SettlementCustody::EditorReleased => Self::within_ceiling(entry),
+                        }
                 }
                 DescriptorOp::Publish { .. } => entry & PRESENT != 0 && entry & PREPARED == 0,
                 // A COW-armed leaf records write as intent (#3121).
@@ -2011,6 +2046,11 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
         true
     }
 
+    /// A hardware write needs the MAY_WRITE ceiling, and execution (NX
+    /// clear) the MAY_EXEC one.
+    fn within_ceiling(entry: u64) -> bool {
+        (entry & WRITE == 0 || entry & MAY_WRITE != 0) && (entry & NX != 0 || entry & MAY_EXEC != 0)
+    }
     fn matches_permissions(entry: u64, permissions: Permissions) -> bool {
         (entry & USER != 0) == permissions.user
             && (entry & WRITE != 0) == permissions.writable
