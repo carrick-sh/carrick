@@ -936,3 +936,64 @@ fn soft_root_private_file_row_survives_its_edits_on_the_host() {
         "every edit returned 0 and every load saw the file's (or the new anonymous) bytes"
     );
 }
+
+/// DISCOVERY ONLY (never lands): on the production EL1 image, a 3-page
+/// `MAP_PRIVATE` read-write row of the 4-page `/data` (page `i` begins with
+/// `1 << i`) grows to 4 pages in place with `mremap`. On Linux the grown
+/// page is the file's page 3, so its first word is 8. Exit = that word.
+#[test]
+#[ignore = "requires CARRICK_A64_ELF pointing to the production EL1 ELF (native arm64 host)"]
+fn soft_root_disc_private_file_row_growth_reads_the_file_tail() {
+    let _carrier_lock = lock_soft_carrier_test();
+    let rootfs = tempfile::tempdir().expect("create the /data rootfs");
+    let mut file = vec![0u8; 4 * 0x1000];
+    for index in 0..4usize {
+        file[index * 0x1000..index * 0x1000 + 8].copy_from_slice(&(1u64 << index).to_le_bytes());
+    }
+    std::fs::write(rootfs.path().join("data"), &file).expect("write /data");
+    let mut code = Vec::new();
+    code.push(movz(0, 100, 0));
+    code.push(neg(0, 0));
+    code.extend(mov32(1, DATA_VA + PATH_OFFSET));
+    code.push(movz(2, 0, 0));
+    code.push(movz(3, 0, 0));
+    code.push(movz(8, NR_OPENAT, 0));
+    code.push(A64_SVC_0);
+    code.push(mov(20, 0));
+    code.push(movz(0, 0, 0));
+    code.extend(mov32(1, 0x3000));
+    code.push(movz(2, 3, 0));
+    code.push(movz(3, 2, 0));
+    code.push(mov(4, 20));
+    code.push(movz(5, 0, 0));
+    code.push(movz(8, NR_MMAP, 0));
+    code.push(A64_SVC_0);
+    code.push(mov(19, 0));
+    // Touch page 2 first, so the row is resident before it grows.
+    code.push(ldr(9, 19, 0x2000));
+    code.push(mov(0, 19));
+    code.extend(mov32(1, 0x3000));
+    code.extend(mov32(2, 0x4000));
+    code.push(movz(3, 0, 0));
+    code.push(movz(8, NR_MREMAP, 0));
+    code.push(A64_SVC_0);
+    code.push(mov(22, 0));
+    code.push(ldr(9, 22, 0x3000));
+    code.push(mov(0, 9));
+    exit_with_x0(&mut code);
+    let (run, _) = run_in(
+        &build_elf(&code, &[(PATH_OFFSET, b"/data\0")]),
+        "/private-file-growth",
+        Some(rootfs.path()),
+        None,
+    );
+    println!(
+        "DISC private file growth: exit={} fault={:?} census={:?} counted_enosys={:?} vmas={:?}",
+        run.exit_code, run.terminating_fault, run.reply_census, run.counted_enosys, run.vmas
+    );
+    assert_eq!(run.terminating_fault, None, "the grown page is served");
+    assert_eq!(
+        run.exit_code, 8,
+        "the grown page is the file's page 3, as on Linux"
+    );
+}
