@@ -766,21 +766,31 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                             .is_some()
                 })
             };
-            let claimed = self.zone.claim_for_host(
-                record,
-                None,
-                if terminal {
-                    Handback::Cancelled
-                } else {
-                    Handback::Signal
-                },
-                &carrick_sched_core::ShortLockSpin,
-                &|owned| crate::sched::object_wait::deliver_completion(self.zone, slot, owned),
-            );
+            let claimed = {
+                let passes = carrick_sched_core::OwedPasses::new();
+                let owed = self.zone.claim_for_host(
+                    record,
+                    None,
+                    if terminal {
+                        Handback::Cancelled
+                    } else {
+                        Handback::Signal
+                    },
+                    &carrick_sched_core::ShortLockSpin,
+                    &|owned| crate::sched::object_wait::deliver_completion(self.zone, slot, owned),
+                    &passes,
+                );
+                service.send_owed_passes(passes);
+                owed
+            };
             if matches!(claimed, carrick_sched_core::HostClaim::Claimed)
                 && member.is_native_owned()
-                && let Some(carrick_sched_core::NativePlacement::Placed(placement)) =
-                    self.zone.place_native_handback(record)
+                && let Some(carrick_sched_core::NativePlacement::Placed(placement)) = {
+                    let passes = carrick_sched_core::OwedPasses::new();
+                    let owed = self.zone.place_native_handback(record, &passes);
+                    service.send_owed_passes(passes);
+                    owed
+                }
                 && placement.resched
             {
                 let mut effects = WakeEffects::default();
@@ -891,9 +901,12 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 // chain is no venue for it: x86 CPL0 drains none (#2620).
                 let mut placed = WakeEffects::default();
                 let (_, effects) = owned.deliver_handbacks(&mut |handed| {
-                    if let Some(carrick_sched_core::NativePlacement::Placed(placement)) =
-                        self.zone.place_native_handback(handed)
-                        && placement.resched
+                    if let Some(carrick_sched_core::NativePlacement::Placed(placement)) = {
+                        let passes = carrick_sched_core::OwedPasses::new();
+                        let owed = self.zone.place_native_handback(handed, &passes);
+                        service.send_owed_passes(passes);
+                        owed
+                    } && placement.resched
                     {
                         placed.request_reschedule(placement.slot);
                     }
@@ -3439,10 +3452,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         // placement ensures an inline-completed continuation runs before peers.
         let was_free =
             self.source.zone.record(self.record.id).claim() == carrick_sched_core::Claim::Free;
-        let requeue = self
-            .source
-            .zone
-            .requeue_checkpoint_head(self.source.slot, self.record.id);
+        let requeue = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed =
+                self.source
+                    .zone
+                    .requeue_checkpoint_head(self.source.slot, self.record.id, &passes);
+            self.service.send_owed_passes(passes);
+            owed
+        };
         if !requeue.is_queued() {
             return Err(NativeFailure::ServiceQuarantined(
                 NativeServiceQuarantine::RequeueRefused,
@@ -4329,12 +4347,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 .publish_owner_continuation(OwnerEntry::Syscall);
         }
         if let Some(LifecycleOutcome::HostCustody) = self.resume_pending_lifecycle() {
-            self.handoff = carrick_core::entry::yield_current_to_host(
-                self.binding,
-                self.source,
-                self.record.id,
-                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
-            )
+            self.handoff = {
+                let passes = carrick_sched_core::OwedPasses::new();
+                let owed = carrick_core::entry::yield_current_to_host(
+                    self.binding,
+                    self.source,
+                    self.record.id,
+                    &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    },
+                    &passes,
+                );
+                self.service.send_owed_passes(passes);
+                owed
+            }
             .ok();
             if self.handoff.is_some() {
                 self.current.linux.mark_pending_host_work();
@@ -4622,11 +4648,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             zone.record(record)
                 .publish_owner_continuation(OwnerEntry::Syscall);
         }
-        let receipt = carrick_core::entry::publish_handoff_park(
-            start,
-            &guard,
-            carrick_el1_abi::EntryRecordGeneration(sequence),
-        )
+        let receipt = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = carrick_core::entry::publish_handoff_park(
+                start,
+                &guard,
+                carrick_el1_abi::EntryRecordGeneration(sequence),
+                &passes,
+            );
+            self.service.send_owed_passes(passes);
+            owed
+        }
         .ok_or(NativeProcessError::ServiceQuarantined(
             NativeServiceQuarantine::WaitHandoffReceipt,
         ))?;

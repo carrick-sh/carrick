@@ -1230,12 +1230,20 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     fn owing<R>(&mut self, op: impl FnOnce(&OwedPasses) -> R) -> R {
         let passes = OwedPasses::new();
         let result = op(&passes);
-        if !passes.is_empty() {
-            let mut effects = WakeEffects::default();
-            passes.fold_into(&mut effects);
-            self.send_sgis(&effects);
-        }
+        self.send_owed_passes(passes);
         result
+    }
+
+    /// Send the idle-scan passes `passes` owes (#3083) through this vCPU's
+    /// SGI route.
+    pub fn send_owed_passes(&mut self, passes: OwedPasses) {
+        if passes.is_empty() {
+            passes.fold_into(&mut WakeEffects::default());
+            return;
+        }
+        let mut effects = WakeEffects::default();
+        passes.fold_into(&mut effects);
+        self.send_sgis(&effects);
     }
 }
 
