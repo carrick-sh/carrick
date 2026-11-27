@@ -1005,6 +1005,50 @@ impl DescriptorTxn<'_> {
         Ok(())
     }
 }
+/// The bits an x86 page walker (the CPU, or the soft walker) stores into a
+/// live entry by itself. It only ever sets them, and only in a present
+/// entry; it never clears them or touches any other bit.
+const WALKER_SET: u64 = ACCESSED | DIRTY;
+
+/// The walker bits `seen` adds to `expected`, when that is the whole
+/// difference: the same frame and permissions, with `ACCESSED` or `DIRTY`
+/// newly set. Any other change is not the walker's (#3133).
+fn walker_set_bits(expected: u64, seen: u64) -> Option<u64> {
+    let added = seen & !expected;
+    (expected & PRESENT != 0
+        && added != 0
+        && added & !WALKER_SET == 0
+        && seen & expected == expected)
+        .then_some(added)
+}
+
+/// Replace `expected` by `new` at `pa`. The exact-MM editor excludes every
+/// other software edit, but not the page walker: a sibling's load or store
+/// on another CPU may set `ACCESSED` or `DIRTY` between the plan's snapshot
+/// and this store. That is not contention. Carry the walker's bits forward
+/// into a present `new` and store again. Each retry absorbs at least one bit
+/// of the two the walker can only set, so this stores at most three times.
+/// Returns the words actually replaced and stored, or `None` when the entry
+/// changed in any other way.
+fn replace_live_entry<W: LiveDescriptorWords + ?Sized>(
+    words: &W,
+    pa: u64,
+    expected: u64,
+    new: u64,
+) -> Result<Option<(u64, u64)>, DescriptorRefusal> {
+    let (mut before, mut after) = (expected, new);
+    while !words.compare_exchange(pa, before, after)? {
+        let Some(added) = walker_set_bits(before, words.load(pa)?) else {
+            return Ok(None);
+        };
+        before |= added;
+        if after & PRESENT != 0 {
+            after |= added;
+        }
+    }
+    Ok(Some((before, after)))
+}
+
 fn undo<W: LiveDescriptorWords + ?Sized>(
     words: &W,
     entries: &[JournalEntry],
@@ -1012,7 +1056,10 @@ fn undo<W: LiveDescriptorWords + ?Sized>(
 ) -> bool {
     let mut restored = true;
     for entry in entries.iter().rev() {
-        restored &= words.compare_exchange(entry.pa, entry.after, entry.before) == Ok(true);
+        restored &= matches!(
+            replace_live_entry(words, entry.pa, entry.after, entry.before),
+            Ok(Some(_))
+        );
     }
     words.publish_barrier();
     words.invalidate_range(span.va, span.len);
@@ -1048,11 +1095,20 @@ pub fn apply_descriptor_plan<W: LiveDescriptorWords + ?Sized, J: DescriptorJourn
         let mut error = None;
         for entry in &plan.entries {
             words.publish_barrier();
-            match words.compare_exchange(entry.pa, entry.before, entry.after) {
-                Ok(true) => {
-                    if !journal.push(*entry) {
-                        let restored =
-                            words.compare_exchange(entry.pa, entry.after, entry.before) == Ok(true);
+            match replace_live_entry(words, entry.pa, entry.before, entry.after) {
+                Ok(Some((before, after))) => {
+                    // Journal the words this store replaced and wrote, so an
+                    // undo restores the walker's bits it absorbed.
+                    let entry = JournalEntry {
+                        before,
+                        after,
+                        ..*entry
+                    };
+                    if !journal.push(entry) {
+                        let restored = matches!(
+                            replace_live_entry(words, entry.pa, entry.after, entry.before),
+                            Ok(Some(_))
+                        );
                         error = Some((DescriptorRefusal::JournalCapacity, restored));
                         break;
                     }

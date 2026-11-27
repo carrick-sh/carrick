@@ -2293,3 +2293,26 @@ fn a_foreign_change_stays_contended_and_the_undo_absorbs_the_walker() {
     );
     assert_eq!(leaf_at(&words, span.va + PAGE), second | MAY_EXEC);
 }
+
+/// Only a present entry gaining `ACCESSED` or `DIRTY`, and nothing else,
+/// is the walker's.
+#[test]
+fn walker_bits_are_only_added_accessed_or_dirty_on_a_present_entry() {
+    let leaf = 0x800000 | PRESENT | WRITE | USER | PRIVATE;
+    assert_eq!(walker_set_bits(leaf, leaf | DIRTY), Some(DIRTY));
+    assert_eq!(
+        walker_set_bits(leaf | ACCESSED, leaf | WALKER_SET),
+        Some(DIRTY)
+    );
+    assert_eq!(walker_set_bits(leaf, leaf), None);
+    assert_eq!(walker_set_bits(leaf | ACCESSED, leaf), None);
+    assert_eq!(walker_set_bits(leaf, leaf | NX), None);
+    assert_eq!(
+        walker_set_bits(leaf, (leaf ^ 0x800000 | 0x900000) | DIRTY),
+        None
+    );
+    assert_eq!(
+        walker_set_bits(leaf & !PRESENT, leaf & !PRESENT | ACCESSED),
+        None
+    );
+}
