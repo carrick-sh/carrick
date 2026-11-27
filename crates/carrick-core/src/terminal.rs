@@ -394,8 +394,9 @@ pub fn park_process_exit<C: carrick_core_abi::EntryContext>(
     start: crate::entry::HandoffStart<'_, C>,
     guard: &carrick_sched_core::BucketGuard<'_, C>,
     sequence: carrick_core_abi::EntryRecordGeneration,
+    passes: &carrick_sched_core::OwedPasses,
 ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
-    crate::entry::publish_terminal_park(start, guard, sequence)
+    crate::entry::publish_terminal_park(start, guard, sequence, passes)
 }
 
 /// Raw task membership supplied by the graph that owns its registry. Core
@@ -985,6 +986,7 @@ impl TerminalCustody<Process, Settled> {
         binding: ExecutionBinding,
         source: carrick_core_abi::BornInZoneSource<'_, C>,
         record: carrick_sched_core::RecordId,
+        passes: &carrick_sched_core::OwedPasses,
     ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
         if self.identity.disposition != ProcessCloseDisposition::Exit
             || binding.mm != EntryMmKey::from_raw(self.identity.address.mm.raw().get())
@@ -997,7 +999,7 @@ impl TerminalCustody<Process, Settled> {
                 .exit_custody()
                 .commit_zone_terminal(crate::lifecycle::NativeExitCompletion::Member);
             true
-        })
+        }, passes)
     }
 
     pub fn identity(self) -> ProcessTerminalIdentity {
@@ -1126,10 +1128,11 @@ pub fn settle_losing_zone_current<C: carrick_core_abi::EntryContext>(
     binding: ExecutionBinding,
     source: carrick_core_abi::BornInZoneSource<'_, C>,
     record: carrick_sched_core::RecordId,
+    passes: &carrick_sched_core::OwedPasses,
 ) -> Option<LosingMemberSettlement<C>> {
     settle_losing_zone_current_before_release(member, binding, source, record, || {
         Ok::<(), core::convert::Infallible>(())
-    })
+    }, passes)
     .ok()
     .flatten()
 }
@@ -1143,6 +1146,7 @@ pub fn settle_losing_zone_current_before_release<C, E>(
     source: carrick_core_abi::BornInZoneSource<'_, C>,
     record: carrick_sched_core::RecordId,
     before_release: impl FnOnce() -> Result<(), E>,
+    passes: &carrick_sched_core::OwedPasses,
 ) -> Result<Option<LosingMemberSettlement<C>>, E>
 where
     C: carrick_core_abi::EntryContext,
@@ -1159,7 +1163,7 @@ where
         || member.host_retirement().is_some()
     {
         before_release()?;
-        Ok(crate::entry::retire_current(binding, source, record)
+        Ok(crate::entry::retire_current(binding, source, record, passes)
             .map(LosingMemberSettlement::Released))
     } else {
         Ok(Some(LosingMemberSettlement::HostCustody))
@@ -1420,6 +1424,7 @@ impl ZoneRetirement<'_, '_> {
         binding: ExecutionBinding,
         source: carrick_core_abi::BornInZoneSource<'_, C>,
         record: carrick_sched_core::RecordId,
+        passes: &carrick_sched_core::OwedPasses,
     ) -> Result<carrick_core_abi::EntryHandoffReceipt<C>, ZoneRetirementRefusal> {
         if binding != self.identity.binding() {
             return Err(ZoneRetirementRefusal::NotReleased);
@@ -1430,7 +1435,7 @@ impl ZoneRetirement<'_, '_> {
         {
             return Err(ZoneRetirementRefusal::HostCustody);
         }
-        crate::entry::retire_current_with(binding, source, record, self)
+        crate::entry::retire_current_with(binding, source, record, self, passes)
             .ok_or(ZoneRetirementRefusal::NotReleased)
     }
 }
@@ -1492,10 +1497,11 @@ impl TerminalCustody<Thread, Terminal> {
         binding: ExecutionBinding,
         source: carrick_core_abi::BornInZoneSource<'_, C>,
         record: carrick_sched_core::RecordId,
+        passes: &carrick_sched_core::OwedPasses,
     ) -> Result<carrick_core_abi::EntryHandoffReceipt<C>, ZoneRetirementRefusal> {
         self.zone_retirement(member, membership, None)
             .ok_or(ZoneRetirementRefusal::NotReleased)?
-            .retire_current(binding, source, record)
+            .retire_current(binding, source, record, passes)
     }
 
     /// A losing process-close caller has irrevocably selected terminal exit.
