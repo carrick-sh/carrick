@@ -1070,6 +1070,14 @@ where
 
     stamp_identity_page(&mut engine, &dispatcher, &root_ctx)
         .map_err(|e| format!("stamp identity page: {e}"))?;
+    // The engine names the root's own MM, as an HVF initial runner binds it
+    // (`admit_bound_mm`), before its first load: the MM ids come from one
+    // process-wide source, so a second soft run's root is not MM 1, and the
+    // owner BIND and every owner transfer authenticate against this id.
+    // The root's ASID is the fixed soft root ASID; its generation is the
+    // MM's, as on HVF without a process context.
+    let root_mm = root_ctx.shared().mm().id().raw();
+    engine.bind_task_snapshot_identity(root_mm, root_mm);
     engine
         .set_guest_thread_id((1u64 << 32) | 1u64)
         .map_err(|e| format!("stamp guest thread id: {e}"))?;
