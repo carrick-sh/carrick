@@ -7228,19 +7228,27 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .has_deliverable(self.record, blocked)
     }
 
-    /// The member's closing group has requested its exit: its published
-    /// host-exit request or, for an unregistered host birth, the page's
-    /// cancellation of that birth (#3081).
-    /// Takes the graph lock.
+    /// The member's group is closing for an exit (`exit_group`, or a fatal
+    /// signal's group exit), and that close has requested this member's
+    /// exit: its published host-exit request or, for an unregistered host
+    /// birth, the page's cancellation of that birth (#3081). An exec's close
+    /// also requests its members' exits but retires them on its own path, so
+    /// it does not end their waits here.
     fn terminal_exit_requested(&self) -> bool {
-        if self.control.host_exit_requested() {
-            return true;
-        }
         let graph = self.runtime.graph.lock();
-        graph.owner.task(self.key).is_ok_and(|row| {
-            self.control
-                .terminal_requested(row.native().resources().page)
-        })
+        self.group_exit_requested_in(&graph)
+    }
+
+    /// [`Self::terminal_exit_requested`] under a graph guard the caller holds.
+    fn group_exit_requested_in(&self, graph: &Graph<'a, M, C>) -> bool {
+        graph
+            .pending
+            .exit(&self.key)
+            .is_some_and(|pending| pending.exec().is_none())
+            && graph.owner.task(self.key).is_ok_and(|row| {
+                self.control
+                    .terminal_requested(row.native().resources().page)
+            })
     }
 
     fn latch_default_terminating_exec_signal(&self) -> bool {
@@ -7403,9 +7411,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .resources()
             .signals()
             .has_deliverable(self.record, blocked)
-            || self
-                .control
-                .terminal_requested(row.native().resources().page)
+            || self.group_exit_requested_in(&graph)
         {
             return Err(carrick_syscall_abi::LINUX_EINTR.guest_retval());
         }
@@ -7681,7 +7687,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             None
         }
     }
-    /// Wake every member parked on a signal channel of this closing group:
+    /// Wake every member parked on a signal channel of this group, which is
+    /// closing for an exit:
     /// the task's own (sleeps, `rt_sigsuspend`, `rt_sigtimedwait`) and its
     /// in-zone IPC waits, as signal arrival does. Each member's exit request
     /// is already published, so each woken decision ends its wait
@@ -9146,7 +9153,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     self.interrupt_member_record(record)?;
                 }
             }
-            self.publish_member_wait_channels()?;
+            if !incoming_exec {
+                self.publish_member_wait_channels()?;
+            }
             // Native exception owners must have their cancellation checkpoint
             // queued before the host can admit its one-shot terminal wake batch.
             page.publish_exit_wait(self.binding.mm, WaitChannel::address(&channel));
