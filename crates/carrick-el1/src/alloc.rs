@@ -319,6 +319,16 @@ impl MetadataStorage {
     }
 
     pub fn allocate(&self, layout: Layout) -> Option<*mut u8> {
+        self.allocate_or_miss(layout).ok()
+    }
+
+    /// Allocate, or say why not (#3085): a grant request now in flight
+    /// for this requester's boundary, or memory no grant can add.
+    fn allocate_or_miss(
+        &self,
+        layout: Layout,
+    ) -> Result<*mut u8, carrick_core::mm::reservation::MetadataMiss> {
+        use carrick_core::mm::reservation::MetadataMiss;
         let align = layout.align().max(16);
         let size = layout.size();
 
@@ -344,9 +354,9 @@ impl MetadataStorage {
         if let Some((mailbox, slot)) = self.mailbox_context() {
             Self::flush_pending_returns(mailbox, &mut core, slot);
         }
-        if p.is_some() {
+        if let Some(p) = p {
             core::mem::drop(core);
-            return p;
+            return Ok(p);
         }
 
         #[cfg(any(target_os = "none", test))]
@@ -356,13 +366,13 @@ impl MetadataStorage {
             // the shared response while bootstrap capacity remained.
             if core.take_grant_denied() {
                 core::mem::drop(core);
-                return None;
+                return Err(MetadataMiss::Exhausted);
             }
             let needed_size = core.needed_grant_size(size, align);
             if let (Some((mailbox, slot)), Some(needed_size)) =
                 (self.mailbox_context(), needed_size)
             {
-                Self::publish_request(
+                let published = Self::publish_request(
                     mailbox,
                     slot,
                     carrick_el1_abi::MetadataGrantRequest {
@@ -373,10 +383,23 @@ impl MetadataStorage {
                         cookie: 0,
                     },
                 );
+                // The mailbox is single-flight: a peer's request in flight
+                // is served at any participant's boundary, so this requester
+                // owes one too and reruns after it.
+                let pending = published || Self::host_work_pending(mailbox, &core);
+                if pending && !published {
+                    Self::mark_pending_host_work(slot);
+                }
+                core::mem::drop(core);
+                return Err(if pending {
+                    MetadataMiss::GrantPending
+                } else {
+                    MetadataMiss::Exhausted
+                });
             }
         }
         core::mem::drop(core);
-        None
+        Err(MetadataMiss::Exhausted)
     }
 
     /// Allocate using the existing allocator/mailbox policy and report the
@@ -384,15 +407,20 @@ impl MetadataStorage {
     /// grants retain the host-issued nonzero token. The caller still owns the
     /// allocation and must return it through `deallocate`, never return the
     /// enclosing extent directly. Call outside reservation and descriptor locks.
-    pub fn allocate_with_extent(&self, layout: Layout) -> Option<(*mut u8, ExtentGrantReceipt)> {
-        let ptr = self.allocate(layout)?;
+    pub fn allocate_with_extent(
+        &self,
+        layout: Layout,
+    ) -> Result<(*mut u8, ExtentGrantReceipt), carrick_core::mm::reservation::MetadataMiss> {
+        let ptr = self.allocate_or_miss(layout)?;
         let core = self.lock.lock_irqsave();
         // SAFETY: allocate just returned this live payload to this caller; it
         // has not escaped and cannot have been deallocated. Header lookup is
         // constant work regardless of the number of extents or allocations.
         let receipt = unsafe { core.allocation_extent(ptr) };
         core::mem::drop(core);
-        receipt.map(|receipt| (ptr, receipt))
+        receipt
+            .map(|receipt| (ptr, receipt))
+            .ok_or(carrick_core::mm::reservation::MetadataMiss::Exhausted)
     }
 
     pub fn deallocate(&self, ptr: *mut u8, layout: Layout) {
@@ -674,7 +702,10 @@ pub fn run_guest_allocator_test(subtest: u64, _arg: u64) -> u64 {
 
 // SAFETY: MetadataStorage owns its granted extents through carrier teardown.
 unsafe impl carrick_core::mm::reservation::ReservationMetadataAllocator for MetadataStorage {
-    fn allocate_with_extent(&self, layout: Layout) -> Option<(*mut u8, ExtentGrantReceipt)> {
+    fn allocate_with_extent(
+        &self,
+        layout: Layout,
+    ) -> Result<(*mut u8, ExtentGrantReceipt), carrick_core::mm::reservation::MetadataMiss> {
         MetadataStorage::allocate_with_extent(self, layout)
     }
     fn deallocate(&self, ptr: *mut u8, layout: Layout) {
@@ -691,6 +722,70 @@ mod tests {
             lock: SpinLock::new(MetadataAllocatorCore::new()),
             mailbox: Some(carrick_el1_abi::MetadataGrantMailbox::new()),
         }
+    }
+
+    /// #3085: a miss that posts a grant (or meets a peer's in flight) is
+    /// "not now", and the grant served at the boundary satisfies the one
+    /// rerun; a denied grant, or a venue with no grant source, is memory
+    /// exhausted. The two are separate values.
+    #[test]
+    fn a_miss_names_a_pending_grant_apart_from_exhausted_memory() {
+        use carrick_core::mm::reservation::MetadataMiss;
+        let large = Layout::from_size_align(24000, 64).unwrap();
+        let mut bootstrap = vec![0u128; 1024];
+        let sourceless = MetadataStorage::new();
+        sourceless
+            .admit_bootstrap_region(bootstrap.as_mut_ptr() as u64, 16384)
+            .unwrap();
+        assert_eq!(
+            sourceless.allocate_with_extent(large).err(),
+            Some(MetadataMiss::Exhausted)
+        );
+
+        let storage = storage_with_mailbox();
+        let mailbox = storage.mailbox.as_ref().unwrap();
+        let mut bootstrap = vec![0u128; 1024];
+        storage
+            .admit_bootstrap_region(bootstrap.as_mut_ptr() as u64, 16384)
+            .unwrap();
+        assert_eq!(
+            storage.allocate_with_extent(large).err(),
+            Some(MetadataMiss::GrantPending)
+        );
+        // A second requester meets the single-flight request in flight.
+        assert_eq!(
+            storage.allocate_with_extent(large).err(),
+            Some(MetadataMiss::GrantPending)
+        );
+        let request = mailbox.claim_request().unwrap();
+        assert_eq!(request.op, carrick_el1_abi::METADATA_GRANT_OP_ALLOC);
+        let mut granted = vec![0u128; 2048];
+        mailbox.publish_response(
+            carrick_el1_abi::METADATA_GRANT_SUCCESS,
+            granted.as_mut_ptr() as u64,
+            32768,
+            76,
+        );
+        // The rerun after the boundary's grant is served.
+        let (_, receipt) = storage.allocate_with_extent(large).unwrap();
+        assert_eq!(receipt.token, 76);
+
+        let denied = storage_with_mailbox();
+        let mailbox = denied.mailbox.as_ref().unwrap();
+        let mut bootstrap = vec![0u128; 1024];
+        denied
+            .admit_bootstrap_region(bootstrap.as_mut_ptr() as u64, 16384)
+            .unwrap();
+        assert_eq!(
+            denied.allocate_with_extent(large).err(),
+            Some(MetadataMiss::GrantPending)
+        );
+        mailbox.claim_request().unwrap();
+        mailbox.publish_response(carrick_el1_abi::METADATA_GRANT_ERR_DENIED, 0, 0, 0);
+        assert_eq!(
+            denied.allocate_with_extent(large).err(),
+            Some(MetadataMiss::Exhausted)
+        );
     }
 
     #[test]

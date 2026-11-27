@@ -2596,6 +2596,7 @@ pub(crate) fn declined_fault_admission_result(
         Err(
             NativeProcessError::Busy
             | NativeProcessError::Exhausted
+            | NativeProcessError::NoMemory
             | NativeProcessError::Fault
             | NativeProcessError::ForkRefused(_)
             | NativeProcessError::Unsupported
@@ -3571,7 +3572,8 @@ fn native_service_fatal_reason(
     match error {
         Error::Invalid => Fatal::NativeServiceInvalid,
         Error::Stale => Fatal::NativeServiceStale,
-        Error::Exhausted => Fatal::NativeServiceExhausted,
+        // Kernel memory is the service's exhausted resource.
+        Error::Exhausted | Error::NoMemory => Fatal::NativeServiceExhausted,
         Error::Fault => Fatal::NativeServiceFault,
         // A supply request no owner took is an unsupported operation there.
         Error::Unsupported | Error::NeedsSupply | Error::SupplySelected => {
