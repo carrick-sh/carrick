@@ -29,6 +29,10 @@
  *     range, then the read of page 0 must fault
  *   18 as 14 with no mprotect: munmap of the sparse range returns 0, and the
  *     read of page 2 (the second resident run, past the hole) then faults
+ *   21 (#3121) the root writes a private RW page, mprotects it PROT_READ and
+ *     forks. The child widens it back to RW and writes it; the parent, after
+ *     the child exits, still reads its own byte (92 if the child's write
+ *     reached it)
  * The parent propagates the child's exit status. */
 
 /* rax = mmap(0, rsi, edx prot, r10 flags, -1, 0); r15 = base or exit errno */
@@ -80,6 +84,12 @@ _start:
 #if CASE == 8 || CASE == 11 || CASE == 12 || CASE == 14 || CASE == 16 || CASE == 17 || CASE == 18
     jmp child               /* the run root itself, no fork */
 #endif
+#if CASE == 21
+    MMAP $0x1000, $3, $0x22
+    mov %r15, %r14
+    movb $0xa5, (%r14)
+    MPROTECT %r14, $0x1000, $1
+#endif
 #if CASE == 9
     MMAP $0x100000000, $0, $0x4022
     mov $0x40000000, %r14
@@ -112,7 +122,7 @@ _start:
     syscall
     test %eax, %eax
     js harness
-#if CASE == 9
+#if CASE == 9 || CASE == 21
     cmpb $0xa5, (%r14)      /* the child's write stayed in the child */
     jne bad
 #endif
@@ -137,6 +147,11 @@ child:
     MMAP $0x40000000, $0, $0x4022
     MPROTECT %r15, $0x1000, $3
     movb $1, (%r15)
+    cmpb $0x3c, (%r14)
+    jne bad
+#elif CASE == 21
+    MPROTECT %r14, $0x1000, $3
+    movb $0x3c, (%r14)
     cmpb $0x3c, (%r14)
     jne bad
 #elif CASE >= 14
