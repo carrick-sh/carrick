@@ -323,7 +323,11 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 native_entropy(record).map_err(|_| fail("native entropy record invalid"))?;
                 true
             }
-            ServiceOperation::CarrierWork { demand, .. } => carrier_work_supplied(demand),
+            ServiceOperation::CarrierWork { demand, .. } => {
+                #[cfg(feature = "test-support")]
+                super::editor_hold::carrier_work(execution.binding);
+                carrier_work_supplied(demand)
+            }
             ServiceOperation::Fault(_) => {
                 let slot = self
                     .grant_portal()?

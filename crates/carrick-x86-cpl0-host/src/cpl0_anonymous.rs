@@ -465,53 +465,101 @@ pub enum EditorHoldSite {
     CowSupply,
 }
 
-/// Witness seam (test-support only): the next exclusion of an MM at the
-/// armed site finds the MM's editor held by a real borrow (a maintenance
-/// borrow under a plan's raised gate, an in-ring edit at a COW supply). The borrow is released
-/// through its production release right after that probe. For a COW supply
-/// the seam also counts the supplies that later succeed for the MM it held,
-/// so a witness can assert "Busy once, then supplied" positively.
+/// Witness seam (test-support only): an exclusion of an MM at the armed
+/// site finds the MM's editor held by a real borrow (a maintenance borrow
+/// under a plan's raised gate, an in-ring edit at a COW supply). The borrow
+/// is released through its production release right after that probe. The
+/// seam stays armed until it actually holds the editor: a probe that finds
+/// the editor already held elsewhere leaves it armed for the next.
+///
+/// At a COW supply it holds exactly one demand, the `nth` supply probe of
+/// one MM, and records that demand: its MM, its page and the member
+/// (execution binding) that asked. It then counts, for that exact demand
+/// only, the supplies published for it, and the carrier work the same member
+/// rang while its demand stayed unsupplied. A sibling's supply of the page,
+/// or another member's carrier work, is not counted (#3061 PR 1a).
 #[cfg(feature = "test-support")]
 pub(super) mod editor_hold {
     use super::EditorHoldSite;
+    use carrick_core_abi::ExecutionBinding;
     use carrick_sched_core::spaces::notification::SpaceReleaseVenue;
     use core::num::NonZeroU64;
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Mutex;
 
-    struct Site {
-        armed: AtomicBool,
-        holds: AtomicU64,
-        /// The MM the last hold was taken on (0: none).
-        held_mm: AtomicU64,
-        supplied_after: AtomicU64,
+    /// The one COW demand the seam held.
+    #[derive(Clone, Copy, Debug)]
+    struct HeldCow {
+        mm: u64,
+        page: u64,
+        member: ExecutionBinding,
+        /// No supply has been published for it yet.
+        outstanding: bool,
     }
+    #[derive(Debug, Default)]
+    struct Site {
+        /// The supply probe of one MM to hold at (1: the first); 0: unarmed.
+        armed_nth: u64,
+        /// Per MM, the supply probes seen while armed.
+        seen: Vec<(u64, u64)>,
+        holds: u64,
+        held: Option<HeldCow>,
+        supplied: u64,
+        carrier_work_while_held: u64,
+    }
+    static BACKING_PLAN: Mutex<Site> = Mutex::new(site());
+    static COW_SUPPLY: Mutex<Site> = Mutex::new(site());
     const fn site() -> Site {
         Site {
-            armed: AtomicBool::new(false),
-            holds: AtomicU64::new(0),
-            held_mm: AtomicU64::new(0),
-            supplied_after: AtomicU64::new(0),
+            armed_nth: 0,
+            seen: Vec::new(),
+            holds: 0,
+            held: None,
+            supplied: 0,
+            carrier_work_while_held: 0,
         }
     }
-    static BACKING_PLAN: Site = site();
-    static COW_SUPPLY: Site = site();
-    fn of(at: EditorHoldSite) -> &'static Site {
+    fn of(at: EditorHoldSite) -> std::sync::MutexGuard<'static, Site> {
         match at {
             EditorHoldSite::BackingPlan => &BACKING_PLAN,
             EditorHoldSite::CowSupply => &COW_SUPPLY,
         }
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
     /// The borrower: no member of the zone.
     const HOLDER: NonZeroU64 = NonZeroU64::MAX;
+
+    /// The demand an exclusion probes for: a COW supply names its page and
+    /// member; a backing plan names none.
+    #[derive(Clone, Copy, Debug)]
+    pub(in super::super) struct Demand {
+        pub page: u64,
+        pub member: ExecutionBinding,
+    }
 
     pub(in super::super) fn take<'a>(
         at: EditorHoldSite,
         venue: SpaceReleaseVenue<'a, carrick_sched_core::ParkedContextWords>,
         mm: NonZeroU64,
+        demand: Option<Demand>,
     ) -> Option<carrick_sched_core::spaces::SpaceEditor<'a, carrick_sched_core::ParkedContextWords>>
     {
-        let site = of(at);
-        if !site.armed.swap(false, Ordering::AcqRel) {
+        let mut site = of(at);
+        if site.armed_nth == 0 {
+            return None;
+        }
+        let seen = match site.seen.iter_mut().find(|(key, _)| *key == mm.get()) {
+            Some((_, seen)) => *seen,
+            None => {
+                site.seen.push((mm.get(), 0));
+                0
+            }
+        };
+        // Not this MM's armed probe yet: count it and let it run.
+        if seen + 1 < site.armed_nth {
+            if let Some((_, seen)) = site.seen.iter_mut().find(|(key, _)| *key == mm.get()) {
+                *seen += 1;
+            }
             return None;
         }
         let index = venue.zone.spaces.find(mm.get())?;
@@ -528,28 +576,53 @@ pub(super) mod editor_hold {
                 spaces.try_begin_edit_cause(index, mm.get(), HOLDER, Some(venue))
             }
         }
+        // Held elsewhere already: stay armed, uncounted, for this demand's
+        // rerun.
         .ok()?;
-        site.held_mm.store(mm.get(), Ordering::Release);
-        site.holds.fetch_add(1, Ordering::AcqRel);
+        site.armed_nth = 0;
+        site.holds += 1;
+        site.held = demand.map(|demand| HeldCow {
+            mm: mm.get(),
+            page: demand.page,
+            member: demand.member,
+            outstanding: true,
+        });
         Some(editor)
     }
-    /// A COW supply for `mm` was published.
-    pub(in super::super) fn supplied(mm: NonZeroU64) {
-        let site = of(EditorHoldSite::CowSupply);
-        if site.held_mm.load(Ordering::Acquire) == mm.get() {
-            site.supplied_after.fetch_add(1, Ordering::AcqRel);
+    /// A COW supply of `mm`'s `page`, asked by `member`, was published.
+    pub(in super::super) fn supplied(mm: NonZeroU64, page: u64, member: ExecutionBinding) {
+        let mut site = of(EditorHoldSite::CowSupply);
+        let Some(held) = site.held.as_mut() else {
+            return;
+        };
+        if held.mm == mm.get() && held.page == page && held.member == member {
+            held.outstanding = false;
+            site.supplied += 1;
         }
     }
-    pub(in super::super) fn arm(at: EditorHoldSite) {
-        of(at).armed.store(true, Ordering::Release);
+    /// `member` rang carrier work (a bare "not now" re-ring).
+    pub(in super::super) fn carrier_work(member: ExecutionBinding) {
+        let mut site = of(EditorHoldSite::CowSupply);
+        if site
+            .held
+            .is_some_and(|held| held.outstanding && held.member == member)
+        {
+            site.carrier_work_while_held += 1;
+        }
+    }
+    pub(in super::super) fn arm(at: EditorHoldSite, nth: u64) {
+        let mut state = of(at);
+        *state = site();
+        state.armed_nth = nth.max(1);
     }
     pub(in super::super) fn holds(at: EditorHoldSite) -> u64 {
-        of(at).holds.load(Ordering::Acquire)
+        of(at).holds
     }
-    pub(in super::super) fn supplied_after_hold() -> u64 {
-        of(EditorHoldSite::CowSupply)
-            .supplied_after
-            .load(Ordering::Acquire)
+    /// The held COW demand's supplies, and the carrier work its member rang
+    /// while it stayed unsupplied.
+    pub(in super::super) fn held_cow() -> (u64, u64) {
+        let site = of(EditorHoldSite::CowSupply);
+        (site.supplied, site.carrier_work_while_held)
     }
 }
 
@@ -557,19 +630,28 @@ pub(super) mod editor_hold {
 /// (test-support only).
 #[cfg(feature = "test-support")]
 pub fn hold_editor_at_next_for_test(at: EditorHoldSite) {
-    editor_hold::arm(at);
+    editor_hold::arm(at, 1);
 }
 
-/// Exclusions at `at` that met the armed maintenance borrow.
+/// Arm [`editor_hold`] for the `nth` copy-on-write supply probe of one MM in
+/// this process (test-support only).
+#[cfg(feature = "test-support")]
+pub fn hold_editor_at_nth_cow_supply_for_test(nth: u64) {
+    editor_hold::arm(EditorHoldSite::CowSupply, nth);
+}
+
+/// Exclusions at `at` that met the armed borrow.
 #[cfg(feature = "test-support")]
 pub fn editor_holds_for_test(at: EditorHoldSite) -> u64 {
     editor_hold::holds(at)
 }
 
-/// COW supplies published for the MM whose supply editor the seam held.
+/// For the exact COW demand whose supply editor the seam held: the supplies
+/// published for it, and the carrier work its member rang while it stayed
+/// unsupplied.
 #[cfg(feature = "test-support")]
-pub fn cow_supplied_after_editor_hold_for_test() -> u64 {
-    editor_hold::supplied_after_hold()
+pub fn held_cow_demand_for_test() -> (u64, u64) {
+    editor_hold::held_cow()
 }
 
 /// The carrier-scoped zone host IPC releases wake into (#2031). The zone
@@ -2162,7 +2244,15 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             ),
         };
         #[cfg(feature = "test-support")]
-        let maintenance = editor_hold::take(EditorHoldSite::CowSupply, venue, mm);
+        let maintenance = editor_hold::take(
+            EditorHoldSite::CowSupply,
+            venue,
+            mm,
+            Some(editor_hold::Demand {
+                page: window.fault_page,
+                member: execution.binding,
+            }),
+        );
         let probe = self.settled_pause(venue, window.operation.mm);
         // The seam's borrow ends through its own release, before this
         // venue's wakes are finished.
@@ -2302,7 +2392,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             return Err(fail("owner COW demand changed during physical publication"));
         }
         #[cfg(feature = "test-support")]
-        editor_hold::supplied(mm);
+        editor_hold::supplied(mm, window.fault_page, execution.binding);
         drop(pause);
         wake.finish()
     }
@@ -3344,7 +3434,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 ),
             };
             #[cfg(feature = "test-support")]
-            let maintenance = editor_hold::take(EditorHoldSite::BackingPlan, venue, mm);
+            let maintenance = editor_hold::take(EditorHoldSite::BackingPlan, venue, mm, None);
             let probe = self.settled_pause(venue, window.operation.mm);
             // The seam's borrow ends through its own release, before this
             // venue's wakes are finished.
