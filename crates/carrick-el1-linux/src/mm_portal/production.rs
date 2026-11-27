@@ -479,33 +479,48 @@ pub fn serve_grant_hw(frame: &mut carrick_el1_abi::TrapFrame) {
 
 #[cfg(target_os = "none")]
 pub fn bind_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
+    // DISCOVERY ONLY (#3061 (b) step 1, never lands): every refusal site
+    // answers `site << 16 | errno`, with the values it compared in x[4..6].
     let Some(executor_slot) = carrick_el1_abi::service_slot_from_stack(
         carrick_el1::substrate::sched::hw::read_current_sp(),
         frame.slot,
     ) else {
-        frame.x[0] = 3;
+        frame.x[0] = (1 << 16) | 3;
         return;
     };
     let _ = executor_slot;
-    let result = (|| -> Result<(), MmError> {
+    let site = |n: u64, e: MmError| (n, e);
+    let mut seen = [0u64; 2];
+    let result = (|| -> Result<(), (u64, MmError)> {
         let slots = unsafe {
             &*(carrick_el1_abi::EL1_MM_PORTAL_BASE as *const carrick_el1_abi::MmPortalSlots)
         };
-        let carrier = slots.carrier().ok_or(MmError::Stale)?;
+        let carrier = slots.carrier().ok_or(site(2, MmError::Stale))?;
         if frame.x[1] != carrier.get() {
-            return Err(MmError::Stale);
+            seen = [frame.x[1], carrier.get()];
+            return Err(site(3, MmError::Stale));
         }
-        let mm = ReservationMm::new(frame.x[2]).ok_or(MmError::Stale)?;
+        let mm = ReservationMm::new(frame.x[2]).ok_or(site(4, MmError::Stale))?;
         let zone =
             unsafe { &*(carrick_el1_abi::EL1_ZONE_BASE as *const carrick_el1_abi::ZoneTables) };
-        // The normal BIND still requires an open grant. The first-load BIND
-        // carries a publication-issued closed-root token and must recheck
-        // that this exact entry has never opened. No transfer service uses
-        // the closed identity observation.
         let root = match frame.x[6] {
-            0 => bind_service_root(&zone.spaces, mm, false, 0)?,
-            1 => bind_service_root(&zone.spaces, mm, true, frame.x[7])?,
-            _ => return Err(MmError::Stale),
+            0 => bind_service_root(&zone.spaces, mm, false, 0).map_err(|e| site(5, e))?,
+            1 => {
+                let index = zone.spaces.find(mm.raw()).ok_or(site(6, MmError::Stale))?;
+                let root = zone
+                    .spaces
+                    .closed_root_identity(index, mm.raw())
+                    .ok_or(site(7, MmError::Stale))?;
+                if root != frame.x[7] {
+                    seen = [root, frame.x[7]];
+                    return Err(site(8, MmError::Stale));
+                }
+                root
+            }
+            other => {
+                seen = [other, 0];
+                return Err(site(9, MmError::Stale));
+            }
         };
         #[cfg(target_arch = "aarch64")]
         let live: u64;
@@ -514,11 +529,14 @@ pub fn bind_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             core::arch::asm!("mrs {}, ttbr0_el1",out(reg)live,options(nomem,nostack));
         }
         #[cfg(target_arch = "x86_64")]
+        let live = 0u64;
+        #[cfg(target_arch = "x86_64")]
         let valid = carrick_el1::isa::x86::portal_descriptor_words(root).is_ok();
         #[cfg(target_arch = "aarch64")]
         let valid = carrick_el1_abi::service_target_table_window(live, root).is_some();
         if !valid {
-            return Err(MmError::Stale);
+            seen = [live, root];
+            return Err(site(10, MmError::Stale));
         }
         let portal = MmPortal::<GuestMetadataPin> {
             backend: core::marker::PhantomData,
@@ -529,17 +547,31 @@ pub fn bind_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             zone: Some(zone),
         };
         frame.x[3] = portal
-            .admitted_handle(mm, frame.slot as u32)?
+            .admitted_handle(mm, frame.slot as u32)
+            .map_err(|e| site(11, e))?
             .incarnation()
             .get();
-        frame.x[4] = portal.root(mm, frame.slot as u32)?.generation().raw();
+        frame.x[4] = portal
+            .root(mm, frame.slot as u32)
+            .map_err(|e| site(12, e))?
+            .generation()
+            .raw();
         frame.x[5] = portal
-            .root(mm, frame.slot as u32)?
-            .next_transfer_sequence()?
+            .root(mm, frame.slot as u32)
+            .map_err(|e| site(13, e))?
+            .next_transfer_sequence()
+            .map_err(|e| site(14, MmError::from(e)))?
             .get();
         Ok(())
     })();
-    frame.x[0] = result.err().map_or(0, |error| u64::from(error.errno()));
+    match result {
+        Ok(()) => frame.x[0] = 0,
+        Err((n, error)) => {
+            frame.x[0] = (n << 16) | u64::from(error.errno());
+            frame.x[4] = seen[0];
+            frame.x[5] = seen[1];
+        }
+    }
 }
 
 #[cfg(test)]

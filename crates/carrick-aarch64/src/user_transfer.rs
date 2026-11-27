@@ -517,6 +517,20 @@ impl TransferTarget {
         }
         let receipt = service.run_user(frame, &mut || false)?;
         carrick_observability::probes::hvpatch_el1_owner_bind_result(receipt.x[0]);
+        if receipt.x[0] != 0 && closed.is_some() {
+            // DISCOVERY ONLY (#3061 (b) step 1): name EL1's refusal site.
+            return Err(TrapError::Hypervisor(format!(
+                "DISC first-load BIND refused: site={} errno={} x1={:#x} x2={:#x} x4={:#x} x5={:#x} x6={:#x} x7={:#x}",
+                receipt.x[0] >> 16,
+                receipt.x[0] & 0xffff,
+                receipt.x[1],
+                receipt.x[2],
+                receipt.x[4],
+                receipt.x[5],
+                receipt.x[6],
+                receipt.x[7]
+            )));
+        }
         if receipt.x[0] != 0 {
             let errno = i32::try_from(receipt.x[0]).map_err(|_| {
                 TrapError::Hypervisor(format!("EL1 BIND answered errno {:#x}", receipt.x[0]))
