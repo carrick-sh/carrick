@@ -206,6 +206,15 @@ mod test_support {
     /// stalls past its bound once before it polls, as a host descheduling
     /// the vCPU there would (#3083). The ICR has recovered by then.
     pub const INJECT_RESCHED_STALL_AT_LAST_RETURN: u64 = 0xffff_ffff_ffff_fe61;
+    /// As [`INJECT_RESCHED_BUSY_THROUGH_LAST_RETURN`], and the last-chance
+    /// wait stalls past its bound once right after its poll read the ICR
+    /// busy; the ICR recovers meanwhile (#3083).
+    pub const INJECT_RESCHED_STALL_AFTER_BUSY_POLL: u64 = 0xffff_ffff_ffff_fe62;
+    /// Three sends find the ICR busy (the first, and two resends at the
+    /// return to user) with no busy poll, and the CPU stalls past the
+    /// last-chance bound once right after the third; the ICR recovers
+    /// meanwhile (#3083).
+    pub const INJECT_RESCHED_STALL_AFTER_BUSY_SEND: u64 = 0xffff_ffff_ffff_fe63;
     /// Every reschedule IPI send of this CPU finds its ICR busy while every
     /// idle-ICR poll reads it idle: a local APIC that never accepts its
     /// send. The last-chance wait must end fatal, never loop (#3083).
@@ -1490,18 +1499,39 @@ mod test_support {
             )),
             INJECT_CURRENT_CPU => Some(u64::from(binding.cpu_slot)),
             INJECT_RESCHED_BUSY_ONCE => {
-                carrick_el1::isa::x86::interrupt::inject_resched_busy(1, 0).then_some(0)
+                carrick_el1::isa::x86::interrupt::inject_resched_busy(1, 0, None).then_some(0)
             }
             INJECT_RESCHED_BUSY_THROUGH_LAST_RETURN => {
-                carrick_el1::isa::x86::interrupt::inject_resched_busy(u32::MAX, 1).then_some(0)
+                carrick_el1::isa::x86::interrupt::inject_resched_busy(u32::MAX, 1, None)
+                    .then_some(0)
             }
             INJECT_RESCHED_STALL_AT_LAST_RETURN => {
-                (carrick_el1::isa::x86::interrupt::inject_resched_stall_once()
-                    && carrick_el1::isa::x86::interrupt::inject_resched_busy(2, 0))
+                carrick_el1::isa::x86::interrupt::inject_resched_busy(
+                    2,
+                    0,
+                    Some(carrick_el1::isa::x86::interrupt::ReschedStall::BeforePoll),
+                )
+                .then_some(0)
+            }
+            INJECT_RESCHED_STALL_AFTER_BUSY_POLL => {
+                carrick_el1::isa::x86::interrupt::inject_resched_busy(
+                    u32::MAX,
+                    1,
+                    Some(carrick_el1::isa::x86::interrupt::ReschedStall::AfterBusyPoll),
+                )
+                .then_some(0)
+            }
+            INJECT_RESCHED_STALL_AFTER_BUSY_SEND => {
+                carrick_el1::isa::x86::interrupt::inject_resched_busy(
+                    3,
+                    0,
+                    Some(carrick_el1::isa::x86::interrupt::ReschedStall::AfterBusySend(3)),
+                )
                 .then_some(0)
             }
             INJECT_RESCHED_ICR_FLAPPING => {
-                carrick_el1::isa::x86::interrupt::inject_resched_busy(u32::MAX, 0).then_some(0)
+                carrick_el1::isa::x86::interrupt::inject_resched_busy(u32::MAX, 0, None)
+                    .then_some(0)
             }
             INJECT_RESCHED_BUSY_CENSUS => {
                 let (injected, resent, waits, site) =
