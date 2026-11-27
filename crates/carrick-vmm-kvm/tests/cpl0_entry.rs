@@ -4432,7 +4432,8 @@ fn production_leader_queued_behind_a_polling_worker_runs_when_its_slice_ends() {
 /// peer's scan hold (the condition, then its reschedule vector), and the
 /// peer goes on only once that vector is pending in its IRR. The vector is
 /// the hold's only wake. A pass that drained vectors after its reads
-/// consumed it and slept past the hold (exit 90); a pass that drains first
+/// consumed it and slept past the hold (the bounded child reaches its
+/// bound); a pass that drains first
 /// still has it pending at HLT, and its next pass takes the hold. Exit 91:
 /// the ordered pass did not run, so nothing was proven.
 #[test]
@@ -4449,7 +4450,8 @@ fn production_idle_pass_publication_after_its_read_still_wakes_it() {
 /// slot is published IdleWfi, right before HLT, and this CPU publishes host
 /// work on the peer's task with no vector, as the host does for a CPU
 /// stopped in a crossing. Only the durable word announces it. An idle path
-/// that sleeps without rechecking it never rings the host (exit 90); one
+/// that sleeps without rechecking it never rings the host (the bounded
+/// child reaches its bound); one
 /// that rechecks the durable wake words before HLT settles it.
 #[test]
 fn production_idle_host_work_published_before_hlt_is_settled() {
@@ -4467,7 +4469,8 @@ fn production_idle_host_work_published_before_hlt_is_settled() {
 /// at its next delivery point, the hold's own return to user, and the peer
 /// goes on only once that resent vector is pending in its IRR. A send that
 /// made the busy ICR fatal ends the run with a CPL0 fatal exit; one that
-/// dropped it leaves the peer asleep (exit 90). Exit 93: the hold was taken
+/// dropped it leaves the peer asleep (the bounded child reaches its
+/// bound). Exit 93: the hold was taken
 /// without exactly one busy send and one resend.
 #[test]
 fn production_resched_ipi_busy_once_is_resent_at_the_next_delivery_point() {
