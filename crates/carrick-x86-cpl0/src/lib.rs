@@ -27,10 +27,12 @@ mod test_support {
     pub const INJECT_ROOT_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe10;
     /// The next owner-selected grant's descriptor executor refuses it before
     /// any store (#2579): for capacity (`TablesExhausted`), for an occupied
-    /// leaf (`Occupied`), or terminally (`WrongMm`).
+    /// leaf (`Occupied`), terminally (`WrongMm`), or for a selection the
+    /// root no longer authenticates (`StaleRoot`, #2766).
     pub const INJECT_GRANT_CAPACITY_REFUSAL_ONCE: u64 = 0xffff_ffff_ffff_fe50;
     pub const INJECT_GRANT_OCCUPIED_REFUSAL_ONCE: u64 = 0xffff_ffff_ffff_fe51;
     pub const INJECT_GRANT_TERMINAL_REFUSAL_ONCE: u64 = 0xffff_ffff_ffff_fe52;
+    pub const INJECT_GRANT_STALE_REFUSAL_ONCE: u64 = 0xffff_ffff_ffff_fe4c;
     /// Injected grant refusals answered in the high 32 bits; the pages of
     /// the first grant applied after one in the low 32 bits.
     pub const INJECT_GRANT_REFUSAL_CENSUS: u64 = 0xffff_ffff_ffff_fe53;
@@ -1265,11 +1267,13 @@ mod test_support {
             }
             INJECT_GRANT_CAPACITY_REFUSAL_ONCE
             | INJECT_GRANT_OCCUPIED_REFUSAL_ONCE
-            | INJECT_GRANT_TERMINAL_REFUSAL_ONCE => {
+            | INJECT_GRANT_TERMINAL_REFUSAL_ONCE
+            | INJECT_GRANT_STALE_REFUSAL_ONCE => {
                 use carrick_mmu_core::descriptor_refusal::DescriptorRefusal;
                 carrick_core::mm::frames::inject_grant_refusal_once(match native {
                     INJECT_GRANT_CAPACITY_REFUSAL_ONCE => DescriptorRefusal::TablesExhausted,
                     INJECT_GRANT_OCCUPIED_REFUSAL_ONCE => DescriptorRefusal::Occupied,
+                    INJECT_GRANT_STALE_REFUSAL_ONCE => DescriptorRefusal::StaleRoot,
                     _ => DescriptorRefusal::WrongMm,
                 })
                 .then_some(0)
