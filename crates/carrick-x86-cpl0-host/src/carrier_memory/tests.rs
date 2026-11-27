@@ -408,3 +408,28 @@ fn window_slot_budget_bounds_windows_preserves_headroom_and_rolls_back() {
     let large = CarrierMemory::new(LargeSlotIo).unwrap();
     assert_eq!(large.available_window_slots(), MAX_WINDOW_SLOTS);
 }
+
+/// #3105: an owner window of whole 2 MiB pages starts on a 2 MiB GPA and a
+/// 2 MiB host address, past the cursor; any other window stays where the
+/// cursor is. The cursor always ends just past the window, and the window's
+/// bytes are fresh zeroes the host can write.
+#[test]
+fn owner_window_places_whole_large_windows_on_large_pages() {
+    let large = HostPlacement::LARGE_PAGE_BYTES;
+    let mut next = FrameGpa::new(large + PAGE);
+    let (small, placement) = BackingExtent::owner_window(&mut next, 3 * PAGE as usize).unwrap();
+    assert_eq!(placement, HostPlacement::Page);
+    assert_eq!(small.base.raw(), large + PAGE);
+    assert_eq!(next.raw(), large + 4 * PAGE);
+    let (window, placement) = BackingExtent::owner_window(&mut next, large as usize).unwrap();
+    assert_eq!(placement, HostPlacement::LargePage);
+    assert_eq!(window.base.raw(), 2 * large);
+    assert_eq!(next.raw(), 3 * large);
+    let host = window.ptr(window.base.raw(), large as usize).unwrap();
+    assert!((host as u64).is_multiple_of(large), "host {host:p}");
+    // SAFETY: the extent's own live mapping, `large` bytes long.
+    let bytes = unsafe { std::slice::from_raw_parts_mut(host, large as usize) };
+    assert!(bytes.iter().all(|byte| *byte == 0));
+    bytes[large as usize - 1] = 7;
+    assert_eq!(bytes[large as usize - 1], 7);
+}

@@ -23,9 +23,12 @@ together by BackingExtent::owner_window, so the hypervisor maps it with one
 large entry. Smaller and partial windows keep page placement and their
 per-page cost; KVM_PRE_FAULT_MEMORY was measured as the alternative and hung
 multi-threaded runs (#3105), so it is not used. The run's stage-2 faults are
-therefore bounded by a constant as the touched pages grow; a run must also
-have made every touched page a private leaf, so a run that faulted nothing
-cannot pass.
+therefore bounded by a constant as the touched pages grow. A run must also
+have made every touched page a private leaf and placed each thread's aligned
+heap as whole large-page windows (ExecutionWitness.large_page_windows), so a
+run that faulted nothing, or that never took the placement path, cannot
+pass; a host with transparent huge pages off is reported as a missing
+prerequisite. CARRICK_X86_LARGE_WINDOWS=0 keeps page placement.
 """
 
 [bindings]

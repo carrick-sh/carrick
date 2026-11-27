@@ -555,6 +555,10 @@ pub struct ExecutionWitness {
     /// takes one per window, not one per page (#3105).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_stage2_faults: Option<u64>,
+    /// Owner-grant windows the run placed on large host pages: a 2 MiB GPA
+    /// and a 2 MiB-aligned host mapping (#3105).
+    #[serde(default)]
+    pub large_page_windows: u64,
     /// Real stage-2 physical services, counted separately from Linux host dispatch.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub physical_crossing_families: Vec<ExecutionFamilyCount>,

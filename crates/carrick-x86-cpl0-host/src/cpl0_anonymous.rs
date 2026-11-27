@@ -3352,8 +3352,12 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             return Ok(Ok(BackingPreparation::FilePastEnd));
         }
         let len = publication_len.next_multiple_of(4096);
-        let mut extent = BackingExtent::owner_window(&mut self.anonymous_next_gpa, len as usize)
-            .map_err(|error| fail(error.to_string()))?;
+        let (mut extent, placement) =
+            BackingExtent::owner_window(&mut self.anonymous_next_gpa, len as usize)
+                .map_err(|error| fail(error.to_string()))?;
+        if placement == crate::carrier_memory::HostPlacement::LargePage {
+            self.large_page_windows += 1;
+        }
         let gpa = extent.base;
         let (mut inventory, grants) = InitialInventory::stage(
             Arc::clone(&self.initial_rollback_fault),

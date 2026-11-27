@@ -5862,6 +5862,17 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
         Ok(custody.peer_active_private_grants())
     }
 
+    /// Owner-grant windows the run placed on large host pages: a 2 MiB GPA
+    /// with a 2 MiB-aligned host mapping, which the hypervisor can map with
+    /// one stage-2 entry (#3105).
+    pub fn large_page_windows(&self) -> Result<u64, TrapError> {
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        Ok(custody.large_page_windows)
+    }
+
     /// Cross-CPU translation drains the run published: each is one
     /// shootdown request (an IPI to every other CPU running the edited MM
     /// and a wait for its acknowledgement). A drain the editing CPU served
@@ -6293,6 +6304,8 @@ pub(crate) struct Cpl0HostCustody<M: CarrierMemoryIo> {
     )>,
     maintenance_root: Option<RootGpa>,
     anonymous_next_gpa: FrameGpa,
+    /// Owner-grant windows placed on large host pages (#3105).
+    large_page_windows: u64,
     /// The carrier's exec owner (#2305): its receipts, reserved at claim,
     /// the successors staged before their arm, the requests parked on the
     /// fork stock's release, and the adopted execs awaiting settlement.
@@ -7795,6 +7808,7 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             fork_stock,
             maintenance_root: None,
             anonymous_next_gpa: FrameGpa::new(DYNAMIC_GRANT_GPA),
+            large_page_windows: 0,
             exec_owner: exec_service::X86ExecOwner::default(),
             exec_predecessors: exec_service::ExecPredecessorCustody::default(),
             root_exec_load: None,
