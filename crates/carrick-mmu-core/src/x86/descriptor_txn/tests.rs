@@ -428,6 +428,7 @@ fn guest_protect_refuses_host_map_leaf() {
                     user: true
                 },
                 exec: ExecAuthority::Leaf,
+                cow_ceiling: None,
                 absent: carrick_guest_arch::AbsentLeaves::Refuse,
             },
             &[]
@@ -472,6 +473,7 @@ fn guest_protect_refuses_write_and_execute_widening_past_grant() {
                     span,
                     permissions,
                     exec: ExecAuthority::Leaf,
+                    cow_ceiling: None,
                     absent: carrick_guest_arch::AbsentLeaves::Refuse
                 },
                 &[]
@@ -514,6 +516,7 @@ fn guest_protect_grants_execute_within_the_mapping_ceiling() {
                 span,
                 permissions: read_write,
                 exec: ExecAuthority::Mapping,
+                cow_ceiling: None,
                 absent: carrick_guest_arch::AbsentLeaves::Refuse,
             },
             &[]
@@ -532,6 +535,7 @@ fn guest_protect_grants_execute_within_the_mapping_ceiling() {
                 span,
                 permissions: read_exec,
                 exec: ExecAuthority::Mapping,
+                cow_ceiling: None,
                 absent: carrick_guest_arch::AbsentLeaves::Refuse,
             },
             &[]
@@ -550,6 +554,7 @@ fn guest_protect_grants_execute_within_the_mapping_ceiling() {
                     span,
                     permissions,
                     exec: ExecAuthority::Leaf,
+                    cow_ceiling: None,
                     absent: carrick_guest_arch::AbsentLeaves::Refuse,
                 },
                 &[]
@@ -587,6 +592,7 @@ fn guest_protect_can_restore_write_within_private_grant_ceiling() {
                 span,
                 permissions: readonly,
                 exec: ExecAuthority::Leaf,
+                cow_ceiling: None,
                 absent: carrick_guest_arch::AbsentLeaves::Refuse,
             },
             &[]
@@ -604,6 +610,7 @@ fn guest_protect_can_restore_write_within_private_grant_ceiling() {
                 span,
                 permissions: writable,
                 exec: ExecAuthority::Leaf,
+                cow_ceiling: None,
                 absent: carrick_guest_arch::AbsentLeaves::Refuse,
             },
             &[]
@@ -654,6 +661,7 @@ fn guest_protect_skips_absent_entries_between_resident_runs() {
                 span: PageSpan::new(0x4000, 8 * PAGE),
                 permissions: readonly,
                 exec: ExecAuthority::Leaf,
+                cow_ceiling: None,
                 absent: carrick_guest_arch::AbsentLeaves::Refuse,
             },
             &[]
@@ -668,6 +676,7 @@ fn guest_protect_skips_absent_entries_between_resident_runs() {
                 span: PageSpan::new(0x4000, 8 * PAGE),
                 permissions: readonly,
                 exec: ExecAuthority::Leaf,
+                cow_ceiling: None,
                 absent: carrick_guest_arch::AbsentLeaves::Lazy,
             },
             &[]
@@ -1369,6 +1378,7 @@ fn first_touch_cow_nx_and_protection_have_distinct_classes() {
                     user: true
                 },
                 exec: ExecAuthority::Leaf,
+                cow_ceiling: None,
                 absent: carrick_guest_arch::AbsentLeaves::Refuse,
             },
             &[]
@@ -1425,6 +1435,7 @@ fn first_touch_cow_nx_and_protection_have_distinct_classes() {
                 user: true,
             },
             exec: ExecAuthority::Leaf,
+            cow_ceiling: None,
             absent: carrick_guest_arch::AbsentLeaves::Refuse,
         },
         &[],
@@ -1616,6 +1627,7 @@ fn split_and_coalesce_preserve_pat_output_and_neighbors() {
                     span,
                     permissions,
                     exec: ExecAuthority::Leaf,
+                    cow_ceiling: None,
                     absent: carrick_guest_arch::AbsentLeaves::Refuse
                 },
                 &grants
@@ -1645,6 +1657,7 @@ fn split_and_coalesce_preserve_pat_output_and_neighbors() {
                     ..permissions
                 },
                 exec: ExecAuthority::Leaf,
+                cow_ceiling: None,
                 absent: carrick_guest_arch::AbsentLeaves::Refuse,
             },
             &[],
@@ -1704,6 +1717,7 @@ fn failed_split_restores_all_512_children_and_parent() {
                         user: true
                     },
                     exec: ExecAuthority::Leaf,
+                    cow_ceiling: None,
                     absent: carrick_guest_arch::AbsentLeaves::Refuse,
                 },
                 &[root(0x4000)]
@@ -1798,6 +1812,7 @@ fn whole_block_protection_edits_one_terminal_without_split_grants() {
                 user: true,
             },
             exec: ExecAuthority::Leaf,
+            cow_ceiling: None,
             absent: carrick_guest_arch::AbsentLeaves::Refuse,
         },
         &[],
@@ -2046,4 +2061,83 @@ fn hardware_walker_is_translate_leaf_hardware_with_refusal_split() {
     ] {
         assert!(seen.contains_key(class), "{class} not reached: {seen:?}");
     }
+}
+
+/// #3121: fork arms COW on every leaf that may be written, a `PROT_READ`
+/// private leaf that keeps `MAY_WRITE` included; `MAY_WRITE` on the armed
+/// leaf is current write intent. A never-writable leaf stays as it is.
+#[test]
+fn fork_arms_a_read_only_leaf_that_may_be_written() {
+    let read_only = 0x800000 | PRESENT | USER | PRIVATE | NX;
+    assert_eq!(arm_cow_terminal(read_only), Ok(read_only));
+    let protected = read_only | MAY_WRITE;
+    assert_eq!(
+        arm_cow_terminal(protected).unwrap() & (COW | WRITE | MAY_WRITE | ADDRESS),
+        COW | 0x800000
+    );
+    let writable = read_only | WRITE | MAY_WRITE;
+    assert_eq!(
+        arm_cow_terminal(writable).unwrap() & (COW | WRITE | MAY_WRITE),
+        COW | MAY_WRITE
+    );
+}
+
+/// #3121: a widening of a fork-shared leaf keeps COW armed and records write
+/// as intent, under the mapping's ceiling only (the shared AArch64 rule).
+#[test]
+fn protect_widens_a_cow_armed_leaf_to_write_intent_only() {
+    let words = Words::new();
+    let span = PageSpan::new(0x4000, PAGE);
+    let rw = Permissions {
+        writable: true,
+        executable: false,
+        user: true,
+    };
+    assert!(matches!(
+        apply(
+            &words,
+            private_prepare(span, 0x800000, rw),
+            &[root(0x2000), root(0x3000), root(0x4000)]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert!(matches!(
+        apply(&words, DescriptorOp::ArmCow(span), &[]),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let protect = |cow_ceiling| DescriptorOp::Protect {
+        span,
+        permissions: rw,
+        exec: ExecAuthority::Leaf,
+        cow_ceiling,
+        absent: carrick_guest_arch::AbsentLeaves::Refuse,
+    };
+    assert_eq!(
+        apply(&words, protect(None), &[]),
+        DescriptorOutcome::Refused(DescriptorRefusal::CowArmed)
+    );
+    let read_only_ceiling = crate::aarch64::GuestPermissionCeiling {
+        readable: true,
+        writable: false,
+        executable: false,
+    };
+    assert_eq!(
+        apply(&words, protect(Some(read_only_ceiling)), &[]),
+        DescriptorOutcome::Refused(DescriptorRefusal::PermissionWidening)
+    );
+    let ceiling = crate::aarch64::GuestPermissionCeiling {
+        writable: true,
+        ..read_only_ceiling
+    };
+    assert!(matches!(
+        apply(&words, protect(Some(ceiling)), &[]),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let leaf = read_terminal_descriptor(&words, root(0x1000), UserVa::new(span.va))
+        .unwrap()
+        .0;
+    assert_eq!(
+        leaf & (COW | WRITE | MAY_WRITE | USER),
+        COW | MAY_WRITE | USER
+    );
 }
