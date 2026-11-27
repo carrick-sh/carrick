@@ -1875,3 +1875,107 @@ pub fn forked_shared_file_window_leaf_is_never_an_inventoried_frame(_make: fn() 
     assert_eq!(slot.allowed, vec![contexts[0].mm.raw()]);
     assert!(!memory.is_quarantined());
 }
+
+/// #2766: the ring applies a first touch's Prepare and releases the MM's
+/// editor before the host settles it, so a sibling thread's `mprotect` of
+/// the same pages (here RW -> RWX, which also raises the MAY_EXEC ceiling)
+/// can land between the two. The settlement must accept the re-protected
+/// leaves: the Prepare owns their frame, PRIVATE and residency, not the
+/// permissions a later protection owns. It used to quarantine the carrier
+/// ("guest MMU publication live descriptor mismatch").
+pub fn prepare_settlement_accepts_a_sibling_protect_applied_before_it(_make: fn() -> MemoryTestIo) {
+    let mut memory = CarrierMemory::new(_make()).unwrap();
+    memory.install(&[backing(0x1000, 0x4000, 1)]).unwrap();
+    let context = AddressContext {
+        root: root(0x1000),
+        mm: MmGeneration::new(nz(1)),
+        generation: ContextGeneration::new(nz(1)),
+    };
+    memory.install_root(nz(1), context).unwrap();
+    let data = backing(0x800000, 2 * PAGE as usize, 2);
+    let tables = [root(0x2000), root(0x3000), root(0x4000)];
+    let prepare = DescriptorTxn {
+        id: DescriptorTxnId {
+            mm_key: nz(1),
+            generation: nz(1),
+        },
+        root: context.root,
+        tables: &tables,
+        op: DescriptorOp::Prepare {
+            span: PageSpan::new(0x4000, 2 * PAGE),
+            output: FrameGpa::new(0x800000),
+            permissions: Permissions {
+                writable: true,
+                executable: false,
+                user: true,
+            },
+            resident: PageSpan::new(0x4000, PAGE),
+            backing: data.identity,
+        },
+    };
+    let mut inventory = Inventory {
+        live: true,
+        fail_publish: false,
+        fail_commit: false,
+        fail_rollback: false,
+    };
+    memory.prepare(&[data], &mut inventory).unwrap();
+    let receipt = execute_descriptor_txn(
+        &memory.words(),
+        &prepare,
+        context.root,
+        &mut InlineJournal::new(),
+    );
+    let publication = GuestMmuPublication::from_x86_receipt(&prepare, &receipt).unwrap();
+    // The sibling's mprotect(PROT_READ | PROT_WRITE | PROT_EXEC), applied in
+    // the ring after the editor's release and before this settlement.
+    let protect = DescriptorTxn {
+        id: DescriptorTxnId {
+            mm_key: nz(1),
+            generation: nz(2),
+        },
+        root: context.root,
+        tables: &[],
+        op: DescriptorOp::Protect {
+            span: PageSpan::new(0x4000, 2 * PAGE),
+            permissions: Permissions {
+                writable: true,
+                executable: true,
+                user: true,
+            },
+            exec: carrick_mmu_core::x86::descriptor_txn::ExecAuthority::Mapping,
+            cow_ceiling: None,
+            absent: carrick_guest_arch::AbsentLeaves::Refuse,
+        },
+    };
+    let protected = execute_descriptor_txn(
+        &memory.words(),
+        &protect,
+        context.root,
+        &mut InlineJournal::new(),
+    );
+    assert!(
+        GuestMmuPublication::from_x86_receipt(&protect, &protected).is_some(),
+        "the sibling's protect applies: {:?}",
+        protected.outcome
+    );
+    // The leaves now carry the protect's permissions, not the Prepare's.
+    for va in [0x4000, 0x5000] {
+        let (entry, _) = read_terminal_descriptor(
+            &memory.words(),
+            context.root,
+            carrick_guest_arch::UserVa::new(va),
+        )
+        .unwrap();
+        assert!(
+            entry & MAY_EXEC != 0 && entry & NX == 0,
+            "{va:#x}: {entry:#x}"
+        );
+    }
+    let settled = memory.publish(&prepare, publication, &mut inventory);
+    assert!(
+        settled.is_ok(),
+        "a Prepare settles over a sibling's later protect: {settled:?}"
+    );
+    assert!(!memory.is_quarantined());
+}

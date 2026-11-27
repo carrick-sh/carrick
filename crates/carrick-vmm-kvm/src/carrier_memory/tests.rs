@@ -92,6 +92,11 @@ fn refused_retire_child_mutates_nothing_and_its_retry_completes() {
     test_support::refused_retire_child_mutates_nothing_and_its_retry_completes(real_memory_io);
 }
 #[test]
+fn prepare_settlement_accepts_a_sibling_protect_applied_before_it() {
+    carrick_test_support::require_kvm!();
+    test_support::prepare_settlement_accepts_a_sibling_protect_applied_before_it(real_memory_io);
+}
+#[test]
 fn inherited_inventory_edge_survives_protect_advancing_mapping_generation() {
     carrick_test_support::require_kvm!();
     test_support::inherited_inventory_edge_survives_protect_advancing_mapping_generation(

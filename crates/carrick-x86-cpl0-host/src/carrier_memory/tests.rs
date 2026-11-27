@@ -127,6 +127,12 @@ fn refused_retire_child_mutates_nothing_and_its_retry_completes() {
     });
 }
 #[test]
+fn prepare_settlement_accepts_a_sibling_protect_applied_before_it() {
+    test_support::prepare_settlement_accepts_a_sibling_protect_applied_before_it(|| {
+        test_support::MemoryTestIo::new(TestMemoryIo::default())
+    });
+}
+#[test]
 fn inherited_inventory_edge_survives_protect_advancing_mapping_generation() {
     test_support::inherited_inventory_edge_survives_protect_advancing_mapping_generation(|| {
         test_support::MemoryTestIo::new(TestMemoryIo::default())
