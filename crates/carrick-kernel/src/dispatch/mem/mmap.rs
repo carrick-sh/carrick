@@ -1524,12 +1524,15 @@ impl<'a> MemView<'a> {
             // source reader serves (`snapshot_private_mmap_description`)
             // takes source custody instead. POPULATE and LOCKED keep the
             // eager venue: lazy custody neither populates nor carries the
-            // host lock into the root (#1141).
+            // host lock into the root (#1141). Only a carrier whose owner
+            // frame grant serves those pages may hand them to the root; any
+            // other keeps them on the host's eager venue, which it serves.
             let owner_file_eligible = map_sharing == MmapSharing::Private
                 && !map_flags.intersects(
                     LinuxMmapFlags::ANONYMOUS | LinuxMmapFlags::GROWSDOWN
                         | LinuxMmapFlags::POPULATE | LinuxMmapFlags::LOCKED,
                 )
+                && memory.private_file_venue() == carrick_guest_mem::PrivateFileVenue::OwnerGrant
                 && this.mem().lock().delegated_root().is_some();
             // Inspect the description once for both venues. Retaining an owner
             // source does not introduce another file-description authority.
