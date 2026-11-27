@@ -1532,6 +1532,45 @@ fn mounted_static_x86_fork_child_execs_after_the_node_pool_grew() {
     );
 }
 
+/// #3085: a fork whose child's reservation tree needs more nodes than the
+/// shared pool holds supplies a node bank and reruns. On main the publish
+/// refused `MetadataRequired` and the errno mapping's catch-all answered
+/// EFAULT (exit 114): apt-get's `Failed to fork` on the shell row. The
+/// second fork, beside the first live child, needs a second bank.
+#[test]
+fn mounted_static_x86_fork_supplies_node_banks_for_a_large_tree() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("fork-supplies-node-banks");
+    compile_assembly_with_flags(
+        "x86_fork_supplies_node_banks.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native fork-supplies-node-banks oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+    assert_eq!(native.stdout, b"ok=2\n", "native oracle");
+
+    let guest = run_mounted_binary(&elf, "fork-supplies-node-banks", false);
+    assert_eq!(
+        (guest.status.code(), guest.stdout.as_slice()),
+        (native.status.code(), native.stdout.as_slice()),
+        "114 is a fork refused EFAULT, 100 + errno another refusal, 96 a \
+         refused mapping, 95 a child that did not exit 0. Stdout: {} Stderr: {}",
+        String::from_utf8_lossy(&guest.stdout),
+        String::from_utf8_lossy(&guest.stderr)
+    );
+}
+
 /// #2851: seven threads of an exec'd fork child map, protect, advise and
 /// unmap memory at once. A call that waited for another's edit reruns its
 /// saved `SYSCALL`; a preemption before that instruction parked the rewound
