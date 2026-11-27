@@ -140,6 +140,108 @@ macro_rules! require_kvm {
     };
 }
 
+/// The policy file of the host kernel's transparent huge pages.
+pub const THP_POLICY: &str = "/sys/kernel/mm/transparent_hugepage/enabled";
+
+/// The host kernel's transparent huge page policy: the bracketed word of
+/// [`THP_POLICY`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThpPolicy {
+    /// Every anonymous mapping may take a huge page on first touch.
+    Always,
+    /// Only a mapping advised with `MADV_HUGEPAGE` may.
+    Madvise,
+    Never,
+}
+
+/// Whether a carrier's unadvised anonymous host mapping can be backed by
+/// huge pages, so the hypervisor can map a 2 MiB guest window with one
+/// large stage-2 entry. Carrick gives its host mappings no huge page advice,
+/// so only [`ThpPolicy::Always`] can.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostHugePages {
+    Policy(ThpPolicy),
+    /// The policy file is absent or names no policy: no THP in this kernel.
+    Unknown,
+}
+
+impl HostHugePages {
+    /// Read [`THP_POLICY`].
+    pub fn probe() -> Self {
+        Self::parse(&std::fs::read_to_string(THP_POLICY).unwrap_or_default())
+    }
+
+    /// The policy of a [`THP_POLICY`] text such as `always [madvise] never`.
+    pub fn parse(text: &str) -> Self {
+        let chosen = text
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix('[')?.strip_suffix(']'));
+        match chosen {
+            Some("always") => Self::Policy(ThpPolicy::Always),
+            Some("madvise") => Self::Policy(ThpPolicy::Madvise),
+            Some("never") => Self::Policy(ThpPolicy::Never),
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn backs_unadvised_mappings(self) -> bool {
+        self == Self::Policy(ThpPolicy::Always)
+    }
+}
+
+static SKIPPED_HUGE_PAGES: AtomicU64 = AtomicU64::new(0);
+
+/// The decision for one test that needs unadvised huge host pages, on a
+/// host in state `host`: `true` to run it.
+///
+/// The policy is always written to the process's real stderr, so a KVM-lane
+/// log records the host it ran on. A host that can't back unadvised mappings
+/// fails the test when `required` (the KVM gate must not skip); otherwise
+/// the skip is counted and reported as a `SKIP thp` line.
+pub fn admit_huge_pages(host: HostHugePages, required: bool, test: &str) -> bool {
+    let usable = host.backs_unadvised_mappings();
+    let line = if usable {
+        format!("HOST thp {host:?}: {test}\n")
+    } else {
+        assert!(
+            !required,
+            "CARRICK_REQUIRE_KVM=1 but the host's transparent huge page policy is \
+             {host:?}, not Always: unadvised host mappings get no huge pages, and \
+             the KVM gate must not skip ({test})"
+        );
+        let count = SKIPPED_HUGE_PAGES.fetch_add(1, Ordering::Relaxed) + 1;
+        format!("SKIP thp #{count}: {test}: transparent huge page policy {host:?}\n")
+    };
+    // SAFETY: writes an owned buffer to the process's stderr; a short write
+    // only truncates this diagnostic.
+    unsafe { libc::write(libc::STDERR_FILENO, line.as_ptr().cast(), line.len()) };
+    usable
+}
+
+/// Whether the calling test may rely on unadvised huge host pages here.
+/// Prefer [`require_huge_pages!`](crate::require_huge_pages).
+pub fn huge_pages_or_skip() -> bool {
+    let thread = std::thread::current();
+    admit_huge_pages(
+        HostHugePages::probe(),
+        kvm_required(),
+        thread.name().unwrap_or("<unnamed test thread>"),
+    )
+}
+
+/// A statement of a test whose claim needs the host to back unadvised
+/// anonymous mappings with huge pages: return, with a counted `SKIP thp`
+/// line, when its policy isn't `always`; fail instead under
+/// `CARRICK_REQUIRE_KVM=1`.
+#[macro_export]
+macro_rules! require_huge_pages {
+    () => {
+        if !$crate::kvm_host::huge_pages_or_skip() {
+            return;
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,6 +309,29 @@ mod tests {
         let message = *required.unwrap_err().downcast::<String>().unwrap();
         assert!(
             message.contains("present but not openable") && message.contains("must not skip"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn only_an_always_thp_policy_admits_and_the_gate_fails_on_any_other() {
+        let always = HostHugePages::parse("[always] madvise never\n");
+        let madvise = HostHugePages::parse("always [madvise] never\n");
+        assert_eq!(always, HostHugePages::Policy(ThpPolicy::Always));
+        assert_eq!(madvise, HostHugePages::Policy(ThpPolicy::Madvise));
+        assert_eq!(
+            HostHugePages::parse("always madvise [never]"),
+            HostHugePages::Policy(ThpPolicy::Never)
+        );
+        assert_eq!(HostHugePages::parse(""), HostHugePages::Unknown);
+
+        assert!(admit_huge_pages(always, true, "always"));
+        assert!(!admit_huge_pages(madvise, false, "madvise"));
+        assert!(!admit_huge_pages(HostHugePages::Unknown, false, "unknown"));
+        let required = std::panic::catch_unwind(|| admit_huge_pages(madvise, true, "gate"));
+        let message = *required.unwrap_err().downcast::<String>().unwrap();
+        assert!(
+            message.contains("Madvise") && message.contains("must not skip"),
             "{message}"
         );
     }

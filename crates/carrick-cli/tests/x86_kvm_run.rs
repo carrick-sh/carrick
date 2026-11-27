@@ -1872,8 +1872,8 @@ fn mounted_static_x86_threads_first_touch_publishes_no_shootdown_per_fault() {
 /// because every owner-grant window was a page-aligned host mapping at a
 /// page-aligned GPA and KVM filled its EPT/NPT one 4 KiB entry at a time.
 /// A window of whole 2 MiB pages is now placed on a 2 MiB GPA boundary with
-/// a 2 MiB-aligned, huge-page-advised host mapping, so the hypervisor maps
-/// it with one large entry. Contract `x86.mm.first-touch-stage2-fill` (its
+/// a 2 MiB-aligned host mapping, so on a host that backs it with a huge page
+/// the hypervisor maps it with one large entry. Contract `x86.mm.first-touch-stage2-fill` (its
 /// affine `host_stage2_faults` budget, read from the registry): the run's
 /// stage-2 faults, from the carrier's own `KVM_GET_STATS_FD`, stay bounded
 /// as the pages touched grow from 4 x 512 to 4 x 2048.
@@ -1903,15 +1903,10 @@ fn mounted_static_x86_threads_first_touch_of_large_windows_takes_no_stage2_fault
     // The hypervisor maps a window with one large entry only when the host
     // backs it with a huge page. Carrick gives no huge page advice (host
     // memory follows the host's policy, #3143), so only a host whose policy
-    // is `always` can show the effect: say so rather than report a
-    // regression.
-    let thp =
-        std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled").unwrap_or_default();
-    assert!(
-        thp.contains("[always]"),
-        "prerequisite: this host's transparent huge page policy is not `always` \
-         ({thp:?}); large-page windows cannot reduce stage-2 faults here"
-    );
+    // is `always` can show the effect. The typed prerequisite writes the
+    // policy to the log on every host, counts a `SKIP thp` elsewhere, and
+    // fails instead under the KVM gate (`CARRICK_REQUIRE_KVM=1`).
+    carrick_test_support::require_huge_pages!();
     let dir = tempfile::tempdir().unwrap();
     let mut observed = Vec::new();
     for pages in [512u64, 1024, 2048] {
