@@ -1010,8 +1010,8 @@ mod settled_idle_tests {
     fn idle_exit_with_a_retained_switched_record_is_refused() {
         let zone = zone();
         let slot = SlotId::from_index(1).unwrap();
-        zone.drive(slot, 2);
-        zone.publish_slot(slot, 0, None, 0);
+        zone.drive(slot, 2, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 0, None, 0, &carrick_sched_core::OwedPasses::new());
         // The record's address space is published and open, so EL1 may
         // install it on the threadless slot (a native-owned record).
         zone.spaces.set_idle_ttbr(0x30000);
@@ -1031,8 +1031,15 @@ mod settled_idle_tests {
             })
             .unwrap();
         assert!(zone.mark_native_owned(record));
-        assert!(zone.requeue_preempted(slot, record).is_queued());
-        assert_eq!(zone.switch_in_full(slot).map(|s| s.record), Some(record));
+        assert!(
+            zone.requeue_preempted(slot, record, &carrick_sched_core::OwedPasses::new())
+                .is_queued()
+        );
+        assert_eq!(
+            zone.switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+                .map(|s| s.record),
+            Some(record)
+        );
         assert_eq!(zone.slot(slot).current(), Some(record));
         assert_eq!(
             SettledIdleSlot::admit_in(Some(&zone), Some(slot)).unwrap_err(),
@@ -1047,8 +1054,8 @@ mod settled_idle_tests {
     fn idle_exit_with_an_empty_slot_is_admitted() {
         let zone = zone();
         let slot = SlotId::from_index(1).unwrap();
-        zone.drive(slot, 2);
-        zone.publish_slot(slot, 0, None, 0);
+        zone.drive(slot, 2, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 0, None, 0, &carrick_sched_core::OwedPasses::new());
         assert!(SettledIdleSlot::admit_in(Some(&zone), Some(slot)).is_ok());
         assert!(SettledIdleSlot::admit_in(Some(&zone), None).is_ok());
         assert!(SettledIdleSlot::admit_in(None, Some(slot)).is_ok());
@@ -1515,12 +1522,17 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         let control = thread.control_lease();
         // Retire the predecessor source before mapping retirement can release it.
         if let Some(zone) = carrick_kernel::el1_zone::zone() {
+            // Kick the idle CPUs the publication's lock release owes a scan
+            // (#3083), as every host zone operation does.
+            let passes = carrick_sched_core::OwedPasses::new();
             zone.publish_slot_with_affinity(
                 slot,
                 0,
                 self.bound_cpu,
                 carrick_sched_core::affinity_source::AffinitySource::UNBOUND,
+                &passes,
             );
+            passes.deliver(carrick_kernel::el1_zone::resched_slot);
         }
         if let Some(mappings) = &self.lifecycle_mappings {
             mappings.publish(index, control.clone()).map_err(|e| {
@@ -1540,7 +1552,9 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
                 zone.slot(slot)
                     .set_sgi_target(carrick_sched_core::HOST_RESCHEDULE_TARGET);
             }
-            zone.publish_slot_with_affinity(slot, mm, self.bound_cpu, source);
+            let passes = carrick_sched_core::OwedPasses::new();
+            zone.publish_slot_with_affinity(slot, mm, self.bound_cpu, source, &passes);
+            passes.deliver(carrick_kernel::el1_zone::resched_slot);
         }
         carrick_el1_abi::publish_zone_identity(index, mm, thread.key().serial.raw());
         attach_loaded_affinity_route(index, |slot| thread.attach_affinity_slot(slot))?;
@@ -1966,13 +1980,16 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         // install its own MM and run directly from the zone.
         let _vacant_at_entry = SettledIdleSlot::admit(Some(slot))?;
         prepare_zone_driver(slot, zone_driver(self.executor_id))?;
+        let passes = carrick_sched_core::OwedPasses::new();
         zone.drive_and_publish(
             slot,
             zone_driver(self.executor_id),
             0,
             self.bound_cpu,
             carrick_sched_core::AffinitySource::UNBOUND,
+            &passes,
         );
+        passes.deliver(carrick_kernel::el1_zone::resched_slot);
         let lifecycle = self
             .lifecycle
             .as_mut()
@@ -1987,7 +2004,9 @@ impl PersistentExecutor for HvpatchPersistentExecutor {
         zone.enter_guest(slot);
         let exit =
             carrick_vmm_hvf::hvf_aarch64_engine::run_worker_idle_entry(lifecycle, vcpu, frame);
-        zone.leave_guest(slot, &carrick_kernel::el1_zone::HostLockWait);
+        let passes = carrick_sched_core::OwedPasses::new();
+        zone.leave_guest(slot, &carrick_kernel::el1_zone::HostLockWait, &passes);
+        passes.deliver(carrick_kernel::el1_zone::resched_slot);
         if let Ok(ref outcome) = exit
             && !matches!(outcome, carrick_aarch64::Aarch64Exit::Halt)
         {
