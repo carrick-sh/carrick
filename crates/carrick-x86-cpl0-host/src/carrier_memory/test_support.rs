@@ -1478,6 +1478,27 @@ pub fn a_released_slot_its_retiring_mm_still_maps_quarantines_the_carrier(
     assert!(fixture.retire(2).is_err());
 }
 
+/// A retirement no drain can repair quarantines the carrier: a second
+/// retirement of an MM that already retired finds no CR3 root, and a rerun
+/// could only refuse the same way again, so it is a broken invariant (fatal),
+/// never a refusal the stock retries (#3061).
+pub fn a_retirement_without_a_carrier_root_quarantines_the_carrier(_make: fn() -> MemoryTestIo) {
+    let mut fixture = RetireFixture::new(2, _make);
+    let private = fixture.slot(0x800000, 91, &[2]);
+    assert_eq!(fixture.retire(2).unwrap().revoked_slots, 1);
+    assert!(fixture.memory.record(private).is_err());
+    assert!(fixture.memory.root(fixture.key(2)).is_none());
+    assert!(!fixture.memory.is_quarantined());
+
+    let rerun = fixture.retire(2);
+
+    assert!(rerun.is_err(), "MM 2 has no carrier root: {rerun:?}");
+    assert!(
+        fixture.memory.is_quarantined(),
+        "an unrepairable retirement is fatal, not a retry"
+    );
+}
+
 /// Returns the first carrier refusal instead of panicking: this harness is
 /// compiled into the library under `test-support`, where the no-panic gate
 /// applies; the `#[test]` callers unwrap the result.

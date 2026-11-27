@@ -1005,7 +1005,25 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
     /// memslot deletion ioctl can fail; that is a host fault, never
     /// guest-reachable, and it quarantines the carrier as every other
     /// indeterminate memslot change does.
+    ///
+    /// So every refusal quarantines the carrier, by construction: nothing a
+    /// later drain does can repair one. Before phase 2 none is retryable (a
+    /// null key or a missing CR3 root names a retired MM the carrier never
+    /// registered, or already retired), and after it the root and aliases
+    /// are gone, so a rerun could only refuse again (#3061).
     pub fn retire_child(
+        &mut self,
+        absence: &carrick_hal::fork_stock::SlotAbsence,
+        inventory: &dyn carrick_hal::PhysicalFrameInventory,
+    ) -> Result<RetiredChild, MemoryError> {
+        let retired = self.retire_child_once(absence, inventory);
+        if retired.is_err() {
+            self.quarantined = true;
+        }
+        retired
+    }
+
+    fn retire_child_once(
         &mut self,
         absence: &carrick_hal::fork_stock::SlotAbsence,
         inventory: &dyn carrick_hal::PhysicalFrameInventory,

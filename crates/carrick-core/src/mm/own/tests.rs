@@ -428,14 +428,21 @@ fn a_release_outcome_is_typed_and_not_now_leaves_the_mm_releasable() {
     assert_eq!(core.finish_release(ticket.clone(), wait), Ok(wait));
     assert_eq!(core.mm_life(a), Some(MmLife::Exiting));
     assert!(
-        core.finish_release(ticket, ReleaseOutcome::Done).is_err(),
+        core.finish_release(ticket.clone(), ReleaseOutcome::Done)
+            .is_err(),
         "a finished ticket is spent"
     );
+    let stale = ticket;
     let (ticket, returned) = core.begin_release(a).unwrap();
     assert!(
         returned.is_empty(),
         "the grants left with the first release"
     );
+    assert!(
+        core.finish_release(stale, ReleaseOutcome::Done).is_err(),
+        "the first attempt's ticket can't finish the second attempt"
+    );
+    assert_eq!(core.mm_life(a), Some(MmLife::Releasing));
     let broken = ReleaseOutcome::Broken(BrokenRelease::at("test"));
     assert_eq!(core.finish_release(ticket, broken), Ok(broken));
     assert_eq!(core.mm_life(a), Some(MmLife::Broken));

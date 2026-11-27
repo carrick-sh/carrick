@@ -2608,6 +2608,30 @@ impl PartialOrd for GuestFrameOwner {
     }
 }
 
+/// Why a whole-MM inventory retirement ([`PhysicalFrameInventory::retire_mm`])
+/// refused. The type has no "not now" case because none exists: retirement
+/// takes the inventory's own lock (it never meets a holder it could wait
+/// for), and it runs only once the MM's editor is excluded, so nothing maps
+/// into the MM and no later drain can make a refused retirement succeed.
+/// Every refusal (mappings left live after the batch, an event or revision
+/// space exhausted, a rejected reservation or apply) is a broken invariant,
+/// and the release that meets one is `Broken`, which ends the run (#3061).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("whole-MM inventory retirement broke an invariant: {invariant}")]
+pub struct MmRetireBroken {
+    invariant: &'static str,
+}
+
+impl MmRetireBroken {
+    pub const fn new(invariant: &'static str) -> Self {
+        Self { invariant }
+    }
+    /// Which invariant the retirement found broken.
+    pub const fn invariant(self) -> &'static str {
+        self.invariant
+    }
+}
+
 pub trait PhysicalFrameInventory: Send + Sync {
     fn bind(&self, owner: GuestFrameOwner) -> Arc<dyn FrameCowAuthority>;
     fn allocate_backing_ids(
@@ -2615,10 +2639,9 @@ pub trait PhysicalFrameInventory: Send + Sync {
     ) -> Result<(crate::FrameId, crate::MappingId), Box<dyn std::error::Error + Send + Sync>>;
     /// Unmap every published mapping of a retired MM (a fork child leaving
     /// quarantine), retiring frames no other MM maps. Returns the count.
-    fn retire_mm(
-        &self,
-        mm: carrick_guest_arch::MmGeneration,
-    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>>;
+    /// Every refusal is a broken invariant ([`MmRetireBroken`]), never "not
+    /// now": see that type.
+    fn retire_mm(&self, mm: carrick_guest_arch::MmGeneration) -> Result<usize, MmRetireBroken>;
     /// Whether any MM, not just one binding's, still holds a live mapping
     /// row (prepared or published) of `frame`. A backend asks this before
     /// it revokes the backing a frame lives in: one row anywhere means the

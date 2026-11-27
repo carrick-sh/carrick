@@ -29,10 +29,7 @@ impl carrick_hal::PhysicalFrameInventory for Inventory {
     > {
         Err("no frame allocation in the reclaim fixture".into())
     }
-    fn retire_mm(
-        &self,
-        _: MmGeneration,
-    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    fn retire_mm(&self, _: MmGeneration) -> Result<usize, carrick_hal::MmRetireBroken> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok(0)
     }

@@ -31,6 +31,9 @@ pub(super) struct MmRecord {
     pub(super) editor: MmEditor,
     /// The base of the MM's arena chunk with room, if any (G4).
     pub(super) chunk: Option<u64>,
+    /// How many releases of the MM began; a [`super::release::ReleaseTicket`]
+    /// finishes only the attempt it was issued for.
+    pub(super) release_attempt: u64,
 }
 
 impl MmRecord {
@@ -39,6 +42,7 @@ impl MmRecord {
             life: MmLife::Live,
             editor: MmEditor::Free,
             chunk: None,
+            release_attempt: 0,
         }
     }
 }
