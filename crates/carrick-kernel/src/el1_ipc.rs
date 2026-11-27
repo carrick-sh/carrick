@@ -574,8 +574,14 @@ impl SocketEpollLockWait<'_> {
     ) {
         let zone = self.0.zone();
         let (waker, effects) = owned.deliver_handbacks(&mut |record| {
-            if let Some(handback) = zone.place_host_handback(record)
-                && let carrick_sched_core::NativePlacement::Placed(placement) = handback.placement
+            if let Some(handback) = {
+                let passes = carrick_sched_core::OwedPasses::new();
+                let owed = zone.place_host_handback(record, &passes);
+                (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(
+                    passes,
+                );
+                owed
+            } && let carrick_sched_core::NativePlacement::Placed(placement) = handback.placement
             {
                 self.0.resched(placement.slot);
             }

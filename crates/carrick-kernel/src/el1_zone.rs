@@ -169,8 +169,9 @@ fn collect_object_wake<C: carrick_el1_abi::EntryContext>(
             continue;
         };
         let mut duplicate = false;
-        queue
-            .notify_object_host(
+        {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = queue.notify_object_host(
                 &mut |record| {
                     let Some(slot) = handed.get_mut(*len) else {
                         duplicate = true;
@@ -185,8 +186,12 @@ fn collect_object_wake<C: carrick_el1_abi::EntryContext>(
                         slots[index / 64] |= 1 << (index % 64);
                     }
                 },
-            )
-            .map_err(|_| CollectFault::Ownership)?;
+                &passes,
+            );
+            (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
+            owed
+        }
+        .map_err(|_| CollectFault::Ownership)?;
         if duplicate {
             return Err(CollectFault::DuplicateDelivery);
         }
@@ -265,9 +270,15 @@ pub(crate) fn hand_back_carrier_completions(carrier: CarrierZoneRef<'_>) {
 /// readiness completion is retained on its owner's queue, exactly like
 /// [`route_native_handback_in_zone`]; a stopped driver takes it on entry.
 fn hand_back_in_carrier(carrier: CarrierZoneRef<'_>, record: RecordRef) {
-    carrier
-        .zone()
-        .hand_back_to_owner(record, &mut |slot| carrier.resched(slot));
+    {
+        let passes = carrick_sched_core::OwedPasses::new();
+        let owed =
+            carrier
+                .zone()
+                .hand_back_to_owner(record, &mut |slot| carrier.resched(slot), &passes);
+        (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
+        owed
+    };
 }
 
 /// Sample a native member's host-readiness queue
@@ -338,21 +349,27 @@ pub(crate) fn notify_host_ready(carrier: Option<&CarrierZone>, record: RecordRef
         let ObjectWakeDelivery {
             handed, len, slots, ..
         } = delivery;
-        let _ = queue.notify_object_host(
-            &mut |record| {
-                // One member's queue hands back at most that member.
-                if let Some(target) = handed.get_mut(*len) {
-                    target.write(record);
-                    *len += 1;
-                }
-            },
-            &mut |placed| {
-                if placed.resched {
-                    let index = usize::from(placed.slot.raw());
-                    slots[index / 64] |= 1 << (index % 64);
-                }
-            },
-        );
+        let _ = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = queue.notify_object_host(
+                &mut |record| {
+                    // One member's queue hands back at most that member.
+                    if let Some(target) = handed.get_mut(*len) {
+                        target.write(record);
+                        *len += 1;
+                    }
+                },
+                &mut |placed| {
+                    if placed.resched {
+                        let index = usize::from(placed.slot.raw());
+                        slots[index / 64] |= 1 << (index % 64);
+                    }
+                },
+                &passes,
+            );
+            (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
+            owed
+        };
         // A refused notification leaves the epoch unmoved and the member
         // parked: the queue was retired with its record.
     }
@@ -413,8 +430,9 @@ impl carrick_el1_abi::MetadataCompletionWake for MetadataCompletionWake {
         let ObjectWakeDelivery {
             handed, len, slots, ..
         } = &mut delivery;
-        queue
-            .notify_object_host(
+        {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = queue.notify_object_host(
                 &mut |record| {
                     let Some(target) = handed.get_mut(*len) else {
                         carrick_fatal::carrick_fatal!(
@@ -431,10 +449,14 @@ impl carrick_el1_abi::MetadataCompletionWake for MetadataCompletionWake {
                         slots[index / 64] |= 1 << (index % 64);
                     }
                 },
-            )
-            .unwrap_or_else(|_| {
-                carrick_fatal::carrick_fatal!("metadata::wake", "metadata wake ownership failed")
-            });
+                &passes,
+            );
+            (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
+            owed
+        }
+        .unwrap_or_else(|_| {
+            carrick_fatal::carrick_fatal!("metadata::wake", "metadata wake ownership failed")
+        });
         drop(queue);
         delivery.deliver();
         fn deliver_space_wake(
@@ -663,9 +685,19 @@ pub fn claim(record: RecordRef, seq: Option<u32>, kind: Handback) -> HostClaim {
         route_native_handback_in_zone(zone, record);
         return HostClaim::Deferred;
     }
-    let outcome = zone.claim_for_host(record, seq, kind, &HostLockWait, &|owned| {
-        crate::el1_zone::complete_object_wake(owned.zone(), owned)
-    });
+    let outcome = {
+        let passes = carrick_sched_core::OwedPasses::new();
+        let owed = zone.claim_for_host(
+            record,
+            seq,
+            kind,
+            &HostLockWait,
+            &|owned| crate::el1_zone::complete_object_wake(owned.zone(), owned),
+            &passes,
+        );
+        (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
+        owed
+    };
     if let HostClaim::El1Held { slot } = outcome {
         kick_slot(slot);
     }
@@ -727,9 +759,19 @@ pub fn cancel(record: RecordRef) {
     let Some(zone) = zone_tables() else {
         return;
     };
-    match zone.claim_for_host(record, None, Handback::Cancelled, &HostLockWait, &|owned| {
-        crate::el1_zone::complete_object_wake(owned.zone(), owned)
-    }) {
+    match {
+        let passes = carrick_sched_core::OwedPasses::new();
+        let owed = zone.claim_for_host(
+            record,
+            None,
+            Handback::Cancelled,
+            &HostLockWait,
+            &|owned| crate::el1_zone::complete_object_wake(owned.zone(), owned),
+            &passes,
+        );
+        (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
+        owed
+    } {
         HostClaim::Claimed | HostClaim::AlreadyHost => {
             if zone.live(record).is_some() {
                 zone.free_record(record.id);
@@ -993,16 +1035,22 @@ fn wake(zone: &ZoneTables, mm: u64, uaddr: u64, bitset: u32, count: u32) -> Zone
         else {
             return wake;
         };
-        wake.count = zone.wake_host(
-            &guard,
-            mm,
-            uaddr,
-            bitset,
-            count,
-            schedules_in_guest(),
-            &mut |transfer| transfers.push(transfer),
-            &mut |placement| placements.push(placement),
-        );
+        wake.count = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = zone.wake_host(
+                &guard,
+                mm,
+                uaddr,
+                bitset,
+                count,
+                schedules_in_guest(),
+                &mut |transfer| transfers.push(transfer),
+                &mut |placement| placements.push(placement),
+                &passes,
+            );
+            (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
+            owed
+        };
     }
     for placement in placements {
         deliver_placement(Some(placement));
@@ -1368,7 +1416,12 @@ pub fn place_service(
     if deferred_capture_control::hold(zone, record) {
         return true;
     }
-    if deliver_placement(zone.place_from_host(record)) {
+    if deliver_placement({
+        let passes = carrick_sched_core::OwedPasses::new();
+        let owed = zone.place_from_host(record, &passes);
+        (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
+        owed
+    }) {
         return true;
     }
     zone.free_record(record);
@@ -1517,7 +1570,12 @@ fn route_native_handback_in_zone(zone: &ZoneTables, record: RecordRef) -> bool {
     if !rec.needs_native_handback() {
         return false;
     }
-    let Some(outcome) = zone.place_native_handback(record) else {
+    let Some(outcome) = ({
+        let passes = carrick_sched_core::OwedPasses::new();
+        let owed = zone.place_native_handback(record, &passes);
+        (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
+        owed
+    }) else {
         return false;
     };
     if let carrick_sched_core::NativePlacement::Placed(placement) = outcome {
@@ -1550,7 +1608,12 @@ fn route_first_entry_in_zone(zone: &ZoneTables, record: RecordRef) -> bool {
     let Some(custody) = zone.claim_first_entry_placement(record) else {
         return false;
     };
-    let custody = match zone.place_first_entry(custody) {
+    let custody = match {
+        let passes = carrick_sched_core::OwedPasses::new();
+        let owed = zone.place_first_entry(custody, &passes);
+        (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
+        owed
+    } {
         Ok(placement) => return deliver_placement(Some(placement)),
         Err(custody) => custody,
     };
@@ -1580,7 +1643,12 @@ pub fn hand_back_wanted(slot: SlotId) {
         return;
     };
     let mut wanted = Vec::new();
-    zone.take_host_wanted(slot, &mut |record| wanted.push(record));
+    {
+        let passes = carrick_sched_core::OwedPasses::new();
+        let owed = zone.take_host_wanted(slot, &mut |record| wanted.push(record), &passes);
+        (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
+        owed
+    };
     for record in wanted {
         publish_handback(record);
     }
@@ -1594,13 +1662,22 @@ pub fn drain_to_host(slot: SlotId) {
         return;
     };
     let mut handed = Vec::new();
-    zone.drain_slot(slot, &mut |record, discard| {
-        if discard {
-            zone.free_record(record.id);
-        } else {
-            handed.push(record);
-        }
-    });
+    {
+        let passes = carrick_sched_core::OwedPasses::new();
+        let owed = zone.drain_slot(
+            slot,
+            &mut |record, discard| {
+                if discard {
+                    zone.free_record(record.id);
+                } else {
+                    handed.push(record);
+                }
+            },
+            &passes,
+        );
+        (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
+        owed
+    };
     for record in handed {
         publish_handback(record);
     }
@@ -1625,12 +1702,18 @@ pub fn step_away_from_slot(slot: SlotId, driver: u64) -> Result<(), SlotLeaveRef
     deferred_capture_control::release_at_step_away(zone, slot, driver);
     let mut records = Vec::new();
     let mut placements = Vec::new();
-    if zone.step_away(
-        slot,
-        driver,
-        &mut |record| records.push(record),
-        &mut |placement| placements.push(placement),
-    ) {
+    if {
+        let passes = carrick_sched_core::OwedPasses::new();
+        let owed = zone.step_away(
+            slot,
+            driver,
+            &mut |record| records.push(record),
+            &mut |placement| placements.push(placement),
+            &passes,
+        );
+        (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
+        owed
+    } {
         settle_vacated(
             zone,
             Some(slot),
@@ -1678,7 +1761,12 @@ fn refuse_ring_occupant(
 /// Executor `driver` of `slot` is back from its blocking host wait.
 pub fn come_back_to_slot(slot: SlotId, driver: u64) {
     if let Some(zone) = zone() {
-        zone.step_back(slot, driver);
+        {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = zone.step_back(slot, driver, &passes);
+            (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
+            owed
+        };
     }
 }
 
@@ -1707,12 +1795,18 @@ pub fn leave_slot_in(
     refuse_ring_occupant(zone, slot, driver)?;
     let mut records = Vec::new();
     let mut placements = Vec::new();
-    if zone.leave_slot(
-        slot,
-        driver,
-        &mut |record| records.push(record),
-        &mut |placement| placements.push(placement),
-    ) {
+    if {
+        let passes = carrick_sched_core::OwedPasses::new();
+        let owed = zone.leave_slot(
+            slot,
+            driver,
+            &mut |record| records.push(record),
+            &mut |placement| placements.push(placement),
+            &passes,
+        );
+        (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(passes);
+        owed
+    } {
         settle_vacated(
             zone,
             now,
@@ -1752,11 +1846,24 @@ fn settle_vacated(
             // A Born thread has reserved first-entry capacity, but no host
             // continuation yet. Even a Resumed handback must reach an
             // executor for activation rather than publish a continuation wake.
-            if deliver_placement(zone.place_from_host(record.id)) {
+            if deliver_placement({
+                let passes = carrick_sched_core::OwedPasses::new();
+                let owed = zone.place_from_host(record.id, &passes);
+                (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(
+                    passes,
+                );
+                owed
+            }) {
                 continue;
             }
-            if deliver_placement(fallback.and_then(|fallback| zone.requeue_on(fallback, record.id)))
-            {
+            if deliver_placement(fallback.and_then(|fallback| {
+                let passes = carrick_sched_core::OwedPasses::new();
+                let owed = zone.requeue_on(fallback, record.id, &passes);
+                (|p: carrick_sched_core::OwedPasses| p.deliver(crate::el1_zone::resched_slot))(
+                    passes,
+                );
+                owed
+            })) {
                 continue;
             }
         }
