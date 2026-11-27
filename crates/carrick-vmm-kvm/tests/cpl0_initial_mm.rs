@@ -9036,6 +9036,13 @@ fn production_mprotect_none_covers_a_sparse_resident_range() {
     );
 }
 reservation_shape_witness!(
+    production_mprotect_widening_in_a_forked_child_keeps_the_parents_page,
+    21,
+    "#3121: a forked child widens a page its parent wrote and made `PROT_READ` back to RW and \
+     writes it; the parent still reads its own byte (92 before the fix: the fork shared the \
+     read-only leaf unarmed)."
+);
+reservation_shape_witness!(
     production_fork_child_runs_beside_a_parent_holding_a_4gib_reservation,
     9,
     "The root reserves 4 GiB, grows brk and the stack, then forks; both processes keep their own \
