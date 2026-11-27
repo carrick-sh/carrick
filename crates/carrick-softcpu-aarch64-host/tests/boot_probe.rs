@@ -2108,13 +2108,14 @@ fn soft_cpu_runs_dynamic_glibc_hello_with_published_root_lifecycle_through_produ
     assert_eq!(run.stdout, b"dynamic glibc hello\n");
     // The ring serves `set_robust_list` (99) from the published control
     // slot, and the admitted root process owner serves `set_tid_address`
-    // (96), `prlimit64` (261) and the terminal `exit_group` (94).
+    // (96), the delegated root's `brk` (214), `prlimit64` (261) and the
+    // terminal `exit_group` (94).
     assert_eq!(
         served
             .iter()
             .map(|&(nr, _, count)| (nr, count))
             .collect::<Vec<_>>(),
-        [(94, 1), (96, 1), (99, 1), (261, 1)]
+        [(94, 1), (96, 1), (99, 1), (214, 1), (261, 1)]
     );
     assert_counted_enosys(&run.counted_enosys, &[(293, 1)], "glibc hello");
     let after = carrick_softcpu_aarch64_host::sample_root_publication(&run.engine)
@@ -2190,19 +2191,27 @@ fn soft_cpu_runs_static_musl_hello_through_production_dispatch() {
     assert_production_replies(&receipt.census, receipt.syscalls_dispatched, 5);
     assert_eq!(receipt.exit_code, 0);
     assert_eq!(receipt.stdout, b"hello, aarch64 world\n");
-    // The admitted root process owner serves `set_tid_address` (96), Rust
-    // std's `rt_sigaction` (134) queries, and the terminal `exit_group` (94)
-    // in the ring; the root's control slot serves the guard's `sigaltstack`
-    // (132) and `rt_sigprocmask` (135). Its `SIGSEGV`/`SIGBUS` guard handler
-    // installs stay counted ENOSYS: the soft root's owner cannot deliver a
-    // caught signal yet (#2814).
-    assert_counted_enosys(&receipt.counted_enosys, &[(134, 2)], "musl hello");
+    // The admitted root process owner serves `set_tid_address` (96), all
+    // five of Rust std's `rt_sigaction` (134) calls (its queries and its
+    // `SIGSEGV`/`SIGBUS` guard handler installs: the soft root's MM is
+    // admitted, so its owner can deliver a caught signal, #2814), the
+    // delegated root's `brk` (214), and the terminal `exit_group` (94) in the
+    // ring; the root's control slot serves the guard's `sigaltstack` (132)
+    // and `rt_sigprocmask` (135). Nothing is refused.
+    assert_counted_enosys(&receipt.counted_enosys, &[], "musl hello");
     assert_eq!(
         served.map(|served| served
             .into_iter()
             .map(|(nr, _, count)| (nr, count))
             .collect::<Vec<_>>()),
-        Some(vec![(94, 1), (96, 1), (132, 3), (134, 3), (135, 1)]),
+        Some(vec![
+            (94, 1),
+            (96, 1),
+            (132, 3),
+            (134, 5),
+            (135, 1),
+            (214, 1)
+        ]),
         "musl hello: the root's calls served in ring"
     );
 }
@@ -2423,9 +2432,8 @@ fn soft_run_resolves_the_pip_row_and_runs_its_python_through_production_dispatch
 /// Counted `ENOSYS` the production-dispatch CPython startup still owes, each
 /// with the issue that retires it (decrease-only; see `assert_counted_enosys`).
 const CPYTHON_COUNTED_ENOSYS: &[(u64, u64)] = &[
-    // rt_sigaction installing the SIGINT handler: the soft root's owner
-    // cannot deliver a caught signal yet (#2814).
-    (134, 1),
+    // The SIGINT handler install is served: the soft root's MM is admitted,
+    // so its owner can deliver a caught signal (#2814).
     // rseq: accepted counted refusal (#1906).
     (293, 1),
 ];
