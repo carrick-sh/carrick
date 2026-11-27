@@ -148,14 +148,28 @@ fn check_process_exit_frames(disassembly: &str) {
     // no single frame can step over the guard without touching it (#369).
     const { assert!(carrick_el1_abi::EL1_STACK_SIZE * 3 / 16 <= carrick_el1_abi::EL1_STACK_GUARD_SIZE) };
     let frames = frame_budget::Frames::parse(disassembly).unwrap_or_else(|error| panic!("{error}"));
-    // Charge the actual vector record as well as every retained Rust frame.
-    for line in frames
-        .check(
-            carrick_el1_abi::EL1_STACK_SIZE as usize,
-            std::mem::size_of::<carrick_el1_abi::TrapFrame>(),
-        )
-        .unwrap_or_else(|error| panic!("{error}"))
-    {
+    // Charge the actual vector record as well as every retained Rust frame,
+    // and refuse a park that runs the next thread on its own stack (#3093).
+    let chains = frames.check(
+        carrick_el1_abi::EL1_STACK_SIZE as usize,
+        std::mem::size_of::<carrick_el1_abi::TrapFrame>(),
+    );
+    let switches = frame_budget::check_switch_venues(disassembly);
+    let failures: Vec<&String> = [chains.as_ref().err(), switches.as_ref().err()]
+        .into_iter()
+        .flatten()
+        .collect();
+    if !failures.is_empty() {
+        panic!(
+            "{}",
+            failures
+                .iter()
+                .map(|failure| failure.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+    for line in chains.unwrap_or_default() {
         println!("cargo:warning={line}");
     }
     for (symbol, ceiling, required) in budgets {
