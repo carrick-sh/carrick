@@ -26,18 +26,19 @@ use carrick_aarch64::{
     Aarch64EngineCore, Aarch64Exit, Aarch64Vcpu, Aarch64VcpuSnapshot, Aarch64Vmm, ForkRamStrategy,
 };
 use carrick_core::mm::own::{
-    BackendResult, CarrierCore, CarrierId, CoreVenue, GpaExtent, Holding, MappingSpec,
+    BackendResult, CarrierCore, CarrierId, CoreVenue, GpaExtent, Holding, MappingSpec, Retire,
 };
 use carrick_el1_abi::{
     EL1_DYNAMIC_METADATA_BASE, EL1_DYNAMIC_METADATA_SIZE, EL1_IPC_BASE, EL1_IPC_POOL_BASE,
     EL1_REGION_BASE, EL1_REGION_SIZE, EL1_STACK_GUARD_TABLES_BASE, IpcWindowBacking,
-    MetadataResolutionError, is_el1_stack_guard,
+    MetadataExtent, MetadataExtentResolver, MetadataResolutionError, PinnedMetadataExtent,
+    is_el1_stack_guard,
 };
 use carrick_guest_arch::FrameGpa;
 use carrick_guest_mem::protections::MemoryProtections;
 use carrick_guest_mem::{
-    Gpa, GuestVa, HostVa, LegacyProtectionRead, MemoryError, SharedFutexLocation,
-    UserMemoryAuthority, zero_range_chunked,
+    Gpa, HostVa, LegacyProtectionRead, MemoryError, SharedFutexLocation, UserMemoryAuthority,
+    zero_range_chunked,
 };
 use carrick_hal::retained_metadata::{
     RetainedMetadataBacking, RetainedMetadataExtent, RetainedMetadataMapper,
@@ -47,6 +48,7 @@ use carrick_hal::{
     GenericVcpuRegistry, GuestEntryRegs, GuestVmBackend, HostAliasBacking, HostAliasSharing,
     MappingGeneration, MemPerms, OsError, Reg, SysReg, TrapError, VcpuKick, VcpuRegistry,
 };
+use carrick_kernel::dispatch::mem::el1_reservations::CarrierReservationAccess;
 use carrick_mem::memory::{
     AddressSpace, CarrierMaintenanceRoot, LINUX_CARRIER_MAINT_ROOT_BASE, LINUX_EL1_IMAGE_SIZE,
     LINUX_EL1_KERNEL_BASE, LINUX_EL1_KERNEL_SIZE, LINUX_FD_CEILING_CONTROL_BASE,
@@ -248,10 +250,17 @@ impl CoreVenue for SoftCoreVenue {
     }
 }
 
-/// The soft carrier's records: every window is one backend mapping. Frame
-/// extents carved over them come with the soft transfer custody (#2814,
-/// #3061 step 3).
-type SoftCore = CarrierCore<SoftCoreVenue, WindowHost, ()>;
+/// The lease of one retained metadata extent: the backing EL1 reads and
+/// writes through it. A metadata pin is a clone of it, so the bytes outlive
+/// the carrier for as long as any pin is out, and the extent does not retire
+/// while one is.
+#[derive(Debug)]
+struct RetainedLease(Arc<dyn RetainedMetadataBacking>);
+
+/// The soft carrier's records: every window is one backend mapping, and each
+/// retained metadata mapping is one frame extent carved over its whole
+/// window. Its `ExtentId` is the grant token EL1 names it by.
+type SoftCore = CarrierCore<SoftCoreVenue, WindowHost, RetainedLease>;
 
 /// A carrier identity no other live soft core holds.
 fn next_soft_carrier() -> CarrierId {
@@ -272,10 +281,6 @@ pub struct SoftStage2 {
     page_perms: BTreeMap<u64, MemPerms>,
     last_abort: Option<Stage2Abort>,
     _ipc_pin: Option<Arc<dyn IpcWindowBacking>>,
-    /// Carrier custody of retained EL1 metadata mapped by
-    /// [`SoftStage2::map_retained_metadata`], keyed by its aperture GPA. A
-    /// backing leaves only with its successful unmap, or with this carrier.
-    retained_metadata: BTreeMap<u64, Arc<dyn RetainedMetadataBacking>>,
 }
 
 impl Drop for SoftStage2 {
@@ -313,7 +318,6 @@ impl SoftStage2 {
             page_perms: BTreeMap::new(),
             last_abort: None,
             _ipc_pin: None,
-            retained_metadata: BTreeMap::new(),
         })
     }
 
@@ -337,7 +341,7 @@ impl SoftStage2 {
     pub fn map_retained_metadata(
         &mut self,
         backing: Arc<dyn RetainedMetadataBacking>,
-    ) -> Result<u64, MetadataResolutionError> {
+    ) -> Result<MetadataExtent, MetadataResolutionError> {
         let len = u64::try_from(backing.mapped_len())
             .map_err(|_| MetadataResolutionError::InvalidExtent)?;
         let host = NonNull::new(backing.host_base().raw() as *mut u8)
@@ -361,30 +365,88 @@ impl SoftStage2 {
             write: true,
             exec: false,
         };
-        // SAFETY: `retained_metadata` keeps `backing`, and with it the range,
-        // until `retire_retained_metadata` unmaps this exact window or the
-        // carrier drops.
+        let extent = GpaExtent::new(gpa, len).ok_or(MetadataResolutionError::InvalidExtent)?;
+        // SAFETY: the extent carved below keeps `backing`, and with it the
+        // range, until `retire_retained_metadata` unmaps this exact window or
+        // the carrier's destroy releases it.
         unsafe { self.map_external_stage2(gpa, host, len, rw, true) }
             .map_err(|_| MetadataResolutionError::Busy)?;
-        self.retained_metadata.insert(gpa, backing);
-        Ok(gpa)
+        let id = match self.core.carve(extent, RetainedLease(backing)) {
+            Ok(id) => id,
+            Err(refused) => {
+                // Nothing was carved: unmap the window before its backing goes.
+                if self.unmap_stage2(gpa, len).is_err() {
+                    soft_carrier_broken(format_args!(
+                        "retained metadata window {gpa:#x} refused its carve ({:?}) and its unmap",
+                        refused.reason
+                    ));
+                }
+                return Err(MetadataResolutionError::Busy);
+            }
+        };
+        MetadataExtent::new(gpa, len, id.token()).ok_or(MetadataResolutionError::InvalidExtent)
     }
 
-    /// Whether the retained mapping at `gpa` is still this carrier's.
-    #[must_use]
-    pub fn retains_metadata_at(&self, gpa: u64) -> bool {
-        self.retained_metadata.contains_key(&gpa)
+    /// Pin the retained mapping EL1 names by `extent`, authenticated by its
+    /// exact base, length and grant token: a successor carved over the same
+    /// range carries another token and is refused.
+    pub fn pin_retained_metadata(
+        &self,
+        extent: MetadataExtent,
+    ) -> Result<SoftMetadataPin, MetadataResolutionError> {
+        let view = self
+            .core
+            .live_extent_at(extent.base())
+            .filter(|view| {
+                view.extent.ipa() == extent.base()
+                    && view.extent.len().get() == extent.len()
+                    && view.id.token() == extent.token()
+            })
+            .ok_or(MetadataResolutionError::StaleOwner)?;
+        let host = NonNull::new(view.lease.0.host_base().as_mut_ptr())
+            .ok_or(MetadataResolutionError::InvalidExtent)?;
+        Ok(SoftMetadataPin {
+            extent,
+            host,
+            _backing: Arc::clone(&view.lease.0),
+        })
     }
 
-    /// Unmap the retained mapping at `gpa`, then release its backing.
-    pub fn retire_retained_metadata(&mut self, gpa: u64) -> Result<(), TrapError> {
-        let backing = self.retained_metadata.get(&gpa).ok_or_else(|| {
-            TrapError::Hypervisor(format!("no retained metadata mapping at {gpa:#x}"))
-        })?;
-        let len = u64::try_from(backing.mapped_len())
-            .map_err(|_| TrapError::Hypervisor("retained metadata length overflow".to_owned()))?;
-        self.unmap_stage2(gpa, len)?;
-        self.retained_metadata.remove(&gpa);
+    /// Retire the retained mapping EL1 names by `extent`: release its extent,
+    /// unmap its window, then drop its backing. A pinned mapping is refused
+    /// and stays, as is one this carrier no longer holds.
+    pub fn retire_retained_metadata(&mut self, extent: MetadataExtent) -> Result<(), TrapError> {
+        let view = self
+            .core
+            .live_extent_at(extent.base())
+            .filter(|view| view.extent.ipa() == extent.base() && view.id.token() == extent.token())
+            .ok_or_else(|| {
+                TrapError::Hypervisor(format!(
+                    "no retained metadata mapping at {:#x}",
+                    extent.base()
+                ))
+            })?;
+        if Arc::strong_count(&view.lease.0) != 1 {
+            return Err(TrapError::Hypervisor(format!(
+                "retained metadata mapping at {:#x} is pinned",
+                extent.base()
+            )));
+        }
+        let (id, window) = (view.id, view.extent);
+        let released = match self.core.retire_extent(id) {
+            Ok(Retire::Released(released)) => released,
+            other => soft_carrier_broken(format_args!(
+                "unpinned retained metadata extent {id:?} did not release: {other:?}"
+            )),
+        };
+        // The backing stays until its window is unmapped.
+        if let Err(error) = self.unmap_stage2(window.ipa(), window.len().get()) {
+            soft_carrier_broken(format_args!(
+                "released retained metadata window {:#x} refused its unmap: {error:?}",
+                window.ipa()
+            ));
+        }
+        drop(released);
         Ok(())
     }
 
@@ -1232,12 +1294,13 @@ impl ExclusiveStage2 {
 #[derive(Clone)]
 pub struct SoftRetainedMetadata {
     stage2: Weak<ExclusiveStage2>,
+    carrier: CarrierId,
 }
 
-/// One retained mapping in its exact soft carrier.
+/// One retained mapping in its exact soft carrier, by its grant identity.
 pub struct SoftRetainedExtent {
     stage2: Weak<ExclusiveStage2>,
-    gpa: u64,
+    extent: MetadataExtent,
 }
 
 impl RetainedMetadataMapper for SoftRetainedMetadata {
@@ -1265,19 +1328,21 @@ impl RetainedMetadataMapper for SoftRetainedMetadata {
             .stage2
             .upgrade()
             .ok_or(MetadataResolutionError::StaleOwner)?;
-        let gpa = stage2
+        let extent = stage2
             .try_borrow()
             .map_err(|_| MetadataResolutionError::Busy)?
             .map_retained_metadata(backing)?;
         Ok(SoftRetainedExtent {
             stage2: Arc::downgrade(&stage2),
-            gpa,
+            extent,
         })
     }
 }
 
-impl RetainedMetadataExtent for SoftRetainedExtent {
-    fn guest_base(&self) -> Result<GuestVa, MetadataResolutionError> {
+impl MetadataExtentResolver for SoftRetainedMetadata {
+    type Pin = SoftMetadataPin;
+
+    fn pin(&self, extent: MetadataExtent) -> Result<SoftMetadataPin, MetadataResolutionError> {
         let stage2 = self
             .stage2
             .upgrade()
@@ -1285,10 +1350,58 @@ impl RetainedMetadataExtent for SoftRetainedExtent {
         let stage2 = stage2
             .try_borrow()
             .map_err(|_| MetadataResolutionError::Busy)?;
-        stage2
-            .retains_metadata_at(self.gpa)
-            .then_some(GuestVa::new(self.gpa))
-            .ok_or(MetadataResolutionError::StaleOwner)
+        stage2.pin_retained_metadata(extent)
+    }
+}
+
+impl CarrierReservationAccess for SoftRetainedMetadata {
+    fn carrier_identity(&self) -> NonZeroU64 {
+        self.carrier.raw()
+    }
+
+    /// The soft carrier publishes no guest COW grants (#3061).
+    fn guest_cow_settlement(&self) -> Option<Arc<dyn carrick_el1_abi::CowGrantSettlement>> {
+        None
+    }
+}
+
+/// A pin of one retained soft mapping: it holds the mapping's backing, so
+/// the bytes stay even after the carrier drops, and its retirement is
+/// refused while the pin is out.
+pub struct SoftMetadataPin {
+    extent: MetadataExtent,
+    host: NonNull<u8>,
+    _backing: Arc<dyn RetainedMetadataBacking>,
+}
+
+// SAFETY: the held backing keeps the stable host range allocated; access to
+// the bytes synchronizes through the ABI's atomics.
+unsafe impl Send for SoftMetadataPin {}
+unsafe impl Sync for SoftMetadataPin {}
+
+// SAFETY: `_backing` keeps `host` mapped for the pin's lifetime, and
+// `retire_retained_metadata` refuses while the pin holds the backing.
+unsafe impl PinnedMetadataExtent for SoftMetadataPin {
+    fn extent(&self) -> MetadataExtent {
+        self.extent
+    }
+    fn host_base(&self) -> NonNull<u8> {
+        self.host
+    }
+}
+
+impl RetainedMetadataExtent for SoftRetainedExtent {
+    type Pin = SoftMetadataPin;
+
+    fn pin(&self) -> Result<SoftMetadataPin, MetadataResolutionError> {
+        let stage2 = self
+            .stage2
+            .upgrade()
+            .ok_or(MetadataResolutionError::StaleOwner)?;
+        let stage2 = stage2
+            .try_borrow()
+            .map_err(|_| MetadataResolutionError::Busy)?;
+        stage2.pin_retained_metadata(self.extent)
     }
 
     fn try_retire(self) -> Result<(), Self> {
@@ -1299,7 +1412,7 @@ impl RetainedMetadataExtent for SoftRetainedExtent {
         let Ok(mut guard) = stage2.try_borrow() else {
             return Err(self);
         };
-        if guard.retire_retained_metadata(self.gpa).is_err() {
+        if guard.retire_retained_metadata(self.extent).is_err() {
             drop(guard);
             return Err(self);
         }
@@ -2100,6 +2213,7 @@ impl<X> SoftAarch64Vmm<X> {
     pub fn retained_metadata(&self) -> SoftRetainedMetadata {
         SoftRetainedMetadata {
             stage2: Arc::downgrade(&self.stage2),
+            carrier: self.stage2.carrier,
         }
     }
 
