@@ -50,6 +50,7 @@ const RLIMIT_STACK: u16 = 3;
 const SIGUSR1: u16 = 10;
 const SIG_IGN: u64 = 1;
 const LINUX_EFAULT: i32 = 14;
+const LINUX_ENOSYS: i32 = 38;
 const LINUX_EINVAL: i32 = 22;
 /// The root's `clear_child_tid` word.
 const CLEAR_TID_OFFSET: u64 = 0x20;
@@ -566,14 +567,16 @@ fn soft_root_exit_group_status_crosses_the_native_root_exit() {
     assert_root_served_in_ring(&run, &[NR_EXIT_GROUP]);
 }
 
-/// The soft root's MM is portal-admitted through the soft transfer custody
-/// (#2814), so the ring accepts a caught handler as well as an ignore, and a
-/// query reads the last disposition back. All three are served in the ring and
-/// none is refused. Exits `handler + ignore + query + (old - SIG_IGN)`: 0 iff
-/// all three calls returned 0 and the query read the ignore back.
+/// The soft root's owner cannot publish a caught signal's frame yet (its MM
+/// is not portal-admitted, #2645 slice D), so installing a handler stays
+/// unrouted, a counted `ENOSYS`, never an accepted handler the ring cannot
+/// deliver. Ignore and default dispositions need no frame: the ring serves
+/// them, and a query reads the ignore back. Exits
+/// `(handler + ENOSYS) + ignore + query + (old - SIG_IGN)`: 0 iff the handler
+/// was refused and the ignore was installed and read back.
 #[test]
 #[ignore = "requires CARRICK_A64_ELF pointing to the production EL1 ELF (native arm64 host)"]
-fn soft_root_rt_sigaction_serves_a_handler_an_ignore_and_a_query_in_ring() {
+fn soft_root_rt_sigaction_refuses_a_handler_it_cannot_deliver() {
     let _carrier_lock = lock_soft_carrier_test();
     let mut handler = [0u8; 32];
     handler[..8].copy_from_slice(&(CODE_VA + 0x800).to_le_bytes());
@@ -602,7 +605,8 @@ fn soft_root_rt_sigaction_serves_a_handler_an_ignore_and_a_query_in_ring() {
     code.extend(mov32(9, DATA_VA + OLD_SIGACTION_OFFSET));
     code.push(ldr(22, 9, 0));
     code.push(sub_imm(22, 22, SIG_IGN as u32));
-    code.push(add(0, 19, 20));
+    code.push(add_imm(0, 19, LINUX_ENOSYS as u32));
+    code.push(add(0, 0, 20));
     code.push(add(0, 0, 21));
     code.push(add(0, 0, 22));
     exit_with_x0(&mut code);
@@ -621,14 +625,18 @@ fn soft_root_rt_sigaction_serves_a_handler_an_ignore_and_a_query_in_ring() {
     );
     assert_eq!(
         run.exit_code, 0,
-        "the handler and the ignore are installed and the ignore is read back"
+        "the handler is refused ENOSYS; the ignore is installed and read back"
     );
-    assert_eq!(run.counted_enosys, Vec::new(), "no disposition is refused");
+    assert_eq!(
+        run.counted_enosys,
+        vec![(u64::from(NR_RT_SIGACTION), "rt_sigaction", 1)],
+        "the refused handler is counted"
+    );
     assert!(
         served
             .iter()
-            .any(|&(nr, _, count)| nr == u64::from(NR_RT_SIGACTION) && count == 3),
-        "the ring serves the handler, the ignore and the query: {served:?}"
+            .any(|&(nr, _, count)| nr == u64::from(NR_RT_SIGACTION) && count == 2),
+        "the ring serves the ignore and the query: {served:?}"
     );
     assert_eq!(
         run.reply_census.kernel_dispatched, 0,
@@ -647,8 +655,9 @@ fn soft_root_rt_sigaction_serves_a_handler_an_ignore_and_a_query_in_ring() {
 ///
 /// Red while the soft root's MM is not portal-admitted: the handler is
 /// refused `ENOSYS`, and the signal's default action ends the process.
+/// Admission needs the soft guest-descriptor lane (#3061 step 3).
 #[test]
-#[ignore = "requires CARRICK_A64_ELF pointing to the production EL1 ELF (native arm64 host)"]
+#[ignore = "#2814: soft guest-descriptor lane, #3061 step 3"]
 fn soft_root_delivers_a_caught_sigusr1_and_returns_through_rt_sigreturn() {
     let _carrier_lock = lock_soft_carrier_test();
     const HANDLER_WORD: usize = 0x800 / 4;
