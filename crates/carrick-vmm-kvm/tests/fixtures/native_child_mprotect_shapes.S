@@ -35,15 +35,28 @@
  *     read of page 2 (the second resident run, past the hole) then faults
  *   19 as 14, then mprotect(PROT_READ|PROT_WRITE) over the whole range: pages
  *     0, 1 (the hole) and 2 take a write and read it back, then munmap
- *   20 (#2875) two live threads: a sibling thread reads a resident RW page
- *     (its CPU caches the translation), the main thread mprotects it
- *     PROT_NONE and wakes the sibling, whose second read must fault with
- *     SEGV_ACCERR at the page; the handler widens it back and its byte is
- *     still there (94 = a futex wait timed out)
+ *   20 (#2875) two live threads on two CPUs: a sibling thread reads a
+ *     resident RW page and keeps reading it, so its CPU holds the
+ *     translation, while the main thread mprotects it PROT_NONE and then
+ *     sets a flag. The sibling's first read after it sees the flag (or any
+ *     earlier one) must fault with SEGV_ACCERR at the page; the handler
+ *     widens it back and its byte is still there (93 = the read after the
+ *     flag did not fault: a stale translation; 94 = a wait timed out).
+ *     The root may run on either CPU, so the sibling spins on one while the
+ *     main thread runs on the other; Carrick's x86 ring does not yet serve
+ *     getcpu(2) or sched_setaffinity(2) (#3131), so the placement itself is
+ *     not checked
  *   21 (#3121) the root writes a private RW page, mprotects it PROT_READ and
  *     forks. The child widens it back to RW and writes it; the parent, after
  *     the child exits, still reads its own byte (99 if the child's write
  *     reached it)
+ *   22 (#2875) the root writes a private RW page, mprotects it PROT_NONE
+ *     and forks. On Linux the child widens it back to RW and reads the
+ *     parent's byte, and the parent, after the child exits, widens its own
+ *     copy and still reads its byte (99 if the child's write reached it).
+ *     Until #2875's slice B, Carrick refuses that fork: the refusal must be
+ *     clean, so the parent then widens the page and reads its byte, and
+ *     exits 120 + the fork's errno
  * The parent propagates the child's exit status. */
 
 /* rax = mmap(0, rsi, edx prot, r10 flags, -1, 0); r15 = base or exit errno */
@@ -131,11 +144,15 @@ _start:
 #if CASE == 8 || CASE == 11 || CASE == 12 || CASE == 14 || CASE == 16 || CASE == 17 || CASE == 18 || CASE == 19 || CASE == 20
     jmp child               /* the run root itself, no fork */
 #endif
-#if CASE == 21
+#if CASE == 21 || CASE == 22
     MMAP $0x1000, $3, $0x22
     mov %r15, %r14
     movb $0xa5, (%r14)
+#if CASE == 21
     MPROTECT %r14, $0x1000, $1
+#else
+    MPROTECT %r14, $0x1000, $0
+#endif
 #endif
 #if CASE == 9
     MMAP $0x100000000, $0, $0x4022
@@ -159,7 +176,11 @@ _start:
     mov $57, %eax
     syscall
     test %eax, %eax
+#if CASE == 22
+    js fork_refused
+#else
     js harness
+#endif
     jz child
     mov %eax, %edi
     lea status(%rip), %rsi
@@ -172,7 +193,10 @@ _start:
 #if CASE == 9
     cmpb $0xa5, (%r14)      /* the child's write stayed in the child */
     jne bad
-#elif CASE == 21
+#elif CASE == 21 || CASE == 22
+#if CASE == 22
+    MPROTECT %r14, $0x1000, $1
+#endif
     cmpb $0xa5, (%r14)      /* the child's write stayed in the child */
     mov $99, %edi
     jne exit
@@ -185,6 +209,17 @@ _start:
 harness:
     mov $91, %edi
     jmp exit
+#if CASE == 22
+fork_refused:
+    neg %eax
+    add $120, %eax
+    mov %eax, %r13d
+    MPROTECT %r14, $0x1000, $1  /* the parent keeps its page and its byte */
+    cmpb $0xa5, (%r14)
+    jne bad
+    mov %r13d, %edi
+    jmp exit
+#endif
 
 child:
 #if CASE == 9
@@ -205,6 +240,11 @@ child:
     movb $0x3c, (%r14)
     cmpb $0x3c, (%r14)
     jne bad
+#elif CASE == 22
+    MPROTECT %r14, $0x1000, $3
+    cmpb $0xa5, (%r14)      /* the child inherits the parent's byte */
+    jne bad
+    movb $0x3c, (%r14)
 #elif CASE == 20
     MMAP $0x1000, $3, $0x22
     mov %r15, base(%rip)
@@ -226,9 +266,8 @@ child:
     je 2f
     WAIT_WHILE flag, $0
     jmp 1b
-2:  MPROTECT %rbx, $0x1000, $0  /* PROT_NONE under the sibling's cached translation */
+2:  MPROTECT %rbx, $0x1000, $0  /* PROT_NONE under the sibling's live translation */
     movl $2, flag(%rip)
-    WAKE flag
 3:  WAIT_WHILE never, $0    /* the sibling's handler ends the process */
     jmp 3b
 sibling:
@@ -236,11 +275,15 @@ sibling:
     jne bad
     movl $1, flag(%rip)
     WAKE flag
-1:  cmpl $2, flag(%rip)
+    mov $0x100000000, %r12  /* a bound of some seconds, then 94 */
+1:  cmpb $0xa5, (%rbx)      /* keep the translation live on its CPU */
+    jne bad
+    cmpl $2, flag(%rip)
     je 2f
-    WAIT_WHILE flag, $1
-    jmp 1b
-2:  movb (%rbx), %al        /* PROT_NONE now: must fault SEGV_ACCERR */
+    dec %r12
+    jnz 1b
+    jmp timed_out
+2:  movb (%rbx), %al        /* after the mprotect returned: must fault SEGV_ACCERR */
     mov $93, %edi
     jmp exit
 restorer:
