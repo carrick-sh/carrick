@@ -244,7 +244,10 @@ pub(crate) fn settle_declined_owner_fault(
     deliver: impl FnOnce() -> Action,
 ) -> Action {
     if action == Action::Forward
-        && outcome == carrick_el1::fault::OwnerFaultSupplyOutcome::PolicyDeclined
+        && matches!(
+            outcome,
+            carrick_el1::fault::OwnerFaultSupplyOutcome::PolicyDeclined(_)
+        )
         && matches!(
             venue,
             carrick_el1::substrate::sched::NativeEntryVenue::SignalOwner
@@ -398,9 +401,11 @@ pub fn dispatch_fault(
             if action == Action::Forward
                 && matches!(
                     supply.outcome(),
-                    OwnerFaultSupplyOutcome::PolicyDeclined | OwnerFaultSupplyOutcome::Unavailable
+                    OwnerFaultSupplyOutcome::PolicyDeclined(_)
+                        | OwnerFaultSupplyOutcome::Unavailable
                 )
-                && (native || supply.outcome() == OwnerFaultSupplyOutcome::PolicyDeclined)
+                && (native
+                    || matches!(supply.outcome(), OwnerFaultSupplyOutcome::PolicyDeclined(_)))
             {
                 crate::native_diagnostic::fault_verdict(
                     frame,

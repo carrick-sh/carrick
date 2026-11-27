@@ -1108,12 +1108,24 @@ impl<'a> GrantMailboxes<'a> {
     }
 }
 
+/// Why the shared fault policy declined a fault, as Linux reports it in a
+/// `SIGSEGV`'s `si_code` (sigaction(2)). The reservation owner's mapping
+/// decides, never the hardware present bit: a `PROT_NONE` page is not
+/// present on x86 yet is an access error (#2875).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SegvCause {
+    /// A mapping covers the page and refuses this access: `SEGV_ACCERR`.
+    Access,
+    /// No mapping covers the page: `SEGV_MAPERR`.
+    Unmapped,
+}
+
 /// A CPL0 fault can request physical supply without delegating leaf publication.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OwnerFaultSupplyOutcome {
     Wait(carrick_el1_abi::PortalOwnerWait),
     Unavailable,
-    PolicyDeclined,
+    PolicyDeclined(SegvCause),
     Selected,
     CowSelected,
 }
@@ -1364,9 +1376,11 @@ impl<'s> FaultSupply<'s> {
         .flatten()
     }
 
-    fn decline(self) {
+    fn decline(self, cause: SegvCause) {
         if let Some(owner) = self.owner() {
-            owner.outcome.set(OwnerFaultSupplyOutcome::PolicyDeclined);
+            owner
+                .outcome
+                .set(OwnerFaultSupplyOutcome::PolicyDeclined(cause));
         }
     }
 
@@ -1604,12 +1618,12 @@ fn dispatch_classified_fault<
                     return Action::Forward;
                 }
                 RootFaultAdmission::Declined => {
-                    supply.decline();
+                    supply.decline(SegvCause::Access);
                     supply.note(FaultVerdict::RootDeclined);
                     return Action::Forward;
                 }
                 RootFaultAdmission::Unmapped if supply.is_owner() => {
-                    supply.decline();
+                    supply.decline(SegvCause::Unmapped);
                     supply.note(FaultVerdict::RootUnmapped);
                     return Action::Forward;
                 }
@@ -1713,11 +1727,11 @@ fn dispatch_classified_fault<
                 .unwrap_or(RootFaultAdmission::Busy)
             {
                 RootFaultAdmission::Declined => {
-                    supply.decline();
+                    supply.decline(SegvCause::Access);
                     supply.note(FaultVerdict::RootDeclined);
                 }
                 RootFaultAdmission::Unmapped if supply.is_owner() => {
-                    supply.decline();
+                    supply.decline(SegvCause::Unmapped);
                     supply.note(FaultVerdict::RootUnmapped);
                 }
                 RootFaultAdmission::Busy => supply.note(FaultVerdict::RootBusy),
@@ -1770,13 +1784,13 @@ fn dispatch_classified_fault<
             .unwrap_or(RootFaultAdmission::Busy)
         {
             RootFaultAdmission::Declined => {
-                supply.decline();
+                supply.decline(SegvCause::Access);
                 supply.note(FaultVerdict::RootDeclined);
                 return Action::Forward;
             }
             RootFaultAdmission::Unmapped => {
                 if supply.is_owner() {
-                    supply.decline();
+                    supply.decline(SegvCause::Unmapped);
                 }
                 supply.note(FaultVerdict::RootUnmapped);
                 return Action::Forward;
@@ -1872,7 +1886,11 @@ fn dispatch_classified_fault<
                     crate::memory::reservations::Refusal::Hole
                     | crate::memory::reservations::Refusal::Limit,
                 ) => {
-                    owner.outcome.set(OwnerFaultSupplyOutcome::PolicyDeclined);
+                    // The root admitted the page, but its window found no
+                    // mapping there.
+                    owner
+                        .outcome
+                        .set(OwnerFaultSupplyOutcome::PolicyDeclined(SegvCause::Unmapped));
                     supply.note(FaultVerdict::WindowHole);
                     return None;
                 }
