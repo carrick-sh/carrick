@@ -244,7 +244,7 @@ impl World {
         frame.esr = 0x5600_0000;
         let mut owner = IdentityOwner(crate::common_entry::execution_binding(self.task()));
         let names = InotifyNameCache::new();
-        match crate::dispatch::dispatch_syscall_with_native::<
+        let completed = crate::dispatch::dispatch_syscall_with_native::<
             _,
             FakeCpu,
             HardwareUserWord,
@@ -270,6 +270,18 @@ impl World {
             None,
             None,
             |_| core::ptr::null_mut(),
+        );
+        // The entry runs the switch a park owed it (#3093).
+        match crate::dispatch::run_owed_entry_route(
+            frame,
+            &self.counters,
+            &self.tasks,
+            Zone {
+                tables: &self.zone,
+                cpu: &mut self.cpu,
+                user: &HardwareUserWord,
+            },
+            completed,
         ) {
             CompletionRoute::Served => Action::Served,
             route => panic!("join was not served in ring: {route:?}"),
@@ -286,26 +298,39 @@ impl World {
             zone: &*self.zone,
             slot: SLOT,
         };
-        match crate::dispatch::dispatch_syscall_with_native::<_, _, _, _, Aarch64ParkedContext>(
+        let completed =
+            crate::dispatch::dispatch_syscall_with_native::<_, _, _, _, Aarch64ParkedContext>(
+                frame,
+                &self.counters,
+                &self.tasks,
+                &[],
+                &[],
+                &[],
+                &[],
+                &InotifyNameCache::new(),
+                Some(Zone {
+                    tables: &self.zone,
+                    cpu: &mut self.cpu,
+                    user: &HardwareUserWord,
+                }),
+                None,
+                Some(&*self.venue),
+                None,
+                Some(source),
+                None,
+                |_| core::ptr::null_mut(),
+            );
+        // The entry runs the switch a park owed it (#3093).
+        match crate::dispatch::run_owed_entry_route(
             frame,
             &self.counters,
             &self.tasks,
-            &[],
-            &[],
-            &[],
-            &[],
-            &InotifyNameCache::new(),
-            Some(Zone {
+            Zone {
                 tables: &self.zone,
                 cpu: &mut self.cpu,
                 user: &HardwareUserWord,
-            }),
-            None,
-            Some(&*self.venue),
-            None,
-            Some(source),
-            None,
-            |_| core::ptr::null_mut(),
+            },
+            completed,
         ) {
             CompletionRoute::Served => Action::Served,
             CompletionRoute::WithWork => Action::ServedWithWork,

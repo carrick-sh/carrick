@@ -3163,6 +3163,52 @@ mod tests {
     use std::collections::HashMap;
     use std::vec::Vec;
 
+    // ---- the entry tail (#3093) ----
+    // A park owes its switch to the entry, which runs it once the serve has
+    // returned. These shadow the adapter's entry points for every test here,
+    // so each call stands in for `dispatch_entry` whole: none can serve
+    // without the tail, and none sees a park's switch run beneath it.
+    fn serve_ipc_with_signals<M: UserCopy>(
+        sched: &mut Sched<'_, FakeCpu, HardwareUserWord>,
+        frame: &mut TrapFrame,
+        venue: &IpcVenue<'_>,
+        user: &mut M,
+        native_signals: bool,
+        interrupt: &mut dyn FnMut() -> bool,
+    ) -> (IpcServed, bool) {
+        let (served, sigpipe) =
+            super::serve_ipc_with_signals(sched, frame, venue, user, native_signals, interrupt);
+        (at_entry(sched, frame, served), sigpipe)
+    }
+    fn serve_ipc<M: UserCopy>(
+        sched: &mut Sched<'_, FakeCpu, HardwareUserWord>,
+        frame: &mut TrapFrame,
+        venue: &IpcVenue<'_>,
+        user: &mut M,
+    ) -> IpcServed {
+        serve_ipc_with_signals(sched, frame, venue, user, false, &mut || false).0
+    }
+    fn serve_single_zone_ppoll<M: UserCopy>(
+        sched: &mut Sched<'_, FakeCpu, HardwareUserWord>,
+        frame: &mut TrapFrame,
+        venue: &IpcVenue<'_>,
+        user: &mut M,
+        output: &mut Option<PollOutput>,
+    ) -> IpcServed {
+        let served = super::serve_single_zone_ppoll(sched, frame, venue, user, output);
+        at_entry(sched, frame, served)
+    }
+    fn at_entry(
+        sched: &mut Sched<'_, FakeCpu, HardwareUserWord>,
+        frame: &mut TrapFrame,
+        served: IpcServed,
+    ) -> IpcServed {
+        match crate::dispatch::run_owed_switch(sched, frame, served == IpcServed::Idle) {
+            None => served,
+            Some(switched) => switched.into(),
+        }
+    }
+
     // ---- allocation counter (this thread's heap allocations) ----
     struct Counting;
     std::thread_local! {
@@ -8958,7 +9004,7 @@ mod tests {
         );
         task.mm.key.store(MM, Ordering::Relaxed);
         task.mm.thread_generation.store(1101, Ordering::Relaxed);
-        crate::dispatch::dispatch_syscall_with_native::<
+        let completed = crate::dispatch::dispatch_syscall_with_native::<
             _,
             FakeCpu,
             HardwareUserWord,
@@ -8984,6 +9030,18 @@ mod tests {
             None,
             None,
             |_| core::ptr::null_mut(),
+        );
+        // The entry runs the switch a park owed it (#3093).
+        crate::dispatch::run_owed_entry_route(
+            frame,
+            w.counters,
+            &tasks,
+            crate::dispatch::Zone {
+                tables: &w.zone,
+                cpu: &mut w.cpu,
+                user: &HardwareUserWord,
+            },
+            completed,
         )
     }
 
