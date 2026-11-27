@@ -570,6 +570,10 @@ pub struct ExecutionWitness {
     /// and a 2 MiB-aligned host mapping (#3105).
     #[serde(default)]
     pub large_page_windows: u64,
+    /// Node banks the shared reservation pool grew by, each supplied after
+    /// a tree outgrew it (#3085).
+    #[serde(default)]
+    pub reservation_node_banks: u64,
     /// Real stage-2 physical services, counted separately from Linux host dispatch.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub physical_crossing_families: Vec<ExecutionFamilyCount>,

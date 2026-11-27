@@ -425,7 +425,9 @@ mod tests {
                 )))
             }
         }
-        table.grow(&alloc, 0).expect("grow dynamic segment 0");
+        table
+            .grow(&alloc, 0, &carrick_core_abi::NO_METADATA_WAITERS)
+            .expect("grow dynamic segment 0");
         assert_eq!(table.extension_count(), 1);
 
         // Without resolver installed, dynamic segment resolution fails closed.

@@ -1886,7 +1886,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                         let child_inventory = frame_inventory.bind(child.into());
                         parent_residency
                             .try_reserve_exact(edges.len())
-                            .map_err(|_| ForkStockRefusal::Capacity)?;
+                            .map_err(|_| ForkStockRefusal::NoMemory)?;
                         let mut rows = std::collections::BTreeMap::new();
                         for edge in &edges {
                             let identity = edge.identity();

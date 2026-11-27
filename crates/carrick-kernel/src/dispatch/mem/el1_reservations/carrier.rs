@@ -97,6 +97,50 @@ fn table<A: CarrierReservationAccess>(access: &A) -> Result<&SharedReservations,
     })
 }
 
+/// The host venue that wakes this carrier's waiters: a reservation root's
+/// release, and every Metadata waiter when a host bank window closes
+/// (#3085).
+fn host_release_venue<A: CarrierReservationAccess>(
+    access: &A,
+) -> Result<
+    carrick_sched_core::spaces::notification::SpaceReleaseVenue<
+        '_,
+        carrick_el1_abi::Aarch64ParkedContext,
+    >,
+    Refusal,
+> {
+    let region = access.region().map_err(|_| Refusal::Stale)?;
+    // SAFETY: this is the same owned carrier region as the reservation
+    // table. ZoneTables are shared atomics and fit the ABI region bounds.
+    let zone = unsafe {
+        &*region
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
+            .cast::<carrick_el1_abi::ZoneTables>()
+    };
+    fn deliver(
+        zone: &carrick_el1_abi::ZoneTables,
+        _: carrick_sched_core::Waker,
+        effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_el1_abi::Aarch64ParkedContext,
+        >,
+    ) {
+        carrick_sched_core::LockWait::complete_object_wake(
+            &crate::el1_zone::HostLockWait,
+            zone,
+            effects,
+        );
+    }
+    Ok(
+        carrick_sched_core::spaces::notification::SpaceReleaseVenue {
+            zone,
+            waker: carrick_sched_core::Waker::Host,
+            deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Function(deliver),
+        },
+    )
+}
+
 impl<A: CarrierReservationAccess> HostReservationProvider for CarrierReservations<A> {
     fn private_file_venue(&self) -> carrick_guest_mem::PrivateFileVenue {
         self.access.private_file_venue()
@@ -133,7 +177,9 @@ impl<A: CarrierReservationAccess> HostReservationProvider for CarrierReservation
         let result = mapping
             .pin()
             .map_err(|_| Refusal::Stale)
-            .and_then(|pin| table.provision_metadata(&pin, generation));
+            .and_then(|pin| {
+                table.provision_metadata(&pin, generation, &host_release_venue(&*self.access)?)
+            });
         if result.is_err() {
             let _ = mapping.try_retire();
         }
@@ -170,41 +216,19 @@ struct PreparedView<A: CarrierReservationAccess>(Arc<Prepared<A>>);
 
 impl<A: CarrierReservationAccess> PreparedHostReservations for PreparedView<A> {
     fn lock(&self, mm: ReservationMm, wait: &dyn RootWait) -> Result<Reservations<'_>, Refusal> {
-        let region = self.0.access.region().map_err(|_| Refusal::Stale)?;
-        // SAFETY: this is the same owned carrier region as the reservation
-        // table. ZoneTables are shared atomics and fit the ABI region bounds.
-        let zone = unsafe {
-            &*region
-                .as_ptr()
-                .add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
-                .cast::<carrick_el1_abi::ZoneTables>()
-        };
-        let index = zone.spaces.find(mm.raw()).ok_or(Refusal::Stale)?.index();
-        fn deliver(
-            zone: &carrick_el1_abi::ZoneTables,
-            _: carrick_sched_core::Waker,
-            effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
-                '_,
-                carrick_el1_abi::Aarch64ParkedContext,
-            >,
-        ) {
-            carrick_sched_core::LockWait::complete_object_wake(
-                &crate::el1_zone::HostLockWait,
-                zone,
-                effects,
-            );
-        }
-        RootReleaseVenue::new(
-            table(&*self.0.access)?,
-            carrick_sched_core::spaces::notification::SpaceReleaseVenue {
-                zone,
-                waker: carrick_sched_core::Waker::Host,
-                deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Function(
-                    deliver,
-                ),
-            },
-        )?
-        .lock_resolved(index, mm, &self.0.nodes, wait)
+        let release = host_release_venue(&*self.0.access)?;
+        let index = release
+            .zone
+            .spaces
+            .find(mm.raw())
+            .ok_or(Refusal::Stale)?
+            .index();
+        RootReleaseVenue::new(table(&*self.0.access)?, release)?.lock_resolved(
+            index,
+            mm,
+            &self.0.nodes,
+            wait,
+        )
     }
 }
 

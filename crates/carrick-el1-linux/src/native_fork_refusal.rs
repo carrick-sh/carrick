@@ -61,8 +61,8 @@ pub enum NativeForkCause {
     /// and no node bank could be added (#3085): the `BANKS` table is full or
     /// the metadata allocator is out of memory (Linux's ENOMEM for a fork
     /// that cannot allocate its kernel structures), or the allocator's
-    /// receipt was broken. A grant in flight is never stored here: it is
-    /// "not now" ([`NodeBankDemand::supply`]).
+    /// receipt was broken. A grant in flight or a held bank window is never
+    /// stored here: it is "not now" ([`NodeBankDemand::supply`]).
     NodeBank(carrick_core::mm::reservation::NodeBankShortfall),
 }
 
@@ -105,7 +105,9 @@ impl NativeForkRefusal {
             NativeForkCause::NodeBank(S::Full | S::Metadata(MetadataMiss::Exhausted)) => {
                 E::NoMemory
             }
-            NativeForkCause::NodeBank(S::Metadata(MetadataMiss::GrantPending)) => E::Busy,
+            NativeForkCause::NodeBank(S::Metadata(MetadataMiss::GrantPending) | S::Publishing) => {
+                E::Busy
+            }
             NativeForkCause::NodeBank(S::Invalid) => E::Invalid,
             NativeForkCause::Mm(error) => mm_error(error),
             NativeForkCause::Reservation(refusal) => reservation_error(refusal),
@@ -195,7 +197,10 @@ fn stock_error(
     match refusal {
         R::Invalid => E::Invalid,
         R::Stale => E::Stale,
+        // An admission limit is EAGAIN; kernel memory the carrier could
+        // not allocate is ENOMEM (`fork(2)`).
         R::Capacity => E::Exhausted,
+        R::NoMemory => E::NoMemory,
         R::Inventory => E::Busy,
         // The fork owner grows the table and answers `Busy` itself. This
         // cause survives only when that growth was refused for good: the
@@ -216,9 +221,10 @@ pub enum PublishRefusal {
 /// held at `observed` (#3085). Not an errno: the venue returns its fork
 /// loan and releases every MM guard, then [`Self::supply`] adds one bank
 /// through the existing bank supply and the fork reruns against it. Each
-/// rerun follows either a pool that grew past `observed` or a metadata
-/// grant served at the fork's own boundary, so reruns are bounded by the
-/// `BANKS` table and the grants the carrier gives.
+/// rerun follows either a pool that grew past `observed`, or a wake of the
+/// parent space's Metadata cause (a grant served, or another supplier's
+/// bank window closed), so reruns are bounded by the `BANKS` table and the
+/// grants the carrier gives.
 #[must_use = "a node bank demand must be supplied after the fork's loan is returned"]
 #[derive(Debug)]
 pub struct NodeBankDemand {
@@ -227,11 +233,17 @@ pub struct NodeBankDemand {
 
 impl NodeBankDemand {
     /// Supply the bank, holding no MM editor, root guard or fork loan.
-    /// `Busy` retains the fork as carrier work and reruns it once (#2306):
-    /// the pool grew past `observed` (this call's bank or a peer's), or the
-    /// allocator posted a metadata grant and marked this boundary as owing
-    /// it, so the carrier serves the grant before the rerun. Only memory no
-    /// bank can come from answers ENOMEM.
+    /// `metadata` is the parent space's Metadata cause, observed before this
+    /// call. The answer is never an errno for contention (#2306):
+    /// - the pool grew past `observed` (this call's bank or a peer's):
+    ///   `Busy`, and the retained fork reruns at once;
+    /// - a metadata grant is in flight for this boundary, or another
+    ///   supplier holds the bank window: `OwnerWait` on `metadata`, which
+    ///   the grant's publication or that window's close wakes, so the fork
+    ///   parks until then, probes once and reruns.
+    ///
+    /// `waiters` are woken when this call's own window closes. Only memory
+    /// no bank can come from answers ENOMEM.
     pub fn supply<
         Policy: carrick_el1_abi::ReservationPolicy,
         Geometry: carrick_el1_abi::ReservationGeometry,
@@ -239,12 +251,17 @@ impl NodeBankDemand {
         self,
         roots: &carrick_core::mm::reservation::SharedReservations<Policy, Geometry>,
         allocator: &impl carrick_core::mm::reservation::ReservationMetadataAllocator,
+        metadata: Option<carrick_core_abi::PortalOwnerWait>,
+        waiters: &impl carrick_core::mm::reservation::MetadataWaiters,
     ) -> super::native_process_runtime::NativeProcessError {
+        use super::native_process_runtime::NativeProcessError as E;
         use carrick_core::mm::reservation::{MetadataMiss, NodeBankShortfall};
-        match roots.supply_node_bank(allocator, self.observed) {
-            Ok(()) | Err(NodeBankShortfall::Metadata(MetadataMiss::GrantPending)) => {
-                super::native_process_runtime::NativeProcessError::Busy
-            }
+        match roots.supply_node_bank(allocator, self.observed, waiters) {
+            Ok(()) => E::Busy,
+            Err(
+                NodeBankShortfall::Metadata(MetadataMiss::GrantPending)
+                | NodeBankShortfall::Publishing,
+            ) => metadata.map_or(E::Busy, E::OwnerWait),
             Err(shortfall) => refused(
                 NativeForkStage::Publish,
                 NativeForkCause::NodeBank(shortfall),
@@ -673,15 +690,43 @@ mod tests {
                 cause: NativeForkCause::Mm(MmError::ParentChanged),
             })
         );
-        // A grant in flight for this boundary: "not now", the fork is
-        // retained as carrier work and reruns once the grant is served.
+        let waiters = carrick_core_abi::NO_METADATA_WAITERS;
+        // SAFETY: a fixture observation; nothing parks on it here.
+        let metadata = unsafe {
+            carrick_core_abi::PortalOwnerWait::from_owner(
+                carrick_core_abi::El1MmHandle::from_admitted_owner(
+                    core::num::NonZeroU64::MIN,
+                    carrick_el1_abi::ReservationMm::new(7).unwrap(),
+                    core::num::NonZeroU64::MIN,
+                ),
+                carrick_core_abi::PortalWaitCause::Metadata,
+                3,
+            )
+        };
+        // A grant in flight for this boundary: "not now", the fork parks on
+        // the Metadata cause it observed, which the grant's publication
+        // wakes, and reruns.
         let PublishRefusal::NodeBank(demand) = refused_publish(MmError::MetadataRequired, observed)
         else {
             unreachable!()
         };
-        let error = demand.supply(&table, &GrantInFlight);
-        assert_eq!(error, NativeProcessError::Busy);
-        assert_eq!(error.failure(), Err(NativeContention::BUSY));
+        let error = demand.supply(&table, &GrantInFlight, Some(metadata), &waiters);
+        assert_eq!(error, NativeProcessError::OwnerWait(metadata));
+        assert_eq!(table.node_capacity(), observed);
+        // Another supplier holds the bank window: the same park, woken by
+        // that window's close; this supply allocated nothing.
+        let PublishRefusal::NodeBank(demand) = refused_publish(MmError::MetadataRequired, observed)
+        else {
+            unreachable!()
+        };
+        let mut peer_backing = std::vec![0u8; 2 * 1024 * 1024];
+        let peer = carrick_el1::alloc::MetadataStorage::new();
+        peer.admit_bootstrap_region(peer_backing.as_mut_ptr() as u64, peer_backing.len())
+            .unwrap();
+        table.hold_bank_window_for_test(true);
+        let error = demand.supply(&table, &peer, Some(metadata), &waiters);
+        table.hold_bank_window_for_test(false);
+        assert_eq!(error, NativeProcessError::OwnerWait(metadata));
         assert_eq!(table.node_capacity(), observed);
         // Memory no grant can add: the demand answers ENOMEM, typed, at
         // Publish.
@@ -690,7 +735,7 @@ mod tests {
             unreachable!()
         };
         let empty = carrick_el1::alloc::MetadataStorage::new();
-        let error = demand.supply(&table, &empty);
+        let error = demand.supply(&table, &empty, Some(metadata), &waiters);
         assert_eq!(
             error,
             NativeProcessError::ForkRefused(NativeForkRefusal {
@@ -711,7 +756,10 @@ mod tests {
         else {
             unreachable!()
         };
-        assert_eq!(demand.supply(&table, &allocator), NativeProcessError::Busy);
+        assert_eq!(
+            demand.supply(&table, &allocator, Some(metadata), &waiters),
+            NativeProcessError::Busy
+        );
         assert_ne!(table.node_capacity(), observed);
     }
 

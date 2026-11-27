@@ -966,6 +966,9 @@ pub struct ForkStockCounters {
     pub loans: u64,
     /// Loans refused for capacity (the guest lowers each to `EAGAIN`).
     pub capacity_refusals: u64,
+    /// Loans or reservations refused because the carrier could not allocate
+    /// the fork's kernel memory (the guest lowers each to `ENOMEM`, #3085).
+    pub no_memory_refusals: u64,
     /// Native backing supplies refused because fewer than one bounded grant
     /// set remained; the carrier stays live and the stock is unchanged.
     pub descriptor_capacity_refusals: u64,
@@ -1006,6 +1009,7 @@ impl ForkStockCounters {
         [
             ("loan", self.loans),
             ("capacity_refusal", self.capacity_refusals),
+            ("no_memory_refusal", self.no_memory_refusals),
             (
                 "descriptor_capacity_refusal",
                 self.descriptor_capacity_refusals,
@@ -2849,6 +2853,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             ForkStockRefusal::Invalid => &mut self.counters.invalid_refusals,
             ForkStockRefusal::Inventory => &mut self.counters.inventory_refusals,
             ForkStockRefusal::Residency => &mut self.counters.residency_refusals,
+            ForkStockRefusal::NoMemory => &mut self.counters.no_memory_refusals,
         };
         *counter = counter.saturating_add(1);
         exchange.refuse(refusal);
@@ -2866,6 +2871,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             ForkStockRefusal::Invalid => &mut self.counters.invalid_refusals,
             ForkStockRefusal::Inventory => &mut self.counters.inventory_refusals,
             ForkStockRefusal::Residency => &mut self.counters.residency_refusals,
+            ForkStockRefusal::NoMemory => &mut self.counters.no_memory_refusals,
         };
         *counter = counter.saturating_add(1);
         settlement.refuse(refusal);
