@@ -2719,10 +2719,8 @@ mod tests {
                     .unwrap()
                     .into_vec();
             fixture.serve(None, &mut record).unwrap();
-            carrick_personality_linux::native_host_file::complete(
-                &record,
-                output,
-                &mut |address, bytes| {
+            carrick_personality_linux::native_host_file::completion(&record, output)
+                .deliver(&mut |address, bytes| {
                     // SAFETY: the staged output ranges are live test buffers.
                     unsafe {
                         std::ptr::copy_nonoverlapping(
@@ -2732,9 +2730,8 @@ mod tests {
                         )
                     };
                     true
-                },
-            )
-            .raw()
+                })
+                .raw()
         };
         let address = |bytes: &[u8]| bytes.as_ptr() as u64;
         let word = |value: u64| value.to_le_bytes();
@@ -2902,10 +2899,8 @@ mod tests {
             if self.serve(None, &mut staged.record).is_err() {
                 return carrick_abi::LINUX_ENOSYS.guest_retval();
             }
-            carrick_personality_linux::native_host_file::complete(
-                &staged.record,
-                staged.output,
-                &mut |address, bytes| {
+            carrick_personality_linux::native_host_file::completion(&staged.record, staged.output)
+                .deliver(&mut |address, bytes| {
                     // SAFETY: the staged output ranges are live test buffers.
                     unsafe {
                         std::ptr::copy_nonoverlapping(
@@ -2915,9 +2910,8 @@ mod tests {
                         )
                     };
                     true
-                },
-            )
-            .raw()
+                })
+                .raw()
         }
 
         fn net_call(&self, nr: carrick_abi::CanonicalNr, args: [u64; 6]) -> i64 {
@@ -3222,12 +3216,9 @@ mod tests {
         ) -> i64 {
             match self.child_served(authority, ordinal, args, inputs) {
                 Ok(ChildServed { record, output, .. }) => {
-                    carrick_personality_linux::native_host_file::complete(
-                        &record,
-                        output,
-                        &mut |_, _| panic!("a mutation has no user output"),
-                    )
-                    .raw()
+                    carrick_personality_linux::native_host_file::completion(&record, output)
+                        .deliver(&mut |_, _| panic!("a mutation has no user output"))
+                        .raw()
                 }
                 Err(result) => result,
             }

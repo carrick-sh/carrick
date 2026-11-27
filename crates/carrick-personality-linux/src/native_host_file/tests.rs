@@ -770,7 +770,7 @@ fn completion_copies_output_only_on_success() {
         .reply(3, b"abc")
         .unwrap();
     let mut copied = Vec::new();
-    let result = complete(&record, output, &mut |address, bytes| {
+    let result = completion(&record, output).deliver(&mut |address, bytes| {
         copied.push((address, bytes.to_vec()));
         true
     });
@@ -786,7 +786,7 @@ fn completion_copies_output_only_on_success() {
         &mut user,
     ));
     assert_eq!(
-        complete(&record, output, &mut |_, _| panic!("no output")),
+        completion(&record, output).deliver(&mut |_, _| panic!("no output")),
         SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO)
     );
 }
@@ -827,7 +827,7 @@ fn x86_fstat_completes_the_canonical_reply_in_x86_layout() {
     )
     .unwrap();
     let mut copied = Vec::new();
-    let result = complete(&record, Some(output), &mut |address, bytes| {
+    let result = completion(&record, Some(output)).deliver(&mut |address, bytes| {
         copied.push((address, bytes.to_vec()));
         true
     });
@@ -850,7 +850,7 @@ fn x86_fstat_completes_the_canonical_reply_in_x86_layout() {
         .reply(0, b"short")
         .unwrap();
     assert_eq!(
-        complete(&record, output, &mut |_, _| panic!("no output")),
+        completion(&record, output).deliver(&mut |_, _| panic!("no output")),
         SyscallResult::from_errno(carrick_syscall_abi::LINUX_EIO)
     );
 }
@@ -1629,12 +1629,13 @@ fn readlink_decodes_and_bounds_the_output_without_a_nul() {
     view.reply(3, b"/bi").unwrap();
     let mut copied = Vec::new();
     assert_eq!(
-        complete(&record, output, &mut |address, bytes| {
-            assert_eq!(address, BASE + 512);
-            copied.extend_from_slice(bytes);
-            true
-        })
-        .raw(),
+        completion(&record, output)
+            .deliver(&mut |address, bytes| {
+                assert_eq!(address, BASE + 512);
+                copied.extend_from_slice(bytes);
+                true
+            })
+            .raw(),
         3
     );
     assert_eq!(copied, b"/bi");
@@ -1657,10 +1658,9 @@ fn readlink_validates_only_the_bytes_returned_by_the_link() {
         .reply(3, b"/bi")
         .unwrap();
     assert_eq!(
-        complete(&record, output, &mut |address, bytes| {
-            user.writable(address, bytes.len()) == bytes.len()
-        })
-        .raw(),
+        completion(&record, output)
+            .deliver(&mut |address, bytes| { user.writable(address, bytes.len()) == bytes.len() })
+            .raw(),
         3
     );
 }
@@ -3066,7 +3066,7 @@ fn select_over_host_descriptors_stages_and_completes_its_sets() {
         // The carrier reports fd 1 writable only: one bit.
         view.reply(1, &[1, 0, 0, 0, 0x5, 0, 0x4, 0]).unwrap();
         let mut written = Vec::new();
-        let result = complete(&record, output, &mut |address, bytes| {
+        let result = completion(&record, output).deliver(&mut |address, bytes| {
             written.push((address, bytes.to_vec()));
             true
         });

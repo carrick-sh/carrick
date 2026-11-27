@@ -2198,7 +2198,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             self.copy_syscall_output(carrick_guest_arch::UserVa::new(address), bytes)
                 .is_ok()
         };
-        let chunk = venue::complete(&file.record, file.output, &mut copy_out);
+        let chunk = venue::completion(&file.record, file.output).deliver(&mut copy_out);
         let step = venue::net_transfer_step(
             &file.record,
             chunk,
@@ -5149,32 +5149,6 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             };
         }
         let mut output = pending.copyout.take();
-        if matches!(request.operation, ServiceOperation::HostFile { .. })
-            && matches!(result, ServiceResult::Supplied | ServiceResult::Cancelled)
-            && let Some(file) = pending.host_file.as_ref()
-            && matches!(
-                file.operation,
-                carrick_core_abi::host_file::HostFileOp::Readlinkat
-                    | carrick_core_abi::host_file::HostFileOp::GetXattr
-                    | carrick_core_abi::host_file::HostFileOp::ListXattr
-                    | carrick_core_abi::host_file::HostFileOp::Ioctl
-            )
-            && let Some(destination) = file.output
-            && let Some(reply) = carrick_core_abi::host_file::reply(&file.record)
-            && reply.result >= 0
-            && reply.output.len() <= destination.len
-        {
-            output = Some(Box::new(OwnedCopyout {
-                data: CopyoutData::Bytes {
-                    address: UserVa::new(destination.address),
-                    bytes: reply.output.to_vec(),
-                },
-                offset: 0,
-                result: SyscallResult::new(reply.result),
-                prefix_on_fault: false,
-                effect: None,
-            }));
-        }
         if matches!(request.operation, ServiceOperation::Entropy { .. })
             && matches!(result, ServiceResult::Supplied | ServiceResult::Cancelled)
             && let Some((record, address, empty_fault)) = pending.entropy.as_ref()
@@ -5465,21 +5439,41 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             .complete_chdir(&pending_file.record, pending_file.call)
                             .map(NativeResume::Returned);
                     }
-                    let mut copy_out = |address: u64, bytes: &[u8]| {
-                        self.copy_syscall_output(carrick_guest_arch::UserVa::new(address), bytes)
-                            .is_ok()
-                    };
-                    let result = carrick_personality_linux::native_host_file::complete(
+                    let completion = carrick_personality_linux::native_host_file::completion(
                         &pending_file.record,
                         pending_file.output,
-                        &mut copy_out,
                     );
                     if carrick_personality_linux::native_host_file::sigpipe_on_epipe(
                         &pending_file.record,
                     ) {
                         carrick_personality_linux::signal::ProcessSignals::raise_sigpipe(self);
                     }
-                    Ok(NativeResume::Returned(result))
+                    if completion.spans.is_empty() {
+                        return Ok(NativeResume::Returned(completion.result));
+                    }
+                    // The reply's output is the ring's to write into the
+                    // caller's memory: the copyout owner supplies a
+                    // destination page that is not resident yet and parks on
+                    // contention, as Linux faults it in under the copy. A
+                    // destination that is not the caller's writable memory
+                    // answers the layout's fault answer (#3050).
+                    output = Some(Box::new(OwnedCopyout {
+                        data: CopyoutData::Spans(
+                            completion
+                                .spans
+                                .into_iter()
+                                .map(|(address, bytes)| (UserVa::new(address), bytes))
+                                .collect(),
+                        ),
+                        offset: 0,
+                        result: completion.result,
+                        prefix_on_fault: matches!(
+                            completion.on_fault,
+                            carrick_personality_linux::native_host_file::FaultAnswer::Delivered
+                        ),
+                        effect: None,
+                    }));
+                    Ok(NativeResume::NoPending)
                 }
                 (ServiceOperation::HostFile { .. }, ServiceResult::Supplied) => {
                     // Supplied without a reply is a transport violation.
