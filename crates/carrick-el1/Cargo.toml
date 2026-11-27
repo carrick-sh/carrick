@@ -20,6 +20,8 @@ zerocopy.workspace = true
 default = []
 host-test = ["carrick-sched-core/host-test", "carrick-core/host-test", "carrick-personality-linux/host-test"]
 allocator-test-control = []
+# Fault injection for the CPL0 fixture image's KVM witnesses (#3083).
+test-support = []
 
 [lib]
 path = "src/lib.rs"

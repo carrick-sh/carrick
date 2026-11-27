@@ -4461,6 +4461,24 @@ fn production_idle_host_work_published_before_hlt_is_settled() {
     );
 }
 
+/// #3083 on x86 CPL0: the idle-read witness above, with the scan hold's
+/// reschedule IPI finding this CPU's ICR busy once (by injection). A busy
+/// ICR is contention, never fatal: the IPI is owed by this CPU and resent
+/// at its next delivery point, the hold's own return to user, and the peer
+/// goes on only once that resent vector is pending in its IRR. A send that
+/// made the busy ICR fatal ends the run with a CPL0 fatal exit; one that
+/// dropped it leaves the peer asleep (exit 90). Exit 93: the hold was taken
+/// without exactly one busy send and one resend.
+#[test]
+fn production_resched_ipi_busy_once_is_resent_at_the_next_delivery_point() {
+    bounded_contention_witness(
+        "production_resched_ipi_busy_once_is_resent_at_the_next_delivery_point",
+        "native_idle_peer_wake.S",
+        &["-DBUSY_RESCHED=1"],
+        "a scan hold whose reschedule IPI found the ICR busy once",
+    );
+}
+
 /// #2321 on x86 CPL0: blocking wait4 on a production fork child that is
 /// already a zombie, with the pre-reap status copy contended once. An editor
 /// holder parks the caller once on the existing owner wait; a Busy copy is

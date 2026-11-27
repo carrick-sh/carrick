@@ -6,7 +6,7 @@ license.workspace = true
 
 [features]
 default = []
-test-support = ["carrick-core/test-support"]
+test-support = ["carrick-core/test-support", "carrick-el1/test-support"]
 
 [dependencies]
 carrick-abi = { path = "../carrick-abi" }
