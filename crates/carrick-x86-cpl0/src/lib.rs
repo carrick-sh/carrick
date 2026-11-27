@@ -190,6 +190,12 @@ mod test_support {
     pub const INJECT_MARK_PEER_HOST_WORK: u64 = 0xffff_ffff_ffff_fe5a;
     /// 1 while the stopped peer's task still has host work pending, else 0.
     pub const INJECT_PEER_HOST_WORK_PENDING: u64 = 0xffff_ffff_ffff_fe5b;
+    /// The next reschedule IPI this kernel sends finds its ICR busy, once
+    /// (#3083): the send is owed by this CPU and resent at its next
+    /// delivery point, never fatal.
+    pub const INJECT_RESCHED_BUSY_ONCE: u64 = 0xffff_ffff_ffff_fe5d;
+    /// `injected busy sends | owed IPIs resent << 32`.
+    pub const INJECT_RESCHED_BUSY_CENSUS: u64 = 0xffff_ffff_ffff_fe5e;
     const ORDER_AFTER_READ: u8 = 1;
     const ORDER_BEFORE_HLT: u8 = 2;
     const ORDER_ARMED: u8 = 1;
@@ -1469,6 +1475,13 @@ mod test_support {
                 ordered_peer_task()?.linux.has_pending_host_work(),
             )),
             INJECT_CURRENT_CPU => Some(u64::from(binding.cpu_slot)),
+            INJECT_RESCHED_BUSY_ONCE => {
+                carrick_el1::isa::x86::interrupt::inject_resched_busy_once().then_some(0)
+            }
+            INJECT_RESCHED_BUSY_CENSUS => {
+                let (injected, resent) = carrick_el1::isa::x86::interrupt::resched_busy_census();
+                Some(injected | resent << 32)
+            }
             INJECT_EDITOR_RELEASED_BEFORE_PARK_ONCE => EARLY_RELEASE_TASK
                 .compare_exchange(0, binding.task_address, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()

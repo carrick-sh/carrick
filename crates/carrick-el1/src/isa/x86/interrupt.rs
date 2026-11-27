@@ -540,9 +540,46 @@ fn bound_apic_id(slot: CpuId) -> Result<interrupts::ApicId, ArchError> {
 pub fn send_resched(slot: carrick_sched_core::SlotId) -> Result<(), ArchError> {
     let apic = bound_apic_id(CpuId::new(u32::from(slot.raw())))?;
     core::sync::atomic::fence(Ordering::SeqCst);
-    // SAFETY: scheduler published the target work before sending this IPI;
-    // the stopped bootstrap retains the destination APIC until retirement.
-    unsafe { interrupts::hardware::send_resched(apic) }.map_err(|_| ArchError::Busy)
+    send_resched_ipi(apic).map_err(|_| ArchError::Busy)
+}
+
+/// Owed reschedule IPIs this CPU resent, for the KVM witness's census.
+#[cfg(feature = "test-support")]
+static OWED_RESCHED_RESENT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Reschedule IPIs that found the ICR busy by injection, for the census.
+#[cfg(feature = "test-support")]
+static RESCHED_BUSY_INJECTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The next reschedule IPI this kernel sends finds the ICR busy, once.
+#[cfg(feature = "test-support")]
+static RESCHED_BUSY_ARMED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Make the next reschedule IPI find its ICR busy, once (#3083 witness).
+/// False when one is already armed.
+#[cfg(feature = "test-support")]
+pub fn inject_resched_busy_once() -> bool {
+    !RESCHED_BUSY_ARMED.swap(true, Ordering::AcqRel)
+}
+
+/// `(injected busy sends, owed IPIs resent)`, for the #3083 witness.
+#[cfg(feature = "test-support")]
+pub fn resched_busy_census() -> (u64, u64) {
+    (
+        RESCHED_BUSY_INJECTED.load(Ordering::Acquire),
+        OWED_RESCHED_RESENT.load(Ordering::Acquire),
+    )
+}
+
+fn send_resched_ipi(apic: interrupts::ApicId) -> Result<(), interrupts::IpiBusy> {
+    #[cfg(feature = "test-support")]
+    if RESCHED_BUSY_ARMED.swap(false, Ordering::AcqRel) {
+        RESCHED_BUSY_INJECTED.fetch_add(1, Ordering::AcqRel);
+        return Err(interrupts::IpiBusy);
+    }
+    // SAFETY: the scheduler published the target work before sending this
+    // IPI; the stopped bootstrap retains the destination APIC until
+    // retirement.
+    unsafe { interrupts::hardware::send_resched(apic) }
 }
 
 /// Query the TSC frequency from architectural CPUID or the exact KVM binding.

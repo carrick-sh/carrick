@@ -17,6 +17,13 @@
  * peer must settle it: only the durable word announces it, so a pass
  * that sleeps without rechecking it never rings the host.
  *
+ * -DBUSY_RESCHED (#3083): as AFTER_IDLE_READ, but the scan hold's
+ * reschedule IPI finds this CPU's ICR busy, once, by injection. A busy
+ * ICR is "not now": the IPI is owed by this CPU and resent at its next
+ * delivery point (here, the hold's own return to user), so the peer still
+ * gets its only wake. Exit 93: the peer took the hold, but the census does
+ * not show exactly one busy send and one resend.
+ *
  * Exit 7: the peer took the publication, and the ordered pass ran once.
  * 81: arming failed; 82: the peer never reached its stop; 83: the
  * publication failed; 84: releasing the peer failed; 90: the ordered pass
@@ -33,7 +40,13 @@
 #define INJECT_ORDER_PEER_CENSUS           0xfffffffffffffe59
 #define INJECT_MARK_PEER_HOST_WORK         0xfffffffffffffe5a
 #define INJECT_PEER_HOST_WORK_PENDING      0xfffffffffffffe5b
+#define INJECT_RESCHED_BUSY_ONCE           0xfffffffffffffe5d
+#define INJECT_RESCHED_BUSY_CENSUS         0xfffffffffffffe5e
 #define POLL_LIMIT                         0x1000000
+
+#ifdef BUSY_RESCHED
+#define AFTER_IDLE_READ 1
+#endif
 
 .global _start
 .text
@@ -59,6 +72,12 @@ reach_loop:
     jmp reach_loop
 reached:
 
+#ifdef BUSY_RESCHED
+    mov $INJECT_RESCHED_BUSY_ONCE, %rax
+    syscall
+    test %rax, %rax
+    jnz fail_publish
+#endif
 #ifdef AFTER_IDLE_READ
     mov $INJECT_HOLD_PEER_SCAN, %rax
 #else
@@ -95,6 +114,13 @@ taken:
     syscall
     cmp $1, %rax
     jne fail_census
+#ifdef BUSY_RESCHED
+    mov $INJECT_RESCHED_BUSY_CENSUS, %rax
+    syscall
+    mov $0x100000001, %rcx
+    cmp %rcx, %rax
+    jne fail_busy_census
+#endif
     mov $7, %edi
     jmp die
 
@@ -119,6 +145,9 @@ fail_slept:
     jmp die
 fail_slept_unordered:
     mov $92, %edi
+    jmp die
+fail_busy_census:
+    mov $93, %edi
     jmp die
 fail_census:
     mov $91, %edi
