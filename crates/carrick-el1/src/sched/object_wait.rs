@@ -185,6 +185,20 @@ fn deliver_host_effects<C: carrick_el1_abi::EntryContext>(
 
 /// Deliver a native owner's plain wake through the same SGI and host-work
 /// authority used by object-wait completion.
+/// Send the idle-scan passes a lock-taking zone operation owed (#3083)
+/// through [`deliver_wake_effects`] from `venue`.
+pub fn deliver_owed_passes<C: carrick_el1_abi::EntryContext>(
+    zone: &carrick_sched_core::ZoneTables<C>,
+    venue: SlotId,
+    passes: carrick_sched_core::OwedPasses,
+) {
+    let mut effects = WakeEffects::default();
+    passes.fold_into(&mut effects);
+    if effects.sgi.iter().any(|word| *word != 0) {
+        deliver_wake_effects(zone, venue, effects);
+    }
+}
+
 pub fn deliver_wake_effects<C: carrick_el1_abi::EntryContext>(
     zone: &carrick_sched_core::ZoneTables<C>,
     venue: SlotId,

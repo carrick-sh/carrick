@@ -224,10 +224,19 @@ pub(super) fn resume_selected<'a, X: ForkStockCrossing>(
         unsafe {
             source.zone.record(record).consume_owner_continuation();
         }
-        let _ =
-            source
-                .zone
-                .release_current(source.slot, record, &carrick_sched_core::ShortLockSpin);
+        let _ = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = source.zone.release_current(
+                source.slot,
+                record,
+                &carrick_sched_core::ShortLockSpin,
+                &passes,
+            );
+            (|p| crate::sched::object_wait::deliver_owed_passes(source.zone, source.slot, p))(
+                passes,
+            );
+            owed
+        };
         return NativeResume::Left(None);
     }
     // The scheduler publishes the execution identity; the native owner also
@@ -374,7 +383,13 @@ fn resume_unregistered(
         unsafe {
             rec.consume_owner_continuation();
         }
-        let _ = zone.release_current(slot, record, &carrick_sched_core::ShortLockSpin);
+        let _ = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed =
+                zone.release_current(slot, record, &carrick_sched_core::ShortLockSpin, &passes);
+            (|p| crate::sched::object_wait::deliver_owed_passes(zone, slot, p))(passes);
+            owed
+        };
         return crate::sched::ResumeAction::Left;
     }
     // A home record resumes with the host's load publication (`Sched::load`).
@@ -418,14 +433,30 @@ fn resume_unregistered(
         let binding = common_entry::execution_binding(task);
         let source = BornInZoneSource { zone, slot };
         let hand_back = || {
-            if carrick_core::entry::yield_current_to_host(binding, source, record, &|owned| {
-                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-            })
+            if {
+                let passes = carrick_sched_core::OwedPasses::new();
+                let owed = carrick_core::entry::yield_current_to_host(
+                    binding,
+                    source,
+                    record,
+                    &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    },
+                    &passes,
+                );
+                (|p| crate::sched::object_wait::deliver_owed_passes(zone, slot, p))(passes);
+                owed
+            }
             .is_err()
             {
                 // An adapter operation cannot be released by the lifecycle
                 // owner. Keep its exact token and queue it for host service.
-                let _ = zone.unswitch(slot, record);
+                let _ = {
+                    let passes = carrick_sched_core::OwedPasses::new();
+                    let owed = zone.unswitch(slot, record, &passes);
+                    (|p| crate::sched::object_wait::deliver_owed_passes(zone, slot, p))(passes);
+                    owed
+                };
             }
         };
         let Some((page, control)) = lifecycle else {
@@ -454,8 +485,19 @@ fn resume_unregistered(
                 // The neutral owner commits exact terminal intent at the
                 // physical release seam, before a queued DirectLoad can
                 // observe the saved record's absence.
-                match custody.retire_zone_current(control, &mut membership, binding, source, record)
-                {
+                match {
+                    let passes = carrick_sched_core::OwedPasses::new();
+                    let owed = custody.retire_zone_current(
+                        control,
+                        &mut membership,
+                        binding,
+                        source,
+                        record,
+                        &passes,
+                    );
+                    (|p| crate::sched::object_wait::deliver_owed_passes(zone, slot, p))(passes);
+                    owed
+                } {
                     Ok(_) => {
                         if let Some(entry) = control.entry() {
                             carrick_core::lifecycle::retire_cancelled_pool_member(
@@ -478,9 +520,16 @@ fn resume_unregistered(
                 use carrick_core::terminal::LosingMemberSettlement;
                 match error {
                     MemberMembershipError::AlreadyTerminal => {
-                        match carrick_core::terminal::settle_losing_zone_current(
-                            control, binding, source, record,
-                        ) {
+                        match {
+                            let passes = carrick_sched_core::OwedPasses::new();
+                            let owed = carrick_core::terminal::settle_losing_zone_current(
+                                control, binding, source, record, &passes,
+                            );
+                            (|p| crate::sched::object_wait::deliver_owed_passes(zone, slot, p))(
+                                passes,
+                            );
+                            owed
+                        } {
                             Some(LosingMemberSettlement::Released(_)) => {
                                 task.linux.mark_native_terminal_work(slot);
                             }
