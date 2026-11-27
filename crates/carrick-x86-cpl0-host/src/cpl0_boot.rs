@@ -5881,6 +5881,27 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
         Ok(table.next_generation.load(Ordering::Acquire))
     }
 
+    /// Node banks the shared reservation pool holds: each one a fork or
+    /// mapping supplied after its tree outgrew the pool (#3085). Banks are
+    /// owned until carrier teardown, so the count only grows.
+    pub fn reservation_node_banks(&self) -> Result<u64, TrapError> {
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        let pointer = custody
+            .ram
+            .host_ptr(
+                META_GPA + carrick_core_abi::X86_CPL0_RESERVATIONS_OFFSET,
+                size_of::<X86Cpl0Reservations>(),
+            )
+            .ok_or_else(|| fail("production reservation backing"))?;
+        // SAFETY: boot initialized the retained, aligned table before any
+        // CPU ran; its bank count is atomic and only ever incremented.
+        let table = unsafe { &*pointer.cast::<X86Cpl0Reservations>() };
+        Ok(u64::from(table.storage_generation()))
+    }
+
     pub fn physical_crossing_counts(
         &self,
     ) -> Result<[(PhysicalCrossingFamily, u64); 6], TrapError> {

@@ -680,8 +680,14 @@ pub struct ForkStockLoan {
 pub enum ForkStockRefusal {
     Invalid,
     Stale,
+    /// An admission limit refused the loan: the stock, ledger or a table
+    /// is at its bound. Linux `fork(2)` answers EAGAIN.
     Capacity,
     Inventory,
+    /// The carrier could not allocate the kernel memory the fork needs
+    /// (#3085), distinct from [`Self::Capacity`]'s admission limit. Linux
+    /// `fork(2)` answers ENOMEM.
+    NoMemory,
     /// The carrier's residency table cannot hold the rows this fork
     /// publishes. Not an error: the guest grows the table through its own
     /// metadata allocator, outside every MM editor, and reruns the fork.
@@ -812,6 +818,7 @@ impl ForkStockExchange {
             ForkStockRefusal::Capacity => 3,
             ForkStockRefusal::Inventory => 4,
             ForkStockRefusal::Residency => 5,
+            ForkStockRefusal::NoMemory => 6,
         };
         self._reserved = 0;
         self.status = 2;
@@ -852,6 +859,7 @@ impl ForkStockExchange {
                 3 => ForkStockRefusal::Capacity,
                 4 => ForkStockRefusal::Inventory,
                 5 => ForkStockRefusal::Residency,
+                6 => ForkStockRefusal::NoMemory,
                 _ => return None,
             }),
             _ => return None,
@@ -1189,6 +1197,7 @@ impl ForkStockSettlement {
             ForkStockRefusal::Capacity => 3,
             ForkStockRefusal::Inventory => 4,
             ForkStockRefusal::Residency => 5,
+            ForkStockRefusal::NoMemory => 6,
         };
         true
     }
@@ -1208,6 +1217,7 @@ impl ForkStockSettlement {
                 3 => ForkStockRefusal::Capacity,
                 4 => ForkStockRefusal::Inventory,
                 5 => ForkStockRefusal::Residency,
+                6 => ForkStockRefusal::NoMemory,
                 _ => return None,
             }),
             _ => return None,

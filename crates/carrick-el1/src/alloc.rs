@@ -36,6 +36,60 @@ fn current_el1_slot() -> Option<usize> {
     None
 }
 
+/// The guest venue that wakes the carrier's Metadata waiters when this CPU
+/// closes a node bank or residency segment window (#3085). A guest grower
+/// with no portal at hand (a copy-on-write or retirement) passes it to the
+/// append, so its close wakes a fork parked on that window.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+pub fn guest_metadata_waiters() -> Option<
+    carrick_sched_core::spaces::notification::SpaceReleaseVenue<
+        'static,
+        carrick_el1_abi::Aarch64ParkedContext,
+    >,
+> {
+    let slot = carrick_sched_core::SlotId::from_index(current_el1_slot()?)?;
+    // SAFETY: the carrier maps the zone for the complete EL1 lifetime.
+    let zone = unsafe { metadata_zone_at(carrick_el1_abi::EL1_ZONE_BASE as *const u8) };
+    crate::substrate::sched::object_wait::space_access(zone, slot).venue()
+}
+
+/// The CPL0 venue: the compact zone the stopped carrier retains, delivering
+/// as the x86 portal's own release does (`native_process::release`).
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub fn guest_metadata_waiters() -> Option<
+    carrick_sched_core::spaces::notification::SpaceReleaseVenue<
+        'static,
+        carrick_sched_core::ParkedContextWords,
+    >,
+> {
+    fn deliver(
+        zone: &carrick_sched_core::ZoneTables<carrick_sched_core::ParkedContextWords>,
+        _: carrick_sched_core::Waker,
+        effects: carrick_sched_core::object_wait::OwnedObjectWakeEffects<
+            '_,
+            carrick_sched_core::ParkedContextWords,
+        >,
+    ) {
+        crate::substrate::sched::object_wait::deliver_host_completion(zone, effects);
+    }
+    let layout = crate::isa::x86_kernel_layout();
+    // SAFETY: the stopped carrier initialized and retains this typed compact
+    // zone in the supervisor region for the complete execution lifetime.
+    let zone = unsafe {
+        &*(layout.zone.raw()
+            as *const carrick_sched_core::ZoneTables<carrick_sched_core::ParkedContextWords>)
+    };
+    Some(
+        carrick_sched_core::spaces::notification::SpaceReleaseVenue {
+            zone,
+            waker: carrick_sched_core::Waker::El1 {
+                slot: carrick_sched_core::SlotId::new(0),
+            },
+            deliver: carrick_sched_core::spaces::notification::SpaceWakeDelivery::Function(deliver),
+        },
+    )
+}
+
 /// Safe thread-safe wrapper around `MetadataAllocatorCore` with IRQ save/restore spinlock.
 pub struct MetadataStorage {
     lock: SpinLock<MetadataAllocatorCore>,

@@ -454,15 +454,15 @@ pub struct ResidencyStorage {
 
 /// The operation must release its MM editor before asking the carrier
 /// allocator to grow. Allocation pressure is distinct from a permanently
-/// full directory. [`FrameGrantResidencyTable::grow`] never answers
-/// `Publishing`: a racing append is a short critical section it waits out
-/// (#3085). `Publishing` names only a grant serve that found the owner's
-/// metadata wait unready.
+/// full directory.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResidencyGrowthRefusal {
     /// The allocator had no extent: a grant is in flight for this
     /// requester's boundary, or memory is exhausted.
     Metadata(crate::MetadataMiss),
+    /// Another appender holds the directory's append window. Not now: its
+    /// close wakes the space's Metadata cause (#3085), which the caller
+    /// observed before it tried.
     Publishing,
     Full,
     InvalidExtent,
@@ -520,10 +520,14 @@ impl FrameGrantResidencyTable {
     ///
     /// Callers must refresh their residency view after this succeeds, even
     /// when another owner published the requested segment first.
+    ///
+    /// `waiters` are woken when this call's append window closes; a refused
+    /// `Publishing` is woken by the holder's close.
     pub fn grow(
         &self,
         allocator: &impl ReservationMetadataAllocator,
         observed_extensions: usize,
+        waiters: &impl crate::MetadataWaiters,
     ) -> Result<(), ResidencyGrowthRefusal> {
         let current = self.extension_count();
         if current > observed_extensions {
@@ -542,8 +546,15 @@ impl FrameGrantResidencyTable {
             .map_err(ResidencyGrowthRefusal::Metadata);
         let (ptr, extent) = match allocation {
             Ok(allocation) => allocation,
+            // A peer holding the window may have taken the last extent for
+            // its segment: its close wakes the caller, never a false ENOMEM.
+            // The flag is read before the count: a holder publishes the
+            // count, then closes (#3085).
+            Err(_) if self.storage.directory.publishing.load(Ordering::Acquire) != 0 => {
+                return Err(ResidencyGrowthRefusal::Publishing);
+            }
             // A peer's segment published while this allocation missed
-            // serves the caller as well as this one would have (#3085).
+            // serves the caller as well as this one would have.
             Err(_) if self.extension_count() > observed_extensions => return Ok(()),
             Err(refusal) => return Err(refusal),
         };
@@ -551,7 +562,7 @@ impl FrameGrantResidencyTable {
             guest_base: ptr as u64,
             extent,
         };
-        let result = self.append_segment(location, layout, observed_extensions);
+        let result = self.append_segment(location, layout, observed_extensions, waiters);
         if !matches!(result, Ok(true)) {
             allocator.deallocate(ptr, layout);
         }
@@ -563,6 +574,7 @@ impl FrameGrantResidencyTable {
         location: ResidencySegmentLocation,
         layout: Layout,
         expected: usize,
+        waiters: &impl crate::MetadataWaiters,
     ) -> Result<bool, ResidencyGrowthRefusal> {
         let address = location.guest_base;
         let extent = location.extent;
@@ -585,21 +597,11 @@ impl FrameGrantResidencyTable {
         // Initialization happens before publication and outside the append lock.
         unsafe { ResidencySegment::init_in_place(address as *mut ResidencySegment) };
         let directory = &self.storage.directory;
-        // The append window below never blocks, allocates or takes another
-        // lock, so a racing appender is waited out, never refused: the
-        // decision after it is one read of `count` under the window (#3085).
-        let mut attempt = 0;
-        while directory
-            .publishing
-            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            carrick_sched_core::ShortLockWait::wait_short(
-                &carrick_sched_core::ShortLockSpin,
-                attempt,
-            );
-            attempt = attempt.wrapping_add(1);
-        }
+        // A held window is "not now", never waited out here: its holder's
+        // close wakes the Metadata cause the caller observed (#3085). Under
+        // the window one read of `count` decides.
+        let window = crate::MetadataPublicationWindow::open(&directory.publishing, waiters)
+            .ok_or(ResidencyGrowthRefusal::Publishing)?;
         let installed = directory.count.load(Ordering::Relaxed) as usize == expected;
         if installed {
             directory.entries[expected].write(location);
@@ -607,7 +609,7 @@ impl FrameGrantResidencyTable {
                 .count
                 .store((expected + 1) as u64, Ordering::Release);
         }
-        directory.publishing.store(0, Ordering::Release);
+        drop(window);
         Ok(installed)
     }
 
@@ -2365,18 +2367,47 @@ mod tests {
             table.try_publish(pending),
             Err(FrameGrantResidencyRefusal::Capacity)
         );
+        struct Wakes(Cell<usize>);
+        impl crate::MetadataWaiters for Wakes {
+            fn wake_metadata_waiters(&self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let wakes = Wakes(Cell::new(0));
         let observed = table.extension_count();
         assert_eq!(
-            table.grow(&allocator, observed),
+            table.grow(&allocator, observed, &wakes),
             Err(ResidencyGrowthRefusal::Metadata(
                 crate::MetadataMiss::Exhausted
             ))
         );
         assert_eq!(table.extension_count(), observed);
         assert_eq!(table.observed_slots_used(), FRAME_GRANT_RESIDENCY_SLOTS);
+        assert_eq!(wakes.0.get(), 0);
 
-        assert_eq!(table.grow(&allocator, observed), Ok(()));
-        assert_eq!(table.grow(&allocator, observed), Ok(()));
+        // #3085: a held append window is "not now", never waited out: the
+        // allocation goes back, and only the holder's close wakes waiters.
+        table
+            .storage
+            .directory
+            .publishing
+            .store(1, Ordering::Release);
+        assert_eq!(
+            table.grow(&allocator, observed, &wakes),
+            Err(ResidencyGrowthRefusal::Publishing)
+        );
+        assert_eq!(table.extension_count(), observed);
+        assert!(allocator.allocations.borrow().is_empty());
+        assert_eq!(wakes.0.get(), 0);
+        table
+            .storage
+            .directory
+            .publishing
+            .store(0, Ordering::Release);
+
+        assert_eq!(table.grow(&allocator, observed, &wakes), Ok(()));
+        assert_eq!(wakes.0.get(), 1);
+        assert_eq!(table.grow(&allocator, observed, &wakes), Ok(()));
         assert_eq!(table.extension_count(), observed + 1);
         assert_eq!(allocator.allocations.borrow().len(), 1);
         // SAFETY: the test allocator returned the same address used by the
