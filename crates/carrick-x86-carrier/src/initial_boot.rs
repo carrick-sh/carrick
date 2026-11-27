@@ -570,11 +570,16 @@ pub fn carrier_peer_boot<P: Personality>() -> ! {
     let zone =
         unsafe { &*(layout.zone.raw() as *const carrick_el1::memory::reservations::X86Cpl0Zone) };
     let slot = carrick_sched_core::SlotId::new(1);
-    zone.drive(slot, 2);
-    zone.publish_slot(slot, mm.get(), Some(binding.cpu_slot), 3);
+    // Peer CPUs may already scan idle work, so this boot's lock-taking
+    // operations can owe them a pass (#3083): send it by IPI before idling.
+    let passes = carrick_sched_core::OwedPasses::new();
+    zone.drive(slot, 2, &passes);
+    zone.publish_slot(slot, mm.get(), Some(binding.cpu_slot), 3, &passes);
     zone.enter_guest(slot);
     crate::entry::user_fault_gate::install_persistent();
-    if !zone.enter_idle(slot, true) {
+    let idle = zone.enter_idle(slot, true, &passes);
+    carrick_el1::substrate::sched::object_wait::deliver_owed_passes(zone, slot, passes);
+    if !idle {
         fatal_boot!();
     }
     // SAFETY: slot publication and its shared sleep guard precede this
