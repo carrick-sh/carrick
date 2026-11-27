@@ -152,6 +152,30 @@ pub enum IpcWindowPart {
     Pool,
 }
 
+/// Make every page of a fresh, zero, private host mapping present for
+/// writing. On Linux one `MADV_POPULATE_WRITE` faults the range in; other
+/// hosts store a zero into each page, which changes no byte of a fresh
+/// anonymous mapping.
+fn populate_write(host: *mut u8, len: usize) -> Result<(), MemoryError> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `host..host + len` is one live private mapping this extent
+        // owns; populating it changes no byte.
+        if unsafe { libc::madvise(host.cast(), len, libc::MADV_POPULATE_WRITE) } != 0 {
+            return Err(error(format!(
+                "populate {len} bytes of carrier extent: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    for offset in (0..len).step_by(PAGE as usize) {
+        // SAFETY: as above; the page is fresh anonymous memory, already zero.
+        unsafe { host.add(offset).write_volatile(0) };
+    }
+    Ok(())
+}
+
 pub struct BackingExtent {
     storage: ExtentStorage,
     pub base: FrameGpa,
@@ -177,6 +201,20 @@ impl BackingExtent {
             base,
             len,
         })
+    }
+    /// A private extent whose host pages are all present before any guest
+    /// can reach it (#3105). An owner grant's window is the guest's promise:
+    /// every page gets a prepared leaf, and the guest's first store would
+    /// otherwise take one hypervisor page fault per fresh page to fault the
+    /// host page in. Populating the whole extent here moves that work into
+    /// one host call, off the guest's fault path.
+    pub fn private_populated(base: FrameGpa, len: usize) -> Result<Self, MemoryError> {
+        let extent = Self::private(base, len)?;
+        let host = extent
+            .ptr(base.raw(), len)
+            .ok_or_else(|| error("populated extent host mapping"))?;
+        populate_write(host, len)?;
+        Ok(extent)
     }
     /// Retain the original IPC allocation without copying it or assuming
     /// ownership of its deallocator. The authority must retain stable writable
