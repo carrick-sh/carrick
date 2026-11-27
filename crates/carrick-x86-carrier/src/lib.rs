@@ -85,9 +85,9 @@ macro_rules! export_carrier {
             let code = <$personality as $crate::personality::Personality>::handle_page_fault(
                 frame, fpstate,
             );
-            // A resolved fault's return to user is a delivery point for the
-            // reschedule IPIs this CPU owes after a busy ICR (#3083).
-            let _ = carrick_el1::isa::x86::interrupt::deliver_owed_resched();
+            // A resolved fault's return to user is the last-chance delivery
+            // point for the reschedule IPIs this CPU owes (#3083).
+            carrick_el1::isa::x86::interrupt::deliver_owed_resched_before_user();
             code
         }
 

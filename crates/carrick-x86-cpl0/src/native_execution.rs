@@ -342,9 +342,10 @@ pub fn schedule(slot: SlotId) -> ! {
                         zone.cpu_enter_user(slot, Some(record), now);
                     }
                     arm_slice(zone, slot);
-                    // The return to user is a delivery point (#3083): the
-                    // migration's kicks above may have owed an IPI.
-                    let _ = carrick_el1::isa::x86::interrupt::deliver_owed_resched();
+                    // The return to user is the last-chance delivery point
+                    // (#3083): the migration's kicks above may have owed an
+                    // IPI, and a still-busy ICR is waited out here.
+                    carrick_el1::isa::x86::interrupt::deliver_owed_resched_before_user();
                 })
             } {
                 Ok(never) => match never {},

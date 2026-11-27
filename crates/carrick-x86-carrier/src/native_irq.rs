@@ -158,9 +158,14 @@ pub unsafe fn carrier_receive_irq<P: Personality>(
         let mut personality = P::default();
         personality.on_irq_return(frame, unsafe { &mut *xsave });
     }
-    // An interrupt is a delivery point: resend the reschedule IPIs this CPU
-    // owes after a busy ICR (#3083), including any its handler just owed.
-    let _ = interrupt::deliver_owed_resched();
+    // An interrupt is a delivery point for the reschedule IPIs this CPU
+    // owes after a busy ICR (#3083), including any its handler just owed;
+    // its return to user is the last-chance one, which waits out a busy ICR.
+    if frame.cs & 3 == 3 {
+        interrupt::deliver_owed_resched_before_user();
+    } else {
+        let _ = interrupt::deliver_owed_resched();
+    }
     if frame.cs & 3 == 3 && interrupt::check_user_return_generation().is_err() {
         // SAFETY: generation mismatch on user return must notify fatal doorbell and halt.
         unsafe {
