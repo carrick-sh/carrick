@@ -1521,12 +1521,6 @@ pub trait Aarch64Vmm: Sized + GuestVmBackend {
     /// and SHARES the protections/page_tables Arc.
     fn materialize_sibling(builder: Self::SiblingBuilder) -> Result<(Self, Self::Vcpu), TrapError>;
 
-    /// Who serves an admitted root's private file pages. A backend answers
-    /// `OwnerGrant` only if [`Self::prepare_owner_frame_grant`] serves them;
-    /// the dispatcher then places them in the root. `HostEager` keeps them on
-    /// the host, so no owner file selection ever reaches this backend.
-    fn private_file_venue(&self) -> carrick_guest_mem::PrivateFileVenue;
-
     /// Retain physical backing for an exact owner-selected lazy file window.
     ///
     /// Every backend answers this itself. `Declined` refuses the fault, and

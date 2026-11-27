@@ -55,6 +55,11 @@ impl CarrierReservationAccess for HvfRetainedMetadata {
     fn guest_cow_settlement(&self) -> Option<Arc<dyn carrick_el1_abi::CowGrantSettlement>> {
         Some(self.0.guest_cow_settlement())
     }
+
+    /// HVF's transfer custody serves owner file grants.
+    fn private_file_venue(&self) -> carrick_guest_mem::PrivateFileVenue {
+        carrick_guest_mem::PrivateFileVenue::OwnerGrant
+    }
 }
 
 impl RetainedMetadataExtent for HvfRetainedExtent {
