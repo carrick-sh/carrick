@@ -1654,6 +1654,8 @@ fn mounted_static_x86_thread_vfork_exec_beside_memory_editing_siblings() {
 /// vforking thread. Linux makes each destination page resident as the read
 /// writes it; on main a read's completion copy is refused and the read
 /// answers EFAULT (exit 93, `read errno 0014`): Go's `read ...: bad address`.
+/// Every read must answer the image's size (a zero-byte answer is wrong too)
+/// and leave the image's bytes in the destination (exit 90 otherwise).
 #[test]
 fn mounted_static_x86_host_file_reads_into_fresh_maps_beside_a_vfork() {
     threads_vfork_exec_matches_native(&["-DREADERS"], "threads-vfork-exec-readers");

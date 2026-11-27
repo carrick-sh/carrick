@@ -19,9 +19,11 @@
 // Built with -DWORKERS=0 there are no siblings; with -DFROM_MAIN the root's
 // own thread forks, with no spawner thread. With -DREADERS the siblings
 // instead `pread` this image (a host file) into a fresh, never-touched
-// anonymous map and check the byte count, as Go's build reads its package
-// archives into fresh heap spans (#3050: `read ...: bad address`). A read
-// that answers anything but the image's size exits 93, printing its errno.
+// anonymous map and check the byte count and the bytes, as Go's build reads
+// its package archives into fresh heap spans (#3050: `read ...: bad
+// address`). A read that answers anything but the image's size (zero
+// included) exits 93, printing its errno; one whose bytes differ from the
+// image's exits 90.
 //
 // No libc: the threads are raw `clone` calls on mapped stacks.
 static long sc(long n, long a, long b, long c, long d, long e, long f) {
@@ -112,9 +114,18 @@ static volatile int failed_round = -1;
 static volatile int failed_status;
 static volatile int failed_clone;
 static volatile long read_answer;
+// Set with the first wrong read answer, so a zero-byte answer is caught.
+static volatile int read_wrong;
+// Set when a read returned the right count but bytes the image lacks.
+static volatile int read_differs;
 static long image_fd = -1;
 static long image_size;
 static struct exec_req req;
+#ifdef READERS
+// The image as the root read it before the siblings start: each sibling's
+// destination must hold exactly these bytes.
+static char probe[READ_SPAN];
+#endif
 
 // pread64 the whole image into `buf` from offset 0, as many calls as the
 // kernel takes (a read may be short): the bytes read, or the first -errno.
@@ -138,7 +149,15 @@ static void read_image(void *unused) {
             break;
         }
         long got = read_all(map, READ_SPAN); // into untouched memory
-        if (got != image_size) __sync_val_compare_and_swap(&read_answer, 0, got);
+        if (got != image_size) {
+            if (__sync_bool_compare_and_swap(&read_wrong, 0, 1)) read_answer = got;
+        } else {
+            for (long i = 0; i < got; i++)
+                if (((volatile char *)map)[i] != probe[i]) {
+                    read_differs = 1;
+                    break;
+                }
+        }
         if (sc(11, map, READ_SPAN, 0, 0, 0, 0) != 0) // munmap
             __sync_fetch_and_add(&bad, 1);
         sc(24, 0, 0, 0, 0, 0, 0); // sched_yield
@@ -247,7 +266,6 @@ void start_c(long *sp) {
     req.envp = envp;
 #ifdef READERS
     image_fd = sc(257, -100, (long)argv[0], 0, 0, 0, 0); // openat(AT_FDCWD, image, O_RDONLY)
-    static char probe[READ_SPAN];
     for (long off = 0; off < READ_SPAN; off += 4096) probe[off] = 1;
     image_size = image_fd < 0 ? -1 : read_all((long)probe, READ_SPAN);
     if (image_size < (long)sizeof image_pad || image_size >= READ_SPAN) sc(231, 92, 0, 0, 0, 0, 0);
@@ -286,13 +304,18 @@ void start_c(long *sp) {
         sc(1, 1, (long)line, sizeof line - 1, 0, 0, 0);
         sc(231, failed_clone ? 94 : 95, 0, 0, 0, 0, 0);
     }
-    if (read_answer != 0) {
-        // The first wrong read answer, negated: an errno (14 is EFAULT).
+    if (read_wrong) {
+        // The first wrong read answer, negated: an errno (14 is EFAULT);
+        // 0000 for a short or zero-byte answer.
         char line[] = "read errno 0000\n";
         long errno_ = read_answer < 0 ? -read_answer : 0;
         for (int i = 0; i < 4; i++) line[14 - i] = '0' + (char)(errno_ / (i == 0 ? 1 : i == 1 ? 10 : i == 2 ? 100 : 1000) % 10);
         sc(1, 1, (long)line, sizeof line - 1, 0, 0, 0);
         sc(231, 93, 0, 0, 0, 0, 0);
+    }
+    if (read_differs) {
+        sc(1, 1, (long)"read bytes differ\n", 18, 0, 0, 0);
+        sc(231, 90, 0, 0, 0, 0, 0);
     }
     sc(1, 1, (long)"ok=16\n", 6, 0, 0, 0);
     sc(231, bad ? 99 : 7, 0, 0, 0, 0, 0);
