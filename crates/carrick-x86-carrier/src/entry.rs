@@ -860,6 +860,10 @@ pub fn carrier_enter<P: Personality>(
 pub fn carrier_validate_return<P: Personality>(frame: &mut NativeFrame, xsave: &mut XsaveArea) {
     let mut personality = P::default();
     personality.on_user_return(frame, xsave);
+    // A return to user is a delivery point: resend the reschedule IPIs
+    // this CPU owes after a busy ICR (#3083). One still busy stays owed
+    // for the next point; the user thread is not held for it.
+    let _ = carrick_el1::isa::x86::interrupt::deliver_owed_resched();
     if !frame.valid_user_return() {
         doorbell(FATAL_PORT, frame);
         halt();
