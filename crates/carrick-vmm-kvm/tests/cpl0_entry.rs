@@ -4495,6 +4495,21 @@ fn production_resched_ipi_busy_at_the_last_return_to_user_is_sent_before_it() {
     );
 }
 
+/// #3083 on x86 CPL0: the last-return witness, with the vCPU stalled past
+/// the last-chance wait's bound before its first poll (a host
+/// descheduling it) while the ICR recovers. The bound measures the APIC,
+/// not the host's scheduling: the poll reads idle and the resend goes out,
+/// never a false `ApicFault`.
+#[test]
+fn production_resched_ipi_busy_across_a_stalled_last_chance_wait_is_sent() {
+    bounded_contention_witness(
+        "production_resched_ipi_busy_across_a_stalled_last_chance_wait_is_sent",
+        "native_idle_peer_wake.S",
+        &["-DLAST_RETURN_STALLED=1"],
+        "a last-chance wait stalled past its bound while the ICR recovered",
+    );
+}
+
 /// #3083 on x86 CPL0: the last-return witness above, with a local APIC
 /// whose sends always find the ICR busy while its polls read it idle. The
 /// last-chance wait's bound must hold across retries that send nothing:
@@ -4512,7 +4527,8 @@ fn production_resched_ipi_never_accepted_at_the_last_return_is_fatal() {
     };
     let message = format!("{failure:?}");
     assert!(
-        message.contains("CPL0 fatal exit at") && message.contains("src/isa/x86/interrupt.rs:"),
+        message.contains("CPL0 fatal exit at src/isa/x86/interrupt.rs:")
+            && message.contains("ApicFault::IcrNeverAccepted at Syscall"),
         "expected the bounded ICR wait's fatal, got {message}"
     );
 }

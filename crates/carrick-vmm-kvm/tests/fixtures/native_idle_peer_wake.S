@@ -29,10 +29,17 @@
  * hold's return to user finds the ICR busy too, and this CPU then runs a
  * syscall-free loop: that return is the last delivery point before it.
  * The peer is released before the hold, so no later syscall comes between
- * the hold and the loop. The return must wait for this CPU's own ICR to go
- * idle (its next poll reads busy once) and send: the census right after the
- * loop must read two busy sends, one resend, one wait that saw the ICR busy,
- * and the resend at the syscall's own return (exit 93 otherwise).
+ * the hold and the loop. The ICR stays busy until a wait sees it go idle
+ * (its first poll reads busy, the next idle). The return must wait for
+ * that and then send: the census right after the loop must read exactly
+ * two busy sends (a resend before the transition would be a third), one
+ * resend, one busy-to-idle transition, and the resend at the syscall's own
+ * return (exit 93 otherwise).
+ *
+ * -DLAST_RETURN_STALLED (#3083): as LAST_RETURN, but the ICR recovers
+ * while the last-chance wait is stalled past its bound before its first
+ * poll (a host descheduling the vCPU). A stall is not a broken APIC: the
+ * poll reads idle and the resend goes out (exit 93 or a fatal otherwise).
  *
  * -DICR_FLAPPING (#3083): as LAST_RETURN, but every send finds the ICR
  * busy while every idle-ICR poll reads it idle, a local APIC that never
@@ -59,17 +66,25 @@
 #define INJECT_RESCHED_BUSY_CENSUS         0xfffffffffffffe5e
 #define POLL_LIMIT                         0x1000000
 
-/* Census: sends found busy | resent << 16 | waits that saw it busy << 32
- * | the last resend's return to user << 48 (1: the syscall's own). */
+/* Census: sends found busy | resent << 16 | busy-to-idle transitions a
+ * wait saw << 32 | the last resend's return to user << 48 (1: the
+ * syscall's own). */
 #ifdef ICR_FLAPPING
 #define LAST_RETURN 1
 #define BUSY_INJECT     INJECT_RESCHED_ICR_FLAPPING
+#elif defined(LAST_RETURN_STALLED)
+#define LAST_RETURN 1
+#define BUSY_INJECT     INJECT_RESCHED_STALL_AT_LAST_RETURN
 #elif defined(LAST_RETURN)
 #define BUSY_INJECT     INJECT_RESCHED_BUSY_THROUGH_LAST_RETURN
 #else
 #define BUSY_INJECT     INJECT_RESCHED_BUSY_ONCE
 #endif
-#ifdef LAST_RETURN
+#if defined(LAST_RETURN_STALLED)
+#define BUSY_RESCHED 1
+#define BUSY_AFTER_HOLD 0x0001000000010002
+#define BUSY_AT_END     0x0001000000010002
+#elif defined(LAST_RETURN)
 #define BUSY_RESCHED 1
 #define BUSY_AFTER_HOLD 0x0001000100010002
 #define BUSY_AT_END     0x0001000100010002
@@ -79,6 +94,7 @@
 #endif
 #define INJECT_RESCHED_BUSY_THROUGH_LAST_RETURN 0xfffffffffffffe5f
 #define INJECT_RESCHED_ICR_FLAPPING        0xfffffffffffffe60
+#define INJECT_RESCHED_STALL_AT_LAST_RETURN 0xfffffffffffffe61
 #define SPIN_USER                          0x1000000
 #ifdef BUSY_RESCHED
 #define AFTER_IDLE_READ 1
