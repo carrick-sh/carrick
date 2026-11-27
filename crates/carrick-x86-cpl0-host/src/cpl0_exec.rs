@@ -2145,6 +2145,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                     .is_ok()
                 },
             );
+            anonymous_owner::fatal_if_quarantined(&self._vm)?;
             if settled.is_err() {
                 self.exec_predecessors.release_permitted.push(receipt);
             }
