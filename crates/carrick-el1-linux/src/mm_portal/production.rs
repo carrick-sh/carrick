@@ -546,6 +546,22 @@ pub fn bind_transfer_hw(frame: &mut carrick_el1_abi::TrapFrame) {
             nodes: None,
             zone: Some(zone),
         };
+        // Site 11 split: the three checks `admitted_handle` makes.
+        let index = zone
+            .spaces
+            .find(mm.raw())
+            .ok_or(site(15, MmError::Stale))?
+            .index();
+        if !carrick_el1::memory::reservations::shared_guest().admitted(index, mm) {
+            seen = [index as u64, mm.raw()];
+            return Err(site(16, MmError::Stale));
+        }
+        let entry = zone
+            .space_entry(NonZeroU64::new(mm.raw()).ok_or(site(17, MmError::Stale))?)
+            .ok_or(site(18, MmError::Stale))?;
+        if entry.live_notifications().is_err() {
+            return Err(site(19, MmError::Stale));
+        }
         frame.x[3] = portal
             .admitted_handle(mm, frame.slot as u32)
             .map_err(|e| site(11, e))?
