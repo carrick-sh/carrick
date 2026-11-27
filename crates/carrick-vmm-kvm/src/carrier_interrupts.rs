@@ -124,12 +124,15 @@ pub fn witness(
             .ok_or_else(|| fail("zone backing"))?
             .cast::<ZoneTables<ParkedContextWords>>()
     };
-    zone.drive(SLOT, 1);
+    // Both vCPUs are stopped, so no idle scan can meet these locks (#3083).
+    let passes = carrick_sched_core::OwedPasses::new();
+    zone.drive(SLOT, 1, &passes);
     zone.publish_slot_with_affinity(
         SLOT,
         11,
         Some(0),
         carrick_sched_core::AffinitySource::UNBOUND,
+        &passes,
     );
     zone.enter_guest(SLOT);
     let root =
@@ -227,7 +230,7 @@ pub fn witness(
             address,
         });
         if index == 0 {
-            if !zone.requeue_preempted(SLOT, id).is_queued() {
+            if !zone.requeue_preempted(SLOT, id, &passes).is_queued() {
                 return Err(fail("run queue publication"));
             }
         } else {
@@ -242,6 +245,9 @@ pub fn witness(
             }
         }
     }
+    passes
+        .expect_none()
+        .map_err(|_| fail("stopped publication owed an idle-scan pass"))?;
     let tasks: [ContextBinding; 2] = tasks.try_into().map_err(|_| fail("two contexts"))?;
     let state_ptr = ram
         .host_ptr(PROGRESS_STATE_GPA, size_of::<ProgressState>())

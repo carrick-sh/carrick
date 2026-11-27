@@ -395,12 +395,24 @@ impl<'a, M: CarrierMemoryIo> HostCowWake<'a, M> {
         // in this exit; for example a member parked on the gate this
         // release lowers) goes back to its native ring owner's queue, as a
         // host IPC release's does. A host thread never completes it.
+        let passes = carrick_sched_core::OwedPasses::new();
         let (_, effects) = owned.deliver_handbacks(&mut |record| {
-            zone.hand_back_to_owner(record, &mut |slot| {
-                if let Err(error) = signal_resched(self.routes, &*self.vm, slot) {
-                    self.error.borrow_mut().get_or_insert(error);
-                }
-            });
+            zone.hand_back_to_owner(
+                record,
+                &mut |slot| {
+                    if let Err(error) = signal_resched(self.routes, &*self.vm, slot) {
+                        self.error.borrow_mut().get_or_insert(error);
+                    }
+                },
+                &passes,
+            );
+        });
+        // The hand-backs' run-queue releases can owe idle guest CPUs a scan
+        // (#3083): kick them through the same MSI route.
+        passes.deliver(|slot| {
+            if let Err(error) = signal_resched(self.routes, &*self.vm, slot) {
+                self.error.borrow_mut().get_or_insert(error);
+            }
         });
         if effects.owes_host_boundary() || effects.queued_own {
             self.error
@@ -3696,9 +3708,12 @@ fn complete_carrier_pool_wake(
     >,
 ) {
     let zone = owned.zone();
+    let passes = carrick_sched_core::OwedPasses::new();
     let (waker, effects) = owned.deliver_handbacks(&mut |record| {
-        zone.hand_back_to_owner(record, &mut |slot| sink.resched(slot));
+        zone.hand_back_to_owner(record, &mut |slot| sink.resched(slot), &passes);
     });
+    // Kick the idle CPUs the hand-backs' lock releases owe a scan (#3083).
+    passes.deliver(|slot| sink.resched(slot));
     let own = match waker {
         Waker::El1 { slot } => Some(slot),
         Waker::Host => None,
@@ -3748,21 +3763,28 @@ fn carrier_pool_release_wake(
             '_,
             carrick_sched_core::ParkedContextWords,
         >| complete_carrier_pool_wake(&*sink, owned);
+        let passes = carrick_sched_core::OwedPasses::new();
         if let Ok(queue) =
             zone.object_wait(pool_key, &carrick_sched_core::ShortLockSpin, &completion)
         {
-            let _ = queue.notify_object_host(&mut |record| handed.push(record), &mut |placed| {
-                if placed.resched {
-                    let index = usize::from(placed.slot.raw());
-                    if let Some(word) = resched_slots.get_mut(index / 64) {
-                        *word |= 1 << (index % 64);
+            let _ = queue.notify_object_host(
+                &mut |record| handed.push(record),
+                &mut |placed| {
+                    if placed.resched {
+                        let index = usize::from(placed.slot.raw());
+                        if let Some(word) = resched_slots.get_mut(index / 64) {
+                            *word |= 1 << (index % 64);
+                        }
                     }
-                }
-            });
+                },
+                &passes,
+            );
         }
         for record in handed {
-            zone.hand_back_to_owner(record, &mut |slot| sink.resched(slot));
+            zone.hand_back_to_owner(record, &mut |slot| sink.resched(slot), &passes);
         }
+        // Kick the idle CPUs this release's run-queue locks owe a scan (#3083).
+        passes.deliver(|slot| sink.resched(slot));
         for (word, mut bits) in resched_slots.into_iter().enumerate() {
             while bits != 0 {
                 let index = word * 64 + bits.trailing_zeros() as usize;
@@ -4458,12 +4480,13 @@ mod custody_tests {
             carrick_sched_core::ParkedContextWords,
         >| wake.deliver(&zone, Waker::Host, owned);
         // The member's ring owner: driven, in the guest, running another MM.
-        zone.drive(OWNER_SLOT, 1);
+        zone.drive(OWNER_SLOT, 1, &carrick_sched_core::OwedPasses::new());
         zone.publish_slot(
             OWNER_SLOT,
             UNPLACEABLE_MM + 1,
             Some(u32::from(OWNER_SLOT.raw())),
             0,
+            &carrick_sched_core::OwedPasses::new(),
         );
         zone.enter_guest(OWNER_SLOT);
         let index = zone

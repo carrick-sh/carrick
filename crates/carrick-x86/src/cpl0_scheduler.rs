@@ -375,12 +375,13 @@ mod tests {
             Box::from_raw(ptr)
         };
         let slot = SlotId::new(0);
-        zone.drive(slot, 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
         zone.publish_slot_with_affinity(
             slot,
             11,
             Some(0),
             carrick_sched_core::AffinitySource::UNBOUND,
+            &carrick_sched_core::OwedPasses::new(),
         );
         zone.enter_guest(slot);
         let mut bindings = Vec::new();
@@ -424,23 +425,33 @@ mod tests {
                 *zone.record(record).ctx_mut() =
                     park_native_context(&native, SavedSyscallPc::AfterSyscall)
             };
-            assert!(zone.requeue_preempted(slot, record).is_queued());
+            assert!(
+                zone.requeue_preempted(slot, record, &carrick_sched_core::OwedPasses::new())
+                    .is_queued()
+            );
             bindings.push(ContextBinding {
                 record: zone.record_ref(record),
                 address,
             });
         }
         for turn in 0..8 {
-            let id = zone.switch_in(slot).unwrap();
+            let id = zone
+                .switch_in(slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap();
             let binding = &bindings[turn % 2];
             assert_eq!(id, binding.record.id);
             assert!(admit_context(&zone, slot, binding));
             assert_eq!(zone.installed_space(slot), binding.address.mm.raw().get());
             assert!(!admit_context(&zone, slot, &bindings[(turn + 1) % 2]));
             zone.release_space(slot);
-            assert!(zone.requeue_preempted(slot, id).is_queued());
+            assert!(
+                zone.requeue_preempted(slot, id, &carrick_sched_core::OwedPasses::new())
+                    .is_queued()
+            );
         }
-        let id = zone.switch_in(slot).unwrap();
+        let id = zone
+            .switch_in(slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap();
         let mut stale = ContextBinding {
             record: bindings[0].record,
             address: bindings[0].address,
