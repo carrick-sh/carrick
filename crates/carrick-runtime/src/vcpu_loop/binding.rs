@@ -7030,7 +7030,7 @@ where
                 ))));
             }
             if let Err(error) = kernel.dispatcher.install_reservation_provider(Arc::new(
-                super::reservations::CarrierReservations::new(access),
+                super::thread_lifecycle::carrier_reservations(access),
             )) {
                 prepared.fail_exact();
                 return VcpuLoopLaunch::Direct(Err(RuntimeError::Configuration(format!(

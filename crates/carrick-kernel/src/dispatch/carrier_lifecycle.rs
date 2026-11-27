@@ -409,9 +409,31 @@ mod tests {
         }
     }
 
+    struct FakePin {
+        extent: carrick_el1_abi::MetadataExtent,
+        host: std::ptr::NonNull<u8>,
+    }
+
+    // SAFETY: the fake extent's backing outlives every pin these tests take.
+    unsafe impl carrick_el1_abi::PinnedMetadataExtent for FakePin {
+        fn extent(&self) -> carrick_el1_abi::MetadataExtent {
+            self.extent
+        }
+        fn host_base(&self) -> std::ptr::NonNull<u8> {
+            self.host
+        }
+    }
+
     impl RetainedMetadataExtent for FakeExtent {
-        fn guest_base(&self) -> Result<GuestVa, MetadataResolutionError> {
-            Ok(self.base)
+        type Pin = FakePin;
+        fn pin(&self) -> Result<FakePin, MetadataResolutionError> {
+            let len = self._backing.mapped_len() as u64;
+            Ok(FakePin {
+                extent: carrick_el1_abi::MetadataExtent::new(self.base.raw(), len, 1)
+                    .ok_or(MetadataResolutionError::InvalidExtent)?,
+                host: std::ptr::NonNull::new(self._backing.host_base().as_mut_ptr())
+                    .ok_or(MetadataResolutionError::InvalidExtent)?,
+            })
         }
         fn try_retire(self) -> Result<(), Self> {
             self.retired.fetch_add(1, Ordering::AcqRel);
