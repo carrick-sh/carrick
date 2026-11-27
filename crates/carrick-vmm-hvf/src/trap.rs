@@ -8495,7 +8495,32 @@ impl HvfInner {
                             .map(|slot| carrick_guest_arch::CpuId::new(u32::from(slot.raw()))),
                     )
                 {
-                    return Err(TrapError::El1StackOverflow(overflow));
+                    // Name the chain that used the stack up (#3093): the
+                    // stopped CPU's frame records, read through the host
+                    // mapping of the EL1 region that holds its stack.
+                    let region = read_el1_region_host_ptr();
+                    let read = |va: u64| -> Option<u64> {
+                        let offset = va.checked_sub(carrick_el1_abi::EL1_REGION_BASE)?;
+                        if region == 0 || offset.checked_add(8)? > carrick_el1_abi::EL1_REGION_SIZE
+                        {
+                            return None;
+                        }
+                        // SAFETY: the live carrier maps its whole EL1 region at
+                        // `region`; this CPU is stopped, so its stack is not
+                        // being written, and the read is bounded above.
+                        Some(unsafe {
+                            core::ptr::read_volatile((region + offset as usize) as *const u64)
+                        })
+                    };
+                    let backtrace = carrick_el1_abi::El1StackBacktrace::walk(
+                        overflow.stack,
+                        vcpu.get_reg(Reg::LR).unwrap_or(0),
+                        vcpu.get_reg(Reg::X29).unwrap_or(0),
+                        read,
+                    );
+                    return Err(TrapError::El1StackOverflow(
+                        overflow.with_backtrace(backtrace),
+                    ));
                 }
                 if x0 == carrick_core_abi::NATIVE_RUN_FAILURE_SENTINEL {
                     // Only EL1's supervisor-owned stack record may name a failure;
