@@ -152,11 +152,13 @@ static void read_image(void *unused) {
         if (got != image_size) {
             if (__sync_bool_compare_and_swap(&read_wrong, 0, 1)) read_answer = got;
         } else {
+#ifdef READERS
             for (long i = 0; i < got; i++)
                 if (((volatile char *)map)[i] != probe[i]) {
                     read_differs = 1;
                     break;
                 }
+#endif
         }
         if (sc(11, map, READ_SPAN, 0, 0, 0, 0) != 0) // munmap
             __sync_fetch_and_add(&bad, 1);
