@@ -2790,9 +2790,9 @@ fn residency_growth_refused_once_then_succeeds<B: carrick_mmu_core::owner_mmu::O
         fn allocate_with_extent(
             &self,
             layout: core::alloc::Layout,
-        ) -> Option<(*mut u8, ExtentGrantReceipt)> {
+        ) -> Result<(*mut u8, ExtentGrantReceipt), carrick_core_abi::MetadataMiss> {
             if self.refuse_next.get() {
-                return None;
+                return Err(carrick_core_abi::MetadataMiss::Exhausted);
             }
             self.inner.allocate_with_extent(layout)
         }
@@ -2968,7 +2968,7 @@ fn residency_growth_refused_once_then_succeeds<B: carrick_mmu_core::owner_mmu::O
     };
     assert_eq!(
         continuation.refusal,
-        ResidencyGrowthRefusal::MetadataRequired
+        ResidencyGrowthRefusal::Metadata(carrick_core_abi::MetadataMiss::Exhausted)
     );
     assert_eq!(continuation.observed_extensions, 0);
     assert!(!continuation.ready_to_retry(table));
@@ -3016,7 +3016,7 @@ fn residency_growth_refused_once_then_succeeds<B: carrick_mmu_core::owner_mmu::O
     };
     assert_eq!(
         cont_retire.refusal,
-        ResidencyGrowthRefusal::MetadataRequired
+        ResidencyGrowthRefusal::Metadata(carrick_core_abi::MetadataMiss::Exhausted)
     );
     assert!(!cont_retire.ready_to_retry(table));
 

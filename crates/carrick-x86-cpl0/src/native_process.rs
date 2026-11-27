@@ -692,9 +692,11 @@ impl Service {
 }
 
 /// Grow the shared residency table after the carrier refused a fork for
-/// residency rows. `Busy` reruns the fork against the larger table; a
-/// concurrent grower also means "rerun". Only a growth the metadata
-/// allocator cannot serve ends the fork.
+/// residency rows. `Busy` reruns the fork once: against the larger table
+/// (this growth or a concurrent grower's; `grow` waits out a racing
+/// append, so it never answers `Publishing`), or after the metadata grant
+/// the allocator posted for this boundary is served (#3085). Only a full
+/// directory or memory no grant can add ends the fork (ENOMEM).
 fn grow_fork_residency() -> NativeProcessError {
     use carrick_core_abi::mm::residency::ResidencyGrowthRefusal;
     let Some(venues) =
@@ -710,9 +712,16 @@ fn grow_fork_residency() -> NativeProcessError {
         residency,
         &carrick_el1::alloc::GLOBAL_ALLOCATOR,
     ) {
-        Ok(()) | Err(ResidencyGrowthRefusal::Publishing) => NativeProcessError::Busy,
+        Ok(())
+        | Err(ResidencyGrowthRefusal::Metadata(
+            carrick_core::mm::reservation::MetadataMiss::GrantPending,
+        )) => NativeProcessError::Busy,
+        // `grow` waits out a racing append; this answer is a broken table.
+        Err(ResidencyGrowthRefusal::Publishing) => NativeProcessError::Invalid,
         Err(
-            ResidencyGrowthRefusal::MetadataRequired
+            ResidencyGrowthRefusal::Metadata(
+                carrick_core::mm::reservation::MetadataMiss::Exhausted,
+            )
             | ResidencyGrowthRefusal::Full
             | ResidencyGrowthRefusal::InvalidExtent,
         ) => refused(

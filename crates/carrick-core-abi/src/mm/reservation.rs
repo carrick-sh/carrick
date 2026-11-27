@@ -603,8 +603,31 @@ pub unsafe trait ReservationMetadataAllocator {
     fn allocate_with_extent(
         &self,
         layout: core::alloc::Layout,
-    ) -> Option<(*mut u8, crate::ExtentGrantReceipt)>;
+    ) -> Result<(*mut u8, crate::ExtentGrantReceipt), MetadataMiss>;
     fn deallocate(&self, ptr: *mut u8, layout: core::alloc::Layout);
+}
+
+/// Why a [`ReservationMetadataAllocator`] had no extent for a request
+/// (#3085). The two answers mean opposite things to the caller, so they are
+/// separate values, never one `None`.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
+pub enum MetadataMiss {
+    /// The allocator has a carrier grant request in flight for this
+    /// requester (its own, or a peer's single-flight request it now also
+    /// owes a boundary for), and marked the requester's boundary as owing
+    /// host work. Not now: leave through that boundary, which serves the
+    /// grant, then rerun the operation once against the granted extent.
+    GrantPending,
+    /// No extent can serve the request: the carrier denied the grant, or
+    /// this venue has no grant source beyond its bootstrap arena. Memory
+    /// is exhausted (Linux `ENOMEM`).
+    Exhausted,
 }
 
 #[derive(

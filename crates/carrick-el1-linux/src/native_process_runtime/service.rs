@@ -1307,6 +1307,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 self.yield_service_checkpoint()?
             }
             Err(NativeProcessError::Fault) => self.retire_adapter_failure(NativeFailure::Fault)?,
+            Err(NativeProcessError::NoMemory) => {
+                self.retire_adapter_failure(NativeFailure::NoMemory)?
+            }
             Err(
                 NativeProcessError::Unsupported
                 | NativeProcessError::NeedsSupply

@@ -233,16 +233,23 @@ mod fork_residency_growth_tests {
     // SAFETY: each allocation is retained until drop and carries its exact
     // enclosing extent.
     unsafe impl ReservationMetadataAllocator for Budget {
-        fn allocate_with_extent(&self, layout: Layout) -> Option<(*mut u8, ExtentGrantReceipt)> {
-            let left = self.budget.get().checked_sub(1)?;
+        fn allocate_with_extent(
+            &self,
+            layout: Layout,
+        ) -> Result<(*mut u8, ExtentGrantReceipt), carrick_core_abi::MetadataMiss> {
+            let left = self
+                .budget
+                .get()
+                .checked_sub(1)
+                .ok_or(carrick_core_abi::MetadataMiss::Exhausted)?;
             self.budget.set(left);
             // SAFETY: a residency segment layout is nonempty.
             let ptr = unsafe { std::alloc::alloc(layout) };
             if ptr.is_null() {
-                return None;
+                return Err(carrick_core_abi::MetadataMiss::Exhausted);
             }
             self.allocations.borrow_mut().push((ptr, layout));
-            Some((
+            Ok((
                 ptr,
                 ExtentGrantReceipt {
                     base_va: ptr as u64,
@@ -306,7 +313,9 @@ mod fork_residency_growth_tests {
         assert_eq!(table.extension_count(), 2);
         assert_eq!(
             grow_residency_for_fork(&table, &allocator),
-            Err(ResidencyGrowthRefusal::MetadataRequired)
+            Err(ResidencyGrowthRefusal::Metadata(
+                carrick_core_abi::MetadataMiss::Exhausted
+            ))
         );
         assert_eq!(table.extension_count(), 2);
         allocator.budget.set(1);
@@ -795,17 +804,14 @@ pub fn grow_residency_or_not_now(
 /// Grow the residency table by one segment for a copy-on-write that found
 /// no slot for its rows (`GuestCowOutcome::ResidencyCapacity`). The caller
 /// holds no MM editor and no descriptor claim. `true` means rerun the
-/// copy-on-write: a segment was published by this caller or a racing owner,
-/// or one is being published now.
+/// copy-on-write: a segment was published by this caller or a racing owner
+/// (a racing append is waited out inside `grow`).
 #[inline(never)]
 pub fn grow_residency_for_cow(
     table: &FrameGrantResidencyTable,
     allocator: &impl ReservationMetadataAllocator,
 ) -> bool {
-    matches!(
-        table.grow(allocator, table.extension_count()),
-        Ok(()) | Err(ResidencyGrowthRefusal::Publishing)
-    )
+    table.grow(allocator, table.extension_count()).is_ok()
 }
 
 /// Grow the residency table for a fork the carrier refused with
