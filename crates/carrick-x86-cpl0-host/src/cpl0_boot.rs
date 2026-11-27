@@ -5595,6 +5595,25 @@ impl<M: CarrierCpuIo, Mem: CarrierMemoryIo> ProductionCpuFactory<M, Mem> {
         Ok(custody.peer_active_private_grants())
     }
 
+    /// Cross-CPU translation drains the run published: each is one
+    /// shootdown request (an IPI to every other CPU running the edited MM
+    /// and a wait for its acknowledgement). A drain the editing CPU served
+    /// alone, with no peer running the MM, publishes none (#3105).
+    pub fn shootdown_rendezvous(&self) -> Result<u64, TrapError> {
+        let custody = self
+            .custody
+            .lock()
+            .map_err(|_| fail("physical custody poisoned"))?;
+        let pointer = custody
+            .ram
+            .host_ptr(META_GPA + SHOOTDOWN_OFFSET, size_of::<ShootdownTable>())
+            .ok_or_else(|| fail("shootdown table backing"))?;
+        // SAFETY: boot initialized the retained table before any CPU ran;
+        // its generation counter is atomic and only ever incremented.
+        let table = unsafe { &*pointer.cast::<ShootdownTable>() };
+        Ok(table.next_generation.load(Ordering::Acquire))
+    }
+
     pub fn physical_crossing_counts(
         &self,
     ) -> Result<[(PhysicalCrossingFamily, u64); 6], TrapError> {
