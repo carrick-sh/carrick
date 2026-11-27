@@ -1977,11 +1977,18 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
                     } else {
                         present != prepared
                     };
-                    state
-                        && entry & PRIVATE != 0
-                        && (entry & MAY_WRITE != 0) == permissions.writable
-                        && (entry & MAY_EXEC != 0) == permissions.executable
-                        && Self::matches_permissions(entry, permissions)
+                    // A Prepare owns the leaf's physical custody: its frame
+                    // (checked above), PRIVATE, residency and the user bit.
+                    // Its permissions are owned by the mapping's latest
+                    // protection, and the ring has released the editor
+                    // before this settlement, so a sibling's `mprotect` may
+                    // already have rewritten WRITE, NX and the MAY_WRITE /
+                    // MAY_EXEC ceiling of these very leaves (#2766). That
+                    // edit is legal and settles through its own Protect
+                    // postcondition; judging it here against the Prepare's
+                    // requested permissions read a later owner's state as a
+                    // broken guest and quarantined the carrier.
+                    state && entry & PRIVATE != 0 && (entry & USER != 0) == permissions.user
                 }
                 DescriptorOp::Publish { .. } => entry & PRESENT != 0 && entry & PREPARED == 0,
                 // A COW-armed leaf records write as intent (#3121).
