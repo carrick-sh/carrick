@@ -232,9 +232,20 @@ fn run(
     path: &str,
     while_parked: Option<WhileParked>,
 ) -> (SoftProcessRun<HostBlockRunner>, Duration) {
+    run_in(elf, path, None, while_parked)
+}
+
+/// [`run`] over `rootfs` as the guest's root directory.
+fn run_in(
+    elf: &[u8],
+    path: &str,
+    rootfs: Option<&std::path::Path>,
+    while_parked: Option<WhileParked>,
+) -> (SoftProcessRun<HostBlockRunner>, Duration) {
     let el1 = production_el1();
     let mut config = SoftSingleProcessConfig::new(elf, path);
     config.el1_elf_override = Some(&el1);
+    config.rootfs_dir = rootfs;
     let started = Arc::new(Mutex::new(None));
     let started_in_setup = Arc::clone(&started);
     let host_thread = Arc::new(Mutex::new(None));
@@ -721,4 +732,78 @@ fn soft_root_delivers_a_caught_sigusr1_and_returns_through_rt_sigreturn() {
             "syscall {nr} is served once in the ring: {served:?}"
         );
     }
+}
+
+const NR_OPENAT: u16 = 56;
+const NR_MMAP: u16 = 222;
+/// Where the witness keeps the `/data` path it opens.
+const PATH_OFFSET: u64 = 0x100;
+/// What `/data` holds at byte 8, read through the private file mapping.
+const FILE_WORD: u64 = 35;
+/// What the code at byte 0 of `/data` returns in x0.
+const FILE_CODE_RESULT: u16 = 7;
+
+/// C6.2.35 BLR: `blr xn`.
+const fn blr(rn: u32) -> u32 {
+    0xd63f_0000 | (rn << 5)
+}
+
+/// The soft root maps a private file page and both reads it and runs code
+/// from it: `openat("/data")`, `mmap(NULL, 4096, PROT_READ | PROT_EXEC,
+/// MAP_PRIVATE, fd, 0)`, `ldr` the word at byte 8, then `blr` to byte 0,
+/// which returns 7. Exits `7 + 35` = 42 iff the page was served with the
+/// file's bytes, for a data read and an instruction fetch.
+///
+/// A delegated root's private file pages are served only through its
+/// owner's frame grant, so a soft carrier that admits its root must serve
+/// that grant (#1236 step 1b): admitting without it turns every lazy file
+/// page into a failed run.
+#[test]
+#[ignore = "requires CARRICK_A64_ELF pointing to the production EL1 ELF (native arm64 host)"]
+fn soft_root_serves_a_private_file_page_for_a_read_and_a_fetch() {
+    let _carrier_lock = lock_soft_carrier_test();
+    let rootfs = tempfile::tempdir().expect("create the /data rootfs");
+    let mut page = vec![0u8; 0x1000];
+    page[0..4].copy_from_slice(&movz(0, FILE_CODE_RESULT, 0).to_le_bytes());
+    page[4..8].copy_from_slice(&A64_RET.to_le_bytes());
+    page[8..16].copy_from_slice(&FILE_WORD.to_le_bytes());
+    std::fs::write(rootfs.path().join("data"), &page).expect("write /data");
+    let mut code = Vec::new();
+    code.push(movz(0, 100, 0));
+    code.push(neg(0, 0));
+    code.extend(mov32(1, DATA_VA + PATH_OFFSET));
+    code.push(movz(2, 0, 0));
+    code.push(movz(3, 0, 0));
+    code.push(movz(8, NR_OPENAT, 0));
+    code.push(A64_SVC_0);
+    code.push(mov(20, 0));
+    code.push(movz(0, 0, 0));
+    code.push(movz(1, 0x1000, 0));
+    code.push(movz(2, 5, 0));
+    code.push(movz(3, 2, 0));
+    code.push(mov(4, 20));
+    code.push(movz(5, 0, 0));
+    code.push(movz(8, NR_MMAP, 0));
+    code.push(A64_SVC_0);
+    code.push(mov(19, 0));
+    code.push(ldr(21, 19, 8));
+    code.push(blr(19));
+    code.push(add(0, 0, 21));
+    exit_with_x0(&mut code);
+    let (run, _) = run_in(
+        &build_elf(&code, &[(PATH_OFFSET, b"/data\0")]),
+        "/private-file",
+        Some(rootfs.path()),
+        None,
+    );
+    println!(
+        "private file page: exit={} fault={:?} census={:?} counted_enosys={:?} vmas={:?}",
+        run.exit_code, run.terminating_fault, run.reply_census, run.counted_enosys, run.vmas
+    );
+    assert_eq!(run.terminating_fault, None, "the file page is served");
+    assert_eq!(
+        run.exit_code,
+        i32::from(FILE_CODE_RESULT) + FILE_WORD as i32,
+        "the read and the fetch both saw the file's bytes"
+    );
 }
