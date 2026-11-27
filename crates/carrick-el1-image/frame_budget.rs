@@ -1114,6 +1114,21 @@ mod tests {
         assert!(error.contains("ring pipe copyout"));
     }
 
+    /// #3093: a resumed wait4 reruns its query beneath the owned checkpoint
+    /// and the pending wait, so both frames are charged to the wait copy.
+    #[test]
+    fn a_resumed_wait_copy_charges_its_whole_checkpoint_chain() {
+        for frame in [
+            "x::NativeProcessEntry::resume_owned_checkpoint::h0",
+            "x::NativeProcessEntry::resume_pending_wait::h0",
+        ] {
+            let mut frames = small_frames();
+            frames.0.insert(frame.to_owned(), 12000);
+            let error = frames.check(16384, 288).unwrap_err();
+            assert!(error.contains("native wait copy"), "{frame}: {error}");
+        }
+    }
+
     #[test]
     fn native_service_return_charges_its_signal_checkpoint() {
         let mut frames = small_frames();
