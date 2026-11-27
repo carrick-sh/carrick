@@ -2316,3 +2316,231 @@ fn walker_bits_are_only_added_accessed_or_dirty_on_a_present_entry() {
         None
     );
 }
+
+
+/// #2875: `PROT_NONE` keeps a resident private frame in a not-present
+/// no-access leaf. No walk translates it, a fork arm refuses it, widening
+/// restores the same frame, and retirement still owes it back.
+#[test]
+fn protect_none_keeps_a_resident_frame_unreachable_until_widened() {
+    use carrick_guest_arch::AbsentLeaves::Refuse;
+    let words = Words::new();
+    let span = PageSpan::new(0x4000, PAGE);
+    let rw = Permissions {
+        writable: true,
+        executable: false,
+        user: true,
+    };
+    assert!(matches!(
+        apply(
+            &words,
+            private_prepare(span, 0x800000, rw),
+            &[root(0x2000), root(0x3000), root(0x4000)]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let leaf = || {
+        read_terminal_descriptor(&words, root(0x1000), UserVa::new(span.va))
+            .unwrap()
+            .0
+    };
+    let none = DescriptorOp::ProtectNone {
+        span,
+        absent: Refuse,
+    };
+    assert!(matches!(
+        apply(&words, none, &[]),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert_eq!(leaf() & ADDRESS, 0x800000, "the frame stays");
+    assert_eq!(
+        leaf() & (PRESENT | PREPARED | WRITE | NO_ACCESS | PRIVATE | MAY_WRITE),
+        NO_ACCESS | PRIVATE | MAY_WRITE
+    );
+    assert!(
+        translate(
+            &words,
+            root(0x1000),
+            UserVa::new(span.va),
+            Access::Read,
+            true
+        )
+        .is_err()
+    );
+    assert!(
+        translate(
+            &words,
+            root(0x1000),
+            UserVa::new(span.va),
+            Access::Read,
+            false
+        )
+        .is_err()
+    );
+    assert_eq!(
+        arm_cow_terminal(leaf()),
+        Err(DescriptorRefusal::PermissionDenied)
+    );
+    // PROT_NONE twice is a no-op, and widening restores the same frame.
+    assert!(matches!(
+        apply(&words, none, &[]),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert!(matches!(
+        apply(
+            &words,
+            DescriptorOp::Protect {
+                span,
+                permissions: rw,
+                exec: ExecAuthority::Leaf,
+                cow_ceiling: None,
+                absent: Refuse,
+            },
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert_eq!(
+        translate(
+            &words,
+            root(0x1000),
+            UserVa::new(span.va),
+            Access::Write,
+            true
+        ),
+        Ok(FrameGpa::new(0x800000))
+    );
+    assert_eq!(leaf() & NO_ACCESS, 0);
+    // A no-access page retires with its frame.
+    assert!(matches!(
+        apply(&words, none, &[]),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert!(matches!(
+        apply(&words, DescriptorOp::Retire(span), &[]),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert_eq!(leaf() & (RETIRED | NO_ACCESS | PRESENT | PREPARED), RETIRED);
+    assert_eq!(leaf() & ADDRESS, 0x800000);
+}
+
+/// #2875: a prepared page of a `PROT_NONE` mapping stays prepared and is
+/// never published; widened back, its first touch publishes it as before.
+#[test]
+fn protect_none_keeps_a_prepared_page_prepared_and_unpublishable() {
+    use carrick_guest_arch::AbsentLeaves::Refuse;
+    let words = Words::new();
+    let span = PageSpan::new(0x4000, 2 * PAGE);
+    let rw = Permissions {
+        writable: true,
+        executable: false,
+        user: true,
+    };
+    assert!(matches!(
+        apply(
+            &words,
+            DescriptorOp::Prepare {
+                span,
+                output: FrameGpa::new(0x800000),
+                permissions: rw,
+                resident: PageSpan::new(0x5000, PAGE),
+                backing: backing(),
+            },
+            &[root(0x2000), root(0x3000), root(0x4000)]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let leaf = |va| {
+        read_terminal_descriptor(&words, root(0x1000), UserVa::new(va))
+            .unwrap()
+            .0
+    };
+    assert!(matches!(
+        apply(
+            &words,
+            DescriptorOp::ProtectNone {
+                span,
+                absent: Refuse
+            },
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert_eq!(
+        leaf(0x4000) & (PRESENT | PREPARED | NO_ACCESS),
+        PREPARED | NO_ACCESS
+    );
+    assert_eq!(leaf(0x5000) & (PRESENT | PREPARED | NO_ACCESS), NO_ACCESS);
+    let publish = DescriptorOp::Publish {
+        span: PageSpan::new(0x4000, PAGE),
+        expected: FrameGpa::new(0x800000),
+        access: Access::Read,
+    };
+    assert_eq!(
+        apply(&words, publish, &[]),
+        DescriptorOutcome::Refused(DescriptorRefusal::PermissionDenied)
+    );
+    assert!(matches!(
+        apply(
+            &words,
+            DescriptorOp::Protect {
+                span,
+                permissions: rw,
+                exec: ExecAuthority::Leaf,
+                cow_ceiling: None,
+                absent: Refuse,
+            },
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert_eq!(leaf(0x4000) & (PRESENT | PREPARED | NO_ACCESS), PREPARED);
+    assert_eq!(leaf(0x5000) & (PRESENT | PREPARED | NO_ACCESS), PRESENT);
+    assert!(matches!(
+        apply(&words, publish, &[]),
+        DescriptorOutcome::Applied { .. }
+    ));
+}
+
+/// #2875: `PROT_NONE` lowers to its own operation; only all-false
+/// permissions do.
+#[test]
+fn protect_none_is_lowered_from_an_all_false_protect() {
+    use carrick_guest_arch::{
+        EditIntent, EditOperation, EditOwner, EditPermissions, GuestLen, UserRange,
+    };
+    let owner = || {
+        // SAFETY: a test owner over the planner's in-memory words.
+        unsafe {
+            EditOwner::issue(
+                root(0x1000),
+                NonZeroU64::new(1).unwrap(),
+                NonZeroU64::new(1).unwrap(),
+            )
+        }
+    };
+    let range = UserRange::checked(UserVa::new(0x4000), GuestLen::new(PAGE)).unwrap();
+    let protect = |readable, writable| EditOperation::Protect {
+        permissions: EditPermissions {
+            readable,
+            writable,
+            executable: false,
+            user: readable || writable,
+        },
+        ceiling: None,
+        absent: carrick_guest_arch::AbsentLeaves::Lazy,
+    };
+    let none = EditIntent::checked(owner(), range, protect(false, false), &[]).unwrap();
+    assert_eq!(
+        DescriptorTxn::from_intent(&none).unwrap().op,
+        DescriptorOp::ProtectNone {
+            span: PageSpan::new(0x4000, PAGE),
+            absent: carrick_guest_arch::AbsentLeaves::Lazy,
+        }
+    );
+    let write_only = EditIntent::checked(owner(), range, protect(false, true), &[]).unwrap();
+    assert_eq!(
+        DescriptorTxn::from_intent(&write_only).map(|txn| txn.op),
+        Err(DescriptorRefusal::BadEncoding)
+    );
+}
