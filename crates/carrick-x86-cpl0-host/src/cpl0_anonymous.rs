@@ -496,6 +496,8 @@ pub(super) mod editor_hold {
         seen: Vec<(u64, u64)>,
         holds: u64,
         held: Option<HeldCow>,
+        /// Further probes of the held demand to refuse after its first.
+        again: u64,
         supplied: u64,
         carrier_work_while_held: u64,
     }
@@ -507,6 +509,7 @@ pub(super) mod editor_hold {
             seen: Vec::new(),
             holds: 0,
             held: None,
+            again: 0,
             supplied: 0,
             carrier_work_while_held: 0,
         }
@@ -538,6 +541,24 @@ pub(super) mod editor_hold {
     ) -> Option<carrick_sched_core::spaces::SpaceEditor<'a, carrick_sched_core::ParkedContextWords>>
     {
         let mut site = of(at);
+        // The held demand's own later probes, while it has refusals left.
+        let again = site.again > 0
+            && site.held.is_some_and(|held| {
+                held.outstanding
+                    && held.mm == mm.get()
+                    && demand.is_some_and(|d| d.page == held.page && d.member == held.member)
+            });
+        if again {
+            let index = venue.zone.spaces.find(mm.get())?;
+            let editor = venue
+                .zone
+                .spaces
+                .try_begin_edit_cause(index, mm.get(), HOLDER, Some(venue))
+                .ok()?;
+            site.again -= 1;
+            site.holds += 1;
+            return Some(editor);
+        }
         if site.armed_nth == 0 {
             return None;
         }
@@ -603,10 +624,11 @@ pub(super) mod editor_hold {
             site.carrier_work_while_held += 1;
         }
     }
-    pub(in super::super) fn arm(at: EditorHoldSite, nth: u64) {
+    pub(in super::super) fn arm(at: EditorHoldSite, nth: u64, probes: u64) {
         let mut state = of(at);
         *state = site();
         state.armed_nth = nth.max(1);
+        state.again = probes.saturating_sub(1);
     }
     pub(in super::super) fn holds(at: EditorHoldSite) -> u64 {
         of(at).holds
@@ -623,14 +645,16 @@ pub(super) mod editor_hold {
 /// (test-support only).
 #[cfg(feature = "test-support")]
 pub fn hold_editor_at_next_for_test(at: EditorHoldSite) {
-    editor_hold::arm(at, 1);
+    editor_hold::arm(at, 1, 1);
 }
 
 /// Arm [`editor_hold`] for the `nth` copy-on-write supply probe of one MM in
-/// this process (test-support only).
+/// this process, and hold that same demand's editor for `probes` probes in a
+/// row (test-support only). Each refused probe must park the demand on the
+/// editor's release; none may re-ring the carrier.
 #[cfg(feature = "test-support")]
-pub fn hold_editor_at_nth_cow_supply_for_test(nth: u64) {
-    editor_hold::arm(EditorHoldSite::CowSupply, nth);
+pub fn hold_editor_at_nth_cow_supply_for_test(nth: u64, probes: u64) {
+    editor_hold::arm(EditorHoldSite::CowSupply, nth, probes);
 }
 
 /// Exclusions at `at` that met the armed borrow.
