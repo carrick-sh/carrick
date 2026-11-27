@@ -421,9 +421,10 @@ impl<V: CoreVenue, M, B> CarrierCore<V, M, B> {
         self.extents.len()
     }
 
-    /// The installed mapping with the greatest base at or below `ipa`, in one
-    /// index probe. The caller checks how far it reaches. A mapping still
-    /// being mapped or unmapped is never returned.
+    /// The mapping with the greatest base at or below `ipa`, in one index
+    /// probe, if it is installed. Mappings never overlap, so it is the only
+    /// one that can contain `ipa`; the caller checks how far it reaches. If
+    /// that mapping is still being mapped or unmapped, this returns `None`.
     pub fn installed_at_or_below(&self, ipa: u64) -> Option<InstalledView<'_, M>> {
         let (_, mapping) = self.mappings.range(..=ipa).next_back()?;
         (mapping.state == MappingState::Installed).then_some(InstalledView {
