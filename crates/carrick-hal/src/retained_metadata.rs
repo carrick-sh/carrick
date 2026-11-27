@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use carrick_el1_abi::MetadataResolutionError;
+use carrick_el1_abi::{MetadataResolutionError, PinnedMetadataExtent};
 use carrick_guest_mem::{GuestVa, HostVa};
 
 /// Storage published read/write to EL1 without copying it.
@@ -44,8 +44,18 @@ pub trait RetainedMetadataMapper: Send + Sync {
 /// Dropping it releases only the authority, never live backing: carrier
 /// custody keeps the backing through VM destruction.
 pub trait RetainedMetadataExtent: Send + Sized {
-    /// The EL1 address of the mapped backing's first byte.
-    fn guest_base(&self) -> Result<GuestVa, MetadataResolutionError>;
+    /// A pin of this exact mapping: while one is out, the mapping and its
+    /// backing stay.
+    type Pin: PinnedMetadataExtent;
+
+    /// Pin the mapping, authenticated by its carrier's exact grant identity.
+    /// Fails `StaleOwner` once the mapping or its carrier generation is gone.
+    fn pin(&self) -> Result<Self::Pin, MetadataResolutionError>;
+
+    /// The EL1 address of the mapped backing's first byte, read through a pin.
+    fn guest_base(&self) -> Result<GuestVa, MetadataResolutionError> {
+        self.pin().map(|pin| GuestVa::new(pin.extent().base()))
+    }
 
     /// Retire the mapping. A refused retirement returns the extent, which
     /// keeps the mapping and its backing for another attempt.

@@ -1190,6 +1190,10 @@ mod tests {
 mod projection;
 pub use projection::{NonAnonymousVmas, ReservationProcMaps};
 
+#[path = "el1_reservations/carrier.rs"]
+mod carrier;
+pub use carrier::{CarrierReservationAccess, CarrierReservations};
+
 #[path = "el1_reservations/provider.rs"]
 mod provider;
 pub(in crate::dispatch) use provider::{DelegatedRoot, ReservationProviderSlot};
