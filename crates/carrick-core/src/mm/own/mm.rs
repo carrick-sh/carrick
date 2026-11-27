@@ -27,12 +27,15 @@ impl MmKey {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(super) struct MmRecord {
     pub(super) editor: MmEditor,
+    /// The base of the MM's arena chunk with room, if any (G4).
+    pub(super) chunk: Option<u64>,
 }
 
 impl MmRecord {
     pub(super) const fn admitted() -> Self {
         Self {
             editor: MmEditor::Free,
+            chunk: None,
         }
     }
 }
