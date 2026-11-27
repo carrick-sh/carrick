@@ -1798,6 +1798,7 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
                         && entry & (PRIVATE | WRITE) == PRIVATE
                         && (entry & MAY_WRITE != 0) == permissions.writable
                         && (!permissions.executable || entry & MAY_EXEC != 0)
+                        && (entry & NX == 0) == permissions.executable
                         && (entry & USER != 0) == permissions.user
                 }
                 DescriptorOp::Protect { permissions, .. } => {
@@ -1807,8 +1808,12 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
                         && (!permissions.executable || entry & MAY_EXEC != 0)
                         && Self::matches_permissions(entry, permissions)
                 }
+                // Every armed leaf keeps its frame and has no hardware
+                // write; MAY_WRITE is its write intent (#3121).
                 DescriptorOp::ArmCow(_) => {
-                    entry & WRITE == 0 && (entry & COW != 0 || entry & MAY_WRITE == 0)
+                    entry & (COW | WRITE) == COW
+                        && entry & (PRESENT | PREPARED) != 0
+                        && entry & ADDRESS != 0
                 }
                 DescriptorOp::CowRepoint { .. } => {
                     entry & PRESENT != 0 && entry & WRITE != 0 && entry & COW == 0
