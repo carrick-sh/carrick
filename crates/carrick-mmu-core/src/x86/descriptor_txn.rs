@@ -276,9 +276,41 @@ impl DescriptorPlan {
         self.entries.len()
     }
 }
+/// Whether an applied edit left translations that some CPU may still cache.
+///
+/// x86 caches translations, in its TLBs and paging-structure caches, only
+/// from present entries (Intel SDM vol. 3A, 4.10.2.3 and 4.10.3.1). An edit
+/// that only fills not-present entries (a first-touch publication, a newly
+/// linked table) leaves nothing cached to drain, on this CPU or any other: a
+/// CPU that walks the old entry faults, and its fault finds the leaf
+/// resident. An edit that changed any present entry must drain it on every
+/// CPU running the MM before its old frames or tables are released (#3105).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TranslationDrain {
+    /// Every store replaced a not-present entry.
+    NotRequired,
+    /// At least one store replaced a present entry.
+    Required,
+}
+
+impl TranslationDrain {
+    /// The drain an applied plan's stores demand.
+    fn of(entries: &[JournalEntry]) -> Self {
+        if entries.iter().any(|entry| entry.before & PRESENT != 0) {
+            Self::Required
+        } else {
+            Self::NotRequired
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DescriptorOutcome {
-    Applied { stores: usize, tables_linked: usize },
+    Applied {
+        stores: usize,
+        tables_linked: usize,
+        drain: TranslationDrain,
+    },
     Refused(DescriptorRefusal),
     RolledBack(DescriptorRefusal),
     Indeterminate(DescriptorRefusal),
@@ -1000,10 +1032,14 @@ pub fn apply_descriptor_plan<W: LiveDescriptorWords + ?Sized, J: DescriptorJourn
             }
         } else {
             words.publish_barrier();
-            words.invalidate_range(plan.span.va, plan.span.len);
+            let drain = TranslationDrain::of(&plan.entries);
+            if drain == TranslationDrain::Required {
+                words.invalidate_range(plan.span.va, plan.span.len);
+            }
             DescriptorOutcome::Applied {
                 stores: plan.entries.len(),
                 tables_linked: plan.tables_linked,
+                drain,
             }
         }
     };

@@ -435,7 +435,15 @@ pub unsafe fn execute_native_descriptor_txn(
     if words.failed_drain.get() || matches!(receipt.outcome, DescriptorOutcome::Indeterminate(_)) {
         return Err(ArchError::Busy);
     }
-    if matches!(receipt.outcome, DescriptorOutcome::Applied { stores, .. } if stores != 0) {
+    // Only an edit that replaced a present entry leaves translations another
+    // CPU may cache; a fill of not-present entries needs no rendezvous (#3105).
+    if matches!(
+        receipt.outcome,
+        DescriptorOutcome::Applied {
+            drain: carrick_mmu_core::x86::descriptor_txn::TranslationDrain::Required,
+            ..
+        }
+    ) {
         let binding = super::context::current_cpu_binding().ok_or(ArchError::Unbound)?;
         let context = super::interrupt::current_address_owner(binding)?;
         if context.root != txn.root || context.mm.raw() != txn.id.mm_key {

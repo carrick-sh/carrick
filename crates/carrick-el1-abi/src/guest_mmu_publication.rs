@@ -81,6 +81,7 @@ impl GuestMmuPublication {
         let DescriptorOutcome::Applied {
             stores,
             tables_linked,
+            ..
         } = receipt.outcome
         else {
             return None;
