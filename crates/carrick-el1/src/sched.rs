@@ -14,6 +14,21 @@ use core::sync::atomic::Ordering;
 /// not be served (a busy lock, a full run queue) is retried after this.
 const TIMER_RETRY_NS: u64 = 50_000;
 
+/// The durable half of a wake an idle CPU can be owed after its last queue
+/// scan, rechecked once its slot is published IdleWfi and before it sleeps
+/// (WFI on ARM, HLT on x86; #3053). A host placement or completion can
+/// publish host work on a CPU stopped in a crossing, or owe it a
+/// reschedule, with no interrupt that survives to that sleep: only these
+/// words announce it. True when the CPU must run another pass instead of
+/// sleeping; an owed reschedule is consumed.
+pub fn idle_wake_owed<C: Copy + Send + Sync + zerocopy::FromZeros>(
+    task: &CurrentTask,
+    zone: &carrick_sched_core::ZoneTables<C>,
+    slot: SlotId,
+) -> bool {
+    task.linux.has_pending_host_work() || zone.take_resched(slot)
+}
+
 #[path = "sched/object_wait.rs"]
 pub mod object_wait;
 
@@ -858,10 +873,10 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
                 // scan while the slot is already IdleWfi. Its exit kick may
                 // have arrived before this vCPU's next effective run. The
                 // shared pending-work and owed-reschedule words are the
-                // durable half of that wake; recheck them before WFI.
-                if self.task.linux.has_pending_host_work()
-                    || zone.slot(slot).affinity_excludes_cpu()
-                    || zone.take_resched(slot)
+                // durable half of that wake; recheck them before WFI. An
+                // affinity that excludes this CPU is ARM's own exit reason:
+                // its host executor moves the thread.
+                if zone.slot(slot).affinity_excludes_cpu() || idle_wake_owed(self.task, zone, slot)
                 {
                     zone.enter_idle(slot, false);
                     continue;
