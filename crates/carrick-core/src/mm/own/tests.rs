@@ -86,6 +86,44 @@ fn an_in_flight_map_reserves_its_extent_and_holds_off_destroy() {
     finish(core);
 }
 
+/// `installed_at_or_below` answers with the one mapping that can hold an
+/// address only once it is installed, and `reserved_extents` names every
+/// mapping in any state, in address order: an allocator must never reuse an
+/// extent that is still being mapped.
+#[test]
+fn the_installed_lookup_skips_in_flight_maps_and_reserved_extents_name_them() {
+    let (mut core, ram) = live(31);
+    let (ticket, _) = core.begin_map(mapping(8 * PAGE, 2 * PAGE, "late")).unwrap();
+    let found = core
+        .installed_at_or_below(3 * PAGE)
+        .expect("inside the installed ram");
+    assert_eq!(
+        (found.id, found.extent, found.host_addr, *found.host),
+        (ram, extent(0, 4 * PAGE), HOST, "ram")
+    );
+    // Past the ram's end the lookup still answers with the ram: the caller
+    // checks the reach, and the gap holds no other mapping.
+    assert_eq!(
+        core.installed_at_or_below(6 * PAGE).map(|view| view.id),
+        Some(ram)
+    );
+    assert!(
+        core.installed_at_or_below(9 * PAGE).is_none(),
+        "an in-flight map is never handed out as installed"
+    );
+    assert_eq!(
+        core.reserved_extents().collect::<Vec<_>>(),
+        vec![extent(0, 4 * PAGE), extent(8 * PAGE, 2 * PAGE)],
+        "the in-flight map's extent is reserved too"
+    );
+    core.finish_map(ticket, BackendResult::Done).unwrap();
+    assert_eq!(
+        core.installed_at_or_below(9 * PAGE).map(|view| *view.host),
+        Some("late")
+    );
+    finish(core);
+}
+
 #[test]
 fn a_carve_is_refused_before_it_exists_and_derives_its_host_address() {
     let (mut core, _) = live(1);
