@@ -77,11 +77,10 @@
  * (94: the park returned).
  *
  * Exit 7: the peer took the publication, and the ordered pass ran once.
- * 81: arming failed; 83: the
- * publication failed; 84: releasing the peer failed; 90: the ordered pass
- * ran once and the peer slept past the publication; 91: the peer took the
- * publication but the ordered pass did not run exactly once; 92: the peer
- * slept, but the ordered pass did not run exactly once.
+ * 81: arming failed; 83: the publication failed; 84: releasing the peer
+ * failed; 91: the peer took the publication but the ordered pass did not
+ * run exactly once. A peer that slept past the publication never takes
+ * it: the bounded child reaches its bound (no exit code).
  */
 #define INJECT_PEER_SCAN_HELD              0xfffffffffffffe2b
 #define INJECT_HOLD_PEER_SCAN              0xfffffffffffffe2a
@@ -94,7 +93,6 @@
 #define INJECT_PEER_HOST_WORK_PENDING      0xfffffffffffffe5b
 #define INJECT_RESCHED_BUSY_ONCE           0xfffffffffffffe5d
 #define INJECT_RESCHED_BUSY_CENSUS         0xfffffffffffffe5e
-#define POLL_LIMIT                         0x1000000
 
 /* Census: sends found busy | resent << 16 | busy-to-idle transitions a
  * wait saw << 32 | the last resend's return to user << 48 (1: the
@@ -246,7 +244,10 @@ spin_user:
     jnz fail_release
 #endif
 
-    mov $POLL_LIMIT, %r13
+    /* Wait for the peer to take the publication, the event itself, as
+     * the reach loop does: a count of polls is a clock that a loaded host
+     * moves (#3136). A peer that slept past the publication never takes
+     * it, and the bounded child reaches its bound with a post-mortem. */
 taken_loop:
 #ifdef AFTER_IDLE_READ
     mov $INJECT_PEER_SCAN_HELD, %rax
@@ -258,8 +259,6 @@ taken_loop:
     cmp $0, %rax
 #endif
     je taken
-    dec %r13
-    jz fail_slept
     pause
     jmp taken_loop
 taken:
@@ -286,16 +285,6 @@ fail_publish:
     jmp die
 fail_release:
     mov $84, %edi
-    jmp die
-fail_slept:
-    mov $INJECT_ORDER_PEER_CENSUS, %rax
-    syscall
-    cmp $1, %rax
-    jne fail_slept_unordered
-    mov $90, %edi
-    jmp die
-fail_slept_unordered:
-    mov $92, %edi
     jmp die
 fail_busy_census:
     mov $93, %edi
