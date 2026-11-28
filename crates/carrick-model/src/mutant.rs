@@ -43,16 +43,17 @@ pub fn is<M: Mutant>(which: M) -> bool {
     ACTIVE.with(|active| active.get() == Some(slot(which)))
 }
 
-/// Run `f` with `which` active on this thread.
+/// Run `f` with `which` active on this thread. The mutant that was active
+/// before (an enclosing `with`, or none) is restored afterwards, on unwind
+/// too, so a nested scope never disables its outer scope's mutant.
 pub fn with<M: Mutant, R>(which: M, f: impl FnOnce() -> R) -> R {
-    struct Reset;
-    impl Drop for Reset {
+    struct Restore(Option<(TypeId, usize)>);
+    impl Drop for Restore {
         fn drop(&mut self) {
-            ACTIVE.with(|active| active.set(None));
+            ACTIVE.with(|active| active.set(self.0));
         }
     }
-    ACTIVE.with(|active| active.set(Some(slot(which))));
-    let _reset = Reset;
+    let _restore = Restore(ACTIVE.with(|active| active.replace(Some(slot(which)))));
     f()
 }
 

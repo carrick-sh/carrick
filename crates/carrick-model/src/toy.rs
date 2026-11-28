@@ -318,3 +318,25 @@ fn a_correct_path_replays_clean() {
         [Class::NotNow(ITEM), Class::Done, Class::Done, Class::Done]
     );
 }
+
+/// A nested `mutant::with` restores the outer scope's mutant when it ends,
+/// on unwind too (#3181 pre-review).
+#[test]
+fn a_nested_mutant_scope_restores_the_outer_mutant() {
+    use crate::mutant;
+    mutant::with(Mutant::FalseEmpty, || {
+        mutant::with(Mutant::CloseNoWake, || {
+            assert!(mutant::is(Mutant::CloseNoWake) && !mutant::is(Mutant::FalseEmpty));
+        });
+        assert!(mutant::is(Mutant::FalseEmpty), "the outer mutant came back");
+        let unwound = std::panic::catch_unwind(|| {
+            mutant::with(Mutant::NotNowCounts, || panic!("inner scope unwinds"))
+        });
+        assert!(unwound.is_err());
+        assert!(mutant::is(Mutant::FalseEmpty), "and after an unwind");
+    });
+    assert!(
+        !mutant::is(Mutant::FalseEmpty),
+        "no mutant outside every scope"
+    );
+}

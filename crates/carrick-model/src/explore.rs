@@ -253,12 +253,34 @@ fn no_false_refusal<P: Protocol>(
     }
 }
 
+/// The protocol's own invariant over its initial state, as a zero-step
+/// counterexample when it fails.
+fn initial_check<P: Protocol>(
+    protocol: &P,
+    init: &P::State,
+) -> Result<(), Box<Counterexample<P::Op>>> {
+    protocol.check(init).map_err(|v| {
+        Box::new(Counterexample {
+            protocol: P::NAME,
+            invariant: InvariantId::Protocol(protocol.invariant(&v)),
+            violation: format!("the initial state: {v:?}"),
+            trace: Vec::new(),
+            path: Vec::new(),
+            states: 1,
+            mutant: None,
+        })
+    })
+}
+
 /// Explore every operation sequence of `protocol` up to `bound`.
 pub fn explore<P: Protocol>(
     protocol: &P,
     bound: Bound,
 ) -> Result<Report, Box<Counterexample<P::Op>>> {
     let root = (protocol.init(), WaitLedger::default());
+    // The initial state is checked too: a protocol that starts broken has a
+    // zero-step counterexample, the shortest there is.
+    initial_check(protocol, &root.0)?;
     let mut coverage = Coverage::default();
     protocol.reached(&root.0, &root.1, &mut coverage);
     let mut seen = HashSet::new();
@@ -321,6 +343,7 @@ pub type Verdicts<Op> = Result<Vec<Step<Op>>, Box<Counterexample<Op>>>;
 /// check, and return its trace, or the counterexample it reproduces.
 pub fn replay<P: Protocol>(protocol: &P, path: &[usize], bound: Bound) -> Verdicts<P::Op> {
     let mut state = protocol.init();
+    initial_check(protocol, &state)?;
     let mut ledger = WaitLedger::default();
     let mut trace = Vec::new();
     for (depth, &index) in path.iter().enumerate() {
