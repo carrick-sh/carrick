@@ -673,7 +673,8 @@ pub fn decide_reservation_syscall_for_origin<
 /// extension) or a `MREMAP_MAYMOVE` relocation (one `Move`).
 ///
 /// Unrouted (the caller's counted refusal) until their owner lands:
-/// `MREMAP_FIXED`, `MREMAP_DONTUNMAP`, a zero `old_size`, growth of a
+/// a shrink across mappings or holes, `MREMAP_FIXED`, `MREMAP_DONTUNMAP`,
+/// a zero `old_size`, growth of a
 /// locked node (`RLIMIT_MEMLOCK` is the host venue's) and growth of a
 /// private file node (its extension's bytes, #3141). A run root whose
 /// geometry keeps a host VMA venue (AArch64) keeps its host `mremap`.
@@ -722,6 +723,10 @@ fn decide_mremap<G: ReservationGeometry, C: Copy + Send + Sync + zerocopy::FromZ
     model
         .mremap(source, request.new_size, target)
         .map_err(|refusal| match refusal {
+            // Linux shrinks before it asks for one mapping (mremap(2)): a
+            // shrink across mappings or holes is not this root's to answer
+            // yet, so it stays a counted refusal, never an errno.
+            Refusal::Hole if request.new_size < request.old_size => MremapLeave::Forward,
             // mremap(2) EFAULT: the old range is not one mapping. Only the
             // allocation layout is this root's to answer for; a source
             // outside it is not proven unmapped.
