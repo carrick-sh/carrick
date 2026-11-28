@@ -388,6 +388,8 @@ pub fn schedule(slot: SlotId) -> ! {
                     carrick_el1::isa::x86::interrupt::DeliveryPoint::Idle,
                 )
             {
+                #[cfg(feature = "test-support")]
+                crate::test_support::park_after_idle_recheck(slot);
                 unsafe {
                     core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
                 }
