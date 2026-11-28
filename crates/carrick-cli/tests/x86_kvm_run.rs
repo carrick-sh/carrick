@@ -5835,8 +5835,6 @@ fn mounted_static_x86_fork_refusal_names_its_resource() {
             )
         })
         .unwrap_or_else(|| panic!("malformed fork report: {line}"));
-    eprintln!("fork-until-refused: forked={forked} errno={errno}");
-
     let census_files: Vec<_> = std::fs::read_dir(&census_dir)
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -5849,6 +5847,7 @@ fn mounted_static_x86_fork_refusal_names_its_resource() {
         fork.is_object(),
         "the x86 census names its fork refusals: {census}"
     );
+    eprintln!("fork-until-refused: forked={forked} errno={errno} fork_refusals={fork}");
     let refusals = fork["refusals"].as_object().unwrap();
     let named: Vec<(&str, u64)> = refusals
         .iter()
