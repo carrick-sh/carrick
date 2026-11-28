@@ -1,6 +1,7 @@
 //! Linux futex decoding, timeout admission and completion values.
 use crate::dispatch::FamilyCompletion;
 use crate::entry::SyscallResult;
+use crate::sleep::AbsoluteDeadline;
 use carrick_core_abi::ReservationMm;
 use carrick_guest_arch::{CounterTick, UserVa};
 use carrick_syscall_abi::{
@@ -100,21 +101,30 @@ impl FutexCall {
         self.args[1] |= 128;
         self.admitted().then_some(self)
     }
+    /// Whether this is a wake spelling (private or shared, plain or bitset):
+    /// the one classification every venue uses.
+    pub fn is_wake(self) -> bool {
+        let private = self.args[1] | 128;
+        private == FUTEX_WAKE_PRIVATE || private == FUTEX_WAKE_BITSET_PRIVATE
+    }
     pub fn admitted(self) -> bool {
-        if self.args[0] & 3 != 0 {
-            // Admission includes invalid operands that policy can finish without
-            // touching memory. Declining this native-child call answers ENOSYS
-            // instead of Linux EINVAL (#1850).
-            return self.args[1] == FUTEX_WAIT_BITSET_PRIVATE_REALTIME && self.args[3] == 0;
-        }
         match self.args[1] {
-            FUTEX_WAIT_PRIVATE => true,
-            // With no timeout the clock selector has no effect. In particular,
-            // glibc sem_wait supplies CLOCK_REALTIME even for an indefinite wait.
-            // Keep absolute timeouts outside admission until their clock domain
-            // and owner-copy protocol are implemented.
-            FUTEX_WAIT_BITSET_PRIVATE => self.args[3] == 0 && self.args[5] as u32 != 0,
-            FUTEX_WAIT_BITSET_PRIVATE_REALTIME => self.args[3] == 0,
+            // Every private wait spelling is admitted whatever its operands:
+            // [`serve_futex`] answers a misaligned word or an empty bitset
+            // EINVAL after it reads and validates a supplied timeout, as
+            // Linux does (EFAULT or EINVAL for the timespec first). Declining
+            // one answers a native child ENOSYS instead (#1850, #3174).
+            //
+            // A bitset wait's timeout is an absolute deadline on the clock its
+            // op names: MONOTONIC, or REALTIME with FUTEX_CLOCK_REALTIME
+            // (glibc's pthread_cond_timedwait, sem_timedwait and timed locks;
+            // an ENOSYS answer aborts them, #3174). With no timeout the clock
+            // selector has no effect: glibc sem_wait supplies CLOCK_REALTIME
+            // even for an indefinite wait.
+            FUTEX_WAIT_PRIVATE | FUTEX_WAIT_BITSET_PRIVATE | FUTEX_WAIT_BITSET_PRIVATE_REALTIME => {
+                true
+            }
+            _ if self.args[0] & 3 != 0 => false,
             FUTEX_WAKE_PRIVATE => self.args[2] as i32 > 0,
             FUTEX_WAKE_BITSET_PRIVATE => self.args[2] as i32 > 0 && self.args[5] as u32 != 0,
             _ => false,
@@ -138,8 +148,22 @@ pub fn ring_owned_futex(ordinal: carrick_guest_arch::NativeOrdinal, args: [u64; 
 
 /// Custody of the original expiry while the futex operand waits for its owner.
 /// This is moved with the operation; it is never stored in a register save area.
+/// The expiry is already a counter tick, converted once at entry from a
+/// relative timeout or an absolute deadline, so a retry never re-reads a
+/// clock or the guest's timespec.
 pub struct RelativeFutexWait {
     pub deadline: CounterTick,
+}
+
+/// Why a venue could not read a guest timeout word for [`serve_futex`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UserReadRefusal {
+    /// The guest cannot read the address: Linux answers EFAULT, in ring.
+    Fault,
+    /// The bytes are not available yet. The venue has retained the guest
+    /// copy request and reruns the exact syscall once it is resolved; policy
+    /// leaves the call to that continuation.
+    Pending,
 }
 
 /// Native context and clock hooks over the existing wait owner. No new wait
@@ -148,9 +172,16 @@ pub trait FutexVenue {
     type Served;
     fn mm(&self) -> Option<ReservationMm>;
     fn timed_wait_allowed(&self) -> bool;
-    fn read_u64(&self, address: UserVa) -> Option<u64>;
+    /// One little-endian word of a supplied timespec. Every venue tells a
+    /// fault from "not yet": a fault is EFAULT on every ISA, never a decline.
+    fn read_u64(&mut self, address: UserVa) -> Result<u64, UserReadRefusal>;
     fn frequency(&self) -> FutexFrequency;
     fn now(&self) -> CounterTick;
+    /// The zone's published realtime calibration (`CLOCK_REALTIME` minus the
+    /// counter epoch), which `clock_gettime(CLOCK_REALTIME)` adds in ring.
+    /// `None` leaves a `FUTEX_CLOCK_REALTIME` deadline unserved, never
+    /// converted on a guessed epoch.
+    fn realtime_offset(&self) -> Option<u64>;
     fn retained_deadline(&self) -> Option<CounterTick> {
         None
     }
@@ -174,6 +205,18 @@ pub struct FutexWait {
     pub timeout_result: SyscallResult,
 }
 
+impl FutexWait {
+    /// Whether this wait's deadline has passed at `now` (the zone timer's
+    /// own rule: a deadline at or before the counter has expired). Once the
+    /// word matches, an expired wait answers ETIMEDOUT without parking, so
+    /// neither a pending signal (EINTR) nor a racing wake can claim it
+    /// (#3174).
+    pub fn expired_at(&self, now: CounterTick) -> bool {
+        self.deadline
+            .is_some_and(|deadline| deadline.raw() <= now.raw())
+    }
+}
+
 pub fn serve_futex<V: FutexVenue>(call: FutexCall, venue: &mut V) -> Option<V::Served> {
     let mm = venue.mm()?;
     if !call.admitted() {
@@ -186,31 +229,72 @@ pub fn serve_futex<V: FutexVenue>(call: FutexCall, venue: &mut V) -> Option<V::S
     } else {
         mask as u32
     };
-    if address.raw() & 3 != 0 || (op == FUTEX_WAIT_BITSET_PRIVATE_REALTIME && bitset == 0) {
-        return venue.invalid(SyscallResult::new(LINUX_EINVAL.guest_retval()));
-    }
-    if matches!(op, FUTEX_WAKE_PRIVATE | FUTEX_WAKE_BITSET_PRIVATE) {
+    let operands_invalid = address.raw() & 3 != 0 || bitset == 0;
+    let einval = SyscallResult::new(LINUX_EINVAL.guest_retval());
+    if call.is_wake() {
+        if operands_invalid {
+            return venue.invalid(einval);
+        }
         return Some(venue.wake(mm, address, bitset, expected as i32 as u32));
     }
-    let deadline = if let Some(deadline) = venue.retained_deadline() {
+    // Linux copies and validates a supplied timeout before it looks at the
+    // word's operands: an unreadable timespec is EFAULT and a malformed one
+    // EINVAL, whatever the word and mask (futex(2)). A retained deadline was
+    // read and validated on the call's first entry.
+    let retained = venue.retained_deadline();
+    let supplied = if retained.is_none() && timeout != 0 {
+        let read = |venue: &mut V, at: u64| match venue.read_u64(UserVa::new(at)) {
+            Ok(word) => Ok(word as i64),
+            Err(UserReadRefusal::Fault) => {
+                Err(venue.invalid(SyscallResult::new(LINUX_EFAULT.guest_retval())))
+            }
+            Err(UserReadRefusal::Pending) => Err(None),
+        };
+        let secs = match read(venue, timeout) {
+            Ok(secs) => secs,
+            Err(served) => return served,
+        };
+        let nanos = match read(venue, timeout.wrapping_add(8)) {
+            Ok(nanos) => nanos,
+            Err(served) => return served,
+        };
+        if secs < 0 || !(0..1_000_000_000).contains(&nanos) {
+            return venue.invalid(einval);
+        }
+        Some((secs, nanos))
+    } else {
+        None
+    };
+    if operands_invalid {
+        return venue.invalid(einval);
+    }
+    let deadline = if let Some(deadline) = retained {
         Some(deadline)
-    } else if timeout != 0 {
+    } else if let Some((secs, nanos)) = supplied {
         if !venue.timed_wait_allowed() {
             return None;
         }
-        let secs = venue.read_u64(UserVa::new(timeout))? as i64;
-        let nanos = venue.read_u64(UserVa::new(timeout + 8))? as i64;
-        if secs < 0 || !(0..1_000_000_000).contains(&nanos) {
+        let realtime_offset = venue.realtime_offset();
+        if op == FUTEX_WAIT_BITSET_PRIVATE_REALTIME && realtime_offset.is_none() {
             return None;
         }
-        let nanos_ticks =
-            (u128::from(nanos as u64) * u128::from(venue.frequency().hz()) / 1_000_000_000) as u64;
-        let ticks = (secs as u64)
-            .saturating_mul(venue.frequency().hz())
-            .saturating_add(nanos_ticks);
-        Some(CounterTick::new(
-            venue.now().raw().saturating_add(ticks).max(1),
-        ))
+        let hz = venue.frequency().hz();
+        let total = (secs as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add(nanos as u64);
+        match op {
+            // FUTEX_WAIT's timeout is relative to now.
+            FUTEX_WAIT_PRIVATE => {
+                let nanos_ticks =
+                    (u128::from(nanos as u64) * u128::from(hz) / 1_000_000_000) as u64;
+                let ticks = (secs as u64).saturating_mul(hz).saturating_add(nanos_ticks);
+                Some(CounterTick::new(
+                    venue.now().raw().saturating_add(ticks).max(1),
+                ))
+            }
+            FUTEX_WAIT_BITSET_PRIVATE => AbsoluteDeadline::Monotonic(total).counter_tick(hz, None),
+            _ => AbsoluteDeadline::Realtime(total).counter_tick(hz, realtime_offset),
+        }
     } else {
         None
     };

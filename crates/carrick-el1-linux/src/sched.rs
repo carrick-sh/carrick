@@ -171,14 +171,49 @@ impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, '_, C, U> {
         // scheduler owner and must not escape to a nonexistent host task.
         true
     }
-    fn read_u64(&self, address: UserVa) -> Option<u64> {
-        self.sched.user.read_u64(self.sched.task, address.raw())
+    fn read_u64(
+        &mut self,
+        address: UserVa,
+    ) -> Result<u64, carrick_personality_linux::sched::UserReadRefusal> {
+        use carrick_core::user_copy::CopyOutcome;
+        use carrick_personality_linux::sched::UserReadRefusal;
+        if let Some(word) = self.sched.user.read_u64(self.sched.task, address.raw()) {
+            return Ok(word);
+        }
+        // The same classification as the futex word: outside the user half
+        // is EFAULT; an unavailable page is the memory owner's to prepare,
+        // and the caller reruns the syscall once it has. A word that
+        // straddles two pages names the page that needs backing: the second
+        // one when the first reads (the copy owner selects supply per page).
+        let first_end = (address.raw() | 0xfff).wrapping_add(1);
+        let (start, len) = if address.raw().wrapping_add(8) > first_end
+            && first_end != 0
+            && self
+                .sched
+                .user
+                .read_u64(self.sched.task, first_end - 8)
+                .is_some()
+        {
+            (UserVa::new(first_end), address.raw() + 8 - first_end)
+        } else {
+            (address, 8)
+        };
+        match carrick_core::user_copy::copy_refusal(start, len, carrick_guest_arch::Access::Read) {
+            CopyOutcome::NotYet(request) => {
+                self.refusal = Some(FutexRefusal::Copy(CopyOutcome::NotYet(request)));
+                Err(UserReadRefusal::Pending)
+            }
+            _ => Err(UserReadRefusal::Fault),
+        }
     }
     fn frequency(&self) -> FutexFrequency {
         FutexFrequency::from_hz(self.sched.cpu.freq())
     }
     fn now(&self) -> CounterTick {
         CounterTick::new(self.sched.cpu.now())
+    }
+    fn realtime_offset(&self) -> Option<u64> {
+        self.sched.zone.realtime_offset()
     }
     fn retained_deadline(&self) -> Option<CounterTick> {
         self.operation.as_ref().map(|op| op.deadline)
@@ -385,7 +420,7 @@ impl<C: ThreadCpu, U: UserWord> LinuxSchedEntry for Sched<'_, C, U> {
         let shared = authenticate.is_some();
         // A wake has no expiry to retain and finishes once policy runs, so
         // its mapping is authenticated first (as #1941 does on x86).
-        let wake = call.args[1] == FUTEX_WAKE_PRIVATE || call.args[1] == FUTEX_WAKE_BITSET_PRIVATE;
+        let wake = call.is_wake();
         if wake && let Some(authenticate) = authenticate.take() {
             match authenticate(UserVa::new(call.args[0]), None) {
                 Ok(true) => {}

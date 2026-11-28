@@ -209,12 +209,22 @@ pub trait UserCopy {
 /// An unavailable atomic operand must be prepared by its exact memory owner.
 /// Alignment and canonical-range failures are already authoritative faults.
 pub fn atomic_word_refusal(address: UserVa, access: Access) -> CopyOutcome {
-    if address.raw() & 3 != 0 || !carrick_guest_arch::lower_half_range(address.raw(), 4) {
+    if address.raw() & 3 != 0 {
+        return CopyOutcome::Fault;
+    }
+    copy_refusal(address, 4, access)
+}
+
+/// An unavailable `len`-byte user range must be prepared by its exact memory
+/// owner; a range outside the canonical user half is already an
+/// authoritative fault.
+pub fn copy_refusal(address: UserVa, len: u64, access: Access) -> CopyOutcome {
+    if !carrick_guest_arch::lower_half_range(address.raw(), len) {
         return CopyOutcome::Fault;
     }
     CopyOutcome::NotYet(GuestCopyRequest {
         address,
-        len: GuestLen::new(4),
+        len: GuestLen::new(len),
         access,
     })
 }

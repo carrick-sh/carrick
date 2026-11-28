@@ -382,6 +382,49 @@ fn serial_host_native_child_timed_futex_slot_reset_wake() {
     );
 }
 
+/// #3174, ARM: glibc's timed condition wait in a fork/exec child is a
+/// `FUTEX_WAIT_BITSET` with an absolute CLOCK_MONOTONIC deadline. Through
+/// the production ARM entry it parks on its own timer lease and is woken
+/// before the deadline, as the relative wait above. On main the ring
+/// declined it and the child answered a counted ENOSYS.
+#[test]
+fn serial_host_native_fork_exec_child_timed_bitset_futex() {
+    fork_exec_probe(
+        Some(crate::sched::FUTEX_WAIT_BITSET_PRIVATE),
+        u32::MAX as u64,
+        true,
+        None,
+    );
+}
+
+/// #3174, ARM: the absolute deadline is kept across the executor's
+/// departure and expires exactly once, at that deadline.
+#[test]
+fn serial_host_native_child_timed_bitset_futex_carrier_exit() {
+    fork_exec_probe_with_departure(
+        Some(crate::sched::FUTEX_WAIT_BITSET_PRIVATE),
+        u32::MAX as u64,
+        true,
+        None,
+        Some(TimerDeparture::CarrierExit),
+        false,
+    );
+}
+
+/// #3174, ARM: a wake after the executor's departure, before the absolute
+/// deadline, ends the wait and releases its timer.
+#[test]
+fn serial_host_native_child_timed_bitset_futex_carrier_exit_wake() {
+    fork_exec_probe_with_departure(
+        Some(crate::sched::FUTEX_WAIT_BITSET_PRIVATE),
+        u32::MAX as u64,
+        true,
+        None,
+        Some(TimerDeparture::CarrierExitWake),
+        false,
+    );
+}
+
 #[test]
 fn serial_host_native_child_nanosleep_is_routed() {
     fork_exec_probe_with_departure(

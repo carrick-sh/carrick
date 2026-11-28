@@ -4,6 +4,7 @@ use carrick_core::user_copy::{CopyOutcome, UserCopy};
 use carrick_guest_arch::CounterTick;
 use carrick_personality_linux::sched::{
     FutexCall, FutexFrequency, FutexVenue, FutexWait, MmFutexKey, RelativeFutexWait,
+    UserReadRefusal,
 };
 use core::cell::{Cell, RefCell};
 
@@ -54,6 +55,7 @@ struct Adapter<'e, 'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<
     mapping_refusal: Option<LifecycleOutcome>,
     now: CounterTick,
     frequency: FutexFrequency,
+    realtime_offset: Option<u64>,
     retained: Option<RelativeFutexWait>,
 }
 impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
@@ -85,17 +87,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Fu
     fn timed_wait_allowed(&self) -> bool {
         true
     }
-    fn read_u64(&self, address: UserVa) -> Option<u64> {
+    fn read_u64(&mut self, address: UserVa) -> Result<u64, UserReadRefusal> {
         let mut bytes = [0; 8];
         match self.copy.borrow_mut().copy_in(&mut bytes, address) {
-            CopyOutcome::Done => Some(u64::from_le_bytes(bytes)),
-            CopyOutcome::Fault => {
-                self.refusal.set(Some(CopyOutcome::Fault));
-                None
-            }
+            CopyOutcome::Done => Ok(u64::from_le_bytes(bytes)),
+            // Policy answers EFAULT through `invalid`.
+            CopyOutcome::Fault => Err(UserReadRefusal::Fault),
             CopyOutcome::NotYet(request) => {
                 self.refusal.set(Some(CopyOutcome::NotYet(request)));
-                None
+                Err(UserReadRefusal::Pending)
             }
         }
     }
@@ -104,6 +104,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Fu
     }
     fn now(&self) -> CounterTick {
         self.now
+    }
+    fn realtime_offset(&self) -> Option<u64> {
+        self.realtime_offset
     }
     fn retained_deadline(&self) -> Option<CounterTick> {
         self.retained.as_ref().map(|wait| wait.deadline)
@@ -169,6 +172,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Fu
         }
         if word != wait.expected {
             return Some(returned(wait.mismatch_result.raw()));
+        }
+        // An expired deadline answers before any park is published, on the
+        // counter read now, after the word matched: the entry sample may be
+        // older than a timespec copy or a bucket acquisition.
+        if wait.deadline.is_some() {
+            let now = self.entry.service.signal_now().unwrap_or(self.now);
+            if wait.expired_at(now) {
+                return Some(returned(wait.timeout_result.raw()));
+            }
         }
         let start =
             carrick_core::entry::prepare_handoff(self.entry.binding, self.entry.source, record)?;
@@ -337,9 +349,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if !call.admitted() {
             return None;
         }
-        let (now, frequency) = if call.args[3] != 0
-            && call.args[1] == carrick_personality_linux::sched::FUTEX_WAIT_PRIVATE
-        {
+        let wake = call.is_wake();
+        // A timed wait's clock: the counter, and the zone's realtime
+        // calibration for a FUTEX_CLOCK_REALTIME deadline.
+        let (now, frequency) = if call.args[3] != 0 && !wake {
             (
                 self.service.signal_now().ok()?,
                 self.service.counter_frequency().ok()?,
@@ -347,6 +360,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         } else {
             (CounterTick::new(0), FutexFrequency::from_hz(1))
         };
+        let realtime_offset = self.source.zone.realtime_offset();
         let retained = self.take_relative_futex_wait();
         let mut adapter = Adapter {
             entry: self,
@@ -356,10 +370,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             mapping_refusal: None,
             now,
             frequency,
+            realtime_offset,
             retained,
         };
-        let wake = call.args[1] == carrick_personality_linux::sched::FUTEX_WAKE_PRIVATE
-            || call.args[1] == carrick_personality_linux::sched::FUTEX_WAKE_BITSET_PRIVATE;
         let result = if shared.is_some()
             && wake
             && adapter.authenticate_mapping(UserVa::new(call.args[0])) != Some(true)
@@ -376,10 +389,23 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 Some(returned(carrick_syscall_abi::LINUX_EFAULT.guest_retval()))
             }
             Some(CopyOutcome::NotYet(request)) => {
+                let retains = adapter.retained.is_some();
                 if let Some(retained) = adapter.retained {
                     adapter.entry.retain_relative_futex_wait(retained);
                 }
-                Some(adapter.entry.wait_guest_copy(request))
+                let outcome = adapter.entry.wait_guest_copy(request);
+                // Only a continuation that reruns this syscall keeps its
+                // deadline; a terminal answer (EFAULT from a synchronous
+                // owner fault) must not leave it for the next futex call.
+                if retains
+                    && !matches!(
+                        outcome,
+                        LifecycleOutcome::Redispatch | LifecycleOutcome::Transferred { .. }
+                    )
+                {
+                    let _ = adapter.entry.take_relative_futex_wait();
+                }
+                Some(outcome)
             }
             Some(CopyOutcome::Done) => Some(
                 adapter

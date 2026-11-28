@@ -18088,6 +18088,206 @@ fn futex_copy_not_yet_owner_fault_publishes_efault() {
     );
 }
 
+/// #3174 (pre-review): a timed `FUTEX_WAIT_BITSET` whose timespec page is
+/// not backed yet goes through the production dispatcher to the memory
+/// owner, which prepares exactly that range, and the owner's continuation
+/// reruns the original syscall: the SVC is rewound with every argument
+/// intact, the word is never read before its timeout, and nothing parks.
+/// The rerun, with the page backed, reads the (past) deadline and answers
+/// ETIMEDOUT. Before #3185 the unreadable timespec answered EFAULT.
+#[cfg(test)]
+#[test]
+fn futex_lazy_timespec_redispatches_through_the_owner_and_reruns() {
+    use crate::native_process_runtime::host_test_support::{Physical, take_prepared_reads};
+    use crate::sched::UserWord;
+    use carrick_el1_abi::Lifecycle;
+    use carrick_guest_arch::GuestLen;
+    use carrick_personality_linux::dispatch::CompletionRoute;
+    const TS: u64 = VA + 0x1000;
+    struct LazyTimespec {
+        backed: core::cell::Cell<bool>,
+        reads: core::cell::Cell<u32>,
+    }
+    impl UserWord for LazyTimespec {
+        fn read_u32(&self, _: &CurrentTask, address: u64) -> Option<u32> {
+            assert_eq!(address, VA);
+            self.reads.set(self.reads.get() + 1);
+            Some(0x12345678)
+        }
+        fn read_u64(&self, _: &CurrentTask, address: u64) -> Option<u64> {
+            // A deadline at the counter epoch, once its page is supplied.
+            assert!(address == TS || address == TS + 8, "{address:#x}");
+            self.backed.get().then_some(0)
+        }
+    }
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut native_service = fixture.process_service();
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut native_service,
+            |_| (),
+        )
+        .unwrap();
+    let runtime = registry()
+        .for_entry(source, &fixture.task, fixture.address)
+        .unwrap();
+    // Two live threads: a sibling has entered and is visible to the leader.
+    let sibling = host_born_sibling(fixture, 42);
+    let mut gettid = carrick_el1_abi::TrapFrame::default();
+    gettid.x[8] = 178;
+    arm_call(fixture, sibling, &mut native_service, &mut gettid).unwrap();
+    assert_eq!(gettid.x[0], 42);
+    assert!(leader_sees_thread(fixture, &mut native_service, 42));
+    run_as_leader(fixture);
+    assert_eq!(fixture.page.live(), 2);
+    let record = process_record_for_call(
+        source,
+        &fixture.task,
+        Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
+        fixture_ttbr0(fixture),
+        fixture.control,
+    )
+    .unwrap();
+    registry()
+        .rehome_entry(
+            source,
+            &fixture.task,
+            fixture.address,
+            fixture.page,
+            fixture.control,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(fixture.zone.mark_native_owned(record));
+    let mut parked = Aarch64ParkedContext::from_parts(ThreadCtx::ZERO, fixture.address);
+    let mut service = Physical {
+        zone: fixture.zone,
+        page: fixture.page,
+        controls: core::slice::from_ref(fixture.control),
+        copies: Vec::new(),
+        tid_words: Default::default(),
+        tid_wakes: 0,
+        tid_writes: Vec::new(),
+        child_copy_error: None,
+        prepare_copy_error: None,
+        child_copy_error_at: None,
+        on_copy_complete: None,
+        native_ipc: None,
+        refuse_copy: false,
+        waker_slot: carrick_sched_core::SlotId::new(0),
+        on_signal_clock: None,
+    };
+    let user = LazyTimespec {
+        backed: core::cell::Cell::new(false),
+        reads: core::cell::Cell::new(0),
+    };
+    let counters = carrick_el1_abi::Counters::new();
+    let cache = carrick_el1_abi::InotifyNameCache::new();
+    fixture.zone.spaces.set_idle_ttbr(0x30000);
+    let mut cpu = crate::sched::FakeCpu {
+        ttbr: (fixture_ttbr0(fixture), fixture_ttbr0(fixture)),
+        now: 100,
+        freq: 1,
+        ..Default::default()
+    };
+    let mut frame = carrick_el1_abi::TrapFrame {
+        elr: 0x4004,
+        ..Default::default()
+    };
+    frame.x[8] = crate::sched::SYS_FUTEX as u64;
+    frame.x[0] = VA;
+    frame.x[1] = crate::sched::FUTEX_WAIT_BITSET_PRIVATE;
+    frame.x[2] = 0x12345678;
+    frame.x[3] = TS;
+    frame.x[5] = u64::from(u32::MAX);
+    let args = [VA, frame.x[1], 0x12345678, TS, 0, u64::from(u32::MAX)];
+    let _ = take_prepared_reads();
+    // One trap of the SVC through the production dispatcher and the entry's
+    // owed route, on a fresh entry for the saved context.
+    macro_rules! dispatch {
+        () => {{
+            let mut entry = runtime
+                .enter_registered(
+                    registry(),
+                    source,
+                    &fixture.task,
+                    fixture.address,
+                    &parked,
+                    &mut service,
+                )
+                .unwrap();
+            let completed = crate::dispatch::dispatch_syscall_with_native(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&fixture.task),
+                &[],
+                &[],
+                &[],
+                &[],
+                &cache,
+                Some(crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &user,
+                }),
+                None,
+                Some(fixture),
+                Some(&mut *entry),
+                Some(source),
+                None,
+                |_| core::ptr::null_mut(),
+            );
+            crate::dispatch::run_owed_entry_route(
+                &mut frame,
+                &counters,
+                core::slice::from_ref(&fixture.task),
+                crate::dispatch::Zone {
+                    tables: fixture.zone,
+                    cpu: &mut cpu,
+                    user: &user,
+                },
+                completed,
+            )
+        }};
+    }
+    crate::sched::ThreadCpu::save(&mut cpu, &frame, &mut parked);
+    let route = dispatch!();
+    assert_eq!(
+        route,
+        CompletionRoute::Served,
+        "the owner prepared the page"
+    );
+    assert_eq!(
+        take_prepared_reads(),
+        vec![(UserVa::new(TS), GuestLen::new(8))],
+        "the owner prepares exactly the timespec's first word"
+    );
+    assert_eq!(frame.elr, 0x4000, "the continuation re-executes the SVC");
+    assert_eq!(frame.x[8], crate::sched::SYS_FUTEX as u64);
+    assert_eq!(&frame.x[..6], &args, "the original syscall, unchanged");
+    assert_eq!(user.reads.get(), 0, "the word waits for its timeout");
+    assert_eq!(fixture.zone.counters.el1_parks.load(Ordering::Relaxed), 0);
+    assert!(!runtime.has_relative_futex_wait_for_test(fixture.control.zone_record().unwrap()));
+
+    // The rerun: the SVC traps again, with the page now backed.
+    user.backed.set(true);
+    frame.elr = 0x4004;
+    crate::sched::ThreadCpu::save(&mut cpu, &frame, &mut parked);
+    let route = dispatch!();
+    assert_eq!(route, CompletionRoute::Served);
+    assert_eq!(frame.x[0] as i64, -110, "ETIMEDOUT on the rerun");
+    assert_eq!(frame.elr, 0x4004, "answered, not rewound again");
+    assert_eq!(user.reads.get(), 1, "the rerun compared the word once");
+    assert!(take_prepared_reads().is_empty());
+    assert_eq!(fixture.zone.counters.el1_parks.load(Ordering::Relaxed), 0);
+}
+
 #[test]
 fn futex_mapping_synchronous_redispatch_rewinds_syscall() {
     futex_owner_wait_episode(

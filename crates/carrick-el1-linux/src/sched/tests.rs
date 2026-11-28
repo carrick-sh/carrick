@@ -654,8 +654,177 @@ fn a_timed_wait_ends_in_guest_with_etimedout() {
     assert_eq!(task.execution.task.load(Ordering::Relaxed), 101);
 }
 
+/// #3174: a timed `FUTEX_WAIT_BITSET` carries an absolute deadline on the
+/// clock its op names. Monotonic is the counter's epoch; realtime adds the
+/// zone's published offset, as `clock_gettime(CLOCK_REALTIME)` does. Each
+/// ends in EL1 with ETIMEDOUT, never before its deadline, on the same
+/// timer lease as the relative wait above.
+#[test]
+fn a_timed_bitset_wait_ends_in_guest_at_its_absolute_deadline() {
+    use carrick_personality_linux::sched::FUTEX_WAIT_BITSET_PRIVATE_REALTIME;
+    const OFFSET_NS: u64 = 1_700_000_000_000_000_000;
+    let zone = zone();
+    zone.publish_realtime_offset(OFFSET_NS);
+    let word = AtomicU32::new(0);
+    let uaddr = word.as_ptr() as u64;
+    let task = task_for(101);
+    for (round, (op, epoch)) in [
+        (FUTEX_WAIT_BITSET_PRIVATE, 0),
+        (FUTEX_WAIT_BITSET_PRIVATE_REALTIME, OFFSET_NS),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (mut frame, mut cpu) = live(0xA, uaddr, op, 0);
+        frame.x[5] = u64::from(u32::MAX);
+        let start = cpu.now;
+        let now_ns = (u128::from(start) * 1_000_000_000 / u128::from(cpu.freq)) as u64;
+        let deadline = epoch + now_ns + 1_000_000;
+        let ts = libc_timespec(deadline / 1_000_000_000, deadline % 1_000_000_000);
+        frame.x[3] = &ts as *const [u64; 2] as u64;
+        assert_eq!(
+            serve(&mut frame, &task, &zone, &mut cpu),
+            SWITCHED,
+            "op {op}"
+        );
+        assert_eq!(frame.x[0] as i64, -110, "ETIMEDOUT, op {op}");
+        assert!(
+            cpu.now - start >= cpu.freq / 1000,
+            "not before its deadline, op {op}"
+        );
+        assert_eq!(
+            zone.counters.el1_timeouts.load(Ordering::Relaxed),
+            round as u64 + 1
+        );
+    }
+}
+
+/// #3174 (pre-review P0-4): a timed wait whose deadline has already passed
+/// answers ETIMEDOUT once its word matches, without publishing a park: no
+/// pending signal or racing wake can claim a wait Linux never sleeps in.
+/// Before the fix it parked, and the timer then expired it.
+#[test]
+fn an_expired_bitset_deadline_answers_etimedout_without_parking() {
+    use carrick_personality_linux::sched::FUTEX_WAIT_BITSET_PRIVATE_REALTIME;
+    let zone = zone();
+    // One nanosecond: zero is "no calibration" to the zone.
+    zone.publish_realtime_offset(1);
+    let word = AtomicU32::new(0);
+    let uaddr = word.as_ptr() as u64;
+    let task = task_for(101);
+    let past = libc_timespec(0, 0);
+    for op in [
+        FUTEX_WAIT_BITSET_PRIVATE,
+        FUTEX_WAIT_BITSET_PRIVATE_REALTIME,
+    ] {
+        let (mut frame, mut cpu) = live(0xA, uaddr, op, 0);
+        frame.x[5] = u64::from(u32::MAX);
+        frame.x[3] = &past as *const [u64; 2] as u64;
+        assert_eq!(
+            serve(&mut frame, &task, &zone, &mut cpu),
+            RETURNED,
+            "op {op}: answered, never parked"
+        );
+        assert_eq!(frame.x[0] as i64, -110, "ETIMEDOUT, op {op}");
+        // A changed word is still EAGAIN first.
+        let (mut frame, mut cpu) = live(0xA, uaddr, op, 1);
+        frame.x[5] = u64::from(u32::MAX);
+        frame.x[3] = &past as *const [u64; 2] as u64;
+        assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), RETURNED);
+        assert_eq!(frame.x[0] as i64, -11, "EAGAIN, op {op}");
+    }
+    assert_eq!(zone.counters.el1_parks.load(Ordering::Relaxed), 0);
+    assert_eq!(zone.counters.el1_timeouts.load(Ordering::Relaxed), 0);
+}
+
+/// #3174 (pre-review): the scheduler adapter tells a timeout pointer the
+/// guest cannot read (EFAULT, in ring) from one whose page is not backed yet
+/// (a guest-copy request naming that page, which the dispatcher turns into
+/// an owner wait and a rerun). A timespec straddling two pages whose first
+/// page reads names the second page. Once backed, the rerun completes.
+#[test]
+fn a_timed_wait_timeout_copy_faults_or_waits_for_its_page() {
+    use carrick_core::user_copy::CopyOutcome;
+    use carrick_guest_arch::GuestLen;
+    use core::cell::Cell;
+    const LAZY: u64 = 0x10_0000_0000;
+    struct LazyTimeout {
+        backed: Cell<bool>,
+    }
+    impl UserWord for LazyTimeout {
+        fn read_u32(&self, task: &CurrentTask, uaddr: u64) -> Option<u32> {
+            HardwareUserWord.read_u32(task, uaddr)
+        }
+        fn read_u64(&self, _: &CurrentTask, uaddr: u64) -> Option<u64> {
+            // Page LAZY - 4096 reads; page LAZY reads only once supplied.
+            // Every readable word is zero: a deadline at the counter epoch.
+            let readable = |byte: u64| {
+                (LAZY - 4096..LAZY).contains(&byte)
+                    || (self.backed.get() && (LAZY..LAZY + 4096).contains(&byte))
+            };
+            (readable(uaddr) && readable(uaddr + 7)).then_some(0)
+        }
+    }
+    let zone = zone();
+    let word = AtomicU32::new(0);
+    let uaddr = word.as_ptr() as u64;
+    let task = task_for(101);
+    let user = LazyTimeout {
+        backed: Cell::new(false),
+    };
+    let serve_with = |timeout: u64| {
+        let (mut frame, mut cpu) = live(0xA, uaddr, FUTEX_WAIT_BITSET_PRIVATE, 0);
+        frame.x[5] = u64::from(u32::MAX);
+        frame.x[3] = timeout;
+        let result = Sched {
+            handoff: None,
+            zone: &zone,
+            slot: SLOT,
+            task: &task,
+            cpu: &mut cpu,
+            user: &user,
+            counters: counters(),
+        }
+        .serve_futex_operation(&mut frame, &mut None, None);
+        (result, frame.x[0] as i64)
+    };
+    // Outside the user half: EFAULT, never a decline or a copy wait.
+    let (result, x0) = serve_with(0xffff_8000_0000_0000);
+    assert!(matches!(
+        result,
+        Ok(Some(Served::Returned { switched: false }))
+    ));
+    assert_eq!(x0, -14, "EFAULT");
+    // Not backed yet: a request for exactly that page.
+    let (result, _) = serve_with(LAZY);
+    assert!(
+        matches!(result, Err(FutexRefusal::Copy(CopyOutcome::NotYet(request)))
+            if request.address.raw() == LAZY && request.len == GuestLen::new(8)),
+        "lazy timespec"
+    );
+    // tv_sec reads on the first page, tv_nsec straddles into the second:
+    // the request names the second page, from its first byte.
+    let (result, _) = serve_with(LAZY - 12);
+    assert!(
+        matches!(result, Err(FutexRefusal::Copy(CopyOutcome::NotYet(request)))
+            if request.address.raw() == LAZY && request.len == GuestLen::new(4)),
+        "straddling timespec"
+    );
+    // Supplied: the rerun reads a deadline already past and answers it.
+    user.backed.set(true);
+    for timeout in [LAZY, LAZY - 12] {
+        let (result, x0) = serve_with(timeout);
+        assert!(matches!(
+            result,
+            Ok(Some(Served::Returned { switched: false }))
+        ));
+        assert_eq!(x0, -110, "ETIMEDOUT after the page is backed, {timeout:#x}");
+    }
+    assert_eq!(zone.counters.el1_parks.load(Ordering::Relaxed), 0);
+}
+
 /// A switched-in thread owns its timer lease even when it is not this
-/// vCPU's host record. Invalid timespecs keep their existing refusal.
+/// vCPU's host record. An invalid timespec is Linux's EINVAL, in ring.
 #[test]
 fn switched_in_timed_wait_uses_its_own_timer_lease() {
     let zone = zone();
@@ -665,7 +834,8 @@ fn switched_in_timed_wait_uses_its_own_timer_lease() {
     let bad = libc_timespec(0, 1_000_000_000);
     let (mut frame, mut cpu) = live(0xA, uaddr, FUTEX_WAIT_PRIVATE, 0);
     frame.x[3] = &bad as *const [u64; 2] as u64;
-    assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), None);
+    assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), RETURNED);
+    assert_eq!(frame.x[0] as i64, -22, "EINVAL");
     // Switch B in (A wakes B, then A waits untimed).
     let b = host_park(&zone, 202, uaddr, thread_ctx(0xB, uaddr));
     set_op(&mut frame, uaddr, FUTEX_WAKE_PRIVATE, 1);
@@ -1196,14 +1366,12 @@ fn unserved_futex_operations_forward() {
     let uaddr = word.as_ptr() as u64;
     let task = task_for(101);
     for (op, timeout, count, bitset) in [
-        (0u64, 0u64, 0u64, 0u64),                  // non-private wait
-        (1, 0, 1, 0),                              // non-private wake
-        (FUTEX_WAIT_BITSET_PRIVATE, 0x1000, 0, 1), // absolute timeout
-        (FUTEX_WAKE_PRIVATE, 0, 0, 0),             // wake 0 (the host decides)
-        (FUTEX_WAIT_BITSET_PRIVATE, 0, 0, 0),      // bitset 0 is EINVAL
-        (128 | 3, 0, 1, 0),                        // requeue
-        (128 | 4, 0, 1, 0),                        // cmp_requeue
-        (256 | FUTEX_WAIT_PRIVATE, 0, 0, 0),       // clock-realtime flag
+        (0u64, 0u64, 0u64, 0u64),            // non-private wait
+        (1, 0, 1, 0),                        // non-private wake
+        (FUTEX_WAKE_PRIVATE, 0, 0, 0),       // wake 0 (the host decides)
+        (128 | 3, 0, 1, 0),                  // requeue
+        (128 | 4, 0, 1, 0),                  // cmp_requeue
+        (256 | FUTEX_WAIT_PRIVATE, 0, 0, 0), // clock-realtime flag
     ] {
         let (mut frame, mut cpu) = live(0xA, uaddr, op, count);
         frame.x[3] = timeout;
@@ -1216,6 +1384,21 @@ fn unserved_futex_operations_forward() {
     }
     let (mut frame, mut cpu) = live(0xA, uaddr + 1, FUTEX_WAKE_PRIVATE, 1);
     assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), None, "unaligned");
+    // An invalid wait operand is Linux's EINVAL, in ring (#3174): a fork
+    // child's decline would answer ENOSYS.
+    for (address, op, bitset) in [
+        (uaddr, FUTEX_WAIT_BITSET_PRIVATE, 0), // bitset 0
+        (uaddr + 1, FUTEX_WAIT_PRIVATE, 0),    // unaligned word
+    ] {
+        let (mut frame, mut cpu) = live(0xA, address, op, 0);
+        frame.x[5] = bitset;
+        assert_eq!(
+            serve(&mut frame, &task, &zone, &mut cpu),
+            RETURNED,
+            "op {op:#x} address {address:#x}"
+        );
+        assert_eq!(frame.x[0] as i64, -22, "EINVAL, op {op:#x}");
+    }
     let off = CurrentTask::new();
     let (mut frame, mut cpu) = live(0xA, uaddr, FUTEX_WAKE_PRIVATE, 1);
     assert_eq!(

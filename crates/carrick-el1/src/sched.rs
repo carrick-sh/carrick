@@ -454,6 +454,14 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             frame.x[0] = mismatch_result;
             return Ok(Some(Served::Returned { switched: false }));
         }
+        // An expired deadline (the zone timer's rule: at or before the
+        // counter) answers before any park is published, so neither a
+        // pending signal nor a racing wake can claim it (#3174).
+        if deadline.is_some_and(|deadline| deadline <= self.cpu.now()) {
+            drop(guard);
+            frame.x[0] = timeout_result;
+            return Ok(Some(Served::Returned { switched: false }));
+        }
         let fresh = zone.slot(slot).current().is_none();
         let Ok(record) = self.current_record() else {
             return Ok(None);
