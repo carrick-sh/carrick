@@ -6537,3 +6537,189 @@ fn a_lock_release_owing_a_scan_pass_cannot_be_dropped_undelivered() {
     assert!(passes.owes(OTHER), "the release owes the enrolled scan");
     drop(passes);
 }
+
+/// A scripted [`IdleVenue`] that records each step of an [`idle_pass`] and
+/// the slot's state when it halts.
+struct ScriptedIdle<'z> {
+    zone: &'z ZoneTables,
+    slot: SlotId,
+    log: Vec<&'static str>,
+    leave: bool,
+    executor: bool,
+    poll: bool,
+    host_work: bool,
+    kicks_sent: bool,
+    halted_in: Option<SlotState>,
+}
+
+impl<'z> ScriptedIdle<'z> {
+    fn new(zone: &'z ZoneTables, slot: SlotId) -> Self {
+        Self {
+            zone,
+            slot,
+            log: Vec::new(),
+            leave: false,
+            executor: false,
+            poll: false,
+            host_work: false,
+            kicks_sent: true,
+            halted_in: None,
+        }
+    }
+}
+
+impl IdleVenue for ScriptedIdle<'_> {
+    fn drain(&mut self) {
+        self.log.push("drain");
+    }
+    fn leaves_for_host(&mut self) -> bool {
+        self.log.push("leaves_for_host");
+        self.leave
+    }
+    fn expire_timers(&mut self) {
+        self.log.push("expire_timers");
+    }
+    fn deliver(&mut self, passes: OwedPasses) {
+        passes.fold_into(&mut WakeEffects::default());
+    }
+    fn leaves_for_executor(&self) -> bool {
+        self.executor
+    }
+    fn keep_polling(&mut self) -> bool {
+        self.log.push("keep_polling");
+        self.poll
+    }
+    fn prepare_sleep(&mut self) {
+        self.log.push("prepare_sleep");
+    }
+    fn sleep_published(&mut self) {
+        self.log.push("sleep_published");
+    }
+    fn recheck_refuses(&mut self) -> bool {
+        self.log.push("recheck_refuses");
+        false
+    }
+    fn host_work_pending(&self) -> bool {
+        self.host_work
+    }
+    fn owed_kicks_sent(&mut self) -> bool {
+        self.log.push("owed_kicks_sent");
+        self.kicks_sent
+    }
+    fn halt(&mut self) {
+        self.log.push("halt");
+        self.halted_in = Some(self.zone.slot(self.slot).state());
+    }
+    fn rejoin(&mut self) {
+        self.log.push("rejoin");
+        self.zone.leave_idle(self.slot);
+    }
+    fn end_pass(&mut self) {
+        self.log.push("end_pass");
+    }
+    fn stop(&mut self, point: IdleStop) {
+        self.log.push(match point {
+            IdleStop::AfterDrain => "stop:after_drain",
+            IdleStop::BeforeScan => "stop:before_scan",
+            IdleStop::IdlePublished => "stop:idle_published",
+            IdleStop::AfterFinalRecheck => "stop:after_final_recheck",
+        });
+    }
+}
+
+/// #3061 S2a: the neutral pass drains before it reads anything, publishes
+/// IdleWfi before its final recheck, and halts only past the stop after
+/// that recheck, in IdleWfi.
+#[test]
+fn an_idle_pass_drains_first_and_halts_only_past_its_final_recheck() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    let mut venue = ScriptedIdle::new(&zone, SLOT);
+    assert_eq!(idle_pass(&zone, SLOT, &mut venue), IdlePass::Again);
+    assert_eq!(
+        venue.log,
+        [
+            "drain",
+            "stop:after_drain",
+            "leaves_for_host",
+            "expire_timers",
+            "stop:before_scan",
+            "keep_polling",
+            "prepare_sleep",
+            "sleep_published",
+            "stop:idle_published",
+            "recheck_refuses",
+            "owed_kicks_sent",
+            "stop:after_final_recheck",
+            "halt",
+            "rejoin",
+            "end_pass",
+        ]
+    );
+    assert_eq!(venue.halted_in, Some(SlotState::IdleWfi));
+    assert_eq!(zone.slot(SLOT).state(), SlotState::Running);
+}
+
+/// The final recheck reads each durable wake word: an owed reschedule (and
+/// consumes it), pending host work, or a kick still owed after a busy ICR
+/// keeps the CPU awake for another pass.
+#[test]
+fn an_idle_pass_never_halts_owing_a_durable_wake() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    zone.slot(SLOT).resched_owed.store(1, Ordering::Release);
+    let mut venue = ScriptedIdle::new(&zone, SLOT);
+    assert_eq!(idle_pass(&zone, SLOT, &mut venue), IdlePass::Again);
+    assert!(!venue.log.contains(&"halt"), "{:?}", venue.log);
+    assert!(venue.log.contains(&"rejoin"));
+    assert!(!zone.take_resched(SLOT), "the recheck consumed it");
+
+    let mut venue = ScriptedIdle::new(&zone, SLOT);
+    venue.host_work = true;
+    assert_eq!(idle_pass(&zone, SLOT, &mut venue), IdlePass::Again);
+    assert!(!venue.log.contains(&"halt"), "{:?}", venue.log);
+
+    let mut venue = ScriptedIdle::new(&zone, SLOT);
+    venue.kicks_sent = false;
+    assert_eq!(idle_pass(&zone, SLOT, &mut venue), IdlePass::Again);
+    assert!(!venue.log.contains(&"halt"), "{:?}", venue.log);
+    assert!(venue.log.contains(&"owed_kicks_sent"));
+}
+
+/// A queued thread is taken before any sleep, and the slot stops idling;
+/// a polling venue never sleeps; a venue's own reason to leave ends the
+/// pass before it reads a timer.
+#[test]
+fn an_idle_pass_takes_queued_work_polls_or_leaves_before_sleeping() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    let record = zone.alloc_record(identity(60)).unwrap();
+    assert!(
+        zone.requeue_preempted(SLOT, record, &OwedPasses::new())
+            .is_queued()
+    );
+    let mut venue = ScriptedIdle::new(&zone, SLOT);
+    match idle_pass(&zone, SLOT, &mut venue) {
+        IdlePass::Took(taken) => assert_eq!(taken.record, record),
+        other => panic!("{other:?}"),
+    }
+    assert!(!venue.log.contains(&"prepare_sleep"), "{:?}", venue.log);
+    assert_eq!(zone.slot(SLOT).state(), SlotState::Running);
+
+    let zone = self::zone();
+    enter(&zone, SLOT, 0);
+    let mut venue = ScriptedIdle::new(&zone, SLOT);
+    venue.poll = true;
+    assert_eq!(idle_pass(&zone, SLOT, &mut venue), IdlePass::Again);
+    assert_eq!(venue.log.last(), Some(&"keep_polling"));
+    assert_eq!(zone.slot(SLOT).state(), SlotState::IdleSpin);
+
+    let mut venue = ScriptedIdle::new(&zone, SLOT);
+    venue.leave = true;
+    assert_eq!(
+        idle_pass(&zone, SLOT, &mut venue),
+        IdlePass::Leave(IdleLeave::Venue)
+    );
+    assert_eq!(venue.log, ["drain", "stop:after_drain", "leaves_for_host"]);
+    assert_eq!(zone.slot(SLOT).state(), SlotState::Running);
+}
