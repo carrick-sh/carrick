@@ -234,12 +234,17 @@ fn run(config: Config, stats: &mut Stats) -> Result<(), String> {
             }
             unchanged(stats, "a Leased refusal")?;
             drop(pin);
-            // Reopened: the lease's row admits a lease again.
-            return match tokens.first().and_then(|token| table.pin_transfer(*token)) {
-                Some(_) => Ok(()),
-                None => Err(format!(
+            // Reopened: every source row, not only the leased one, admits a
+            // lease again.
+            return if tokens
+                .iter()
+                .all(|token| table.pin_transfer(*token).is_some())
+            {
+                Ok(())
+            } else {
+                Err(format!(
                     "T7: a Leased refusal left a row closed: {config:?}"
-                )),
+                ))
             };
         }
         Err(ResidencyTransferRefusal::Capacity) => {
@@ -397,22 +402,28 @@ fn every_transfer_keeps_t1_to_t9() {
 
 #[test]
 fn every_seeded_transfer_mutant_is_found() {
-    for which in [
-        Mutant::TransferCopies,
-        Mutant::KeepsSource,
-        Mutant::IgnoresLease,
-        Mutant::AdmitsOverlap,
-        Mutant::AdmitsPopulatedDst,
-        Mutant::AdmitsPopulatedTail,
-        Mutant::SplitDropsOutside,
-        Mutant::DropsBits,
-        Mutant::ReusesEpoch,
-        Mutant::FailDropsSource,
-        Mutant::MovesPeerRecord,
-        Mutant::ExposesEarly,
+    // Each mutant must be found by its own invariant, not incidentally.
+    for (which, invariant) in [
+        (Mutant::TransferCopies, "T1/T5:"),
+        (Mutant::KeepsSource, "T2:"),
+        (Mutant::IgnoresLease, "T3:"),
+        (Mutant::AdmitsOverlap, "T4:"),
+        (Mutant::AdmitsPopulatedDst, "T4:"),
+        (Mutant::AdmitsPopulatedTail, "T4:"),
+        (Mutant::SplitDropsOutside, "T1/T5:"),
+        (Mutant::DropsBits, "T1/T5:"),
+        (Mutant::ReusesEpoch, "T6:"),
+        (Mutant::FailDropsSource, "T7:"),
+        (Mutant::MovesPeerRecord, "T8:"),
+        (Mutant::ExposesEarly, "T9:"),
     ] {
         match mutant::with(which, explore) {
-            Err(counterexample) => std::println!("mutant {which:?} found: {counterexample}"),
+            Err(counterexample) if counterexample.starts_with(invariant) => {
+                std::println!("mutant {which:?} found: {counterexample}")
+            }
+            Err(counterexample) => {
+                panic!("mutant {which:?} was found, but not by {invariant}: {counterexample}")
+            }
             Ok(stats) => panic!("mutant {which:?} survived {stats:?}"),
         }
     }
@@ -481,5 +492,79 @@ fn a_transfer_without_room_changes_nothing() {
     assert!(
         table.pin_transfer(token).is_some(),
         "the source row reopened"
+    );
+}
+
+fn writing_slots(table: &FrameGrantResidencyTable) -> Vec<usize> {
+    (0..table.slot_capacity())
+        .filter(|&slot| {
+            table.slot(slot).is_some_and(|record| {
+                record.state.load(core::sync::atomic::Ordering::Acquire) & GRANT_STATE_MASK
+                    == GRANT_WRITING
+            })
+        })
+        .collect()
+}
+
+/// Pre-review P0 1 (`94c4cf601`): a reserved slot left holding a
+/// transfer's identity must never be taken for a later transfer's own
+/// reservation. MM `B` shares `A`'s probe chains (keys congruent modulo the
+/// segment size), so `B`'s retirement preclaim claims the tombstone `A`'s
+/// cancelled transfer left, and `A`'s next transfer reserves a later slot.
+#[test]
+fn a_stale_reservation_marker_is_never_taken_for_a_new_one() {
+    const B: u64 = MM + 4096;
+    let table = table();
+    publish(&table, MM, 3, ROWS[3]);
+    let (src, len) = (at(0), P);
+    let dst = src + W + P;
+    let range = TransferRange::new(MM, src, dst, len).unwrap();
+    // A reserves the slot for its one-page part at dst, then cancels.
+    drop(table.begin_transfer(range).expect("first admission"));
+    assert_eq!(writing(&table), 0);
+    // B owns a two-page row at dst and preclaims the retirement of its
+    // second page: the one-page part below it reserves on A's chain.
+    table
+        .publish(FrameGrantResidencyIdentity {
+            mm_key: B,
+            semantic_base: dst,
+            physical_ipa: 0x9000_0000,
+            len: 2 * P,
+            mapping_id: 1,
+            frame_id: 1,
+            owner_generation: 1,
+            inventory_revision: 1,
+        })
+        .expect("B's row");
+    let preclaim = table
+        .begin_retire_overlapping(B, dst + P, P, super::super::SplitRowCustody::Reserved)
+        .expect("B's preclaim");
+    let held = writing_slots(&table);
+    assert_eq!(held.len(), 1, "B holds one reservation");
+    // A's second transfer must commit into its own reservation.
+    let receipt = table
+        .begin_transfer(range)
+        .expect("second admission")
+        .commit()
+        .expect("commit under exclusion");
+    assert_eq!(receipt.frames_relinked, 1);
+    assert_eq!(
+        writing_slots(&table),
+        held,
+        "B's reservation is intact and A leaked none"
+    );
+    assert!(
+        preclaim.commit(),
+        "B's retirement commits into its own slot"
+    );
+    let b = view(&table, B).unwrap();
+    assert_eq!(
+        b.keys().copied().collect::<Vec<_>>(),
+        [dst],
+        "B keeps its first page"
+    );
+    assert!(
+        view(&table, MM).unwrap().contains_key(&dst),
+        "A's page moved"
     );
 }

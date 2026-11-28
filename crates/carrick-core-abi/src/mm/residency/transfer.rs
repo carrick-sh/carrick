@@ -40,6 +40,11 @@ use super::{
 #[cfg(test)]
 mod explore_tests;
 
+/// The `transfer_pins` word of a slot a transfer reserved: a retired-state
+/// value no lease, close or retirement ever writes (they write 0, a pin
+/// count, `TRANSFER_PIN_RETIRING` or `TRANSFER_PIN_RETIRED`).
+const TRANSFER_RESERVED: u64 = super::TRANSFER_PIN_RETIRED | 2;
+
 /// One equal-length move of one MM's pages: `[src, src + len)` to
 /// `[dst, dst + len)`. Only [`Self::new`] makes one, so every transfer is
 /// non-empty, page-aligned, overflow-free and has disjoint ranges (T4's
@@ -60,6 +65,10 @@ impl TransferRange {
         let aligned = |value: u64| value.is_multiple_of(GRANT_PAGE_SIZE);
         let src_end = src.checked_add(len)?;
         let dst_end = dst.checked_add(len)?;
+        // The parts are cut at 2 MiB windows: the window after either end
+        // must be representable.
+        src_end.checked_add(EL1_FRAME_GRANT_TARGET_SIZE)?;
+        dst_end.checked_add(EL1_FRAME_GRANT_TARGET_SIZE)?;
         let disjoint = src_end <= dst || dst_end <= src;
         let admits_overlap = mutant::active() == mutant::Mutant::AdmitsOverlap;
         (mm_key != 0
@@ -336,6 +345,7 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
             {
                 continue;
             }
+            let identity = record.identity();
             let closed = record
                 .transfer_pins
                 .compare_exchange(
@@ -348,6 +358,20 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
             if !closed && mutant::active() != mutant::Mutant::IgnoresLease {
                 failed = Some(slot);
                 break;
+            }
+            // The close must land on the generation this scan read. If the
+            // row was retired and the slot republished in between (by the
+            // host, or for another MM), undo the close on the newcomer: it
+            // is not a source row, and the row this scan read is gone.
+            if closed
+                && (record.state.load(Ordering::Acquire) != state || record.identity() != identity)
+            {
+                let _ = record.transfer_pins.compare_exchange(
+                    TRANSFER_PIN_RETIRING,
+                    0,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
             }
         }
         let Some(failed) = failed else {
@@ -369,12 +393,19 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
         Err(ResidencyTransferRefusal::Leased)
     }
 
-    /// Name a reserved slot by the row it will hold. It stays `WRITING`, so
-    /// no lookup sees it, and no other MM's reservation can take it.
+    /// Name a slot this transfer just reserved by the row it will hold, and
+    /// tag it as a transfer's reservation. It stays `WRITING`, so no lookup
+    /// sees it and no other reservation can take it. Only the claimant of
+    /// the slot's current generation writes the tag, and every path that
+    /// ends the reservation clears it first, so a stale identity left in a
+    /// tombstone that someone else claims later never matches.
     fn mark_reserved(&self, slot: usize, identity: FrameGrantResidencyIdentity) {
         let Some(record) = self.slot(slot) else {
             return;
         };
+        record
+            .transfer_pins
+            .store(TRANSFER_RESERVED, Ordering::Relaxed);
         record.mm_key.store(identity.mm_key, Ordering::Relaxed);
         record
             .semantic_base
@@ -408,6 +439,7 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
                 let slot = Self::probe(identity.mm_key, bucket, class, probe);
                 let record = &segment.slots[slot];
                 if record.state.load(Ordering::Acquire) & GRANT_STATE_MASK == GRANT_WRITING
+                    && record.transfer_pins.load(Ordering::Acquire) == TRANSFER_RESERVED
                     && record.identity() == identity
                 {
                     return Some(segment_index * FRAME_GRANT_RESIDENCY_SLOTS + slot);
@@ -415,6 +447,17 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
             }
         }
         None
+    }
+
+    /// Give back a slot this transfer reserved: clear its tag before the
+    /// slot becomes reusable, so its next claimant never carries it.
+    fn release_transfer_slot(&self, slot: usize) {
+        if let Some(record) = self.slot(slot) {
+            record
+                .transfer_pins
+                .store(super::TRANSFER_PIN_RETIRED, Ordering::Release);
+        }
+        self.release_reserved_slot(slot);
     }
 
     fn commit_transfer(&self, range: TransferRange) -> Option<TransferReceipt> {
@@ -468,7 +511,7 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
         {
             // Re-key the source record in place: its slot and epoch survive
             // at `dst`, so a source token's generation names the moved row.
-            self.release_reserved_slot(reserved);
+            self.release_transfer_slot(reserved);
             self.mark_live_in_place(slot, part.identity);
             receipt.rows_rekeyed += 1;
             receipt.frames_relinked += part.identity.len / GRANT_PAGE_SIZE;
@@ -479,6 +522,20 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
             return true;
         }
         if mutant::active() != mutant::Mutant::KeepsSource {
+            // While the row is still live (and closed) nobody else can claim
+            // its slot, so its dirty bit is still its own: clear it now, not
+            // after the retirement, when another MM may have reused the slot
+            // and set its own. Its bits move to the published parts, which
+            // are marked dirty.
+            dirty.fetch_and(!(1 << (slot % 64)), Ordering::AcqRel);
+            // Announce the retirement before it happens: a lock-free reader
+            // that misses this row between the retirement and the parts'
+            // publication sees the epoch move and looks again.
+            self.storage
+                .rows()
+                .directory
+                .retirement_epoch
+                .fetch_add(1, Ordering::Release);
             if record
                 .state
                 .compare_exchange(
@@ -491,12 +548,6 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
             {
                 return false;
             }
-            dirty.fetch_and(!(1 << (slot % 64)), Ordering::AcqRel);
-            self.storage
-                .rows()
-                .directory
-                .retirement_epoch
-                .fetch_add(1, Ordering::Release);
         }
         receipt.rows_rekeyed += 1;
         for (index, entry) in slots.into_iter().enumerate() {
@@ -505,7 +556,7 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
             };
             let outside = index < 2;
             if outside && mutant::active() == mutant::Mutant::SplitDropsOutside {
-                self.release_reserved_slot(reserved);
+                self.release_transfer_slot(reserved);
                 continue;
             }
             let carried = if !outside && mutant::active() == mutant::Mutant::DropsBits {
@@ -530,15 +581,27 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
         let Some((record, dirty)) = self.slot_entry(slot) else {
             return 0;
         };
-        record.publish(part.identity);
+        // `mark_reserved` already wrote `part.identity` (`find_reserved`
+        // matched it). Write the committed bits before the row goes live,
+        // so no reader sees it live with a commit missing.
+        let mut words = [0u64; 8];
         let mut carried = 0;
         for bit in 0..(part.identity.len / GRANT_PAGE_SIZE) as usize {
             let old = part.shift + bit;
             if bits[old / 64] & (1 << (old % 64)) != 0 {
-                record.committed[bit / 64].fetch_or(1 << (bit % 64), Ordering::Release);
+                words[bit / 64] |= 1 << (bit % 64);
                 carried += 1;
             }
         }
+        for (word, value) in record.committed.iter().zip(words) {
+            word.store(value, Ordering::Relaxed);
+        }
+        record.transfer_pins.store(0, Ordering::Release);
+        let writing = record.state.load(Ordering::Relaxed);
+        record.state.store(
+            (writing & !GRANT_STATE_MASK) | GRANT_LIVE,
+            Ordering::Release,
+        );
         // The host's walk sees the new row, committed or not.
         dirty.fetch_or(1 << (slot % 64), Ordering::Release);
         carried
@@ -556,7 +619,7 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
         self.for_each_transfer_row(range, |_, row| {
             for part in Parts::of(range, row).all() {
                 if let Some(slot) = self.find_reserved(part.identity) {
-                    self.release_reserved_slot(slot);
+                    self.release_transfer_slot(slot);
                 }
             }
         });
