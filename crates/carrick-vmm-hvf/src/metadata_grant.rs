@@ -722,6 +722,19 @@ impl HostApertureState {
                 publish_backing_using(custody, generation, host, ipa, len, token, map)
             },
         )
+        // `begin_destroy` can end this generation between the check above
+        // and the stage-2 record's admission, which then refuses it, and
+        // the slot code reports any refusal as `Busy`. A generation never
+        // lives again once it is destroying, so a refusal it no longer
+        // outlives is that stale generation, never a missing slot (never
+        // the shared provider's ENOMEM, #3085).
+        .map_err(|error| {
+            if request_has_live_vm(custody, Some(generation)) {
+                error
+            } else {
+                MetadataResolutionError::StaleOwner
+            }
+        })
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
