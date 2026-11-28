@@ -2837,3 +2837,41 @@ fn neutral_relink_intent_lowers_and_its_receipt_verifies() {
     let receipt = execute_descriptor_txn(&words, &txn, root(0x1000), &mut InlineJournal::new());
     assert_eq!(txn.verify_receipt(&receipt), Ok(()));
 }
+
+/// A failure after the move linked a fresh destination table undoes the
+/// link, the table's words and the source clears alike.
+#[test]
+fn relink_rolls_back_a_fresh_destination_table() {
+    let (words, _) = relink_source();
+    let before = words.words.borrow().clone();
+    // Three installs into the granted PT, its link, then three clears.
+    words.fail.set(words.writes.get() + 6);
+    assert_eq!(
+        apply(&words, relink(RELINK_SRC + (1 << 21)), &[root(0x5000)]),
+        DescriptorOutcome::RolledBack(DescriptorRefusal::Contended)
+    );
+    assert_eq!(*words.words.borrow(), before);
+}
+
+/// The Carrick-owned COW copy window is refused as either span.
+#[test]
+fn relink_refuses_the_cow_copy_window() {
+    use crate::x86::copy_window::COW_COPY_WINDOW_BASE as WINDOW;
+    let (words, _) = relink_source();
+    let before = words.words.borrow().clone();
+    for op in [
+        relink(WINDOW),
+        relink(WINDOW - 2 * PAGE),
+        DescriptorOp::Relink {
+            src: PageSpan::new(WINDOW, PAGE),
+            dst: WINDOW + 0x10_0000,
+        },
+    ] {
+        assert_eq!(
+            apply(&words, op, &[root(0x5000), root(0x6000), root(0x7000)]),
+            DescriptorOutcome::Refused(DescriptorRefusal::CarrickOwnedWindow),
+            "{op:?}"
+        );
+    }
+    assert_eq!(*words.words.borrow(), before);
+}

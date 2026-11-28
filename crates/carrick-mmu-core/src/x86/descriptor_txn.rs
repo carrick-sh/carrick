@@ -487,6 +487,16 @@ pub fn plan_descriptor_txn<W: LiveDescriptorWords + ?Sized>(
         } => return Err(DescriptorRefusal::BadRange),
         DescriptorOp::Relink { src, dst } => {
             let target = PageSpan::new(dst, src.len);
+            // The COW copy window is Carrick's, never a guest range: no move
+            // may name it as either span, whatever its parent links say.
+            let window = PageSpan::new(
+                super::copy_window::COW_COPY_WINDOW_BASE,
+                super::copy_window::COW_COPY_WINDOW_LEN,
+            );
+            let overlaps = |span: PageSpan| matches!((span.end(), window.end()), (Some(a), Some(b)) if span.va < b && window.va < a);
+            if overlaps(src) || overlaps(target) {
+                return Err(DescriptorRefusal::CarrickOwnedWindow);
+            }
             // Disjoint: a word installed at `dst` is never a source word yet
             // to be read or cleared.
             if !valid_span(target)

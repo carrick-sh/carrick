@@ -437,12 +437,14 @@ pub unsafe fn execute_native_descriptor_txn(
     }
     // Only an edit that replaced a present entry leaves translations another
     // CPU may cache; a fill of not-present entries needs no rendezvous (#3105).
+    // A rollback undid stores another CPU may already have walked (a relink's
+    // destination was present until its undo, #2611), so it drains as well.
     if matches!(
         receipt.outcome,
         DescriptorOutcome::Applied {
             drain: carrick_mmu_core::x86::descriptor_txn::TranslationDrain::Required,
             ..
-        }
+        } | DescriptorOutcome::RolledBack(_)
     ) {
         let binding = super::context::current_cpu_binding().ok_or(ArchError::Unbound)?;
         let context = super::interrupt::current_address_owner(binding)?;

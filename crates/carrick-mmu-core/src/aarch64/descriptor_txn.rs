@@ -6233,6 +6233,34 @@ mod tests {
             assert_eq!(words.image(), before);
         }
 
+        /// A failure after the move linked a fresh destination table undoes
+        /// the link and the source clears: the reachable graph is exactly
+        /// the pre-image. Only the unlinked grant page keeps its words, as
+        /// for any rolled-back grant.
+        #[test]
+        fn relink_rolls_back_a_fresh_destination_table() {
+            let (words, _) = relink_source();
+            let grant = (page(4) - ROOT) as usize / 8;
+            let reachable = |image: Vec<u64>| {
+                let mut image = image;
+                image[grant..grant + 512].fill(0);
+                image
+            };
+            let before = words.image();
+            let first = words.forward_cas.get();
+            // The table link, then three clears: fail the last clear.
+            words.fail_cas_at.set(Some(first + 3));
+            assert_eq!(
+                run(&words, relink(VA + (1 << 21)), &grants(&[4])),
+                DescriptorOutcome::RolledBack(DescriptorRefusal::Contended)
+            );
+            assert_eq!(reachable(words.image()), reachable(before));
+            assert_eq!(
+                words.get(page(2) + indices(VA + (1 << 21))[2] as u64 * 8),
+                0
+            );
+        }
+
         /// Refusals change nothing: an occupied destination, a retired or
         /// foreign source leaf, a block source, and overlapping spans.
         #[test]

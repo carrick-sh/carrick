@@ -2107,6 +2107,10 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
                 DescriptorOp::Coalesce { size: expected, .. } => {
                     entry & PRESENT != 0 && size == expected.bytes()
                 }
+                // A relink moves `PublicationBook` aliases between two spans;
+                // its settlement comes with that alias re-key (#2611). Until
+                // then the host never settles one.
+                DescriptorOp::Relink { .. } => false,
             };
             if !valid {
                 return false;
