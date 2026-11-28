@@ -570,6 +570,12 @@ pub enum EditOperation {
     Coalesce {
         size: EditLeafSize,
     },
+    /// Move the intent range's private leaves, verbatim and with their COW
+    /// state, to the equal-length, disjoint range at `destination`, and leave
+    /// the source empty. No frame is granted, copied or returned (#2611).
+    Relink {
+        destination: UserVa,
+    },
 }
 
 /// ISA-neutral transaction input. The native backend validates unsupported

@@ -128,6 +128,21 @@ pub enum DescriptorOp {
         span: PageSpan,
         size: LeafSize,
     },
+    /// Move the private leaves of `src` to the equal-length, disjoint span at
+    /// `dst` (a ring-served `mremap` move, #2611). Each source PT word is
+    /// copied to `dst + (va - src.va)` verbatim (its frame, permissions,
+    /// ceilings and `COW` state), with the walker's `ACCESSED`/`DIRTY` set on
+    /// a present word, since the walker may still set them on the source
+    /// until its clear. Then the source entry is cleared to empty: no frame
+    /// is granted, copied, retired or returned, so the move is no inventory
+    /// event. A lazy source page stays a lazy destination page. Every
+    /// destination page must be empty, and every source terminal a private
+    /// page (prepared, resident or no-access), never a block or a host leaf.
+    /// Both walks share one journal, so a failure restores both spans.
+    Relink {
+        src: PageSpan,
+        dst: u64,
+    },
 }
 impl DescriptorOp {
     /// Digest operation kind, also used by descriptor diagnostics.
@@ -145,6 +160,7 @@ impl DescriptorOp {
             Self::ProtectWindow { .. } => 10,
             Self::UnmapWindow(_) => 11,
             Self::ProtectNone { .. } => 12,
+            Self::Relink { .. } => 13,
         }
     }
 
@@ -162,6 +178,7 @@ impl DescriptorOp {
             | Self::Retire(span)
             | Self::Unmap(span)
             | Self::UnmapWindow(span) => span,
+            Self::Relink { src, .. } => src,
         }
     }
 }
@@ -282,6 +299,10 @@ impl<'a> DescriptorTxn<'a> {
             EditOperation::Coalesce { size: leaf_size } => DescriptorOp::Coalesce {
                 span,
                 size: size(leaf_size),
+            },
+            EditOperation::Relink { destination } => DescriptorOp::Relink {
+                src: span,
+                dst: destination.raw(),
             },
             _ => return Err(DescriptorRefusal::BadEncoding),
         };
@@ -955,6 +976,7 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                 entry & !(WRITE | USER | NX) | (permissions(p) & (WRITE | USER | NX))
             }
             DescriptorOp::Coalesce { .. } => self.coalesced(entry, level)?,
+            DescriptorOp::Relink { .. } => return Err(DescriptorRefusal::BadEncoding),
         };
         check_leaf_privilege_matches_range(UserVa::new(self.txn.op.span().va + offset), new)?;
         self.set(slot, new)
@@ -1079,6 +1101,7 @@ impl DescriptorTxn<'_> {
             DescriptorOp::ProtectNone { .. } => (0, 0, NO_ACCESS, None),
             DescriptorOp::Retire(_) => (0, 0, 0, None),
             DescriptorOp::Coalesce { size, .. } => (size.bytes(), 0, 0, None),
+            DescriptorOp::Relink { dst, .. } => (dst, 0, 0, None),
         };
         for word in [self.op.kind(), a, b, flags] {
             hash = mix(hash, word);

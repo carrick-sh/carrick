@@ -93,7 +93,7 @@ use super::{
 };
 
 /// Wire protocol revision of [`DescriptorTxnSlot`]. Both venues must agree.
-pub const DESCRIPTOR_TXN_PROTOCOL_VERSION: u64 = 11;
+pub const DESCRIPTOR_TXN_PROTOCOL_VERSION: u64 = 12;
 
 /// Maximum host-reserved table pages carried by one transaction. A 2 MiB
 /// grant needs at most one L1, one L2 and two L3 tables when it straddles a
@@ -248,6 +248,18 @@ pub enum DescriptorOp {
     /// are edited in place, and only range edges split. `edit` carries the
     /// image construction mode and the IPA window no valid output may name.
     Terminal { span: PageSpan, edit: TerminalEdit },
+    /// Move the private leaves of `src` to the equal-length, disjoint span at
+    /// `dst` (a ring-served `mremap` move, #2611). Each source L3 word is
+    /// copied to `dst + (va - src.va)` verbatim, so its output, permissions
+    /// and COW state (`SW_EL1_COW`, `SW_EL1_MAY_WRITE`, deferred fork COW)
+    /// move unchanged, and then the source leaf is cleared to empty. No frame
+    /// is granted, copied, retired or returned: the source keeps no
+    /// `SW_RETIRED` lease, so the move is no inventory event. A lazy source
+    /// page stays a lazy destination page. Every destination page must be
+    /// empty, and every source terminal must be a private page (prepared or
+    /// resident, COW-armed or not), never a block or a foreign leaf. Both
+    /// walks share one journal, so a failure restores both spans.
+    Relink { src: PageSpan, dst: u64 },
 }
 
 /// Permissions of a populated alias. Deferred backing retains its output
@@ -530,6 +542,7 @@ impl DescriptorOp {
     const KIND_COW_REPOINT: u64 = 5;
     const KIND_TERMINAL: u64 = 6;
     const KIND_MAP_ALIAS: u64 = 7;
+    const KIND_RELINK: u64 = 8;
 
     /// The complete semantic span this operation may edit.
     #[must_use]
@@ -542,6 +555,7 @@ impl DescriptorOp {
             | Self::MapAlias { span, .. } => span,
             Self::Protect(edit) => PageSpan::new(edit.va, edit.len),
             Self::CowRepoint { va, len, .. } => PageSpan::new(va, len),
+            Self::Relink { src, .. } => src,
         }
     }
 
@@ -575,6 +589,7 @@ impl DescriptorOp {
             Self::CowRepoint { .. } => Self::KIND_COW_REPOINT,
             Self::Terminal { .. } => Self::KIND_TERMINAL,
             Self::MapAlias { .. } => Self::KIND_MAP_ALIAS,
+            Self::Relink { .. } => Self::KIND_RELINK,
         }
     }
 
@@ -636,6 +651,7 @@ impl DescriptorOp {
                 edit.excluded_len,
                 0,
             ],
+            Self::Relink { src, dst } => [src.va, src.len, dst, 0, 0, 0],
         };
         (self.kind(), payload)
     }
@@ -704,6 +720,10 @@ impl DescriptorOp {
             Self::KIND_TERMINAL => Some(Self::Terminal {
                 span: PageSpan::new(payload[0], payload[1]),
                 edit: TerminalEdit::from_wire(payload[2], payload[3], payload[4])?,
+            }),
+            Self::KIND_RELINK if payload[3..] == [0; 3] => Some(Self::Relink {
+                src: PageSpan::new(payload[0], payload[1]),
+                dst: payload[2],
             }),
             _ => None,
         }
@@ -2533,6 +2553,7 @@ impl Executor<'_> {
             // Terminal rules share the host editor's definition and are
             // applied in `visit_entry` before this per-op table.
             DescriptorOp::Terminal { .. } => Err(DescriptorRefusal::Malformed),
+            DescriptorOp::Relink { .. } => Err(DescriptorRefusal::BadEncoding),
         }
     }
 }
@@ -2593,6 +2614,16 @@ fn validate_op(op: &DescriptorOp) -> Result<(), DescriptorRefusal> {
                     .is_some_and(|end| end <= PA_MASK_4KIB + PT_PAGE)
         }
         DescriptorOp::Protect(_) | DescriptorOp::Retire(_) => true,
+        DescriptorOp::Relink { src, dst } => {
+            let target = PageSpan::new(dst, src.len);
+            if copy_window::overlaps_cow_copy_window(target.va, target.len) {
+                return Err(DescriptorRefusal::CarrickOwnedWindow);
+            }
+            // Disjoint: a word copied into `dst` is never a source word yet
+            // to be read or cleared.
+            target.is_well_formed()
+                && matches!((src.end(), target.end()), (Some(a), Some(b)) if a <= dst || b <= src.va)
+        }
         DescriptorOp::Terminal { edit, .. } => {
             if !edit.reclaim_well_formed() {
                 return Err(DescriptorRefusal::BadEncoding);
@@ -5947,6 +5978,229 @@ mod tests {
                 slot.take_receipt(txn.id).unwrap().outcome,
                 DescriptorOutcome::Indeterminate(DescriptorRefusal::BadEncoding)
             );
+        }
+
+        /// Leaf word address of `va` under the L3 table at `page(table)`.
+        fn leaf_in(table: u64, va: u64) -> u64 {
+            page(table) + indices(va)[3] as u64 * 8
+        }
+
+        /// A four-page source row at `VA`: page 0 resident and fork-COW
+        /// armed with write intent, page 1 resident and writable, page 2
+        /// prepared with deferred fork COW, page 3 lazy (no leaf).
+        fn relink_source() -> (TestWords, [u64; 4]) {
+            let words = fixture(3);
+            applied(run(
+                &words,
+                prepare(3, PageSpan::new(VA, 2 * PT_PAGE), true),
+                &TableGrants::NONE,
+            ));
+            let fork = TerminalEdit::fork_arm(false, false, false, true, 0, 0);
+            for page in [0, 2] {
+                applied(run(
+                    &words,
+                    DescriptorOp::Terminal {
+                        span: PageSpan::new(VA + page * PT_PAGE, PT_PAGE),
+                        edit: fork,
+                    },
+                    &TableGrants::NONE,
+                ));
+            }
+            let source =
+                core::array::from_fn(|page| words.get(leaf_pa(VA + page as u64 * PT_PAGE)));
+            assert!(el1_cow(source[0]) && source[0] & SW_EL1_MAY_WRITE != 0);
+            assert!(!el1_cow(source[1]) && source[1] & AP_MASK == AP_RW);
+            assert_eq!(
+                el1_private_leaf_state(source[2]),
+                El1PrivateLeafState::Prepared
+            );
+            assert_ne!(source[2] & SW_FORK_COW_DEFERRED, 0);
+            assert_eq!(source[3], 0);
+            (words, source)
+        }
+
+        fn relink(dst: u64) -> DescriptorOp {
+            DescriptorOp::Relink {
+                src: PageSpan::new(VA, 4 * PT_PAGE),
+                dst,
+            }
+        }
+
+        /// #2611: a relinked leaf keeps its frame, permission and COW bits
+        /// word for word, the source is left empty with no retired lease, no
+        /// frame is named for return, and nothing is made newly resident.
+        #[test]
+        fn relink_moves_private_leaves_verbatim_and_clears_the_source() {
+            let (words, source) = relink_source();
+            let dst = VA + 16 * PT_PAGE;
+            let moved = applied(run(&words, relink(dst), &TableGrants::NONE));
+            assert_eq!(moved.pages, 4);
+            assert_eq!(moved.resident, PageSpan::EMPTY, "no page becomes resident");
+            assert!(moved.reclaimed.is_empty(), "no table is returned");
+            assert_eq!(moved.tables_linked, 0);
+            assert_eq!(moved.live_stores, 6, "three installs and three clears");
+            assert!(moved.flush_required, "resident source leaves were removed");
+            for (page, &word) in source.iter().enumerate() {
+                let offset = page as u64 * PT_PAGE;
+                assert_eq!(
+                    words.get(leaf_pa(dst + offset)),
+                    word,
+                    "page {page} verbatim"
+                );
+                assert_eq!(
+                    words.get(leaf_pa(VA + offset)),
+                    0,
+                    "page {page} source empty"
+                );
+            }
+            let armed = words.get(leaf_pa(dst));
+            assert!(el1_cow(armed) && armed & SW_EL1_MAY_WRITE != 0);
+            assert_eq!(armed & PA_MASK_4KIB, IPA, "same frame, no copy");
+        }
+
+        /// A destination in another 2 MiB window links a granted table, and
+        /// the source's emptied table stays linked (nothing is reclaimed).
+        #[test]
+        fn relink_into_an_unbuilt_window_links_its_table_from_the_grants() {
+            let (words, source) = relink_source();
+            let dst = VA + (1 << 21);
+            assert_eq!(
+                plan_descriptor_op(&words, SubstrateGpa(ROOT), relink(dst)),
+                Ok(DescriptorPlan {
+                    table_grants: 1,
+                    live_stores: 4,
+                    reclaimed_tables: 0,
+                })
+            );
+            assert_eq!(
+                run(&words, relink(dst), &TableGrants::NONE),
+                DescriptorOutcome::Refused(DescriptorRefusal::TablesExhausted)
+            );
+            let moved = applied(run(&words, relink(dst), &grants(&[4])));
+            assert_eq!(moved.tables_linked, 1);
+            assert!(moved.reclaimed.is_empty());
+            for (page, &word) in source.iter().enumerate() {
+                let offset = page as u64 * PT_PAGE;
+                assert_eq!(words.get(leaf_in(4, dst + offset)), word);
+                assert_eq!(words.get(leaf_pa(VA + offset)), 0);
+            }
+            assert_eq!(
+                words.get(page(2) + indices(dst)[2] as u64 * 8),
+                table(4),
+                "the granted table is linked"
+            );
+        }
+
+        /// A failure on the last store undoes both walks under the one
+        /// journal: the destination is empty again and the source intact.
+        #[test]
+        fn relink_rolls_back_both_spans_under_one_journal() {
+            let (words, _) = relink_source();
+            let before = words.image();
+            let first = words.forward_cas.get();
+            words.fail_cas_at.set(Some(first + 5));
+            assert_eq!(
+                run(&words, relink(VA + 16 * PT_PAGE), &TableGrants::NONE),
+                DescriptorOutcome::RolledBack(DescriptorRefusal::Contended)
+            );
+            assert_eq!(words.image(), before);
+        }
+
+        /// Refusals change nothing: an occupied destination, a retired or
+        /// foreign source leaf, a block source, and overlapping spans.
+        #[test]
+        fn relink_refuses_before_the_first_store() {
+            let (words, _) = relink_source();
+            let before = words.image();
+            // Occupied destination: a prepared neighbour at dst page 1.
+            let dst = VA + 16 * PT_PAGE;
+            words.set(leaf_pa(dst + PT_PAGE), words.get(leaf_pa(VA + 2 * PT_PAGE)));
+            let occupied = words.image();
+            assert_eq!(
+                run(&words, relink(dst), &TableGrants::NONE),
+                DescriptorOutcome::Refused(DescriptorRefusal::Occupied)
+            );
+            assert_eq!(words.image(), occupied);
+            words.set(leaf_pa(dst + PT_PAGE), 0);
+            assert_eq!(words.image(), before);
+
+            // A retired source leaf is a lease owed to the host: not movable.
+            applied(run(
+                &words,
+                DescriptorOp::Retire(PageSpan::new(VA + PT_PAGE, PT_PAGE)),
+                &TableGrants::NONE,
+            ));
+            let retired = words.image();
+            assert_eq!(
+                run(&words, relink(dst), &TableGrants::NONE),
+                DescriptorOutcome::Refused(DescriptorRefusal::NotPrivateAnonymous)
+            );
+            assert_eq!(words.image(), retired);
+
+            // A backend (untagged) leaf is not private custody.
+            let (words, _) = relink_source();
+            words.set(
+                leaf_pa(VA + 3 * PT_PAGE),
+                (IPA + 3 * PT_PAGE) | USER_PAGE_FLAGS,
+            );
+            let foreign = words.image();
+            assert_eq!(
+                run(&words, relink(dst), &TableGrants::NONE),
+                DescriptorOutcome::Refused(DescriptorRefusal::NotPrivateAnonymous)
+            );
+            assert_eq!(words.image(), foreign);
+
+            // A 2 MiB block source is never split by a move.
+            let words = fixture(2);
+            words.set(
+                page(2) + indices(VA)[2] as u64 * 8,
+                IPA | super::super::super::USER_BLOCK_FLAGS | NON_GLOBAL,
+            );
+            let block = words.image();
+            assert_eq!(
+                run(&words, relink(VA + (1 << 21)), &grants(&[4])),
+                DescriptorOutcome::Refused(DescriptorRefusal::NotPrivateAnonymous)
+            );
+            assert_eq!(words.image(), block);
+
+            // Overlapping or misaligned spans are refused by shape.
+            let (words, _) = relink_source();
+            for dst in [VA + PT_PAGE, VA - PT_PAGE, VA + 16 * PT_PAGE + 1] {
+                assert_eq!(
+                    run(&words, relink(dst), &TableGrants::NONE),
+                    DescriptorOutcome::Refused(DescriptorRefusal::BadRange)
+                );
+            }
+        }
+
+        /// The wire carries exactly the two spans, and a receipt for the
+        /// move verifies with no resident span and no return.
+        #[test]
+        fn relink_round_trips_the_slot_and_verifies_its_receipt() {
+            let op = relink(VA + 16 * PT_PAGE);
+            let (kind, payload) = op.encode();
+            assert_eq!(DescriptorOp::decode(kind, payload, None), Some(op));
+            let mut extra = payload;
+            extra[3] = 1;
+            assert_eq!(DescriptorOp::decode(kind, extra, None), None);
+            let (words, _) = relink_source();
+            let txn = DescriptorTxn {
+                id: DescriptorTxnId {
+                    mm_key: nz(7),
+                    generation: nz(9),
+                },
+                root: SubstrateGpa(ROOT),
+                op,
+                tables: TableGrants::NONE,
+            };
+            let mut journal = InlineJournal::new();
+            let receipt = execute_descriptor_txn(&words, SubstrateGpa(ROOT), &txn, &mut journal);
+            let verified = txn.verify_receipt(&receipt).unwrap();
+            assert_eq!(verified.resident(), PageSpan::EMPTY);
+            assert!(verified.reclaimed_tables().is_empty());
+            assert!(verified.unused_table_grants().is_empty());
+            assert_eq!(verified.prepared_backing(), None);
+            assert_eq!(verified.cow_repoint(), None);
         }
     }
 }

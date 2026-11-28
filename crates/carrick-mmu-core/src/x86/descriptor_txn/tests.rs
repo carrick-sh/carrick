@@ -2586,3 +2586,254 @@ fn protect_none_is_lowered_from_an_all_false_protect() {
         Err(DescriptorRefusal::BadEncoding)
     );
 }
+
+/// Terminal word at `va`, or 0 where the walk finds no leaf.
+fn relink_leaf(words: &Words, va: u64) -> u64 {
+    read_terminal_descriptor(words, root(0x1000), UserVa::new(va)).map_or(0, |(leaf, _)| leaf)
+}
+
+const RELINK_SRC: u64 = 0x4000;
+
+/// A four-page private row at `RELINK_SRC`: page 0 resident and fork-COW
+/// armed with write intent, page 1 resident and writable, page 2 prepared,
+/// page 3 lazy (no leaf).
+fn relink_source() -> (Words, [u64; 4]) {
+    let words = Words::new();
+    let writable = Permissions {
+        writable: true,
+        executable: false,
+        user: true,
+    };
+    assert!(matches!(
+        apply(
+            &words,
+            DescriptorOp::Prepare {
+                span: PageSpan::new(RELINK_SRC, 3 * PAGE),
+                output: FrameGpa::new(0x800000),
+                permissions: writable,
+                resident: PageSpan::new(RELINK_SRC, 2 * PAGE),
+                backing: backing(),
+            },
+            &[root(0x2000), root(0x3000), root(0x4000)]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert!(matches!(
+        apply(
+            &words,
+            DescriptorOp::ArmCow(PageSpan::new(RELINK_SRC, PAGE)),
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let source = core::array::from_fn(|page| relink_leaf(&words, RELINK_SRC + page as u64 * PAGE));
+    assert_eq!(source[0] & (COW | MAY_WRITE | WRITE), COW | MAY_WRITE);
+    assert_eq!(source[1] & (COW | WRITE | PRESENT), WRITE | PRESENT);
+    assert_eq!(source[2] & (PREPARED | PRESENT), PREPARED);
+    assert_eq!(source[3], 0);
+    (words, source)
+}
+
+fn relink(dst: u64) -> DescriptorOp {
+    DescriptorOp::Relink {
+        src: PageSpan::new(RELINK_SRC, 4 * PAGE),
+        dst,
+    }
+}
+
+/// The walker bits a relinked present word carries as already set.
+fn relinked(word: u64) -> u64 {
+    if word & PRESENT != 0 {
+        word | ACCESSED | DIRTY
+    } else {
+        word
+    }
+}
+
+/// #2611: a relinked leaf keeps its frame, permission, ceiling and COW bits,
+/// the source is left empty with no `RETIRED` predecessor (nothing to scrub
+/// or return), and a lazy page stays lazy.
+#[test]
+fn relink_moves_private_leaves_verbatim_and_clears_the_source() {
+    let (words, source) = relink_source();
+    let dst = RELINK_SRC + 16 * PAGE;
+    let outcome = apply(&words, relink(dst), &[]);
+    assert_eq!(
+        outcome,
+        DescriptorOutcome::Applied {
+            stores: 6,
+            tables_linked: 0,
+            drain: TranslationDrain::Required,
+        }
+    );
+    for (page, &word) in source.iter().enumerate() {
+        let offset = page as u64 * PAGE;
+        assert_eq!(
+            relink_leaf(&words, dst + offset),
+            relinked(word),
+            "page {page}"
+        );
+        assert_eq!(
+            relink_leaf(&words, RELINK_SRC + offset),
+            0,
+            "page {page} source empty"
+        );
+    }
+    let armed = relink_leaf(&words, dst);
+    assert_eq!(armed & ADDRESS, 0x800000, "same frame, no copy");
+    assert_eq!(
+        armed & (COW | MAY_WRITE | WRITE | PRIVATE),
+        COW | MAY_WRITE | PRIVATE
+    );
+}
+
+/// A destination in another 2 MiB window links a granted table; the moved
+/// row is reachable there and the old one is gone.
+#[test]
+fn relink_into_an_unbuilt_window_links_its_table_from_the_grants() {
+    let (words, source) = relink_source();
+    let dst = RELINK_SRC + (1 << 21);
+    let before = words.words.borrow().clone();
+    assert_eq!(
+        apply(&words, relink(dst), &[]),
+        DescriptorOutcome::Refused(DescriptorRefusal::TablesExhausted)
+    );
+    assert_eq!(*words.words.borrow(), before);
+    assert!(matches!(
+        apply(&words, relink(dst), &[root(0x5000)]),
+        DescriptorOutcome::Applied {
+            tables_linked: 1,
+            ..
+        }
+    ));
+    for (page, &word) in source.iter().enumerate() {
+        let offset = page as u64 * PAGE;
+        assert_eq!(relink_leaf(&words, dst + offset), relinked(word));
+        assert_eq!(relink_leaf(&words, RELINK_SRC + offset), 0);
+    }
+}
+
+/// A failure on the last store undoes both walks under the one journal,
+/// and drains the destination it had made present as well as the source.
+#[test]
+fn relink_rolls_back_both_spans_under_one_journal() {
+    let (words, _) = relink_source();
+    let before = words.words.borrow().clone();
+    words.fail.set(words.writes.get() + 5);
+    let drained = words.invalidations.get();
+    assert_eq!(
+        apply(&words, relink(RELINK_SRC + 16 * PAGE), &[]),
+        DescriptorOutcome::RolledBack(DescriptorRefusal::Contended)
+    );
+    assert_eq!(*words.words.borrow(), before);
+    assert_eq!(
+        words.invalidations.get() - drained,
+        2,
+        "source and destination"
+    );
+}
+
+/// Refusals change nothing: an occupied destination, a retired or host
+/// source leaf, a block source, and overlapping or misaligned spans.
+#[test]
+fn relink_refuses_before_the_first_store() {
+    let dst = RELINK_SRC + 16 * PAGE;
+    let unchanged = |words: &Words, op, tables: &[RootGpa], refusal| {
+        let before = words.words.borrow().clone();
+        assert_eq!(
+            apply(words, op, tables),
+            DescriptorOutcome::Refused(refusal)
+        );
+        assert_eq!(*words.words.borrow(), before);
+    };
+    // Occupied destination.
+    let (words, _) = relink_source();
+    assert!(matches!(
+        apply(&words, map(dst + PAGE, 0x900000, PAGE, LeafSize::Page), &[]),
+        DescriptorOutcome::Applied { .. }
+    ));
+    unchanged(&words, relink(dst), &[], DescriptorRefusal::Occupied);
+    // A retired source leaf still owes its scrub: not movable.
+    let (words, _) = relink_source();
+    assert!(matches!(
+        apply(
+            &words,
+            DescriptorOp::Retire(PageSpan::new(RELINK_SRC + PAGE, PAGE)),
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    unchanged(
+        &words,
+        relink(dst),
+        &[],
+        DescriptorRefusal::NotPrivateAnonymous,
+    );
+    // A host-mapped leaf is not private custody.
+    let (words, _) = relink_source();
+    assert!(matches!(
+        apply(
+            &words,
+            map(RELINK_SRC + 3 * PAGE, 0x900000, PAGE, LeafSize::Page),
+            &[]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    unchanged(
+        &words,
+        relink(dst),
+        &[],
+        DescriptorRefusal::NotPrivateAnonymous,
+    );
+    // A 2 MiB block source is never split by a move.
+    let words = Words::new();
+    assert!(matches!(
+        apply(
+            &words,
+            map(0x200000, 0x400000, 1 << 21, LeafSize::Block2M),
+            &[root(0x2000), root(0x3000)]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    unchanged(
+        &words,
+        DescriptorOp::Relink {
+            src: PageSpan::new(0x200000, PAGE),
+            dst: 0x600000,
+        },
+        &[root(0x5000)],
+        DescriptorRefusal::NotPrivateAnonymous,
+    );
+    // Overlapping or misaligned spans.
+    let (words, _) = relink_source();
+    for dst in [RELINK_SRC + PAGE, RELINK_SRC - PAGE, dst + 1] {
+        unchanged(&words, relink(dst), &[], DescriptorRefusal::BadRange);
+    }
+}
+
+/// The neutral intent lowers to the op, and its receipt verifies.
+#[test]
+fn neutral_relink_intent_lowers_and_its_receipt_verifies() {
+    let (words, _) = relink_source();
+    let n = NonZeroU64::new(1).unwrap();
+    // SAFETY: the test is the only editor of this table image.
+    let owner = unsafe { carrick_guest_arch::EditOwner::issue(root(0x1000), n, n) };
+    let range = carrick_guest_arch::UserRange::checked(
+        UserVa::new(RELINK_SRC),
+        carrick_guest_arch::GuestLen::new(4 * PAGE),
+    )
+    .unwrap();
+    let intent = EditIntent::checked(
+        owner,
+        range,
+        EditOperation::Relink {
+            destination: UserVa::new(RELINK_SRC + 16 * PAGE),
+        },
+        &[],
+    )
+    .unwrap();
+    let txn = DescriptorTxn::from_intent(&intent).unwrap();
+    assert_eq!(txn.op, relink(RELINK_SRC + 16 * PAGE));
+    let receipt = execute_descriptor_txn(&words, &txn, root(0x1000), &mut InlineJournal::new());
+    assert_eq!(txn.verify_receipt(&receipt), Ok(()));
+}

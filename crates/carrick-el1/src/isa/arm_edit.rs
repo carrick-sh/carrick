@@ -118,6 +118,10 @@ pub fn lower_edit_intent(intent: EditIntent<'_, RootGpa>) -> Result<DescriptorTx
             ),
         },
         EditOperation::Unmap => DescriptorOp::Retire(span),
+        EditOperation::Relink { destination } => DescriptorOp::Relink {
+            src: span,
+            dst: destination.raw(),
+        },
         _ => return Err(ArchError::Unbound),
     };
     let grants = intent.table_grants();
