@@ -64,11 +64,14 @@ pub(super) fn metadata_roots(root: &Path) -> Result<Vec<BuildRoot>, DebtError> {
                 .iter()
                 .any(|kind| PRODUCT_KINDS.contains(&kind.as_str().unwrap_or("")))
             {
-                let source =
+                let declared =
                     Path::new(target["src_path"].as_str().ok_or_else(|| {
                         DebtError::Policy("missing product target source".into())
-                    })?)
-                    .canonicalize()?;
+                    })?);
+                // A declared root that doesn't exist shares no source.
+                let source = declared
+                    .canonicalize()
+                    .unwrap_or_else(|_| declared.to_path_buf());
                 let relative = source.strip_prefix(root).map_err(|_| {
                     DebtError::Policy("product target source escapes workspace".into())
                 })?;
