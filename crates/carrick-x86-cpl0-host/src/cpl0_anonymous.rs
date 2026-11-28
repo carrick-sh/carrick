@@ -3132,22 +3132,21 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                 };
                 fail(format!("owner grant refused: {:?}; cpu={} mm={} root={:#x} window_va={:#x} window_len={:#x} offered_tables={} receipt_tables_linked={linked:?}", receipt.outcome, pending.execution.cpu.raw(), pending.execution.context.mm.raw(), pending.execution.context.root.address().raw(), pending.window.range.start(), pending.window.range.len(), pending.txn.tables.len()))
             })?;
+        // The ring released the editor before this settlement crossed: the
+        // publish and the private witness judge the leaves by that one custody.
+        let custody = crate::carrier_memory::SettlementCustody::EditorReleased;
         X86Mmu::project_grant(
             pending.txn.root.raw(),
             &pending.txn,
             |native| match &mut pending.backing {
-                GrantBacking::Private { inventory, .. } => self._vm.publish(
-                    native,
-                    publication,
-                    crate::carrier_memory::SettlementCustody::EditorReleased,
-                    &mut **inventory,
-                ),
-                GrantBacking::Window => self._vm.publish(
-                    native,
-                    publication,
-                    crate::carrier_memory::SettlementCustody::EditorReleased,
-                    &mut WindowInventory,
-                ),
+                GrantBacking::Private { inventory, .. } => {
+                    self._vm
+                        .publish(native, publication, custody, &mut **inventory)
+                }
+                GrantBacking::Window => {
+                    self._vm
+                        .publish(native, publication, custody, &mut WindowInventory)
+                }
             },
         )
         .map_err(|error| fail(format!("owner grant projection: {error:?}")))?
@@ -3168,7 +3167,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                     window: pending.window,
                     txn: &pending.txn,
                     publication,
-                    custody: crate::carrier_memory::SettlementCustody::EditorReleased,
+                    custody,
                     peer: pending
                         .peer
                         .combine(crate::cpl0_private_witness::PeerActivity::observe(
