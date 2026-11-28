@@ -32,6 +32,8 @@ pub mod explore;
 #[cfg(any(test, feature = "std"))]
 pub mod ledger;
 #[cfg(any(test, feature = "std"))]
+pub mod loom_ledger;
+#[cfg(any(test, feature = "std"))]
 pub mod mutant;
 #[cfg(test)]
 mod toy;

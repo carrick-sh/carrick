@@ -11,6 +11,7 @@
 //! | OnCpu / OnCpuRequested, adopted thread | Host(park sequence) | first-entry mint refused |
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use super::*;
+use carrick_model::loom_ledger::{LoomLedger, ModelIrq};
 use loom::{model::Builder, sync::Arc, thread};
 use std::boxed::Box;
 
@@ -825,8 +826,13 @@ fn native_hold_races_driver_cpu_publication() {
 /// it looks for an idle slot is on no queue for that scan, so the scan may
 /// sleep past it when the migration then puts it back: the x86 leader-slice
 /// witness hung that way behind a held fork.
-#[test]
-fn migration_and_idle_scan_never_lose_the_queued_thread() {
+///
+/// On the shared ledger (#3061 S1): the scan's pass drains its vector,
+/// probes its wait, scans and halts against [`ModelIrq`]; the migration
+/// publishes the thread for the scan once it is queued again and sends the
+/// vectors its effects owe. I1 fails any execution in which the scan sleeps
+/// past that publication with no vector for it.
+fn migration_vs_idle_scan() {
     // Two preemptions reach the lost wake (the migration pops, the scan
     // runs and sleeps, the migration puts back); a third leaves the
     // exhaustive run past the loom timeout.
@@ -855,20 +861,53 @@ fn migration_and_idle_scan_never_lose_the_queued_thread() {
             })
             .unwrap();
         assert!(zone.requeue_preempted(SLOT, record).is_queued());
+        let ledger = Arc::new(LoomLedger::new());
         let scan_zone = zone.clone();
+        let scan_ledger = ledger.clone();
         let scanner = thread::spawn(move || {
-            if scan_zone.take_idle_work(thief).is_some() {
-                return false;
+            let irq = ModelIrq::new(&scan_ledger);
+            let me = thief.index();
+            irq.drain(me);
+            irq.probe(me);
+            if scan_zone.take_idle_work(thief).is_some() || !scan_zone.enter_idle(thief, true) {
+                return;
             }
-            scan_zone.enter_idle(thief, true)
+            irq.halt(me);
         });
         let mut effects = WakeEffects::default();
         zone.migrate_queued(SLOT, &mut effects);
-        let sleeping = scanner.join().unwrap();
-        assert!(
-            !sleeping || effects.sgi_slots().any(|slot| slot == thief),
-            "the idle slot sleeps with no kick while {:?} waits on slot 0",
-            zone.record(record).claim()
-        );
+        // Queued again (here or on the thief): published for the scan, and
+        // the vectors the migration owes are sent.
+        let irq = ModelIrq::new(&ledger);
+        ledger.publish(SLOT.index(), ModelIrq::wait(thief.index()));
+        for slot in effects.sgi_slots() {
+            irq.send(slot.index());
+        }
+        scanner.join().unwrap();
+        ledger.finish();
     });
+}
+
+#[test]
+fn migration_and_idle_scan_never_lose_the_queued_thread() {
+    migration_vs_idle_scan();
+}
+
+/// Mutant S1 (#3061): with the put-back's kick gone, the model fails, and
+/// on I1 (a lost wake), not on any other check.
+#[test]
+fn put_back_with_no_kick_is_killed_by_i1() {
+    let payload = std::panic::catch_unwind(|| {
+        carrick_model::mutant::with(Mutant::PutBackNoKick, migration_vs_idle_scan)
+    })
+    .expect_err("mutant PutBackNoKick survived the migration/idle-scan model");
+    let message = payload
+        .downcast_ref::<std::string::String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).into()))
+        .unwrap_or_default();
+    assert!(
+        message.starts_with("I1: "),
+        "mutant PutBackNoKick was killed by something other than I1: {message:?}"
+    );
 }

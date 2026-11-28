@@ -484,7 +484,7 @@ test-kernel *ARGS:
 # CI runs it in the Linux `loom` job (PRs and merge groups); `just ci` runs
 # it locally. Runtime takes the host's platform features (Linux has no HVF).
 # Pipe venue lock/wake model waits for N1; see the M2 handoff.
-test-loom *ARGS: (test-loom-a ARGS) (test-loom-b ARGS)
+test-loom *ARGS: (test-loom-a ARGS) (test-loom-b ARGS) (test-loom-c ARGS)
 
 test-loom-a *ARGS:
     {{_admit}} {{_xtask}} loom-run _test-loom-a -- {{ARGS}}
@@ -501,11 +501,20 @@ test-loom-b *ARGS:
 
 [private]
 _test-loom-b *ARGS:
-    {{_admit}} {{_cargo}} test --locked -p carrick-sched-core --features loom --lib loom_models {{ARGS}}
     {{_admit}} {{_cargo}} test --locked -p carrick-kernel --features loom --lib loom_models {{ARGS}}
     {{_admit}} {{_cargo}} test --locked -p carrick-runtime {{_platform_features}} --features loom --lib terminal_clear_loom {{ARGS}}
     {{_admit}} {{_cargo}} test --locked -p carrick-runtime {{_platform_features}} --features loom --lib owner_wait_loom {{ARGS}}
     {{_admit}} {{_cargo}} test --locked -p carrick-core --features loom --lib loom_models {{ARGS}}
+
+# Shard c (#3061): the scheduler's models on the shared wait ledger. Shard b
+# ran about 19.5 minutes of its 20-minute per-binary cap, so new models start
+# here, with a 15-minute target.
+test-loom-c *ARGS:
+    {{_admit}} {{_xtask}} loom-run _test-loom-c -- {{ARGS}}
+
+[private]
+_test-loom-c *ARGS:
+    {{_admit}} {{_cargo}} test --locked -p carrick-sched-core --features loom --lib loom_models {{ARGS}}
 
 # The scripted kernel-semantics suites alone (crates/carrick-kernel-example):
 # two-process Linux semantics against the public kernel API with no VMM, no

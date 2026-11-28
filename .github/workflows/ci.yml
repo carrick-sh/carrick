@@ -1089,7 +1089,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [a, b]
+        shard: [a, b, c]
     timeout-minutes: 60
     env:
       # R2 reader for the compiler cache (#858).
