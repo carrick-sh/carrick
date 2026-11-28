@@ -11,7 +11,7 @@
 //!
 //! - **Always compiled, `no_std`, no alloc:** [`Class`] (with its
 //!   [`Enrolment`] and [`Answer`]), [`Verdict`], [`WaitId`], [`ObjectId`],
-//!   [`InvariantId`], [`OpKind`], [`Step`] and the named stop
+//!   [`InvariantId`], [`OpKind`] (with its [`Effect`]), [`Step`] and the named stop
 //!   points ([`StopPoint`], [`Stops`]). Production outcome types implement
 //!   [`Verdict`] in their own crates, with an exhaustive match, so a new
 //!   variant fails to compile until it is classified.
@@ -51,10 +51,10 @@ pub enum Class {
     /// [`Enrolment`] carries the epoch the actor actually observed, so a
     /// park on a stale observation is a lost wakeup (I1).
     NotNow(Enrolment),
-    /// The operation's observation of the wait went stale (a peer committed
-    /// a publication on it): rerun now. Only a peer's committed publication
-    /// on that same wait pays for it (I4).
-    Rerun(WaitId),
+    /// The operation's observation of the wait went stale: rerun now. The
+    /// [`Enrolment`] is the observation it acted on, and it is paid for only
+    /// if the wait had already moved past it before this step (I4).
+    Rerun(Enrolment),
     /// A broken invariant (`Stale`, `Invalid`, `Quarantined`): fatal.
     Broken,
     /// The operation answered its caller (a Linux result, an errno).
@@ -154,11 +154,12 @@ pub enum InvariantId {
     /// A close wakes every actor enrolled before it, and a later enrolment
     /// on the closed wait doesn't park.
     I3,
-    /// "Not now" never polls: it changes no protocol state and notifies
-    /// nobody, names a wait with a live publisher (runnable, or parked on a
-    /// chain of waits that ends at a runnable one), and probes each
-    /// `(wait, epoch)` at most once between the actor's progress steps; a
-    /// `Rerun` on a wait is paid for by a peer's committed publication on it.
+    /// "Not now" never polls: it changes no protocol state; every parked
+    /// actor, in every state, waits on a wait with a live publisher
+    /// (runnable, or parked on a chain of waits that ends at a runnable
+    /// one); only a committed publication or close of a wait wakes its
+    /// waiters (so a re-probe always sees a moved epoch, by I1); and a
+    /// `Rerun` acts on an observation the wait had already moved past.
     I4,
     /// Broken is fatal and contention is not: a step is `Broken` (or
     /// panics) exactly when it reads a corrupted object.
@@ -167,33 +168,50 @@ pub enum InvariantId {
     Protocol(&'static str),
 }
 
-/// What an operation does to its protocol's waits, for the ledger and the
-/// I2 drain. A publication or a close counts only when its step is `Done`.
+/// What a committed step does to a wait.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Effect {
+    /// Nothing the ledger tracks.
+    None,
+    /// Publishes the wait's release: advances its epoch and wakes its queue.
+    Publish(WaitId),
+    /// Closes the wait: every waiter is woken and no later enrolment parks.
+    Close(WaitId),
+}
+
+/// What an operation is, for the ledger and the I2 drain. Its effect counts
+/// only when its step is `Done`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum OpKind {
-    /// Starts an operation (it may hold something until its finish).
+    /// Starts an operation (it may hold something until its finish). No
+    /// effect.
     Begin,
-    /// Completes an operation in flight, publishing the wait's release if it
-    /// names one. The I2 drain runs only these.
-    Finish(Option<WaitId>),
-    /// Publishes `WaitId`'s release on its own (advances its epoch, wakes
-    /// its queue): a new commit, not a finish, so the I2 drain doesn't run
-    /// it.
-    Publish(WaitId),
-    /// Closes `WaitId`: every waiter is woken and no later enrolment parks.
-    Close(WaitId),
+    /// Completes an operation in flight, with its effect (a two-phase put's
+    /// publication, a two-phase close). The I2 drain runs only these.
+    Finish(Effect),
+    /// A new single-step commit with its effect: not a finish of anything in
+    /// flight, so the I2 drain doesn't run it.
+    Commit(Effect),
     /// Corrupts one object on purpose (an adversarial shell): every later
     /// step that reads it must be `Broken`.
     Corrupt(ObjectId),
 }
 
 impl OpKind {
-    /// The wait a committed step of this kind publishes, if any.
-    pub const fn publishes(self) -> Option<WaitId> {
+    /// This kind's effect on a wait.
+    pub const fn effect(self) -> Effect {
         match self {
-            OpKind::Finish(wait) => wait,
-            OpKind::Publish(wait) | OpKind::Close(wait) => Some(wait),
-            OpKind::Begin | OpKind::Corrupt(_) => None,
+            OpKind::Finish(effect) | OpKind::Commit(effect) => effect,
+            OpKind::Begin | OpKind::Corrupt(_) => Effect::None,
+        }
+    }
+
+    /// The wait a committed step of this kind may notify: the one it
+    /// publishes or closes.
+    pub const fn notifies(self) -> Option<WaitId> {
+        match self.effect() {
+            Effect::Publish(wait) | Effect::Close(wait) => Some(wait),
+            Effect::None => None,
         }
     }
 }

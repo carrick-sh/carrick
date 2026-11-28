@@ -2,7 +2,7 @@
 //! pre-fix behaviour, so a model proves it would have found the bug.
 //!
 //! A crate declares its mutants as one enum, implements the always-compiled
-//! [`Mutant`](crate::Mutant) trait for it with [`mutants!`](crate::mutants), and
+//! [`Mutant`] trait for it with [`mutants!`](crate::mutants), and
 //! gates the branch on its own test builds, so production code can't take
 //! it:
 //!
@@ -76,6 +76,19 @@ pub fn with<M: Mutant, R>(which: M, f: impl FnOnce() -> R) -> R {
         }
     }
     let _restore = Restore(ACTIVE.with(|active| active.replace(Some(slot(which)))));
+    f()
+}
+
+/// Run `f` with no mutant active on this thread, restoring the enclosing
+/// one afterwards (on unwind too).
+pub fn none<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Active>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ACTIVE.with(|active| active.set(self.0));
+        }
+    }
+    let _restore = Restore(ACTIVE.with(|active| active.replace(None)));
     f()
 }
 

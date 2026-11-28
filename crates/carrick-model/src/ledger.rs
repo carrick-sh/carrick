@@ -18,7 +18,7 @@ use std::format;
 use std::string::String;
 use std::vec::Vec;
 
-use crate::{Class, Enrolment, InvariantId, ObjectId, OpKind, WaitId};
+use crate::{Class, Effect, Enrolment, InvariantId, ObjectId, OpKind, WaitId};
 
 /// The step that woke a parked actor.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -42,19 +42,13 @@ pub struct Park {
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
 pub struct WaitLedger {
     parked: BTreeMap<usize, Park>,
-    /// Each actor's unchanged probes since its last progress (`Done`, an
-    /// `Answer`, or a paid `Rerun`).
-    probes: BTreeMap<usize, BTreeSet<(WaitId, u64)>>,
     closed: BTreeSet<WaitId>,
-    /// Every actor that has taken a step.
-    actors: BTreeSet<usize>,
-    /// The waits peers committed a publication on since each actor's last
-    /// step: what pays for its `Rerun`.
-    owed: BTreeMap<usize, BTreeSet<WaitId>>,
     corrupted: BTreeSet<ObjectId>,
     ended: bool,
     /// The step running now, for [`Waker`].
     stepping: Option<Waker>,
+    /// The waits the running step's notifies woke someone on.
+    woke: BTreeSet<WaitId>,
 }
 
 /// A harness invariant the ledger found broken.
@@ -67,8 +61,6 @@ pub(crate) struct Facts {
     pub class: Class,
     /// The protocol state equals its value before the step.
     pub state_unchanged: bool,
-    /// The step called no notify.
-    pub notified_nobody: bool,
     /// The step reads an object a `Corrupt` step corrupted.
     pub reads_corruption: bool,
     /// The step panicked (its class is then `Broken`).
@@ -86,6 +78,7 @@ impl WaitLedger {
         for park in self.parked.values_mut() {
             if park.wait == wait && park.woken.is_none() {
                 park.woken = Some(waker);
+                self.woke.insert(wait);
             }
         }
     }
@@ -123,24 +116,22 @@ impl WaitLedger {
     }
 
     /// Account one step and check the step-local invariants. `epoch` reads
-    /// the state before (`false`) or after (`true`) the step; `publishers`
-    /// lists who in the state before the step can still publish a wait.
+    /// the state before (`false`) or after (`true`) the step.
     pub(crate) fn account(
         &mut self,
         facts: Facts,
         epoch: impl Fn(bool, WaitId) -> u64,
-        publishers: impl Fn(WaitId) -> Vec<usize>,
     ) -> Result<(), Broken> {
         let Facts {
             actor,
             kind,
             class,
             state_unchanged,
-            notified_nobody,
             reads_corruption,
             panic,
         } = facts;
         self.stepping = None;
+        let woke = core::mem::take(&mut self.woke);
         // I5: broken is fatal, contention is not, per object.
         let broken = class == Class::Broken;
         if reads_corruption && !broken {
@@ -162,12 +153,26 @@ impl WaitLedger {
         if broken {
             self.ended = true;
         }
+        // I4: only a committed publication or close of a wait wakes its
+        // waiters. A wake from anything else (a "not now", a step that
+        // publishes another wait) is a spurious wake: the waiter re-probes
+        // an unmoved epoch, which is polling.
+        if let Some(&wait) = woke
+            .iter()
+            .find(|&&wait| class != Class::Done || kind.notifies() != Some(wait))
+        {
+            return Err((
+                InvariantId::I4,
+                format!(
+                    "actor {actor}'s {kind:?} answered {class:?} and woke the waiters of {wait:?}: \
+                     only a committed publication or close of a wait may wake them"
+                ),
+            ));
+        }
         if let (OpKind::Corrupt(object), Class::Done) = (kind, class) {
             self.corrupted.insert(object);
         }
-        self.actors.insert(actor);
         self.parked.remove(&actor);
-        let owed = self.owed.remove(&actor).unwrap_or_default();
         match class {
             Class::NotNow(Enrolment { wait, observed }) => {
                 let now = epoch(true, wait);
@@ -186,35 +191,10 @@ impl WaitLedger {
                         format!("actor {actor}'s \"not now\" on {wait:?} changed the state"),
                     ));
                 }
-                if !notified_nobody {
-                    return Err((
-                        InvariantId::I4,
-                        format!("actor {actor}'s \"not now\" on {wait:?} notified a wait"),
-                    ));
-                }
                 if self.closed.contains(&wait) {
                     return Err((
                         InvariantId::I3,
                         format!("actor {actor} parked on {wait:?} after its close"),
-                    ));
-                }
-                let mut visited = BTreeSet::from([actor]);
-                if !self.live_publisher(wait, &publishers, &mut visited) {
-                    let publishers = publishers(wait);
-                    return Err((
-                        InvariantId::I4,
-                        format!(
-                            "actor {actor} waits on {wait:?}, and no runnable peer will publish it \
-                             (publishers {publishers:?})"
-                        ),
-                    ));
-                }
-                if !self.probes.entry(actor).or_default().insert((wait, now)) {
-                    return Err((
-                        InvariantId::I4,
-                        format!(
-                            "actor {actor} polled {wait:?} at epoch {now} again with no progress between"
-                        ),
                     ));
                 }
                 self.parked.insert(
@@ -226,56 +206,74 @@ impl WaitLedger {
                     },
                 );
             }
-            Class::Rerun(wait) => {
-                if !owed.contains(&wait) {
+            Class::Rerun(Enrolment { wait, observed }) => {
+                if epoch(false, wait) == observed {
                     return Err((
                         InvariantId::I4,
                         format!(
-                            "actor {actor} reran on {wait:?}, and no peer committed a publication \
-                             on it since its last step (peers published {owed:?})"
+                            "actor {actor} reran on {wait:?} observed at epoch {observed}, and the \
+                             wait is still there: nothing moved under the observation"
                         ),
                     ));
                 }
-                self.probes.remove(&actor);
             }
-            Class::Done | Class::Answer(_) => {
-                self.probes.remove(&actor);
-            }
-            Class::Broken => {}
+            Class::Done | Class::Answer(_) | Class::Broken => {}
         }
         // Only a committed step publishes or closes: a "not now" close
         // closes nothing.
-        if class == Class::Done
-            && let Some(wait) = kind.publishes()
-        {
-            // A publication is an epoch advance (a close is its own record:
-            // the closed set, which I3 checks).
-            if !matches!(kind, OpKind::Close(_)) && epoch(true, wait) == epoch(false, wait) {
-                return Err((
-                    InvariantId::I1,
-                    format!(
-                        "actor {actor}'s committed {kind:?} left {wait:?} at epoch {}",
-                        epoch(false, wait)
-                    ),
-                ));
-            }
-            for &peer in &self.actors {
-                if peer != actor {
-                    self.owed.entry(peer).or_default().insert(wait);
-                }
-            }
-            if let OpKind::Close(wait) = kind {
-                self.closed.insert(wait);
-                if let Some((&waiter, _)) = self
-                    .parked
-                    .iter()
-                    .find(|(_, park)| park.wait == wait && park.woken.is_none())
-                {
+        if class == Class::Done {
+            match kind.effect() {
+                Effect::Publish(wait) if epoch(true, wait) == epoch(false, wait) => {
                     return Err((
-                        InvariantId::I3,
-                        format!("the close of {wait:?} left actor {waiter} parked"),
+                        InvariantId::I1,
+                        format!(
+                            "actor {actor}'s committed {kind:?} left {wait:?} at epoch {}",
+                            epoch(false, wait)
+                        ),
                     ));
                 }
+                Effect::Close(wait) => {
+                    self.closed.insert(wait);
+                    if let Some((&waiter, _)) = self
+                        .parked
+                        .iter()
+                        .find(|(_, park)| park.wait == wait && park.woken.is_none())
+                    {
+                        return Err((
+                            InvariantId::I3,
+                            format!("the close of {wait:?} left actor {waiter} parked"),
+                        ));
+                    }
+                }
+                Effect::Publish(_) | Effect::None => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// I4, in every state: every parked, unwoken actor waits on a wait with
+    /// a live publisher in the state reached. Checked after every step, so a
+    /// waiter whose last publisher later finishes without publishing, or
+    /// parks behind it, is stranded there.
+    pub(crate) fn check_stranded(
+        &self,
+        publishers: impl Fn(WaitId) -> Vec<usize>,
+    ) -> Result<(), Broken> {
+        for (&actor, park) in &self.parked {
+            if park.woken.is_some() {
+                continue;
+            }
+            let mut visited = BTreeSet::from([actor]);
+            if !self.live_publisher(park.wait, &publishers, &mut visited) {
+                return Err((
+                    InvariantId::I4,
+                    format!(
+                        "actor {actor} waits on {:?}, and no runnable peer will publish it \
+                         (publishers {:?})",
+                        park.wait,
+                        publishers(park.wait)
+                    ),
+                ));
             }
         }
         Ok(())

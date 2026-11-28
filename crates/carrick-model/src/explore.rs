@@ -49,7 +49,7 @@ pub trait Protocol {
         ledger: &mut WaitLedger,
     ) -> Result<Class, Self::Violation>;
     /// The protocol's own invariants, in the initial state and after every
-    /// step.
+    /// step, the I2 drain's peer finishes and retries included.
     fn check(&self, state: &Self::State) -> Result<(), Self::Violation>;
     /// The name of a protocol invariant's failure (`"V5"`, `"G5"`).
     fn invariant(&self, violation: &Self::Violation) -> &'static str;
@@ -191,7 +191,6 @@ fn advance<P: Protocol>(
         .corruptions()
         .any(|object| protocol.reads(state, op, object));
     next_ledger.begin_step(actor, kind);
-    let before_step = next_ledger.clone();
     let stepped = catch_unwind(AssertUnwindSafe(|| {
         protocol.step(&mut next, op, &mut next_ledger)
     }));
@@ -223,35 +222,32 @@ fn advance<P: Protocol>(
             )
         })?;
     }
-    let notified_nobody = next_ledger == before_step;
     let facts = Facts {
         actor,
         kind,
         class,
         state_unchanged: next == *state,
-        notified_nobody,
         reads_corruption,
         panic,
     };
     next_ledger
-        .account(
-            facts,
-            |after, w| {
-                if after {
-                    protocol.epoch(&next, w)
-                } else {
-                    protocol.epoch(state, w)
-                }
-            },
-            |w| {
-                let mut out = Vec::new();
-                protocol.publishers(state, w, &mut out);
-                out
-            },
-        )
+        .account(facts, |after, w| {
+            if after {
+                protocol.epoch(&next, w)
+            } else {
+                protocol.epoch(state, w)
+            }
+        })
         .map_err(with_class)?;
     next_ledger
         .check_wakes(|w| protocol.epoch(&next, w))
+        .map_err(with_class)?;
+    next_ledger
+        .check_stranded(|w| {
+            let mut out = Vec::new();
+            protocol.publishers(&next, w, &mut out);
+            out
+        })
         .map_err(with_class)?;
     if judge && class == Class::Answer(Answer::Settled) {
         no_false_refusal(protocol, state, ledger, op, bound).map_err(with_class)?;
@@ -293,13 +289,17 @@ fn no_false_refusal<P: Protocol>(
             && drained_ledger.is_runnable(actor)
             && runnable(protocol, &drained, &drained_ledger).contains(&op)
         {
-            let mut retry = drained.clone();
-            let mut retry_ledger = drained_ledger.clone();
-            retry_ledger.begin_step(actor, protocol.kind(op));
-            let retried = catch_unwind(AssertUnwindSafe(|| {
-                protocol.step(&mut retry, op, &mut retry_ledger)
-            }));
-            if let Ok(Ok(Class::Done)) = retried {
+            // The retry is a step like any other: every check runs on it,
+            // and a failure is a counterexample, not a pass.
+            let retried = advance(protocol, &drained, &drained_ledger, op, bound, false).map_err(
+                |(invariant, why, _)| {
+                    (
+                        invariant,
+                        format!("in the I2 drain, retrying {op:?} after the finishes {finishes:?}: {why}"),
+                    )
+                },
+            )?;
+            if retried.2 == Class::Done {
                 return Err((
                     InvariantId::I2,
                     format!(
@@ -570,7 +570,8 @@ pub fn replay_line<P: Protocol, M: Mutant>(protocol: &P, line: &str) -> Verdicts
         drain: parsed.drain,
     };
     match parsed.mutant {
-        None => replay(protocol, &parsed.path, bound),
+        // A clean line replays clean, even inside a mutant's scope.
+        None => mutant::none(|| replay(protocol, &parsed.path, bound)),
         Some(name) => {
             let Some(&which) = M::ALL.iter().find(|m| m.name() == name) else {
                 return Err(refuse(format!("no mutant {name} in {}", P::NAME)));

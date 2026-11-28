@@ -17,7 +17,7 @@ use crate::explore::{
     Bound, Coverage, Protocol, explore, mutants_killed, replay, replay_line, replay_to,
 };
 use crate::ledger::WaitLedger;
-use crate::{Answer, Class, InvariantId, ObjectId, OpKind, WaitId};
+use crate::{Answer, Class, Effect, InvariantId, ObjectId, OpKind, WaitId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Mutant {
@@ -122,8 +122,8 @@ impl Protocol for Toy {
     fn kind(&self, op: Op) -> OpKind {
         match op {
             Op::BeginPut | Op::Take(_) => OpKind::Begin,
-            Op::FinishPut => OpKind::Finish(Some(ITEM)),
-            Op::Close => OpKind::Close(ITEM),
+            Op::FinishPut => OpKind::Finish(Effect::Publish(ITEM)),
+            Op::Close => OpKind::Commit(Effect::Close(ITEM)),
             Op::Corrupt => OpKind::Corrupt(SLOT),
         }
     }
@@ -216,7 +216,7 @@ impl Protocol for Toy {
         if woken.is_some() {
             coverage.note("parked, then woken");
         }
-        if woken.is_some_and(|waker| waker.kind == OpKind::Close(ITEM)) {
+        if woken.is_some_and(|waker| waker.kind == OpKind::Commit(Effect::Close(ITEM))) {
             coverage.note("parked, then woken by the close");
         }
         if ledger.ended() {
@@ -251,10 +251,11 @@ fn the_toy_mailbox_has_its_known_state_count_and_coverage() {
 
 /// The correct mailbox's distinct states (protocol state and ledger) to
 /// [`DEPTH`]. A pin: an explorer or ledger change that moves it must say why.
-/// 582 to 767 (#3181 fixes): the ledger now also holds who woke each park,
-/// the waits a rerun may be paid by, and each actor's probes since its last
-/// progress, so it tells apart states the first ledger merged.
-const TOY_STATES: usize = 767;
+/// 582 to 320 (#3181 fixes): the ledger now holds who woke each park, and
+/// no longer the publication counters or the last "not now" per actor (a
+/// rerun carries its observation, and a spurious wake is refused at the
+/// waker), so it stops telling apart states that differ only in those.
+const TOY_STATES: usize = 320;
 
 #[test]
 fn each_toy_mutant_is_killed_by_its_invariant_at_its_shortest_depth() {
@@ -412,4 +413,31 @@ fn a_wake_by_the_close_is_noted() {
     let mut coverage = Coverage::default();
     Toy.reached(&state, &ledger, &mut coverage);
     assert!(coverage.has("parked, then woken by the close"));
+}
+
+/// A `mutant=none` line replays clean even inside a mutant's scope, and a
+/// line's drain bound is the one the replay runs with (#3181's second
+/// pre-review).
+#[test]
+fn a_replay_line_runs_with_its_own_mutant_and_drain() {
+    // Begin, then Take(1) meets the put in flight: clean, it parks; under
+    // FalseEmpty, it answers.
+    let clean = "CARRICK_MODEL_REPLAY=toy-mailbox:mutant=none:drain=32:0,1";
+    let trace = mutant::with(Mutant::FalseEmpty, || {
+        replay_line::<Toy, Mutant>(&Toy, clean)
+    })
+    .expect("a clean line replays clean");
+    assert_eq!(trace[1].class, Class::NotNow(ITEM.at(0)));
+    let unproven = replay_line::<Toy, Mutant>(
+        &Toy,
+        "CARRICK_MODEL_REPLAY=toy-mailbox:mutant=FalseEmpty:drain=0:0,1",
+    )
+    .expect_err("FalseEmpty answers");
+    assert!(unproven.violation.contains("unproven"), "{unproven:?}");
+    let refused = replay_line::<Toy, Mutant>(
+        &Toy,
+        "CARRICK_MODEL_REPLAY=toy-mailbox:mutant=FalseEmpty:drain=32:0,1",
+    )
+    .expect_err("FalseEmpty answers");
+    assert!(refused.violation.contains("it is Done"), "{refused:?}");
 }
