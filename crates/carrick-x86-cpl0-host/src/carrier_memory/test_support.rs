@@ -2357,3 +2357,129 @@ pub fn prepare_settlement_refuses_a_leaf_outside_its_ceiling(make: fn() -> Memor
     assert_eq!(error.0, "guest MMU publication live descriptor mismatch");
     assert!(quarantined);
 }
+
+/// What the private-anonymous witness reads after an owner grant settled.
+pub struct SettledOwnerGrant {
+    pub memory: CarrierMemory<MemoryTestIo>,
+    pub context: AddressContext<RootGpa>,
+    /// The grant as the ring sent it.
+    pub wire: carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
+    pub publication: GuestMmuPublication,
+    pub backing: BackingIdentity,
+}
+
+/// #3153: the ring applies an owner grant's Prepare (RW, two pages, the
+/// first resident) and releases the MM's editor before the host settles it.
+/// A sibling thread's vfork, which Carrick serves as a copy-on-write fork,
+/// can arm the parent's private leaves in between. Applies the grant from
+/// its wire form and, with `fork_arms`, the fork's `ArmCow`, both through
+/// the production projection and descriptor executor, then settles the
+/// grant through `CarrierMemory::publish` as the owner grant does
+/// ([`SettlementCustody::EditorReleased`]).
+pub fn owner_grant_settled_after_a_fork(
+    make: fn() -> MemoryTestIo,
+    fork_arms: bool,
+) -> SettledOwnerGrant {
+    use carrick_mmu_core::aarch64::descriptor_txn as wire;
+    let mut memory = CarrierMemory::new(make()).unwrap();
+    memory.install(&[backing(0x1000, 0x4000, 1)]).unwrap();
+    let context = AddressContext {
+        root: root(0x1000),
+        mm: MmGeneration::new(nz(1)),
+        generation: ContextGeneration::new(nz(1)),
+    };
+    memory.install_root(nz(1), context).unwrap();
+    let data = backing(0x800000, 2 * PAGE as usize, 2);
+    let identity = data.identity;
+    let tables = [0x2000, 0x3000, 0x4000].map(carrick_mmu_core::aarch64::SubstrateGpa::new);
+    let grant = wire::DescriptorTxn {
+        id: wire::DescriptorTxnId {
+            mm_key: nz(1),
+            generation: nz(1),
+        },
+        root: carrick_mmu_core::aarch64::SubstrateGpa::new(0x1000),
+        op: wire::DescriptorOp::Prepare {
+            publication: carrick_mmu_core::aarch64::GuestLeafPublication {
+                va: 0x4000,
+                ipa: 0x800000,
+                len: 2 * PAGE,
+                writable: true,
+                executable: false,
+            },
+            resident: wire::PageSpan::new(0x4000, PAGE),
+            backing: identity,
+        },
+        tables: wire::TableGrants::new(&tables).unwrap(),
+    };
+    let mut inventory = Inventory {
+        live: true,
+        fail_publish: false,
+        fail_commit: false,
+        fail_rollback: false,
+    };
+    memory.prepare(&[data], &mut inventory).unwrap();
+    let register = context.root.address().raw();
+    let publication =
+        carrick_mmu_core::x86::owner_mmu::X86Mmu::project_grant(register, &grant, |native| {
+            let receipt = execute_descriptor_txn(
+                &memory.words(),
+                native,
+                context.root,
+                &mut InlineJournal::new(),
+            );
+            GuestMmuPublication::from_x86_receipt(native, &receipt)
+        })
+        .unwrap()
+        // The ring applies the grant.
+        .unwrap();
+    if fork_arms {
+        let arm = DescriptorTxn {
+            id: DescriptorTxnId {
+                mm_key: nz(1),
+                generation: nz(2),
+            },
+            root: context.root,
+            tables: &[],
+            op: DescriptorOp::ArmCow(PageSpan::new(0x4000, 2 * PAGE)),
+        };
+        let armed = execute_descriptor_txn(
+            &memory.words(),
+            &arm,
+            context.root,
+            &mut InlineJournal::new(),
+        );
+        assert!(
+            GuestMmuPublication::from_x86_receipt(&arm, &armed).is_some(),
+            "the fork arms the grant's leaves: {:?}",
+            armed.outcome
+        );
+        for va in [0x4000, 0x5000] {
+            let (entry, _) = read_terminal_descriptor(
+                &memory.words(),
+                context.root,
+                carrick_guest_arch::UserVa::new(va),
+            )
+            .unwrap();
+            assert_eq!(entry & (COW | WRITE), COW, "{va:#x}: {entry:#x}");
+        }
+    }
+    carrick_mmu_core::x86::owner_mmu::X86Mmu::project_grant(register, &grant, |native| {
+        memory.publish(
+            native,
+            publication,
+            SettlementCustody::EditorReleased,
+            &mut inventory,
+        )
+    })
+    .unwrap()
+    // #3151: an owner grant settles over leaves a fork armed after the
+    // editor's release.
+    .unwrap();
+    SettledOwnerGrant {
+        memory,
+        context,
+        wire: grant,
+        publication,
+        backing: identity,
+    }
+}
