@@ -208,11 +208,10 @@ impl HostResidencyView {
                 carrick_el1_abi::SplitRowCustody::Declinable,
             )
             .ok()?
-            .into_preclaim();
+            .into_preclaim()?;
         Some(HostResidencyRetirement {
             view: self,
-            preclaim,
-            active: true,
+            preclaim: Some(preclaim),
         })
     }
 }
@@ -221,8 +220,8 @@ impl HostResidencyView {
 /// exact-MM host alias install or unmap transaction.
 pub struct HostResidencyRetirement {
     view: HostResidencyView,
-    preclaim: carrick_el1_abi::ResidencyRetirementPreclaim,
-    active: bool,
+    /// Spent once, by the commit or the drop.
+    preclaim: Option<carrick_el1_abi::ResidencyRetirementPreclaim>,
 }
 
 impl HostResidencyRetirement {
@@ -230,21 +229,16 @@ impl HostResidencyRetirement {
     /// unreachable. Exact-MM exclusion makes a failed commit an invariant error.
     #[must_use]
     pub fn commit(mut self) -> bool {
-        let committed = self
-            .view
-            .table()
-            .commit_preclaimed_retirement(self.preclaim);
-        self.active = false;
-        committed
+        self.preclaim
+            .take()
+            .is_some_and(|preclaim| self.view.table().commit_preclaimed_retirement(preclaim))
     }
 }
 
 impl Drop for HostResidencyRetirement {
     fn drop(&mut self) {
-        if self.active {
-            self.view
-                .table()
-                .cancel_preclaimed_retirement(self.preclaim);
+        if let Some(preclaim) = self.preclaim.take() {
+            self.view.table().cancel_preclaimed_retirement(preclaim);
         }
     }
 }

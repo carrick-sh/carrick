@@ -22,7 +22,8 @@ use std::vec::Vec;
 use super::pause::{self, Point};
 use super::{
     EL1_FRAME_GRANT_TARGET_SIZE, FrameGrantResidencyIdentity, FrameGrantResidencyTable, GRANT_LIVE,
-    GRANT_PAGE_SIZE, GRANT_STATE_MASK, GRANT_WRITING, SplitRowCustody, TransferRange,
+    GRANT_PAGE_SIZE, GRANT_STATE_MASK, GRANT_WRITING, ResidencyTransferRefusal, SplitRowCustody,
+    TransferRange,
 };
 
 const P: u64 = GRANT_PAGE_SIZE;
@@ -332,4 +333,80 @@ fn a_lock_free_reader_never_misses_a_kept_page_mid_resplit() {
         failures.extend(seen.borrow().iter().cloned());
     }
     assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Ruling 4 on #2611: a held lease is "not now". The refusal carries the
+/// release count it observed; once the lease drops, the one probe reports
+/// the release and the rerun is admitted and commits.
+#[test]
+fn a_leased_transfer_is_admitted_once_the_lease_drops() {
+    let table = table();
+    publish_committed(table, row(A, X, 2, 1));
+    let range = TransferRange::new(A, X, X + W, 2 * P).unwrap();
+    let pin = table
+        .pin_transfer(table.lookup(A, X + P).unwrap())
+        .expect("lease");
+    let Err(ResidencyTransferRefusal::Leased(release)) = table.begin_transfer(range) else {
+        panic!("a held lease refuses the transfer as Leased");
+    };
+    assert!(!table.lease_released(release), "no release yet");
+    assert_eq!(writing(table), 0, "the refusal changed nothing");
+    // The lease drops before the refused caller enrols: the probe after
+    // enrolling still sees it, so the wake cannot be missed.
+    drop(pin);
+    assert!(table.lease_released(release), "the probe sees the release");
+    let receipt = table
+        .begin_transfer(range)
+        .expect("the rerun is admitted")
+        .commit()
+        .expect("and commits");
+    assert_eq!(receipt.frames_relinked, 2);
+    assert!(table.is_guest_committed(A, X + W + P));
+}
+
+/// Pre-review of `7dd713aad`, P0 4: `A`'s admission reads its live source
+/// row and pauses before closing it. The row is retired (by a path that
+/// ignores `A`'s editor) and `B` reuses the slot and leases its own row.
+/// `A` must not report `B`'s lease as its contention, must not close `B`'s
+/// row, and moves nothing: a source that disappeared was retired, not
+/// moved.
+#[test]
+fn a_recycled_source_slot_is_neither_closed_nor_contention() {
+    let table = table();
+    let a_row = row(A, X, 1, 1);
+    let a_slot = table.publish(a_row).expect("A's row");
+    let b_row = row(B, X, 1, 2);
+    let b_pin = Rc::new(RefCell::new(None));
+    let admitted = pause::with(
+        {
+            let b_pin = Rc::clone(&b_pin);
+            move |point| {
+                if point == (Point::SourceRead { slot: a_slot }) && b_pin.borrow().is_none() {
+                    assert!(table.retire(a_slot, a_row), "A's row retires");
+                    let b_slot = table.publish(b_row).expect("B's row");
+                    assert_eq!(b_slot, a_slot, "B reuses A's slot");
+                    let pin = table
+                        .pin_transfer(table.lookup(B, X).unwrap())
+                        .expect("B's lease");
+                    *b_pin.borrow_mut() = Some(pin);
+                }
+            }
+        },
+        || {
+            table
+                .begin_transfer(TransferRange::new(A, X, X + W, P).unwrap())
+                .map(|transfer| transfer.commit())
+        },
+    );
+    assert!(b_pin.borrow().is_some(), "A paused at its source read");
+    let receipt = admitted.expect("B's lease is not A's contention");
+    assert_eq!(receipt.map(|r| r.rows_rekeyed), Some(0), "nothing moved");
+    drop(b_pin.borrow_mut().take());
+    assert!(
+        table
+            .begin_retire_overlapping(B, X, P, SplitRowCustody::Reserved)
+            .is_ok(),
+        "B's row is open: A never closed it"
+    );
+    assert_eq!(pages(table, B).get(&X).map(|p| p.0), Some(2));
 }

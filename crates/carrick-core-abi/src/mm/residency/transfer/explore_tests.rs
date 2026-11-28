@@ -227,7 +227,7 @@ fn run(config: Config, stats: &mut Stats) -> Result<(), String> {
             }
             return unchanged(stats, "an DestinationNotHole refusal");
         }
-        Err(ResidencyTransferRefusal::Leased) => {
+        Err(ResidencyTransferRefusal::Leased(_)) => {
             stats.leased += 1;
             if pin.is_none() || dst_populated {
                 return Err(format!("T3: a spurious Leased: {config:?}"));

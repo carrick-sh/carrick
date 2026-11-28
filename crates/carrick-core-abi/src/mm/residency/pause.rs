@@ -18,6 +18,9 @@ pub(super) enum Point {
     Published { slot: usize },
     /// A transfer has just tagged a slot as one of its reservations.
     Tagged { slot: usize },
+    /// A transfer's admission has read a live source row and not yet
+    /// closed it.
+    SourceRead { slot: usize },
 }
 
 #[cfg(test)]

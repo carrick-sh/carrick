@@ -1043,7 +1043,7 @@ pub fn residency_retirement_error(
     use carrick_core_abi::mm::residency::ResidencyRetirementRefusal as Refusal;
     match refusal {
         Refusal::Capacity => GuestRetirementError::ResidencyCapacity,
-        Refusal::InvalidRange | Refusal::Leased => GuestRetirementError::ResidencyBusy,
+        Refusal::InvalidRange | Refusal::Leased(_) => GuestRetirementError::ResidencyBusy,
     }
 }
 
