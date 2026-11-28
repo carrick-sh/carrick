@@ -191,6 +191,13 @@ mod test_support {
     /// IRR: the publication lands exactly between the pass's read and the
     /// rest of the pass, and its vector is the only wake it has.
     pub const INJECT_ORDER_PEER_AFTER_IDLE_READ: u64 = 0xffff_ffff_ffff_fe5c;
+    /// As [`INJECT_ORDER_PEER_AFTER_IDLE_READ`], but this CPU finishes its
+    /// arming only once the peer has run an idle pass after the arming
+    /// vector was sent and before the arming was complete, as a host that
+    /// deschedules this vCPU at the send's exit does (#3136). That pass
+    /// consumed the arming vector: it must still stop, never sleep past the
+    /// arming with no vector left to wake it.
+    pub const INJECT_ORDER_PEER_AFTER_IDLE_READ_LATE_ARM: u64 = 0xffff_ffff_ffff_fe70;
     /// Wake the peer CPU and stop it right after its idle slot is published
     /// IdleWfi, before HLT, until this CPU says it published (#3053). This
     /// CPU then publishes host work on the peer's task with no vector
@@ -285,6 +292,10 @@ mod test_support {
     /// already taken, so the peer's pending-vector check sees it.
     static ORDER_ARM_SENT: core::sync::atomic::AtomicBool =
         core::sync::atomic::AtomicBool::new(false);
+    /// Armed passes of the peer that ran after the arming vector was sent
+    /// and before the arming was complete (#3136).
+    static ORDER_ARMING_PASSES: core::sync::atomic::AtomicU64 =
+        core::sync::atomic::AtomicU64::new(0);
     /// The stopped peer's current task, published at its ordering point.
     static ORDER_PEER_TASK: core::sync::atomic::AtomicUsize =
         core::sync::atomic::AtomicUsize::new(0);
@@ -772,8 +783,11 @@ mod test_support {
         if ORDER_POINT.load(Ordering::Acquire) != point
             || ORDER_SLOT.load(Ordering::Acquire) != slot.raw() + 1
             || ORDER_STATE.load(Ordering::Acquire) != ORDER_ARMED
-            || !ORDER_ARM_SENT.load(Ordering::Acquire)
         {
+            return;
+        }
+        if !ORDER_ARM_SENT.load(Ordering::Acquire) {
+            ORDER_ARMING_PASSES.fetch_add(1, Ordering::AcqRel);
             return;
         }
         // Stop only at a pass that owes no wake already: a vector still
@@ -828,6 +842,7 @@ mod test_support {
     fn arm_peer_order(
         binding: &carrick_el1::isa::x86::context::native::CpuBinding,
         point: u8,
+        late: bool,
     ) -> Option<u64> {
         let peer = carrick_sched_core::SlotId::new(u8::from(binding.cpu_slot == 0));
         if ORDER_STATE.load(Ordering::Acquire) != 0 {
@@ -838,6 +853,13 @@ mod test_support {
         ORDER_STATE.store(ORDER_ARMED, Ordering::Release);
         carrick_el1::isa::x86::interrupt::send_resched(peer)
             .unwrap_or_else(|_| carrick_x86_carrier::entry::fatal_boot!());
+        if late {
+            // The peer's pass, woken by the vector just sent, runs before
+            // the arming completes: the event, never a count of spins.
+            while ORDER_ARMING_PASSES.load(Ordering::Acquire) == 0 {
+                core::hint::spin_loop();
+            }
+        }
         ORDER_ARM_SENT.store(true, Ordering::Release);
         Some(0)
     }
@@ -1595,8 +1617,11 @@ mod test_support {
                 Some(0)
             }
             INJECT_HOLD_RUN_QUEUE_ACROSS_PEER_HLT => hold_run_queue_across_peer_hlt(binding),
-            INJECT_ORDER_PEER_AFTER_IDLE_READ => arm_peer_order(binding, ORDER_AFTER_READ),
-            INJECT_ORDER_PEER_BEFORE_IDLE_HLT => arm_peer_order(binding, ORDER_BEFORE_HLT),
+            INJECT_ORDER_PEER_AFTER_IDLE_READ => arm_peer_order(binding, ORDER_AFTER_READ, false),
+            INJECT_ORDER_PEER_AFTER_IDLE_READ_LATE_ARM => {
+                arm_peer_order(binding, ORDER_AFTER_READ, true)
+            }
+            INJECT_ORDER_PEER_BEFORE_IDLE_HLT => arm_peer_order(binding, ORDER_BEFORE_HLT, false),
             INJECT_ORDER_PEER_REACHED => Some(u64::from(
                 ORDER_STATE.load(Ordering::Acquire) >= ORDER_REACHED,
             )),

@@ -68,6 +68,12 @@
  * two resends, one transition, at the syscall's own return, and one stall
  * (exit 93 or a fatal otherwise).
  *
+ * -DLATE_ARM (#3136): as AFTER_IDLE_READ, but the arming completes only
+ * once the peer has run a pass woken by the arming vector, as a host that
+ * deschedules this vCPU right after the send does. That pass consumed the
+ * vector, so it must still stop at its ordering point: a pass that went on
+ * and slept has no wake left, and the bounded child reaches its bound.
+ *
  * -DIDLE_OWED (#3129 P0 2): every send of this CPU finds the ICR busy, and
  * the scheduler owes the other CPU a reschedule when this CPU's task parks
  * (in a FUTEX_WAIT nobody ends), as a waker whose syscall then blocks
@@ -150,7 +156,11 @@
 #define INJECT_RESCHED_STALL_AFTER_BUSY_SEND 0xfffffffffffffe63
 #define INJECT_RESCHED_TWO_OWED_STALLED    0xfffffffffffffe64
 #define INJECT_RESCHED_OWED_AT_PARK        0xfffffffffffffe65
+#define INJECT_ORDER_PEER_AFTER_IDLE_READ_LATE_ARM 0xfffffffffffffe70
 #define SPIN_USER                          0x1000000
+#ifdef LATE_ARM
+#define AFTER_IDLE_READ 1
+#endif
 #ifdef BUSY_RESCHED
 #define AFTER_IDLE_READ 1
 #endif
@@ -174,7 +184,9 @@ _start:
     mov $94, %edi
     jmp die
 #endif
-#ifdef AFTER_IDLE_READ
+#if defined(LATE_ARM)
+    mov $INJECT_ORDER_PEER_AFTER_IDLE_READ_LATE_ARM, %rax
+#elif defined(AFTER_IDLE_READ)
     mov $INJECT_ORDER_PEER_AFTER_IDLE_READ, %rax
 #else
     mov $INJECT_ORDER_PEER_BEFORE_IDLE_HLT, %rax
