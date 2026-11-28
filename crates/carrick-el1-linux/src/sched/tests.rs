@@ -654,8 +654,53 @@ fn a_timed_wait_ends_in_guest_with_etimedout() {
     assert_eq!(task.execution.task.load(Ordering::Relaxed), 101);
 }
 
+/// #3174: a timed `FUTEX_WAIT_BITSET` carries an absolute deadline on the
+/// clock its op names. Monotonic is the counter's epoch; realtime adds the
+/// zone's published offset, as `clock_gettime(CLOCK_REALTIME)` does. Each
+/// ends in EL1 with ETIMEDOUT, never before its deadline, on the same
+/// timer lease as the relative wait above.
+#[test]
+fn a_timed_bitset_wait_ends_in_guest_at_its_absolute_deadline() {
+    use carrick_personality_linux::sched::FUTEX_WAIT_BITSET_PRIVATE_REALTIME;
+    const OFFSET_NS: u64 = 1_700_000_000_000_000_000;
+    let zone = zone();
+    zone.publish_realtime_offset(OFFSET_NS);
+    let word = AtomicU32::new(0);
+    let uaddr = word.as_ptr() as u64;
+    let task = task_for(101);
+    for (round, (op, epoch)) in [
+        (FUTEX_WAIT_BITSET_PRIVATE, 0),
+        (FUTEX_WAIT_BITSET_PRIVATE_REALTIME, OFFSET_NS),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (mut frame, mut cpu) = live(0xA, uaddr, op, 0);
+        frame.x[5] = u64::from(u32::MAX);
+        let start = cpu.now;
+        let now_ns = (u128::from(start) * 1_000_000_000 / u128::from(cpu.freq)) as u64;
+        let deadline = epoch + now_ns + 1_000_000;
+        let ts = libc_timespec(deadline / 1_000_000_000, deadline % 1_000_000_000);
+        frame.x[3] = &ts as *const [u64; 2] as u64;
+        assert_eq!(
+            serve(&mut frame, &task, &zone, &mut cpu),
+            SWITCHED,
+            "op {op}"
+        );
+        assert_eq!(frame.x[0] as i64, -110, "ETIMEDOUT, op {op}");
+        assert!(
+            cpu.now - start >= cpu.freq / 1000,
+            "not before its deadline, op {op}"
+        );
+        assert_eq!(
+            zone.counters.el1_timeouts.load(Ordering::Relaxed),
+            round as u64 + 1
+        );
+    }
+}
+
 /// A switched-in thread owns its timer lease even when it is not this
-/// vCPU's host record. Invalid timespecs keep their existing refusal.
+/// vCPU's host record. An invalid timespec is Linux's EINVAL, in ring.
 #[test]
 fn switched_in_timed_wait_uses_its_own_timer_lease() {
     let zone = zone();
@@ -665,7 +710,8 @@ fn switched_in_timed_wait_uses_its_own_timer_lease() {
     let bad = libc_timespec(0, 1_000_000_000);
     let (mut frame, mut cpu) = live(0xA, uaddr, FUTEX_WAIT_PRIVATE, 0);
     frame.x[3] = &bad as *const [u64; 2] as u64;
-    assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), None);
+    assert_eq!(serve(&mut frame, &task, &zone, &mut cpu), RETURNED);
+    assert_eq!(frame.x[0] as i64, -22, "EINVAL");
     // Switch B in (A wakes B, then A waits untimed).
     let b = host_park(&zone, 202, uaddr, thread_ctx(0xB, uaddr));
     set_op(&mut frame, uaddr, FUTEX_WAKE_PRIVATE, 1);
@@ -1196,14 +1242,13 @@ fn unserved_futex_operations_forward() {
     let uaddr = word.as_ptr() as u64;
     let task = task_for(101);
     for (op, timeout, count, bitset) in [
-        (0u64, 0u64, 0u64, 0u64),                  // non-private wait
-        (1, 0, 1, 0),                              // non-private wake
-        (FUTEX_WAIT_BITSET_PRIVATE, 0x1000, 0, 1), // absolute timeout
-        (FUTEX_WAKE_PRIVATE, 0, 0, 0),             // wake 0 (the host decides)
-        (FUTEX_WAIT_BITSET_PRIVATE, 0, 0, 0),      // bitset 0 is EINVAL
-        (128 | 3, 0, 1, 0),                        // requeue
-        (128 | 4, 0, 1, 0),                        // cmp_requeue
-        (256 | FUTEX_WAIT_PRIVATE, 0, 0, 0),       // clock-realtime flag
+        (0u64, 0u64, 0u64, 0u64),             // non-private wait
+        (1, 0, 1, 0),                         // non-private wake
+        (FUTEX_WAKE_PRIVATE, 0, 0, 0),        // wake 0 (the host decides)
+        (FUTEX_WAIT_BITSET_PRIVATE, 0, 0, 0), // bitset 0 is EINVAL
+        (128 | 3, 0, 1, 0),                   // requeue
+        (128 | 4, 0, 1, 0),                   // cmp_requeue
+        (256 | FUTEX_WAIT_PRIVATE, 0, 0, 0),  // clock-realtime flag
     ] {
         let (mut frame, mut cpu) = live(0xA, uaddr, op, count);
         frame.x[3] = timeout;
