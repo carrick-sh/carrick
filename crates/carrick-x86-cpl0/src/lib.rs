@@ -278,9 +278,15 @@ mod test_support {
     }
     const ORDER_AFTER_READ: u8 = 1;
     const ORDER_BEFORE_HLT: u8 = 2;
-    const ORDER_ARMED: u8 = 1;
-    const ORDER_REACHED: u8 = 2;
-    const ORDER_PUBLISHED: u8 = 3;
+    /// Armed, with the arming reschedule not yet known sent: a pass that
+    /// sees this waits for [`ORDER_ARMED`], never goes on (#3136).
+    const ORDER_ARMING: u8 = 1;
+    /// Armed, and the arming reschedule was sent: its vector is in the
+    /// peer's IRR or already taken, so the peer's pending-vector check sees
+    /// it.
+    const ORDER_ARMED: u8 = 2;
+    const ORDER_REACHED: u8 = 3;
+    const ORDER_PUBLISHED: u8 = 4;
     /// Which ordering point is armed ([`ORDER_AFTER_READ`] or
     /// [`ORDER_BEFORE_HLT`]), 0 for none.
     static ORDER_POINT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
@@ -288,12 +294,8 @@ mod test_support {
     static ORDER_SLOT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
     static ORDER_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
     static ORDER_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-    /// The arming reschedule was sent: its vector is in the peer's IRR or
-    /// already taken, so the peer's pending-vector check sees it.
-    static ORDER_ARM_SENT: core::sync::atomic::AtomicBool =
-        core::sync::atomic::AtomicBool::new(false);
-    /// Armed passes of the peer that ran after the arming vector was sent
-    /// and before the arming was complete (#3136).
+    /// Passes of the peer that found its ordering point
+    /// [`ORDER_ARMING`] (#3136).
     static ORDER_ARMING_PASSES: core::sync::atomic::AtomicU64 =
         core::sync::atomic::AtomicU64::new(0);
     /// The stopped peer's current task, published at its ordering point.
@@ -782,12 +784,23 @@ mod test_support {
     ) {
         if ORDER_POINT.load(Ordering::Acquire) != point
             || ORDER_SLOT.load(Ordering::Acquire) != slot.raw() + 1
-            || ORDER_STATE.load(Ordering::Acquire) != ORDER_ARMED
         {
             return;
         }
-        if !ORDER_ARM_SENT.load(Ordering::Acquire) {
+        let mut state = ORDER_STATE.load(Ordering::Acquire);
+        if state == ORDER_ARMING {
+            // The arming CPU sent a vector this pass may already have
+            // drained, and has not yet said so (#3136): a pass that went on
+            // here could sleep past the arming with no wake left. Its next
+            // store ends the window; then the pending-vector check below
+            // tells a taken vector from one still to come.
             ORDER_ARMING_PASSES.fetch_add(1, Ordering::AcqRel);
+            while state == ORDER_ARMING {
+                core::hint::spin_loop();
+                state = ORDER_STATE.load(Ordering::Acquire);
+            }
+        }
+        if state != ORDER_ARMED {
             return;
         }
         // Stop only at a pass that owes no wake already: a vector still
@@ -850,7 +863,7 @@ mod test_support {
         }
         ORDER_SLOT.store(peer.raw() + 1, Ordering::Release);
         ORDER_POINT.store(point, Ordering::Release);
-        ORDER_STATE.store(ORDER_ARMED, Ordering::Release);
+        ORDER_STATE.store(ORDER_ARMING, Ordering::Release);
         carrick_el1::isa::x86::interrupt::send_resched(peer)
             .unwrap_or_else(|_| carrick_x86_carrier::entry::fatal_boot!());
         if late {
@@ -860,7 +873,7 @@ mod test_support {
                 core::hint::spin_loop();
             }
         }
-        ORDER_ARM_SENT.store(true, Ordering::Release);
+        ORDER_STATE.store(ORDER_ARMED, Ordering::Release);
         Some(0)
     }
 
