@@ -9,16 +9,19 @@
 //! it, so each protocol models its own production calls and the harness, not
 //! the protocol's author, checks the waits.
 //!
-//! - **Always compiled, `no_std`, no alloc:** [`Class`], [`Verdict`],
-//!   [`WaitId`], [`InvariantId`], [`OpKind`], [`Step`] and the named stop
+//! - **Always compiled, `no_std`, no alloc:** [`Class`] (with its
+//!   [`Enrolment`] and [`Answer`]), [`Verdict`], [`WaitId`], [`ObjectId`],
+//!   [`InvariantId`], [`OpKind`], [`Step`] and the named stop
 //!   points ([`StopPoint`], [`Stops`]). Production outcome types implement
 //!   [`Verdict`] in their own crates, with an exhaustive match, so a new
 //!   variant fails to compile until it is classified.
 //! - **`std` feature (dev-dependencies only):** the breadth-first
 //!   [`explore`](explore::explore) over a [`Protocol`](explore::Protocol),
 //!   the [`WaitLedger`](ledger::WaitLedger) that checks I1 to I5, the
-//!   shortest [`Counterexample`](explore::Counterexample) with a replay line,
-//!   and the seeded-[`mutant`] runner ([`mutants!`] declares the enum).
+//!   shortest [`Counterexample`](explore::Counterexample) with a replay line
+//!   that names its mutant and drain bound
+//!   ([`replay_line`](explore::replay_line), `CARRICK_MODEL_REPLAY`), and
+//!   the seeded-[`mutant`] runner ([`mutants!`] declares the enum).
 //!
 //! Everything is generic: no `dyn`, so a venue that implements [`Stops`] in
 //! a small CPL0 or EL1 frame pays nothing for it.
@@ -43,16 +46,40 @@ mod toy;
 pub enum Class {
     /// The operation took effect.
     Done,
-    /// Contention: the operation keeps its request, enrols on `WaitId`'s
-    /// release, probes once and parks. Never an errno, never fatal.
-    NotNow(WaitId),
-    /// The operation's observation went stale (a peer committed under it):
-    /// rerun now. A peer's committed publication pays for it (I4d).
-    Rerun,
+    /// Contention: the operation keeps its request, enrols on the wait's
+    /// release, probes once and parks. Never an errno, never fatal. The
+    /// [`Enrolment`] carries the epoch the actor actually observed, so a
+    /// park on a stale observation is a lost wakeup (I1).
+    NotNow(Enrolment),
+    /// The operation's observation of the wait went stale (a peer committed
+    /// a publication on it): rerun now. Only a peer's committed publication
+    /// on that same wait pays for it (I4).
+    Rerun(WaitId),
     /// A broken invariant (`Stale`, `Invalid`, `Quarantined`): fatal.
     Broken,
     /// The operation answered its caller (a Linux result, an errno).
-    Answer,
+    Answer(Answer),
+}
+
+/// Why an operation answered its caller instead of waiting.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Answer {
+    /// The answer claims no peer's finish could change it (end of file,
+    /// `ENOENT`). I2 judges it: if a drain of the peers' in-flight finishes
+    /// makes the retry `Done`, it refused contention.
+    Settled,
+    /// Linux's own answer to contention the caller asked not to wait on
+    /// (`EAGAIN` under `O_NONBLOCK`, `EBUSY` from a trylock). I2 leaves it.
+    Declined,
+}
+
+/// A "not now"'s enrolment: the wait, and the epoch of it the actor
+/// observed before it decided to park. In production, the
+/// `ObjectWaitSnapshot` the probe compares against.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct Enrolment {
+    pub wait: WaitId,
+    pub observed: u64,
 }
 
 /// A production outcome's class. Implement it in the outcome's own crate
@@ -97,47 +124,78 @@ impl WaitId {
             kind: WaitKind::Hardware,
         }
     }
+    /// Enrol on this wait, having observed it at `observed`.
+    pub const fn at(self, observed: u64) -> Enrolment {
+        Enrolment {
+            wait: self,
+            observed,
+        }
+    }
 }
+
+/// One object a protocol's state holds, as far as corruption goes: a
+/// `Corrupt` step names the one it corrupts, and a step reads a set of them
+/// (I5 is per object).
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ObjectId(pub u64);
 
 /// The harness's own invariants. A protocol's own (`V1`, `G5`, `L2`, ...)
 /// are [`InvariantId::Protocol`].
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum InvariantId {
-    /// No lost wakeup: an actor parked on `(w, e)` sees `e(w) = e`, or a
-    /// wake for it is pending.
+    /// No lost wakeup: an actor parks only on the epoch it observed, and
+    /// one parked on `(w, e)` sees `e(w) = e`, or a wake for it is pending;
+    /// a committed publication advances its wait's epoch.
     I1,
-    /// No false refusal: an `Answer` that a drain of the peers' finishes and
-    /// publications would turn into `Done` was a refusal of contention.
+    /// No false refusal: a settled `Answer` that some order of the peers'
+    /// in-flight finishes would turn into `Done` was a refusal of
+    /// contention. A drain that runs out of budget proves nothing, and fails.
     I2,
     /// A close wakes every actor enrolled before it, and a later enrolment
     /// on the closed wait doesn't park.
     I3,
-    /// "Not now" never polls: it changes no protocol state, names a wait
-    /// with a publisher, and an actor's next "not now" on the same wait
-    /// follows an epoch advance; a `Rerun` is paid for by a peer.
+    /// "Not now" never polls: it changes no protocol state and notifies
+    /// nobody, names a wait with a live publisher (runnable, or parked on a
+    /// chain of waits that ends at a runnable one), and probes each
+    /// `(wait, epoch)` at most once between the actor's progress steps; a
+    /// `Rerun` on a wait is paid for by a peer's committed publication on it.
     I4,
-    /// Broken is fatal and contention is not: no legal step is `Broken`,
-    /// and the first step that reads a corruption is.
+    /// Broken is fatal and contention is not: a step is `Broken` (or
+    /// panics) exactly when it reads a corrupted object.
     I5,
     /// The protocol's own invariant, by name.
     Protocol(&'static str),
 }
 
 /// What an operation does to its protocol's waits, for the ledger and the
-/// I2 drain.
+/// I2 drain. A publication or a close counts only when its step is `Done`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum OpKind {
     /// Starts an operation (it may hold something until its finish).
     Begin,
-    /// Completes a held operation.
-    Finish,
-    /// Publishes `WaitId`'s release (advances its epoch, wakes its queue).
+    /// Completes an operation in flight, publishing the wait's release if it
+    /// names one. The I2 drain runs only these.
+    Finish(Option<WaitId>),
+    /// Publishes `WaitId`'s release on its own (advances its epoch, wakes
+    /// its queue): a new commit, not a finish, so the I2 drain doesn't run
+    /// it.
     Publish(WaitId),
     /// Closes `WaitId`: every waiter is woken and no later enrolment parks.
     Close(WaitId),
-    /// Corrupts the state on purpose (an adversarial shell): the next step
-    /// that reads it must be `Broken`.
-    Corrupt,
+    /// Corrupts one object on purpose (an adversarial shell): every later
+    /// step that reads it must be `Broken`.
+    Corrupt(ObjectId),
+}
+
+impl OpKind {
+    /// The wait a committed step of this kind publishes, if any.
+    pub const fn publishes(self) -> Option<WaitId> {
+        match self {
+            OpKind::Finish(wait) => wait,
+            OpKind::Publish(wait) | OpKind::Close(wait) => Some(wait),
+            OpKind::Begin | OpKind::Corrupt(_) => None,
+        }
+    }
 }
 
 /// One step of a trace: who ran which operation, and how it ended.

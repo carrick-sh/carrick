@@ -1,12 +1,12 @@
 //! Known answers for the checker itself (#3181 pre-review). Each seeded
-//! broken protocol here is one the first checker passed: every test fails
-//! on `df3815c4d`. Written against that checker's API, as the red witness.
+//! broken protocol here is one the first checker passed: the same tests,
+//! written against its API, fail on `df3815c4d` (commit `45e8b4689`).
 
 use std::vec::Vec;
 
 use crate::explore::{Bound, Protocol, explore};
 use crate::ledger::WaitLedger;
-use crate::{Class, InvariantId, OpKind, WaitId};
+use crate::{Answer, Class, InvariantId, ObjectId, OpKind, WaitId};
 
 const W1: WaitId = WaitId::software(1);
 const W2: WaitId = WaitId::software(2);
@@ -49,7 +49,9 @@ enum SlotOp {
     Put,
 }
 
-struct StaleObservation;
+struct StaleObservation {
+    fixed: bool,
+}
 
 impl Protocol for StaleObservation {
     type State = Slot;
@@ -97,8 +99,19 @@ impl Protocol for StaleObservation {
                 }
                 Class::Done
             }
-            // The bug: it parks on what it observed, without a probe.
-            SlotOp::Settle => Class::NotNow(W1),
+            // The bug: it parks on what it observed, without a probe. The
+            // fixed waiter reruns when the epoch moved under it.
+            SlotOp::Settle if s.full && self.fixed => {
+                s.full = false;
+                s.taken = true;
+                s.observed = None;
+                Class::Done
+            }
+            SlotOp::Settle if self.fixed && s.observed != Some(s.epoch) => {
+                s.observed = None;
+                Class::Rerun(W1)
+            }
+            SlotOp::Settle => Class::NotNow(W1.at(s.observed.unwrap_or(0))),
             SlotOp::Put => {
                 s.put = true;
                 s.full = true;
@@ -117,16 +130,25 @@ impl Protocol for StaleObservation {
     fn epoch(&self, s: &Slot, _: WaitId) -> u64 {
         s.epoch
     }
-    fn has_publisher(&self, _: &Slot, _: WaitId) -> bool {
-        true
+    fn publishers(&self, _: &Slot, _: WaitId, out: &mut Vec<usize>) {
+        out.push(1);
+    }
+    fn reads(&self, _: &Slot, _: SlotOp, _: ObjectId) -> bool {
+        false
     }
 }
 
 #[test]
 fn a_park_on_a_stale_observation_is_a_lost_wakeup() {
     // Observe (empty, epoch 0), Put (epoch 1), Settle parks.
-    let depth = killed_by(&StaleObservation, Bound::depth(4), InvariantId::I1);
+    let depth = killed_by(
+        &StaleObservation { fixed: false },
+        Bound::depth(4),
+        InvariantId::I1,
+    );
     assert_eq!(depth, 3);
+    // The fixed waiter, which reruns on the moved epoch, passes.
+    explore(&StaleObservation { fixed: true }, Bound::depth(6)).expect("the fixed waiter");
 }
 
 /// I2: two peer finishes are in flight. The first releases the resource;
@@ -192,22 +214,21 @@ impl Protocol for Race2 {
     fn kind(&self, op: RaceOp) -> OpKind {
         match op {
             RaceOp::Take => OpKind::Begin,
-            RaceOp::FinishRelease => OpKind::Publish(W1),
-            RaceOp::FinishGrab => OpKind::Finish,
+            RaceOp::FinishRelease => OpKind::Finish(Some(W1)),
+            RaceOp::FinishGrab => OpKind::Finish(None),
         }
     }
     fn step(&self, s: &mut Race, op: RaceOp, ledger: &mut WaitLedger) -> Result<Class, Never> {
         Ok(match op {
             RaceOp::Take => {
-                // The first checker's `Answer` carries no reason, so both
-                // takes answer the same way.
-                let _ = self.nonblocking;
                 s.answered = true;
                 if s.free > 0 {
                     s.free -= 1;
                     Class::Done
+                } else if self.nonblocking {
+                    Class::Answer(Answer::Declined)
                 } else {
-                    Class::Answer
+                    Class::Answer(Answer::Settled)
                 }
             }
             RaceOp::FinishRelease => {
@@ -233,8 +254,13 @@ impl Protocol for Race2 {
     fn epoch(&self, s: &Race, _: WaitId) -> u64 {
         s.epoch
     }
-    fn has_publisher(&self, s: &Race, _: WaitId) -> bool {
-        s.release_in_flight
+    fn publishers(&self, s: &Race, _: WaitId, out: &mut Vec<usize>) {
+        if s.release_in_flight {
+            out.push(1);
+        }
+    }
+    fn reads(&self, _: &Race, _: RaceOp, _: ObjectId) -> bool {
+        false
     }
 }
 
@@ -319,7 +345,7 @@ impl Protocol for UnpaidRerun {
             // The bug: it claims its observation of W1 moved; nothing did.
             UnpaidOp::Try if !s.reran => {
                 s.reran = true;
-                Class::Rerun
+                Class::Rerun(W1)
             }
             UnpaidOp::Try => {
                 s.done = true;
@@ -336,8 +362,11 @@ impl Protocol for UnpaidRerun {
     fn epoch(&self, s: &Unpaid, wait: WaitId) -> u64 {
         if wait == W2 { s.epoch2 } else { 0 }
     }
-    fn has_publisher(&self, _: &Unpaid, _: WaitId) -> bool {
-        true
+    fn publishers(&self, _: &Unpaid, _: WaitId, out: &mut Vec<usize>) {
+        out.push(0);
+    }
+    fn reads(&self, _: &Unpaid, _: UnpaidOp, _: ObjectId) -> bool {
+        false
     }
 }
 
@@ -384,8 +413,8 @@ impl Protocol for Deadlock {
         Ok(match op {
             // Actor 0 waits on W1, which actor 1 publishes; actor 1 waits on
             // W2, which actor 0 publishes.
-            PairOp::WaitForOne => Class::NotNow(W1),
-            PairOp::WaitForZero => Class::NotNow(W2),
+            PairOp::WaitForOne => Class::NotNow(W1.at(0)),
+            PairOp::WaitForZero => Class::NotNow(W2.at(0)),
         })
     }
     fn check(&self, _: &Pair) -> Result<(), Never> {
@@ -397,8 +426,11 @@ impl Protocol for Deadlock {
     fn epoch(&self, _: &Pair, _: WaitId) -> u64 {
         0
     }
-    fn has_publisher(&self, _: &Pair, _: WaitId) -> bool {
-        true
+    fn publishers(&self, _: &Pair, wait: WaitId, out: &mut Vec<usize>) {
+        out.push(if wait == W1 { 1 } else { 0 });
+    }
+    fn reads(&self, _: &Pair, _: PairOp, _: ObjectId) -> bool {
+        false
     }
 }
 
@@ -413,16 +445,21 @@ fn a_wait_whose_only_publisher_is_parked_is_stranded() {
 /// ledger remembered only the last probe.
 #[test]
 fn alternating_unchanged_probes_are_polling() {
+    use crate::ledger::Facts;
     let mut ledger = WaitLedger::default();
-    let mut probe = |ledger: &mut WaitLedger, wait| {
+    let probe = |ledger: &mut WaitLedger, wait: WaitId| {
         ledger.account(
-            0,
-            OpKind::Begin,
-            Class::NotNow(wait),
-            true,
-            false,
-            |_| 0,
-            |_| true,
+            Facts {
+                actor: 0,
+                kind: OpKind::Begin,
+                class: Class::NotNow(wait.at(0)),
+                state_unchanged: true,
+                notified_nobody: true,
+                reads_corruption: false,
+                panic: None,
+            },
+            |_, _| 0,
+            |_| std::vec![1],
         )
     };
     probe(&mut ledger, W1).expect("the first probe of W1 parks");
@@ -451,6 +488,9 @@ enum ObjectsOp {
     ReadB,
     Panic,
 }
+
+const A: ObjectId = ObjectId(1);
+const B: ObjectId = ObjectId(2);
 
 struct WrongObject {
     panics: bool,
@@ -484,7 +524,7 @@ impl Protocol for WrongObject {
     }
     fn kind(&self, op: ObjectsOp) -> OpKind {
         match op {
-            ObjectsOp::CorruptA => OpKind::Corrupt,
+            ObjectsOp::CorruptA => OpKind::Corrupt(A),
             ObjectsOp::ReadB | ObjectsOp::Panic => OpKind::Begin,
         }
     }
@@ -511,11 +551,10 @@ impl Protocol for WrongObject {
     fn epoch(&self, _: &Objects, _: WaitId) -> u64 {
         0
     }
-    fn has_publisher(&self, _: &Objects, _: WaitId) -> bool {
-        false
-    }
-    fn reads_corruption(&self, _: &Objects, _: ObjectsOp) -> bool {
-        false
+    fn publishers(&self, _: &Objects, _: WaitId, _: &mut Vec<usize>) {}
+    fn reads(&self, _: &Objects, op: ObjectsOp, object: ObjectId) -> bool {
+        // ReadB reads only B; nothing reads A.
+        op == ObjectsOp::ReadB && object == B
     }
 }
 
@@ -579,7 +618,8 @@ impl Protocol for StartsBroken {
     fn epoch(&self, _: &Born, _: WaitId) -> u64 {
         0
     }
-    fn has_publisher(&self, _: &Born, _: WaitId) -> bool {
+    fn publishers(&self, _: &Born, _: WaitId, _: &mut Vec<usize>) {}
+    fn reads(&self, _: &Born, _: SlotOp, _: ObjectId) -> bool {
         false
     }
 }
@@ -592,4 +632,120 @@ fn a_protocol_that_starts_broken_fails_at_depth_zero() {
         InvariantId::Protocol("born"),
     );
     assert_eq!(depth, 0);
+}
+
+/// The P1 half: a close that is itself "not now" (its lock is held)
+/// closes nothing, so the consumer parked before it is still legally
+/// parked. The first ledger marked the wait closed on any close attempt
+/// and failed this correct protocol on I3.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct Gate {
+    locked: bool,
+    lock_epoch: u64,
+    closed: bool,
+    item_epoch: u64,
+    answered: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum GateOp {
+    Take,
+    Close,
+    Unlock,
+}
+
+struct BusyClose;
+
+impl Protocol for BusyClose {
+    type State = Gate;
+    type Op = GateOp;
+    type Violation = Never;
+    const NAME: &'static str = "kat-busy-close";
+
+    fn init(&self) -> Gate {
+        Gate {
+            locked: true,
+            lock_epoch: 0,
+            closed: false,
+            item_epoch: 0,
+            answered: false,
+        }
+    }
+    fn enabled(&self, s: &Gate, out: &mut Vec<GateOp>) {
+        if !s.answered {
+            out.push(GateOp::Take);
+        }
+        if !s.closed {
+            out.push(GateOp::Close);
+        }
+        if s.locked {
+            out.push(GateOp::Unlock);
+        }
+    }
+    fn actor(&self, op: GateOp) -> usize {
+        match op {
+            GateOp::Take => 0,
+            GateOp::Close => 1,
+            GateOp::Unlock => 2,
+        }
+    }
+    fn kind(&self, op: GateOp) -> OpKind {
+        match op {
+            GateOp::Take => OpKind::Begin,
+            GateOp::Close => OpKind::Close(W1),
+            GateOp::Unlock => OpKind::Finish(Some(W2)),
+        }
+    }
+    fn step(&self, s: &mut Gate, op: GateOp, ledger: &mut WaitLedger) -> Result<Class, Never> {
+        Ok(match op {
+            GateOp::Take if s.closed => {
+                s.answered = true;
+                Class::Answer(Answer::Settled)
+            }
+            GateOp::Take => Class::NotNow(W1.at(s.item_epoch)),
+            GateOp::Close if s.locked => Class::NotNow(W2.at(s.lock_epoch)),
+            GateOp::Close => {
+                s.closed = true;
+                s.item_epoch += 1;
+                ledger.notify(W1);
+                Class::Done
+            }
+            GateOp::Unlock => {
+                s.locked = false;
+                s.lock_epoch += 1;
+                ledger.notify(W2);
+                Class::Done
+            }
+        })
+    }
+    fn check(&self, _: &Gate) -> Result<(), Never> {
+        Ok(())
+    }
+    fn invariant(&self, v: &Never) -> &'static str {
+        match *v {}
+    }
+    fn epoch(&self, s: &Gate, wait: WaitId) -> u64 {
+        if wait == W1 {
+            s.item_epoch
+        } else {
+            s.lock_epoch
+        }
+    }
+    fn publishers(&self, s: &Gate, wait: WaitId, out: &mut Vec<usize>) {
+        if wait == W1 && !s.closed {
+            out.push(1);
+        }
+        if wait == W2 && s.locked {
+            out.push(2);
+        }
+    }
+    fn reads(&self, _: &Gate, _: GateOp, _: ObjectId) -> bool {
+        false
+    }
+}
+
+#[test]
+fn a_close_that_is_not_now_closes_nothing() {
+    let report = explore(&BusyClose, Bound::depth(6)).expect("a busy close is legal");
+    assert!(report.states > 1);
 }

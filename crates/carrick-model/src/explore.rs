@@ -2,8 +2,8 @@
 //! three explorers (`carrick-core` `mm/own`): every sequence of enabled
 //! operations up to a depth, states deduplicated by equality (a hash
 //! collision never merges two), the protocol's own invariants and the
-//! ledger's I1 to I5 checked after every step. Breadth first, so the first
-//! counterexample found is a shortest one.
+//! ledger's I1 to I5 checked in the initial state and after every step.
+//! Breadth first, so the first counterexample found is a shortest one.
 //!
 //! A protocol models its production calls: its state holds the production
 //! state by value and its steps call the production functions, never a
@@ -13,11 +13,12 @@ use core::fmt;
 use std::boxed::Box;
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::format;
-use std::string::String;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::string::{String, ToString};
 use std::vec::Vec;
 
-use crate::ledger::WaitLedger;
-use crate::{Class, InvariantId, OpKind, Step, WaitId};
+use crate::ledger::{Facts, WaitLedger};
+use crate::{Answer, Class, InvariantId, Mutant, ObjectId, OpKind, Step, WaitId, mutant};
 
 /// A protocol the explorer can run. Generic over its state and operations;
 /// nothing is `dyn`.
@@ -39,25 +40,27 @@ pub trait Protocol {
     fn actor(&self, op: Self::Op) -> usize;
     fn kind(&self, op: Self::Op) -> OpKind;
     /// Run `op`. A production notify calls [`WaitLedger::notify`]. `Err` is
-    /// a protocol invariant broken inside the step.
+    /// a protocol invariant broken inside the step. A panic is caught and
+    /// judged as `Broken` (I5).
     fn step(
         &self,
         state: &mut Self::State,
         op: Self::Op,
         ledger: &mut WaitLedger,
     ) -> Result<Class, Self::Violation>;
-    /// The protocol's own invariants, after every step.
+    /// The protocol's own invariants, in the initial state and after every
+    /// step.
     fn check(&self, state: &Self::State) -> Result<(), Self::Violation>;
     /// The name of a protocol invariant's failure (`"V5"`, `"G5"`).
     fn invariant(&self, violation: &Self::Violation) -> &'static str;
     /// The epoch of `wait` in `state`: in production, the queue's revision.
     fn epoch(&self, state: &Self::State, wait: WaitId) -> u64;
-    /// Whether something in `state` can still publish `wait` (I4b).
-    fn has_publisher(&self, state: &Self::State, wait: WaitId) -> bool;
-    /// Whether `op` reads what a `Corrupt` step corrupted (I5b).
-    fn reads_corruption(&self, _state: &Self::State, _op: Self::Op) -> bool {
-        true
-    }
+    /// The actors that can still publish `wait` in `state` (I4: one of them,
+    /// other than the waiter, must be runnable).
+    fn publishers(&self, state: &Self::State, wait: WaitId, out: &mut Vec<usize>);
+    /// Whether `op` reads `object` (I5 is per object). No default: a wrong
+    /// guess either way hides a bug.
+    fn reads(&self, state: &Self::State, op: Self::Op, object: ObjectId) -> bool;
     /// Record the coverage shapes `state` reaches.
     fn reached(&self, _state: &Self::State, _ledger: &WaitLedger, _coverage: &mut Coverage) {}
 }
@@ -67,7 +70,8 @@ pub trait Protocol {
 pub struct Bound {
     /// The longest operation sequence.
     pub depth: usize,
-    /// How many peer finishes and publications the I2 drain may run.
+    /// How many peer finishes one I2 drain may run, over every order. A
+    /// drain that needs more fails: it proved nothing.
     pub drain: usize,
 }
 
@@ -110,6 +114,8 @@ pub struct Counterexample<Op> {
     pub protocol: &'static str,
     pub invariant: InvariantId,
     pub violation: String,
+    /// Each step with the class it returned; a step that panicked or broke
+    /// a protocol invariant inside itself reads `Broken`.
     pub trace: Vec<Step<Op>>,
     /// The op indices, into each state's enabled list, that replay it.
     pub path: Vec<usize>,
@@ -117,13 +123,22 @@ pub struct Counterexample<Op> {
     pub states: usize,
     /// The seeded mutant that was active, if any.
     pub mutant: Option<&'static str>,
+    /// The I2 drain bound it ran with.
+    pub drain: usize,
 }
 
 impl<Op> Counterexample<Op> {
-    /// `CARRICK_MODEL_REPLAY=<protocol>:i,j,k`, for [`replay`].
+    /// `CARRICK_MODEL_REPLAY=<protocol>:mutant=<name|none>:drain=<n>:i,j,k`,
+    /// which [`replay_line`] (or [`replay_env`]) reruns as it is.
     pub fn replay_line(&self) -> String {
         let path: Vec<String> = self.path.iter().map(|i| format!("{i}")).collect();
-        format!("CARRICK_MODEL_REPLAY={}:{}", self.protocol, path.join(","))
+        format!(
+            "{REPLAY_VAR}={}:mutant={}:drain={}:{}",
+            self.protocol,
+            self.mutant.unwrap_or("none"),
+            self.drain,
+            path.join(",")
+        )
     }
 }
 
@@ -151,46 +166,95 @@ impl<Op: fmt::Debug> fmt::Debug for Counterexample<Op> {
     }
 }
 
-/// One step from `(state, ledger)`, with every check. `Err` names the
-/// broken invariant.
+/// The environment variable [`replay_env`] reads.
+pub const REPLAY_VAR: &str = "CARRICK_MODEL_REPLAY";
+
+/// A checker failure: the invariant, why, and the class the step returned
+/// (`None` when the step itself failed or panicked).
+type Fail = (InvariantId, String, Option<Class>);
+
+/// One step from `(state, ledger)`, with every check. `judge` runs the I2
+/// drain for a settled answer (the drain's own peer steps don't recurse).
 fn advance<P: Protocol>(
     protocol: &P,
     state: &P::State,
     ledger: &WaitLedger,
     op: P::Op,
     bound: Bound,
-) -> Result<(P::State, WaitLedger, Class), (InvariantId, String)> {
+    judge: bool,
+) -> Result<(P::State, WaitLedger, Class), Fail> {
     let mut next = state.clone();
     let mut next_ledger = ledger.clone();
     let actor = protocol.actor(op);
-    let reads = protocol.reads_corruption(state, op);
-    let class = protocol
-        .step(&mut next, op, &mut next_ledger)
-        .map_err(|v| {
+    let kind = protocol.kind(op);
+    let reads_corruption = ledger
+        .corruptions()
+        .any(|object| protocol.reads(state, op, object));
+    next_ledger.begin_step(actor, kind);
+    let before_step = next_ledger.clone();
+    let stepped = catch_unwind(AssertUnwindSafe(|| {
+        protocol.step(&mut next, op, &mut next_ledger)
+    }));
+    let (class, panic) = match stepped {
+        Ok(Ok(class)) => (class, None),
+        Ok(Err(v)) => {
+            return Err((
+                InvariantId::Protocol(protocol.invariant(&v)),
+                format!("{v:?}"),
+                None,
+            ));
+        }
+        Err(payload) => {
+            let why = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| String::from("a non-string panic"));
+            (Class::Broken, Some(why))
+        }
+    };
+    let with_class = |(invariant, why): (InvariantId, String)| (invariant, why, Some(class));
+    if panic.is_none() {
+        protocol.check(&next).map_err(|v| {
             (
                 InvariantId::Protocol(protocol.invariant(&v)),
                 format!("{v:?}"),
+                Some(class),
             )
         })?;
-    protocol.check(&next).map_err(|v| {
-        (
-            InvariantId::Protocol(protocol.invariant(&v)),
-            format!("{v:?}"),
-        )
-    })?;
-    let unchanged = next == *state;
-    next_ledger.account(
+    }
+    let notified_nobody = next_ledger == before_step;
+    let facts = Facts {
         actor,
-        protocol.kind(op),
+        kind,
         class,
-        unchanged,
-        reads,
-        |w| protocol.epoch(&next, w),
-        |w| protocol.has_publisher(state, w),
-    )?;
-    next_ledger.check_wakes(|w| protocol.epoch(&next, w))?;
-    if class == Class::Answer {
-        no_false_refusal(protocol, state, ledger, op, bound)?;
+        state_unchanged: next == *state,
+        notified_nobody,
+        reads_corruption,
+        panic,
+    };
+    next_ledger
+        .account(
+            facts,
+            |after, w| {
+                if after {
+                    protocol.epoch(&next, w)
+                } else {
+                    protocol.epoch(state, w)
+                }
+            },
+            |w| {
+                let mut out = Vec::new();
+                protocol.publishers(state, w, &mut out);
+                out
+            },
+        )
+        .map_err(with_class)?;
+    next_ledger
+        .check_wakes(|w| protocol.epoch(&next, w))
+        .map_err(with_class)?;
+    if judge && class == Class::Answer(Answer::Settled) {
+        no_false_refusal(protocol, state, ledger, op, bound).map_err(with_class)?;
     }
     Ok((next, next_ledger, class))
 }
@@ -206,9 +270,11 @@ fn runnable<P: Protocol>(protocol: &P, state: &P::State, ledger: &WaitLedger) ->
     ops
 }
 
-/// I2: run the peers' enabled finishes and publications until none is
-/// left, then rerun `op`; if it is `Done` there, its `Answer` refused
-/// contention.
+/// I2: from the state before `op` answered, explore every order of the
+/// peers' in-flight finishes (breadth first, every step checked), and retry
+/// `op` in each state reached. A retry that is `Done` means the answer
+/// refused contention. A drain that runs out of budget before it has seen
+/// every order fails: it proved nothing.
 fn no_false_refusal<P: Protocol>(
     protocol: &P,
     state: &P::State,
@@ -217,40 +283,66 @@ fn no_false_refusal<P: Protocol>(
     bound: Bound,
 ) -> Result<(), (InvariantId, String)> {
     let actor = protocol.actor(op);
-    let mut drained = state.clone();
-    let mut drained_ledger = ledger.clone();
-    for _ in 0..bound.drain {
-        let Some(peer) = runnable(protocol, &drained, &drained_ledger)
-            .into_iter()
-            .find(|&peer| {
-                protocol.actor(peer) != actor
-                    && matches!(protocol.kind(peer), OpKind::Finish | OpKind::Publish(_))
-            })
-        else {
-            break;
-        };
-        if protocol
-            .step(&mut drained, peer, &mut drained_ledger)
-            .is_err()
+    let mut seen = HashSet::new();
+    let mut queue = VecDeque::new();
+    seen.insert((state.clone(), ledger.clone()));
+    queue.push_back((state.clone(), ledger.clone(), Vec::new()));
+    let mut budget = bound.drain;
+    while let Some((drained, drained_ledger, finishes)) = queue.pop_front() {
+        if !finishes.is_empty()
+            && drained_ledger.is_runnable(actor)
+            && runnable(protocol, &drained, &drained_ledger).contains(&op)
         {
-            return Ok(());
+            let mut retry = drained.clone();
+            let mut retry_ledger = drained_ledger.clone();
+            retry_ledger.begin_step(actor, protocol.kind(op));
+            let retried = catch_unwind(AssertUnwindSafe(|| {
+                protocol.step(&mut retry, op, &mut retry_ledger)
+            }));
+            if let Ok(Ok(Class::Done)) = retried {
+                return Err((
+                    InvariantId::I2,
+                    format!(
+                        "actor {actor}'s {op:?} answered as settled, but after the peers' \
+                         finishes {finishes:?} it is Done"
+                    ),
+                ));
+            }
+        }
+        for peer in runnable(protocol, &drained, &drained_ledger) {
+            if protocol.actor(peer) == actor || !matches!(protocol.kind(peer), OpKind::Finish(_)) {
+                continue;
+            }
+            if budget == 0 {
+                return Err((
+                    InvariantId::I2,
+                    format!(
+                        "actor {actor}'s settled answer to {op:?} is unproven: the drain ran out \
+                         of its budget of {} peer finishes with orders left",
+                        bound.drain
+                    ),
+                ));
+            }
+            budget -= 1;
+            let mut path = finishes.clone();
+            path.push(peer);
+            let (next, next_ledger, _) =
+                advance(protocol, &drained, &drained_ledger, peer, bound, false).map_err(
+                    |(invariant, why, _)| {
+                        (
+                            invariant,
+                            format!(
+                                "in the I2 drain of {op:?}, after the finishes {path:?}: {why}"
+                            ),
+                        )
+                    },
+                )?;
+            if seen.insert((next.clone(), next_ledger.clone())) {
+                queue.push_back((next, next_ledger, path));
+            }
         }
     }
-    let mut enabled = Vec::new();
-    protocol.enabled(&drained, &mut enabled);
-    if !enabled.contains(&op) {
-        return Ok(());
-    }
-    let mut rerun = drained.clone();
-    match protocol.step(&mut rerun, op, &mut drained_ledger.clone()) {
-        Ok(Class::Done) => Err((
-            InvariantId::I2,
-            format!(
-                "actor {actor}'s {op:?} answered, but after the peers' finishes and publications it is Done"
-            ),
-        )),
-        _ => Ok(()),
-    }
+    Ok(())
 }
 
 /// The protocol's own invariant over its initial state, as a zero-step
@@ -258,6 +350,7 @@ fn no_false_refusal<P: Protocol>(
 fn initial_check<P: Protocol>(
     protocol: &P,
     init: &P::State,
+    bound: Bound,
 ) -> Result<(), Box<Counterexample<P::Op>>> {
     protocol.check(init).map_err(|v| {
         Box::new(Counterexample {
@@ -267,7 +360,8 @@ fn initial_check<P: Protocol>(
             trace: Vec::new(),
             path: Vec::new(),
             states: 1,
-            mutant: None,
+            mutant: mutant::active(),
+            drain: bound.drain,
         })
     })
 }
@@ -280,7 +374,7 @@ pub fn explore<P: Protocol>(
     let root = (protocol.init(), WaitLedger::default());
     // The initial state is checked too: a protocol that starts broken has a
     // zero-step counterexample, the shortest there is.
-    initial_check(protocol, &root.0)?;
+    initial_check(protocol, &root.0, bound)?;
     let mut coverage = Coverage::default();
     protocol.reached(&root.0, &root.1, &mut coverage);
     let mut seen = HashSet::new();
@@ -297,7 +391,7 @@ pub fn explore<P: Protocol>(
             let mut next_trace: Vec<Step<P::Op>> = trace.clone();
             let mut next_path: Vec<usize> = path.clone();
             next_path.push(index);
-            match advance(protocol, &state, &ledger, op, bound) {
+            match advance(protocol, &state, &ledger, op, bound, true) {
                 Ok((next, next_ledger, class)) => {
                     next_trace.push(Step {
                         actor: protocol.actor(op),
@@ -310,11 +404,11 @@ pub fn explore<P: Protocol>(
                         queue.push_back((node, next_trace, next_path));
                     }
                 }
-                Err((invariant, violation)) => {
+                Err((invariant, violation, class)) => {
                     next_trace.push(Step {
                         actor: protocol.actor(op),
                         op,
-                        class: Class::Broken,
+                        class: class.unwrap_or(Class::Broken),
                     });
                     return Err(Box::new(Counterexample {
                         protocol: P::NAME,
@@ -323,7 +417,8 @@ pub fn explore<P: Protocol>(
                         trace: next_trace,
                         path: next_path,
                         states: seen.len(),
-                        mutant: None,
+                        mutant: mutant::active(),
+                        drain: bound.drain,
                     }));
                 }
             }
@@ -339,26 +434,52 @@ pub fn explore<P: Protocol>(
 /// A replayed trace, or the counterexample it reproduces.
 pub type Verdicts<Op> = Result<Vec<Step<Op>>, Box<Counterexample<Op>>>;
 
+/// A replayed trace with the state and ledger it ends in.
+pub type Ending<P> = (
+    Vec<Step<<P as Protocol>::Op>>,
+    <P as Protocol>::State,
+    WaitLedger,
+);
+
 /// Rerun one path of op indices (a [`Counterexample::path`]) with every
-/// check, and return its trace, or the counterexample it reproduces.
+/// check, under whatever mutant is active, and return its trace, or the
+/// counterexample it reproduces.
 pub fn replay<P: Protocol>(protocol: &P, path: &[usize], bound: Bound) -> Verdicts<P::Op> {
+    replay_to(protocol, path, bound).map(|(trace, _, _)| trace)
+}
+
+/// [`replay`], keeping the state and ledger the path ends in.
+pub fn replay_to<P: Protocol>(
+    protocol: &P,
+    path: &[usize],
+    bound: Bound,
+) -> Result<Ending<P>, Box<Counterexample<P::Op>>> {
     let mut state = protocol.init();
-    initial_check(protocol, &state)?;
+    initial_check(protocol, &state, bound)?;
     let mut ledger = WaitLedger::default();
     let mut trace = Vec::new();
+    let failed = |invariant, violation, trace, depth: usize| {
+        Box::new(Counterexample {
+            protocol: P::NAME,
+            invariant,
+            violation,
+            trace,
+            path: path[..=depth].to_vec(),
+            states: 0,
+            mutant: mutant::active(),
+            drain: bound.drain,
+        })
+    };
     for (depth, &index) in path.iter().enumerate() {
         let Some(op) = runnable(protocol, &state, &ledger).get(index).copied() else {
-            return Err(Box::new(Counterexample {
-                protocol: P::NAME,
-                invariant: InvariantId::Protocol("replay"),
-                violation: format!("step {depth}: no enabled op {index}"),
+            return Err(failed(
+                InvariantId::Protocol("replay"),
+                format!("step {depth}: no enabled op {index}"),
                 trace,
-                path: path[..=depth].to_vec(),
-                states: 0,
-                mutant: None,
-            }));
+                depth,
+            ));
         };
-        match advance(protocol, &state, &ledger, op, bound) {
+        match advance(protocol, &state, &ledger, op, bound, true) {
             Ok((next, next_ledger, class)) => {
                 trace.push(Step {
                     actor: protocol.actor(op),
@@ -368,34 +489,102 @@ pub fn replay<P: Protocol>(protocol: &P, path: &[usize], bound: Bound) -> Verdic
                 state = next;
                 ledger = next_ledger;
             }
-            Err((invariant, violation)) => {
+            Err((invariant, violation, class)) => {
                 trace.push(Step {
                     actor: protocol.actor(op),
                     op,
-                    class: Class::Broken,
+                    class: class.unwrap_or(Class::Broken),
                 });
-                return Err(Box::new(Counterexample {
-                    protocol: P::NAME,
-                    invariant,
-                    violation,
-                    trace,
-                    path: path[..=depth].to_vec(),
-                    states: 0,
-                    mutant: None,
-                }));
+                return Err(failed(invariant, violation, trace, depth));
             }
         }
     }
-    Ok(trace)
+    Ok((trace, state, ledger))
 }
 
-/// Parse a replay line's path for `protocol` (`<protocol>:i,j,k`).
-pub fn parse_replay(protocol: &str, line: &str) -> Option<Vec<usize>> {
-    let path = line.strip_prefix(protocol)?.strip_prefix(':')?;
-    if path.is_empty() {
-        return Some(Vec::new());
+/// A parsed replay line.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReplayLine {
+    pub protocol: String,
+    pub mutant: Option<String>,
+    pub drain: usize,
+    pub path: Vec<usize>,
+}
+
+impl ReplayLine {
+    /// Parse `[CARRICK_MODEL_REPLAY=]<protocol>:mutant=<name|none>:drain=<n>:i,j,k`.
+    pub fn parse(line: &str) -> Option<Self> {
+        let line = line
+            .strip_prefix(REPLAY_VAR)
+            .and_then(|rest| rest.strip_prefix('='))
+            .unwrap_or(line);
+        let mut fields = line.splitn(4, ':');
+        let protocol = fields.next()?.to_string();
+        let mutant = fields.next()?.strip_prefix("mutant=")?;
+        let drain = fields.next()?.strip_prefix("drain=")?.parse().ok()?;
+        let path = fields.next()?;
+        let path = if path.is_empty() {
+            Vec::new()
+        } else {
+            path.split(',')
+                .map(|i| i.parse().ok())
+                .collect::<Option<Vec<usize>>>()?
+        };
+        Some(Self {
+            protocol,
+            mutant: (mutant != "none").then(|| mutant.to_string()),
+            drain,
+            path,
+        })
     }
-    path.split(',').map(|i| i.parse().ok()).collect()
+}
+
+/// Rerun a replay line as it is: its protocol, its mutant (one of `M`) and
+/// its drain bound. A line for another protocol, a mutant `M` doesn't name,
+/// or a malformed line is an `Err` that says so.
+pub fn replay_line<P: Protocol, M: Mutant>(protocol: &P, line: &str) -> Verdicts<P::Op> {
+    let refuse = |why: String| {
+        Box::new(Counterexample {
+            protocol: P::NAME,
+            invariant: InvariantId::Protocol("replay"),
+            violation: why,
+            trace: Vec::new(),
+            path: Vec::new(),
+            states: 0,
+            mutant: None,
+            drain: 0,
+        })
+    };
+    let Some(parsed) = ReplayLine::parse(line) else {
+        return Err(refuse(format!("not a replay line: {line}")));
+    };
+    if parsed.protocol != P::NAME {
+        return Err(refuse(format!(
+            "the line replays {}, not {}",
+            parsed.protocol,
+            P::NAME
+        )));
+    }
+    let bound = Bound {
+        depth: parsed.path.len(),
+        drain: parsed.drain,
+    };
+    match parsed.mutant {
+        None => replay(protocol, &parsed.path, bound),
+        Some(name) => {
+            let Some(&which) = M::ALL.iter().find(|m| m.name() == name) else {
+                return Err(refuse(format!("no mutant {name} in {}", P::NAME)));
+            };
+            mutant::with(which, || replay(protocol, &parsed.path, bound))
+        }
+    }
+}
+
+/// [`replay_line`] on `CARRICK_MODEL_REPLAY`, if it is set for `protocol`.
+pub fn replay_env<P: Protocol, M: Mutant>(protocol: &P) -> Option<Verdicts<P::Op>> {
+    let line = std::env::var(REPLAY_VAR).ok()?;
+    let parsed = ReplayLine::parse(&line)?;
+    (parsed.protocol == P::NAME).then(|| replay_line::<P, M>(protocol, &line))
 }
 
 /// Run each seeded mutant and require that its named invariant kills it.
@@ -414,8 +603,13 @@ pub fn mutants_killed<M: Copy + fmt::Debug, Op: fmt::Debug>(
                     report.states
                 ));
             }
-            Err(mut counterexample) => {
-                counterexample.mutant = Some(name);
+            Err(counterexample) => {
+                if counterexample.mutant != Some(name) {
+                    return Err(format!(
+                        "mutant {mutant:?}'s run recorded mutant {:?}: run it under mutant::with",
+                        counterexample.mutant
+                    ));
+                }
                 if counterexample.invariant != expected {
                     return Err(format!(
                         "mutant {mutant:?} was killed by {:?}, not {expected:?}:\n{counterexample:?}",

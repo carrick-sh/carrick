@@ -6,16 +6,18 @@
 //! empty one answers (end of file). An adversarial shell may corrupt the
 //! slot once, and the next take must be `Broken`.
 //!
-//! Five seeded mutants each restore one classic bug, and each must be
+//! Six seeded mutants each restore one classic bug, and each must be
 //! killed by its own invariant, I1 to I5, at a known shortest depth. The
 //! correct protocol's state count is asserted, so a change to the explorer
 //! or the ledger that explores less (or more) shows.
 
 use std::vec::Vec;
 
-use crate::explore::{Bound, Coverage, Protocol, explore, mutants_killed, parse_replay, replay};
+use crate::explore::{
+    Bound, Coverage, Protocol, explore, mutants_killed, replay, replay_line, replay_to,
+};
 use crate::ledger::WaitLedger;
-use crate::{Class, InvariantId, OpKind, WaitId};
+use crate::{Answer, Class, InvariantId, ObjectId, OpKind, WaitId};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Mutant {
@@ -38,6 +40,7 @@ use crate::Mutant as _;
 use crate::mutant;
 
 const ITEM: WaitId = WaitId::software(1);
+const SLOT: ObjectId = ObjectId(0);
 const PRODUCER: usize = 0;
 const SHELL: usize = 3;
 
@@ -119,9 +122,9 @@ impl Protocol for Toy {
     fn kind(&self, op: Op) -> OpKind {
         match op {
             Op::BeginPut | Op::Take(_) => OpKind::Begin,
-            Op::FinishPut => OpKind::Publish(ITEM),
+            Op::FinishPut => OpKind::Finish(Some(ITEM)),
             Op::Close => OpKind::Close(ITEM),
-            Op::Corrupt => OpKind::Corrupt,
+            Op::Corrupt => OpKind::Corrupt(SLOT),
         }
     }
 
@@ -158,14 +161,14 @@ impl Protocol for Toy {
                     s.taken[consumer - 1] += 1;
                     Class::Done
                 } else if s.closed || (s.put_in_flight && mutant::is(Mutant::FalseEmpty)) {
-                    Class::Answer
+                    Class::Answer(Answer::Settled)
                 } else if s.put_in_flight && mutant::is(Mutant::BusyIsBroken) {
                     Class::Broken
                 } else {
                     if mutant::is(Mutant::NotNowCounts) {
                         s.misses += 1;
                     }
-                    Class::NotNow(ITEM)
+                    Class::NotNow(ITEM.at(s.item_epoch))
                 }
             }
             Op::Corrupt => {
@@ -194,23 +197,26 @@ impl Protocol for Toy {
         if wait == ITEM { s.item_epoch } else { 0 }
     }
 
-    fn has_publisher(&self, s: &Mailbox, wait: WaitId) -> bool {
+    fn publishers(&self, s: &Mailbox, wait: WaitId, out: &mut Vec<usize>) {
         // The producer can still put or close.
-        wait == ITEM && !s.closed
+        if wait == ITEM && !s.closed {
+            out.push(PRODUCER);
+        }
     }
 
-    fn reads_corruption(&self, _: &Mailbox, op: Op) -> bool {
-        matches!(op, Op::Take(_))
+    fn reads(&self, _: &Mailbox, op: Op, object: ObjectId) -> bool {
+        object == SLOT && matches!(op, Op::Take(_))
     }
 
     fn reached(&self, s: &Mailbox, ledger: &WaitLedger, coverage: &mut Coverage) {
         if s.taken.iter().all(|&taken| taken > 0) {
             coverage.note("both consumers took an item");
         }
-        if ledger.parked(1).is_some_and(|park| park.woken) {
+        let woken = ledger.parked(1).and_then(|park| park.woken);
+        if woken.is_some() {
             coverage.note("parked, then woken");
         }
-        if s.closed && ledger.parked(1).is_some_and(|park| park.woken) {
+        if woken.is_some_and(|waker| waker.kind == OpKind::Close(ITEM)) {
             coverage.note("parked, then woken by the close");
         }
         if ledger.ended() {
@@ -245,7 +251,10 @@ fn the_toy_mailbox_has_its_known_state_count_and_coverage() {
 
 /// The correct mailbox's distinct states (protocol state and ledger) to
 /// [`DEPTH`]. A pin: an explorer or ledger change that moves it must say why.
-const TOY_STATES: usize = 582;
+/// 582 to 767 (#3181 fixes): the ledger now also holds who woke each park,
+/// the waits a rerun may be paid by, and each actor's probes since its last
+/// progress, so it tells apart states the first ledger merged.
+const TOY_STATES: usize = 767;
 
 #[test]
 fn each_toy_mutant_is_killed_by_its_invariant_at_its_shortest_depth() {
@@ -285,20 +294,11 @@ fn each_toy_mutant_is_killed_by_its_invariant_at_its_shortest_depth() {
     let lengths: Vec<usize> = found.iter().map(|c| c.trace.len()).collect();
     for counterexample in &found {
         std::println!("{counterexample:?}");
-        // The replay line reproduces the same kill.
-        let which = Mutant::ALL
-            .iter()
-            .copied()
-            .find(|m| Some(m.name()) == counterexample.mutant)
-            .unwrap();
+        // The replay line alone reproduces the same kill: no mutant is
+        // active here, the line names it.
         let line = counterexample.replay_line();
-        let path = parse_replay(
-            Toy::NAME,
-            line.strip_prefix("CARRICK_MODEL_REPLAY=").unwrap(),
-        )
-        .expect("a replay line parses");
-        let replayed = mutant::with(which, || replay(&Toy, &path, Bound::depth(DEPTH)))
-            .expect_err("the replay reproduces the kill");
+        let replayed =
+            replay_line::<Toy, Mutant>(&Toy, &line).expect_err("the replay reproduces the kill");
         assert_eq!(replayed.invariant, counterexample.invariant);
         assert_eq!(replayed.trace.len(), counterexample.trace.len());
     }
@@ -310,8 +310,9 @@ fn each_toy_mutant_is_killed_by_its_invariant_at_its_shortest_depth() {
 /// - FalseEmpty: begin, take answers (a drain's finish makes it Done): 2;
 /// - CloseNoWake: take parks, close leaves it parked: 2;
 /// - NotNowCounts: the first take's "not now" writes the state: 1;
-/// - BusyIsBroken: begin, take meets the put in flight as Broken: 2.
-const TOY_KILL_LENGTHS: [usize; 6] = [3, 2, 2, 1, 2, 3];
+/// - BusyIsBroken: begin, take meets the put in flight as Broken: 2;
+/// - SilentPut: begin, finish commits without advancing the epoch: 2.
+const TOY_KILL_LENGTHS: [usize; 6] = [3, 2, 2, 1, 2, 2];
 
 #[test]
 fn a_correct_path_replays_clean() {
@@ -320,7 +321,12 @@ fn a_correct_path_replays_clean() {
     let classes: Vec<Class> = trace.iter().map(|step| step.class).collect();
     assert_eq!(
         classes,
-        [Class::NotNow(ITEM), Class::Done, Class::Done, Class::Done]
+        [
+            Class::NotNow(ITEM.at(0)),
+            Class::Done,
+            Class::Done,
+            Class::Done
+        ]
     );
 }
 
@@ -353,8 +359,11 @@ fn a_replay_line_names_its_mutant_and_drain() {
     let counterexample = mutant::with(Mutant::FalseEmpty, || explore(&Toy, Bound::depth(DEPTH)))
         .expect_err("FalseEmpty is killed");
     let line = counterexample.replay_line();
-    assert!(line.contains("FalseEmpty"), "no mutant in {line}");
+    assert!(line.contains("mutant=FalseEmpty"), "no mutant in {line}");
     assert!(line.contains("drain=32"), "no drain bound in {line}");
+    // Outside the mutant's scope, the line still replays the kill.
+    let replayed = replay_line::<Toy, Mutant>(&Toy, &line).expect_err("the line replays the kill");
+    assert_eq!(replayed.invariant, InvariantId::I2);
 }
 
 /// With no drain budget, an answer during a put in flight is unproven, not
@@ -368,29 +377,23 @@ fn an_exhausted_drain_budget_is_not_a_pass() {
     let explored = mutant::with(Mutant::FalseEmpty, || explore(&Toy, bound));
     let counterexample = explored.expect_err("a partial drain certifies nothing");
     assert_eq!(counterexample.invariant, InvariantId::I2);
+    assert!(
+        counterexample.violation.contains("unproven"),
+        "{counterexample:?}"
+    );
+    // The correct mailbox's settled answers (closed, nothing in flight)
+    // need no drain, so they pass on no budget.
+    explore(&Toy, bound).expect("a settled answer with nothing in flight needs no drain");
 }
 
 /// "Woken by the close" means the close did the wake: here the put woke the
 /// consumer, and then the producer closed.
 #[test]
 fn a_wake_by_an_earlier_put_is_not_a_wake_by_the_close() {
-    let mut state = Toy.init();
-    let mut ledger = WaitLedger::default();
-    for op in [Op::Take(1), Op::BeginPut, Op::FinishPut, Op::Close] {
-        let before = state.clone();
-        let class = Toy.step(&mut state, op, &mut ledger).unwrap();
-        ledger
-            .account(
-                Toy.actor(op),
-                Toy.kind(op),
-                class,
-                state == before,
-                false,
-                |w| Toy.epoch(&state, w),
-                |w| Toy.has_publisher(&before, w),
-            )
-            .unwrap();
-    }
+    // Take(1) parks; begin, finish (the put wakes it); close.
+    let (_, state, ledger) =
+        replay_to(&Toy, &[2, 0, 0, 0], Bound::depth(DEPTH)).expect("a legal path");
+    assert!(ledger.parked(1).is_some_and(|park| park.woken.is_some()));
     let mut coverage = Coverage::default();
     Toy.reached(&state, &ledger, &mut coverage);
     assert!(
@@ -398,4 +401,15 @@ fn a_wake_by_an_earlier_put_is_not_a_wake_by_the_close() {
         "the put woke it: {:?}",
         coverage.shapes().collect::<Vec<_>>()
     );
+}
+
+/// The positive half of the close-wake shape: a close that wakes a parked
+/// consumer is noted.
+#[test]
+fn a_wake_by_the_close_is_noted() {
+    // Take(1) parks; close.
+    let (_, state, ledger) = replay_to(&Toy, &[2, 1], Bound::depth(DEPTH)).expect("a legal path");
+    let mut coverage = Coverage::default();
+    Toy.reached(&state, &ledger, &mut coverage);
+    assert!(coverage.has("parked, then woken by the close"));
 }

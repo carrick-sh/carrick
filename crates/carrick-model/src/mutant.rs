@@ -25,29 +25,51 @@ use core::cell::Cell;
 
 use crate::Mutant;
 
-std::thread_local! {
-    /// The active mutant: its enum's type and its index in `ALL`.
-    static ACTIVE: Cell<Option<(TypeId, usize)>> = const { Cell::new(None) };
+/// The active mutant: its enum's type, its index in `ALL`, and its name
+/// (which a counterexample's replay line carries).
+#[derive(Clone, Copy, Debug)]
+struct Active {
+    ty: TypeId,
+    index: usize,
+    name: &'static str,
 }
 
-fn slot<M: Mutant>(which: M) -> (TypeId, usize) {
+std::thread_local! {
+    static ACTIVE: Cell<Option<Active>> = const { Cell::new(None) };
+}
+
+fn slot<M: Mutant>(which: M) -> Active {
     let index = M::ALL
         .iter()
         .position(|&m| m == which)
         .unwrap_or(usize::MAX);
-    (TypeId::of::<M>(), index)
+    Active {
+        ty: TypeId::of::<M>(),
+        index,
+        name: which.name(),
+    }
 }
 
 /// Whether `which` is the active mutant on this thread.
 pub fn is<M: Mutant>(which: M) -> bool {
-    ACTIVE.with(|active| active.get() == Some(slot(which)))
+    let want = slot(which);
+    ACTIVE.with(|active| {
+        active
+            .get()
+            .is_some_and(|now| now.ty == want.ty && now.index == want.index)
+    })
+}
+
+/// The name of the active mutant on this thread, if any.
+pub fn active() -> Option<&'static str> {
+    ACTIVE.with(|active| active.get().map(|now| now.name))
 }
 
 /// Run `f` with `which` active on this thread. The mutant that was active
 /// before (an enclosing `with`, or none) is restored afterwards, on unwind
 /// too, so a nested scope never disables its outer scope's mutant.
 pub fn with<M: Mutant, R>(which: M, f: impl FnOnce() -> R) -> R {
-    struct Restore(Option<(TypeId, usize)>);
+    struct Restore(Option<Active>);
     impl Drop for Restore {
         fn drop(&mut self) {
             ACTIVE.with(|active| active.set(self.0));
@@ -55,6 +77,18 @@ pub fn with<M: Mutant, R>(which: M, f: impl FnOnce() -> R) -> R {
     }
     let _restore = Restore(ACTIVE.with(|active| active.replace(Some(slot(which)))));
     f()
+}
+
+/// The mutant set of a protocol that has none, for
+/// [`replay_line`](crate::explore::replay_line).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NoMutants {}
+
+impl Mutant for NoMutants {
+    const ALL: &'static [Self] = &[];
+    fn name(self) -> &'static str {
+        match self {}
+    }
 }
 
 /// Implement [`Mutant`](crate::Mutant) for a crate's mutant enum, listing
