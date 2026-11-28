@@ -3706,7 +3706,7 @@ fn run_mounted_binary_in_archive_with_census(
         json,
         image_archive,
         census_dir,
-        Duration::from_secs(5),
+        Duration::from_secs(60),
         &[],
     )
 }

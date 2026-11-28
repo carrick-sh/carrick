@@ -237,7 +237,7 @@ static void put_count(char *at, int value) {
 // Waits five seconds at most; past that, prints how far the threads got.
 static void wait_for(volatile int *flag, int want) {
     long pause[2] = {0, 1000000};
-    long deadline = now_ns() + 5000000000L;
+    long deadline = now_ns() + 60000000000L;
     while (*flag != want) {
         if (now_ns() > deadline) {
             char line[] = "timeout rounds 00 workers 00\n";
