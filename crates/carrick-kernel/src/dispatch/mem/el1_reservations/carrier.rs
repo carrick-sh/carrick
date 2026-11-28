@@ -1,29 +1,54 @@
-//! Bind host reservation views to the exact persistent carrier's mappings.
+//! The one host reservation provider every carrier installs: it binds the
+//! shared reservation views to the exact carrier's EL1 region and its
+//! dynamic metadata aperture. A backend supplies only the metadata access
+//! ([`CarrierReservationAccess`]); the views, the bank provisioning and the
+//! publication backing are shared.
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use carrick_el1::memory::reservations::{
     Refusal, Reservations, ResolvedReservationNodes, RootReleaseVenue, RootWait, SharedReservations,
 };
-use carrick_el1_abi::ReservationMm;
+use carrick_el1_abi::{MetadataExtentResolver, ReservationMm};
 use carrick_guest_mem::HostVa;
+use carrick_hal::retained_metadata::{
+    RetainedMetadataBacking, RetainedMetadataExtent, RetainedMetadataMapper,
+};
 use carrick_host::host_mapping::{HostMappingKind, OwnedHostMapping};
-use carrick_kernel::dispatch::mem::el1_reservations::{
-    HostReservationProvider, PreparedHostReservations,
-};
-use carrick_vmm_hvf::metadata_grant::{
-    CarrierMetadataAccess, HostMetadataExtentPin, RetainedMetadataBacking,
-};
 use parking_lot::Mutex;
 
-pub(super) struct CarrierReservations {
-    access: Arc<CarrierMetadataAccess>,
-    prepared: Mutex<Option<Arc<Prepared>>>,
+use super::{HostReservationProvider, PreparedHostReservations};
+use crate::kernel::mm_occupancy::{AddressSpaceBacking, AddressSpaceRegion};
+
+/// One carrier generation's metadata access: its EL1 region and dynamic
+/// aperture ([`RetainedMetadataMapper`]), the authenticated pin of an extent
+/// EL1 names ([`MetadataExtentResolver`]), its transfer identity, and its
+/// guest COW settlement.
+pub trait CarrierReservationAccess:
+    RetainedMetadataMapper + MetadataExtentResolver + 'static
+{
+    /// The carrier's transfer identity, as its portal is bound to it.
+    fn carrier_identity(&self) -> NonZeroU64;
+
+    /// The carrier's guest COW grant settlement, if it settles any.
+    fn guest_cow_settlement(&self) -> Option<Arc<dyn carrick_el1_abi::CowGrantSettlement>>;
+
+    /// Who serves this carrier's delegated private file pages
+    /// ([`HostReservationProvider::private_file_venue`]): `OwnerGrant` only
+    /// if its owner frame grant serves them.
+    fn private_file_venue(&self) -> carrick_guest_mem::PrivateFileVenue;
+}
+
+/// The reservation provider of one carrier generation.
+pub struct CarrierReservations<A: CarrierReservationAccess> {
+    access: Arc<A>,
+    prepared: Mutex<Option<Arc<Prepared<A>>>>,
     capacity: Mutex<()>,
 }
 
-impl CarrierReservations {
-    pub(super) fn new(access: CarrierMetadataAccess) -> Self {
+impl<A: CarrierReservationAccess> CarrierReservations<A> {
+    pub fn new(access: A) -> Self {
         Self {
             access: Arc::new(access),
             prepared: Mutex::new(None),
@@ -48,19 +73,19 @@ unsafe impl RetainedMetadataBacking for ReservationBankBacking {
     }
 }
 
-struct Prepared {
-    access: Arc<CarrierMetadataAccess>,
-    nodes: ResolvedReservationNodes<HostMetadataExtentPin>,
+struct Prepared<A: CarrierReservationAccess> {
+    access: Arc<A>,
+    nodes: ResolvedReservationNodes<<A as MetadataExtentResolver>::Pin>,
     generation: u32,
 }
 
 // SAFETY: the view is immutable after construction. Its exact carrier and
 // extent pins retain every address. SharedReservations serializes node access
 // through the exact MM root lock; no mutable reference is exposed by this view.
-unsafe impl Send for Prepared {}
-unsafe impl Sync for Prepared {}
+unsafe impl<A: CarrierReservationAccess> Send for Prepared<A> {}
+unsafe impl<A: CarrierReservationAccess> Sync for Prepared<A> {}
 
-fn table(access: &CarrierMetadataAccess) -> Result<&SharedReservations, Refusal> {
+fn table<A: CarrierReservationAccess>(access: &A) -> Result<&SharedReservations, Refusal> {
     let region = access.region().map_err(|_| Refusal::Stale)?;
     // SAFETY: access owns the complete aligned carrier region; the reservation
     // ABI asserts this table fits its assigned region. It starts zero-filled.
@@ -72,10 +97,12 @@ fn table(access: &CarrierMetadataAccess) -> Result<&SharedReservations, Refusal>
     })
 }
 
-impl HostReservationProvider for CarrierReservations {
-    fn address_space_backing(
-        &self,
-    ) -> Option<Arc<dyn carrick_kernel::kernel::mm_occupancy::AddressSpaceBacking>> {
+impl<A: CarrierReservationAccess> HostReservationProvider for CarrierReservations<A> {
+    fn private_file_venue(&self) -> carrick_guest_mem::PrivateFileVenue {
+        self.access.private_file_venue()
+    }
+
+    fn address_space_backing(&self) -> Option<Arc<dyn AddressSpaceBacking>> {
         self.access.region().ok()?;
         Some(Arc::new(CarrierPublicationBacking(Arc::clone(
             &self.access,
@@ -91,7 +118,7 @@ impl HostReservationProvider for CarrierReservations {
             Err(Refusal::MetadataRequired) => {}
             Err(refusal) => return Err(refusal),
         }
-        let table = table(&self.access)?;
+        let table = table(&*self.access)?;
         let generation = table.storage_generation();
         drop(root);
         drop(view);
@@ -114,7 +141,7 @@ impl HostReservationProvider for CarrierReservations {
     }
 
     fn prepare(&self) -> Result<Box<dyn PreparedHostReservations>, Refusal> {
-        let table = table(&self.access)?;
+        let table = table(&*self.access)?;
         let generation = table.storage_generation();
         let mut cached = self.prepared.lock();
         if let Some(view) = cached.as_ref().filter(|view| view.generation == generation) {
@@ -139,9 +166,9 @@ impl HostReservationProvider for CarrierReservations {
     }
 }
 
-struct PreparedView(Arc<Prepared>);
+struct PreparedView<A: CarrierReservationAccess>(Arc<Prepared<A>>);
 
-impl PreparedHostReservations for PreparedView {
+impl<A: CarrierReservationAccess> PreparedHostReservations for PreparedView<A> {
     fn lock(&self, mm: ReservationMm, wait: &dyn RootWait) -> Result<Reservations<'_>, Refusal> {
         let region = self.0.access.region().map_err(|_| Refusal::Stale)?;
         // SAFETY: this is the same owned carrier region as the reservation
@@ -162,13 +189,13 @@ impl PreparedHostReservations for PreparedView {
             >,
         ) {
             carrick_sched_core::LockWait::complete_object_wake(
-                &carrick_kernel::el1_zone::HostLockWait,
+                &crate::el1_zone::HostLockWait,
                 zone,
                 effects,
             );
         }
         RootReleaseVenue::new(
-            table(&self.0.access)?,
+            table(&*self.0.access)?,
             carrick_sched_core::spaces::notification::SpaceReleaseVenue {
                 zone,
                 waker: carrick_sched_core::Waker::Host,
@@ -183,12 +210,10 @@ impl PreparedHostReservations for PreparedView {
 
 /// This physical view retains the exact carrier used for both publication and
 /// cleanup. It contains no process registry or lifecycle policy.
-struct CarrierPublicationBacking(Arc<CarrierMetadataAccess>);
+struct CarrierPublicationBacking<A: CarrierReservationAccess>(Arc<A>);
 // SAFETY: metadata access retains the exact immutable carrier mapping inventory.
-unsafe impl carrick_kernel::kernel::mm_occupancy::AddressSpaceBacking
-    for CarrierPublicationBacking
-{
-    fn region(&self) -> Option<carrick_kernel::kernel::mm_occupancy::AddressSpaceRegion<'_>> {
+unsafe impl<A: CarrierReservationAccess> AddressSpaceBacking for CarrierPublicationBacking<A> {
+    fn region(&self) -> Option<AddressSpaceRegion<'_>> {
         let region = self.0.region().ok()?;
         // SAFETY: the retained access owns the complete aligned ABI region.
         let zone = unsafe {
@@ -197,13 +222,13 @@ unsafe impl carrick_kernel::kernel::mm_occupancy::AddressSpaceBacking
                 .add(carrick_el1_abi::EL1_ZONE_OFFSET as usize)
                 .cast::<carrick_el1_abi::ZoneTables>()
         };
-        Some(carrick_kernel::kernel::mm_occupancy::AddressSpaceRegion {
+        Some(AddressSpaceRegion {
             carrier: self.0.carrier_identity(),
             zone,
-            reservations: table(&self.0).ok()?,
+            reservations: table(&*self.0).ok()?,
         })
     }
     fn settlement(&self) -> Option<Arc<dyn carrick_el1_abi::CowGrantSettlement>> {
-        Some(self.0.guest_cow_settlement())
+        self.0.guest_cow_settlement()
     }
 }

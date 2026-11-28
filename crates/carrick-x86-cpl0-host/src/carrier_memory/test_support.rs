@@ -353,14 +353,16 @@ pub fn physical_alias_unlink_visits_only_touched_edges_at_three_populations(
                 },
             );
         }
-        memory.slots.get_mut(&handle.slot).unwrap().alias_count = population as usize;
+        for _ in 0..population {
+            memory.holds.alias(handle.slot, key(nz(1))).unwrap();
+        }
         memory.remove_aliases(nz(1), PageSpan::new(0x10000 + PAGE, PAGE), context);
         assert_eq!(
             memory.alias_visits, 1,
             "512 unrelated edges cannot amplify unlink"
         );
         assert_eq!(memory.aliases[&nz(1)][&0x10000].span.len, PAGE);
-        assert_eq!(memory.slots[&handle.slot].alias_count, population as usize);
+        assert_eq!(memory.holds.alias_count(handle.slot), population as usize);
     }
 }
 struct TestDrain {
@@ -407,12 +409,11 @@ pub fn drain_failure_retains_slot_and_retirement_failure_reinstalls_same_generat
         mm: MmGeneration::new(nz(1)),
         generation: ContextGeneration::new(nz(1)),
     };
+    memory.holds.alias(handle.slot, key(nz(1))).unwrap();
     memory
-        .slots
-        .get_mut(&handle.slot)
-        .unwrap()
-        .drains
-        .push(context);
+        .holds
+        .unalias(handle.slot, key(nz(1)), SlotDrain(context))
+        .unwrap();
     let mut drain = TestDrain {
         calls: 0,
         fail: true,
@@ -714,7 +715,7 @@ pub fn inherited_inventory_edges_authorize_only_selected_child_pages(_make: fn()
             .is_err(),
         "private inheritance must reject writable parent and child aliases"
     );
-    assert_eq!(memory.slots[&data.slot].alias_count, 1);
+    assert_eq!(memory.holds.alias_count(data.slot), 1);
     let shared = memory
         .select_inherited_frames(
             contexts[0],
@@ -831,7 +832,7 @@ pub fn inherited_inventory_edges_authorize_only_selected_child_pages(_make: fn()
         2,
         "inheritance must not allocate a memslot"
     );
-    assert_eq!(memory.slots[&data.slot].alias_count, 2);
+    assert_eq!(memory.holds.alias_count(data.slot), 2);
     assert!(
         memory
             .attach_inherited_frame(
@@ -895,7 +896,8 @@ pub fn inherited_inventory_edges_authorize_only_selected_child_pages(_make: fn()
         contexts[0],
     );
     assert_eq!(
-        memory.slots[&data.slot].alias_count, 1,
+        memory.holds.alias_count(data.slot),
+        1,
         "child retains physical custody after parent unlink"
     );
     let mut drain = TestDrain {
@@ -1132,8 +1134,11 @@ impl RetireFixture {
     /// A descriptor alias of `mm` naming `handle` (as `publish` records one).
     fn alias(&mut self, mm: u64, handle: BackingHandle, va: u64, inherited: Option<u64>) {
         let key = self.key(mm);
+        self.memory
+            .holds
+            .alias(handle.slot, super::key(key))
+            .unwrap();
         let slot = self.memory.slots.get_mut(&handle.slot).unwrap();
-        slot.alias_count += 1;
         if let Some(gpa) = inherited {
             slot.inherited_identities
                 .insert((key, gpa), slot.backing.identity);
@@ -1152,17 +1157,61 @@ impl RetireFixture {
     /// records one).
     fn owe_drain(&mut self, mm: u64, handle: BackingHandle) {
         let context = self.context(mm);
+        let key = key(self.key(mm));
+        self.memory.holds.alias(handle.slot, key).unwrap();
         self.memory
-            .slots
-            .get_mut(&handle.slot)
-            .unwrap()
-            .drains
-            .push(context);
-        self.memory
-            .drained_by
-            .entry(self.key(mm))
-            .or_default()
-            .insert(handle.slot);
+            .holds
+            .unalias(handle.slot, key, SlotDrain(context))
+            .unwrap();
+    }
+
+    /// Publish one fresh inventory row of a fresh frame in `mm` at `gpa`.
+    fn map_frame(&self, mm: u64, gpa: u64) -> (carrick_hal::FrameId, carrick_hal::MappingId) {
+        use carrick_hal::{
+            FrameEventCapacity, FrameInventoryEvent, FrameLength, MappingGeneration,
+        };
+        let mut reservation = self
+            .authority
+            .reserve(
+                &self.ids,
+                1,
+                1,
+                FrameEventCapacity::for_event_count(2).unwrap(),
+            )
+            .unwrap();
+        let transaction = reservation.transaction();
+        let frame = reservation.claim_frame().unwrap();
+        let mapping = reservation.claim_mapping().unwrap();
+        let generation = MappingGeneration::from_backend_counter(nz(1));
+        reservation
+            .push(FrameInventoryEvent::PrepareMapping {
+                transaction,
+                frame,
+                mapping,
+                generation,
+                gpa: carrick_guest_mem::Gpa::new(gpa),
+                length: FrameLength::from_mapping_extent(nz(PAGE)),
+                permissions: carrick_hal::MemPerms {
+                    read: true,
+                    write: true,
+                    exec: false,
+                },
+            })
+            .unwrap();
+        reservation
+            .push(FrameInventoryEvent::PublishMapping {
+                transaction,
+                mapping,
+                generation,
+            })
+            .unwrap();
+        self.authority
+            .apply(
+                carrick_kernel::kernel::FrameOwner::GuestMm(self.context(mm).into()),
+                reservation.commit(()),
+            )
+            .unwrap();
+        (frame, mapping)
     }
 
     fn retire(&mut self, mm: u64) -> Result<RetiredChild, MemoryError> {
@@ -1176,25 +1225,24 @@ impl RetireFixture {
     }
 
     fn allowed(&self, handle: BackingHandle) -> Vec<NonZeroU64> {
-        self.memory.record(handle).unwrap().allowed.clone()
+        self.memory
+            .holds
+            .admitted(handle.slot)
+            .iter()
+            .map(|mm| mm.raw())
+            .collect()
+    }
+    fn alias_count(&self, handle: BackingHandle) -> usize {
+        self.memory.holds.alias_count(handle.slot)
+    }
+    /// The slots `mm` holds anything in.
+    fn held_by(&self, mm: u64) -> BTreeSet<u32> {
+        self.memory.holds.held_by(key(self.key(mm))).collect()
     }
 
-    /// `admitted` equals the slots whose `allowed` names each MM.
+    /// The hold ledger's index matches its holds (H1 to H3).
     fn assert_admitted_exact(&self) {
-        let mut derived: BTreeMap<NonZeroU64, BTreeSet<u32>> = BTreeMap::new();
-        for (index, slot) in &self.memory.slots {
-            for mm in &slot.allowed {
-                derived.entry(*mm).or_default().insert(*index);
-            }
-        }
-        let indexed: BTreeMap<_, _> = self
-            .memory
-            .admitted
-            .iter()
-            .filter(|(_, slots)| !slots.is_empty())
-            .map(|(mm, slots)| (*mm, slots.clone()))
-            .collect();
-        assert_eq!(indexed, derived);
+        self.memory.holds.check_invariants().unwrap();
     }
 }
 
@@ -1227,24 +1275,24 @@ pub fn retire_child_revokes_private_slots_and_keeps_slots_a_live_parent_shares(
     assert_eq!(fixture.memory.slot_count(), slots - 1);
     let kept = fixture.memory.record(shared).unwrap();
     assert_eq!(
-        kept.allowed,
+        fixture.allowed(shared),
         vec![fixture.key(1)],
         "child left the shared slot"
     );
-    assert_eq!(kept.alias_count, 0);
+    assert_eq!(fixture.alias_count(shared), 0);
     assert!(kept.inherited_identities.is_empty());
-    // Drains of the retired context are gone through `drained_by`; the
-    // live parent's drain debt is untouched.
-    assert_eq!(kept.drains, vec![fixture.context(1)]);
-    assert!(!fixture.memory.drained_by.contains_key(&fixture.key(2)));
+    // Drains of the retired context are gone with its holds; the live
+    // parent's drain debt is untouched.
     assert_eq!(
-        fixture.memory.drained_by.get(&fixture.key(1)),
-        Some(&BTreeSet::from([shared.slot]))
+        fixture.memory.holds.drains(shared.slot),
+        [SlotDrain(fixture.context(1))]
     );
+    assert!(fixture.held_by(2).is_empty());
+    assert_eq!(fixture.held_by(1), BTreeSet::from([shared.slot]));
     assert!(fixture.memory.root(fixture.key(2)).is_none());
     assert!(fixture.memory.root(fixture.key(1)).is_some());
     assert!(!fixture.memory.aliases.contains_key(&fixture.key(2)));
-    assert!(!fixture.memory.admitted.contains_key(&fixture.key(2)));
+    assert!(fixture.held_by(2).is_empty());
     fixture.assert_admitted_exact();
     assert!(!fixture.memory.is_quarantined());
 }
@@ -1265,8 +1313,8 @@ pub fn grandchild_inherits_a_slot_after_its_parent_retired(_make: fn() -> Memory
         }
     );
     let kept = fixture.memory.record(inherited).unwrap();
-    assert_eq!(kept.allowed, vec![fixture.key(3)]);
-    assert_eq!(kept.alias_count, 1);
+    assert_eq!(fixture.allowed(inherited), vec![fixture.key(3)]);
+    assert_eq!(fixture.alias_count(inherited), 1);
     assert_eq!(
         kept.inherited_identities
             .keys()
@@ -1287,57 +1335,114 @@ pub fn grandchild_inherits_a_slot_after_its_parent_retired(_make: fn() -> Memory
     );
     assert!(fixture.memory.record(inherited).is_err());
     fixture.assert_admitted_exact();
-    assert!(fixture.memory.admitted.is_empty());
+    assert!(fixture.held_by(2).is_empty() && fixture.held_by(3).is_empty());
 }
 
-pub fn refused_retire_child_mutates_nothing_and_its_retry_completes(_make: fn() -> MemoryTestIo) {
-    use carrick_hal::{FrameEventCapacity, FrameInventoryEvent, FrameLength, MappingGeneration};
-    let mut fixture = RetireFixture::new(2, _make);
-    // The child's private frame is still mapped in the inventory: the
-    // carrier must refuse before touching any of its own state.
-    let child = fixture.context(2);
-    let mut reservation = fixture
-        .authority
-        .reserve(
-            &fixture.ids,
-            1,
-            1,
-            FrameEventCapacity::for_event_count(2).unwrap(),
-        )
-        .unwrap();
-    let transaction = reservation.transaction();
-    let frame = reservation.claim_frame().unwrap();
-    let mapping = reservation.claim_mapping().unwrap();
-    let generation = MappingGeneration::from_backend_counter(nz(1));
-    reservation
-        .push(FrameInventoryEvent::PrepareMapping {
-            transaction,
-            frame,
-            mapping,
-            generation,
-            gpa: carrick_guest_mem::Gpa::new(0x800000),
-            length: FrameLength::from_mapping_extent(nz(PAGE)),
-            permissions: carrick_hal::MemPerms {
-                read: true,
-                write: true,
-                exec: false,
-            },
-        })
-        .unwrap();
-    reservation
-        .push(FrameInventoryEvent::PublishMapping {
-            transaction,
-            mapping,
-            generation,
-        })
-        .unwrap();
+/// #3127: a slot whose owner retired goes with whichever inheritor drops
+/// its last hold, whether that hold was an alias or the drain debt of an
+/// unmap, and no retirement refuses or waits on another. Owner 1 holds
+/// slots A and B; inheritors 2 and 3 alias both. 2 unmaps B and 3 unmaps
+/// A (the cross-unmap shape that once refused both retirements), then
+/// each retires.
+pub fn an_owner_retired_slot_goes_with_the_retirement_that_drops_its_last_hold(
+    _make: fn() -> MemoryTestIo,
+) {
+    let mut fixture = RetireFixture::new(3, _make);
+    let a = fixture.slot(0x800000, 91, &[1]);
+    let b = fixture.slot(0x900000, 92, &[1]);
+    for (mm, va) in [(2, 0x4000), (3, 0x4000)] {
+        fixture.alias(mm, a, va, Some(0x800000));
+        fixture.alias(mm, b, va + PAGE, Some(0x900000));
+    }
+    let slots = fixture.memory.slot_count();
+    let owner = fixture.retire(1).unwrap();
+    assert_eq!(owner.revoked_slots, 0, "the inheritors still alias both");
+    // Each inheritor unmaps the other's slot: the production unlink.
+    let (two, three) = (fixture.context(2), fixture.context(3));
     fixture
-        .authority
-        .apply(
-            carrick_kernel::kernel::FrameOwner::GuestMm(child.into()),
-            reservation.commit(()),
-        )
-        .unwrap();
+        .memory
+        .remove_aliases(fixture.key(2), PageSpan::new(0x4000 + PAGE, PAGE), two);
+    fixture
+        .memory
+        .remove_aliases(fixture.key(3), PageSpan::new(0x4000, PAGE), three);
+    assert!(!fixture.memory.is_quarantined());
+    fixture.assert_admitted_exact();
+    // 2 still aliases A and owes B a drain; 3 aliases B and owes A one.
+    let second = fixture.retire(2).unwrap();
+    assert_eq!(second.revoked_slots, 0, "3 still holds both");
+    assert_eq!(fixture.memory.slot_count(), slots);
+    let last = fixture.retire(3).unwrap();
+    assert_eq!(
+        last,
+        RetiredChild {
+            aliases: 1,
+            revoked_slots: 2
+        },
+        "A's last hold was 3's drain debt, B's was 3's alias"
+    );
+    assert!(fixture.memory.record(a).is_err() && fixture.memory.record(b).is_err());
+    assert_eq!(fixture.memory.slot_count(), slots - 2);
+    assert!(fixture.held_by(2).is_empty() && fixture.held_by(3).is_empty());
+    fixture.assert_admitted_exact();
+    assert!(!fixture.memory.is_quarantined());
+}
+
+/// #3132 P0: a slot released by its last holder's drain debt, whose frame
+/// another MM still maps with no hold on the slot (a broken ledger), is
+/// never revoked. Owner 1 owns slot A; inheritor 2 aliases it, the owner
+/// retires, then 2 unmaps (its COW repoint off A), so 2's drain debt is
+/// A's last hold. MM 3 still has a published row of A's frame. 2's
+/// retirement must see that row although it is another MM's, refuse to
+/// revoke A, and quarantine the carrier: no holder is left to wait for.
+pub fn a_released_slot_whose_frame_another_mm_maps_quarantines_the_carrier(
+    _make: fn() -> MemoryTestIo,
+) {
+    let mut fixture = RetireFixture::new(3, _make);
+    let (frame, _) = fixture.map_frame(3, 0x800000);
+    let mut prepared = backing(0x800000, PAGE as usize, 91);
+    prepared.identity.frame_id = nz(frame.raw());
+    let a = fixture.slot_with(prepared, &[1]);
+    fixture.alias(2, a, 0x4000, Some(0x800000));
+    let owner = fixture.retire(1).unwrap();
+    assert_eq!(owner.revoked_slots, 0, "2 still aliases A");
+    let two = fixture.context(2);
+    fixture
+        .memory
+        .remove_aliases(fixture.key(2), PageSpan::new(0x4000, PAGE), two);
+    assert_eq!(
+        fixture.memory.holds.drains(a.slot),
+        [SlotDrain(two)],
+        "2's drain debt is A's last hold"
+    );
+    assert!(!fixture.memory.is_quarantined());
+
+    let refused = fixture.retire(2);
+
+    assert!(
+        refused.is_err(),
+        "A was revoked under MM 3's live row: {refused:?}"
+    );
+    assert!(fixture.memory.record(a).is_ok(), "A stays registered");
+    assert!(
+        fixture.memory.is_quarantined(),
+        "a broken invariant is fatal"
+    );
+    // Nothing moved before the refusal.
+    assert!(fixture.memory.root(fixture.key(2)).is_some());
+    assert_eq!(fixture.held_by(2), BTreeSet::from([a.slot]));
+}
+
+/// The retiring MM's own private frame is still mapped when the carrier
+/// retires it: production releases the inventory side first
+/// (`release_child_mm`), so a live row here means the ledger and the
+/// inventory disagree. The slot has no holder left to wait for, so the
+/// carrier quarantines (fatal) instead of refusing for a retry that could
+/// only loop, and it moves nothing before it does.
+pub fn a_released_slot_its_retiring_mm_still_maps_quarantines_the_carrier(
+    _make: fn() -> MemoryTestIo,
+) {
+    let mut fixture = RetireFixture::new(2, _make);
+    let (frame, mapping) = fixture.map_frame(2, 0x800000);
     let mut prepared = backing(0x800000, PAGE as usize, 91);
     prepared.identity.frame_id = nz(frame.raw());
     prepared.identity.mapping_id = nz(mapping.raw());
@@ -1347,41 +1452,30 @@ pub fn refused_retire_child_mutates_nothing_and_its_retry_completes(_make: fn() 
     fixture.owe_drain(2, shared);
 
     assert!(fixture.retire(2).is_err());
+    assert!(
+        fixture.memory.is_quarantined(),
+        "a broken invariant is fatal"
+    );
     // Nothing moved: root, aliases, drains and admissions all intact.
     assert!(fixture.memory.root(fixture.key(2)).is_some());
+    assert!(fixture.memory.record(private).is_ok());
     assert_eq!(fixture.allowed(private), vec![fixture.key(2)]);
     assert_eq!(
         fixture.allowed(shared),
         vec![fixture.key(1), fixture.key(2)]
     );
-    assert_eq!(fixture.memory.record(shared).unwrap().alias_count, 1);
+    assert_eq!(fixture.alias_count(shared), 1);
     assert_eq!(
-        fixture.memory.record(shared).unwrap().drains,
-        vec![fixture.context(2)]
+        fixture.memory.holds.drains(shared.slot),
+        [SlotDrain(fixture.context(2))]
     );
-    assert!(fixture.memory.drained_by.contains_key(&fixture.key(2)));
     assert_eq!(
-        fixture.memory.admitted.get(&fixture.key(2)),
-        Some(&BTreeSet::from([private.slot, shared.slot]))
+        fixture.held_by(2),
+        BTreeSet::from([private.slot, shared.slot])
     );
-    assert!(!fixture.memory.is_quarantined());
-
-    // Once the inventory side releases the MM, the same call completes.
-    fixture
-        .inventory()
-        .retire_mm(MmGeneration::new(fixture.key(2)))
-        .unwrap();
-    let retired = fixture.retire(2).unwrap();
-    assert_eq!(
-        retired,
-        RetiredChild {
-            aliases: 1,
-            revoked_slots: 1
-        }
-    );
-    assert!(fixture.memory.record(private).is_err());
-    assert_eq!(fixture.allowed(shared), vec![fixture.key(1)]);
     fixture.assert_admitted_exact();
+    // Quarantined: no later edit, the same retirement included, proceeds.
+    assert!(fixture.retire(2).is_err());
 }
 
 /// Returns the first carrier refusal instead of panicking: this harness is
@@ -1566,6 +1660,7 @@ pub fn inherited_inventory_edge_survives_protect_advancing_mapping_generation(
                 user: true,
             },
             exec: carrick_mmu_core::x86::descriptor_txn::ExecAuthority::Leaf,
+            cow_ceiling: None,
             absent: carrick_guest_arch::AbsentLeaves::Refuse,
         },
     };
@@ -1697,9 +1792,8 @@ pub fn retire_child_keeps_a_shared_file_window_slot_for_the_run(_make: fn() -> M
         },
         "a window slot outlives the MMs that mapped it"
     );
-    let kept = fixture.memory.record(window).unwrap();
-    assert!(kept.allowed.is_empty());
-    assert_eq!(kept.alias_count, 0);
+    assert!(fixture.allowed(window).is_empty());
+    assert_eq!(fixture.alias_count(window), 0);
     assert_eq!(fixture.memory.slot_count(), slots);
     fixture.assert_admitted_exact();
     assert!(!fixture.memory.is_quarantined());
@@ -1779,7 +1873,7 @@ pub fn forked_shared_file_window_leaf_is_never_an_inventoried_frame(_make: fn() 
             memory.publish(&txn, publication, &mut inventory).unwrap();
         }
     }
-    assert_eq!(memory.slots[&window.slot].alias_count, 1);
+    assert_eq!(memory.holds.alias_count(window.slot), 1);
     let selection = carrick_el1_abi::PortalForkCustody::Frame {
         va: 0x4000,
         ipa: base,
@@ -1845,11 +1939,14 @@ pub fn forked_shared_file_window_leaf_is_never_an_inventoried_frame(_make: fn() 
         "the parent is never its own child"
     );
     memory.attach_inherited_window(contexts[1], &edge).unwrap();
-    let slot = &memory.slots[&window.slot];
-    assert_eq!(slot.alias_count, 2, "parent and child each map the window");
     assert_eq!(
-        slot.allowed,
-        vec![contexts[0].mm.raw(), contexts[1].mm.raw()]
+        memory.holds.alias_count(window.slot),
+        2,
+        "parent and child each map the window"
+    );
+    assert_eq!(
+        memory.holds.admitted(window.slot),
+        [key(contexts[0].mm.raw()), key(contexts[1].mm.raw())]
     );
     assert!(
         memory.attach_inherited_window(contexts[1], &edge).is_err(),
@@ -1869,8 +1966,10 @@ pub fn forked_shared_file_window_leaf_is_never_an_inventoried_frame(_make: fn() 
             revoked_slots: 0
         }
     );
-    let slot = memory.record(window).unwrap();
-    assert_eq!(slot.alias_count, 1);
-    assert_eq!(slot.allowed, vec![contexts[0].mm.raw()]);
+    assert_eq!(memory.holds.alias_count(window.slot), 1);
+    assert_eq!(
+        memory.holds.admitted(window.slot),
+        [key(contexts[0].mm.raw())]
+    );
     assert!(!memory.is_quarantined());
 }

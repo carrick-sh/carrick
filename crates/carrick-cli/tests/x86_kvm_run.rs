@@ -710,6 +710,35 @@ fn mounted_static_x86_fork_cow_arena_chunks_retire_with_their_last_inheritor() {
     );
 }
 
+/// #3127: the same, when the grandchild first replaces every inherited
+/// page (its own COW, which repoints it off the child's chunks) and then
+/// unmaps the range. Its last hold on the chunks is then the drain debt of
+/// those unlinks rather than an alias, and the chunks must still retire
+/// with it: by the end of the run the carrier holds no more memslots than
+/// without a grandchild.
+#[test]
+fn mounted_static_x86_fork_cow_arena_chunks_retire_after_their_last_inheritor_unmaps() {
+    let Some(plain) = fork_child_cow_pages(4096, "x86-fork-cow-plain-u", Duration::from_secs(30))
+    else {
+        return;
+    };
+    let unmapped = fork_child_cow_pages_with(
+        4096,
+        &["-DGRANDCHILD", "-DUNMAP"],
+        "x86-fork-cow-grandchild-unmap",
+        Duration::from_secs(30),
+    )
+    .expect("kvm");
+    eprintln!("#3127 memslots: plain {plain:?}, grandchild unmapped {unmapped:?}");
+    assert!(
+        unmapped.live <= plain.live,
+        "the unmapping grandchild run ended holding {} memslots against {} without it: \
+         chunks whose last holder was an unmap's drain debt stayed registered",
+        unmapped.live,
+        plain.live
+    );
+}
+
 /// #3099: past KVM's memslot limit (32764 here). One memslot per COW page
 /// ended the carrier ("carrier memslot capacity") partway through the
 /// child's stores; from the arena the run matches native.
@@ -2121,6 +2150,165 @@ fn mounted_static_x86_munmap_split_keeps_residency_when_the_table_is_full() {
     );
 }
 
+/// `mremap` of private anonymous rows, in the root and in a forked child
+/// beside its live parent (#3152): grow in place, shrink, and grow by move
+/// past a blocker, each with Linux's address and bytes. Before #3152 the x86
+/// ring had no `mremap` arm and every shape answered a counted ENOSYS.
+#[test]
+fn mounted_static_x86_mremap_grows_shrinks_and_moves_anonymous_rows_as_native() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("mremap-anonymous-growth");
+    compile_assembly_with_flags(
+        "x86_mremap_anonymous_growth.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native mremap oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+    assert_eq!(native.stdout, b"mremap ok\n", "native oracle");
+    let guest = run_mounted_binary(&elf, "mremap-anonymous-growth", false);
+    assert_eq!(
+        (guest.status.code(), guest.stdout.as_slice()),
+        (native.status.code(), native.stdout.as_slice()),
+        "11-14 a root shape (grow in place, shrink, grow by move, the moved \
+         source vacant), 21-24 the child's, 25 the child's shrink of its \
+         inherited row, 33 a parent row the child changed, 9 \
+         a setup map; the errno or bad value is printed. stdout: {} \
+         stderr: {}",
+        String::from_utf8_lossy(&guest.stdout),
+        String::from_utf8_lossy(&guest.stderr)
+    );
+}
+
+/// `mremap` of an old range that is not one mapping (#3171), in the root and
+/// in a forked child beside its live parent, answered as native Linux
+/// answers each shape: a shrink across mappings of the same type, of
+/// different protections or sharing, or over holes, returns `old_address`
+/// and retires the whole tail; a same-size call returns `old_address`;
+/// only an unmapped `old_address` is EFAULT, before any effect; growth
+/// across mappings is EFAULT. Each line carries the result and which of the
+/// four pages are vacant afterwards. Before #3171 the ring left the
+/// cross-mapping shrinks unrouted (a counted ENOSYS, `r=-38`).
+#[test]
+fn mounted_static_x86_mremap_shrink_across_mappings_answers_as_native() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("mremap-shrink-across-mappings");
+    compile_assembly_with_flags(
+        "x86_mremap_shrink_across_mappings.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native mremap shrink oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+    let native_lines = String::from_utf8_lossy(&native.stdout);
+    assert!(
+        native_lines.starts_with("child\n")
+            && native_lines.contains("rw_then_r_shrink_1 r=0 v=0111 h=1\n")
+            && native_lines.contains("hole_at_start_shrink_1 r=-14 v=1000 h=-\n"),
+        "native oracle: {native_lines}"
+    );
+    let guest = run_mounted_binary(&elf, "mremap-shrink-across-mappings", false);
+    assert_eq!(
+        (guest.status.code(), String::from_utf8_lossy(&guest.stdout)),
+        (native.status.code(), native_lines.clone()),
+        "lines after `child` are the forked child's; r=-38 is an unrouted \
+         shape. stderr: {}",
+        String::from_utf8_lossy(&guest.stderr)
+    );
+}
+
+/// A counted in-ring refusal appears in the run's compat report (#3152).
+/// The ring answers `tuxcall` (x86_64 184, never implemented by Linux)
+/// with ENOSYS, as Linux does, and counts it; before #3152 the report was built only from host
+/// dispatch and showed no gap for such a run.
+#[test]
+fn mounted_static_x86_ring_refusal_appears_in_the_compat_report() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("unrouted-syscall-counted");
+    compile_assembly_with_flags(
+        "x86_unrouted_syscall_counted.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native tuxcall oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+    assert_eq!(native.stdout, b"U\n", "native oracle");
+    let guest = run_mounted_binary(&elf, "unrouted-syscall-counted", true);
+    assert_eq!(
+        guest.status.code(),
+        Some(7),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&guest.stdout),
+        String::from_utf8_lossy(&guest.stderr)
+    );
+    let envelope = guest
+        .stdout
+        .strip_prefix(b"U\n")
+        .expect("guest tuxcall output");
+    let report: serde_json::Value = serde_json::from_slice(envelope).unwrap();
+    let rows = report["report"]["ring_refused_syscalls"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no ring refusals in the report: {}", report["report"]));
+    // `tuxcall` has no canonical syscall, so the ring counts it in its
+    // overflow bucket (native 512, "unknown"): two calls, one root row.
+    assert!(
+        rows.iter().any(|row| row["native"] == 512
+            && row["name"] == "unknown"
+            && row["caller"] == "root"
+            && row["count"] == 2),
+        "two tuxcalls are one root ring-refusal row of count 2: {rows:?}"
+    );
+    let summary = &report["report"]["summary"];
+    assert_eq!(
+        summary["distinct_ring_refused_syscalls"],
+        rows.len(),
+        "{summary}"
+    );
+    let invocations: u64 = rows
+        .iter()
+        .map(|row| {
+            row["count"]
+                .as_u64()
+                .expect("every row has a numeric count")
+        })
+        .sum();
+    assert_eq!(
+        summary["ring_refused_invocations"].as_u64(),
+        Some(invocations),
+        "{summary}"
+    );
+}
+
 #[test]
 fn mounted_static_x86_exec_refuses_before_replacement_identity() {
     if skip_without_kvm() {
@@ -3527,6 +3715,43 @@ fn compare_mounted_binary_with_native(
     assert!(run.stderr.is_empty());
 }
 
+/// Run a native oracle with stdin at /dev/null, bounded by `deadline`.
+fn output_with_null_stdin(
+    mut command: std::process::Command,
+    deadline: Duration,
+    what: &str,
+) -> std::process::Output {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn {what}: {error}"));
+    let mut stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let out = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let err = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let status = match child.wait_timeout(deadline).unwrap() {
+        Some(status) => status,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{what} did not exit within {deadline:?}");
+        }
+    };
+    std::process::Output {
+        status,
+        stdout: out.join().unwrap().unwrap(),
+        stderr: err.join().unwrap().unwrap(),
+    }
+}
+
 fn run_mounted_binary(elf: &std::path::Path, run_id: &str, json: bool) -> std::process::Output {
     run_mounted_binary_with_capture(elf, run_id, json).0
 }
@@ -3666,8 +3891,11 @@ fn run_mounted_binary_within(
         command.args(["--volume", volume]);
     }
     command.arg("x86-kvm-hello:latest");
+    // The guest's stdin is /dev/null whatever the harness's stdin is, so a
+    // fixture that observes fd 0 sees what its native oracle sees.
     command
         .process_group(0)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = command
@@ -5431,10 +5659,15 @@ fn mounted_static_x86_root_select_host_descriptors_match_native() {
     let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/x86_root_select_host.c");
     x86_process_entry::compile_static_fixture(&source, &elf, &[]);
-    let native = Command::new(&elf)
-        .timeout(Duration::from_secs(10))
-        .output()
-        .expect("run native root-select-host oracle");
+    // The fixture selects on stdin, so the oracle's stdin is /dev/null, as
+    // the guest's is. `assert_cmd` gives the oracle a pipe it closes only
+    // once its wait begins: a select that ran before that saw an idle pipe,
+    // and the verdict followed host load.
+    let native = output_with_null_stdin(
+        std::process::Command::new(&elf),
+        Duration::from_secs(10),
+        "native root-select-host oracle",
+    );
     let native_stdout = String::from_utf8_lossy(&native.stdout);
     assert_eq!(
         native.status.code(),

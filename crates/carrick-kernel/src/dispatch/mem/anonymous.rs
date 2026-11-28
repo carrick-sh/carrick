@@ -1263,6 +1263,26 @@ impl MemState {
         )
     }
 
+    /// The retained private file source the root takes with the row
+    /// `[start, end)`, if any: the one rule for every import of a private
+    /// file row into the root (admission and the host-row mirror; mmap asks
+    /// the same [`DelegatedRoot::takes_private_files`]). A root whose carrier
+    /// answered `HostEager` takes none, so the row stays a host-owned node
+    /// that keeps its host VMA, file map and protection.
+    pub(in crate::dispatch) fn root_file_source(
+        &self,
+        root: &DelegatedRoot,
+        start: u64,
+        end: u64,
+    ) -> Option<&super::PrivateFileMapEntry> {
+        if !root.takes_private_files() {
+            return None;
+        }
+        self.private_file_maps
+            .iter()
+            .find(|source| source.start <= start && source.end >= end)
+    }
+
     /// Mirror the host rows of `[start, end)` into the root as opaque nodes,
     /// replacing whatever the root held there. No-op in host setup and for a
     /// range the pending host proposal owns.
@@ -1343,9 +1363,7 @@ impl MemState {
                 boundaries.dedup();
                 for span in boundaries.windows(2) {
                     let backing = self
-                        .private_file_maps
-                        .iter()
-                        .find(|source| source.start <= span[0] && source.end >= span[1])
+                        .root_file_source(&root, span[0], span[1])
                         .map(|source| {
                             let lease = self
                                 .host_backing_custody
@@ -2443,7 +2461,7 @@ impl MemView<'_> {
         let new_address: GuestPtr = cx.typed_arg(4);
         let root = self.mem().lock().delegated_root().cloned();
         if let Some(root) = root {
-            let request = match super::mmap::mremap_request(
+            let request = match carrick_personality_linux::mm::mremap::request(
                 self.linux_page_size(),
                 old_address.0,
                 old_size,
@@ -2479,10 +2497,10 @@ impl MemView<'_> {
         &self,
         cx: &mut MutationSyscallCtx<'_, '_, '_, M>,
         root: &DelegatedRoot,
-        request: super::mmap::MremapRequest,
+        request: carrick_personality_linux::mm::mremap::Request,
     ) -> Result<Option<DispatchOutcome>, DispatchError> {
         use carrick_el1::memory::reservations::MoveTarget;
-        let super::mmap::MremapRequest {
+        let carrick_personality_linux::mm::mremap::Request {
             old_address,
             old_size,
             new_size,
@@ -2495,7 +2513,16 @@ impl MemView<'_> {
         let Some(old_end) = old_address.checked_add(old_size).filter(|_| old_size != 0) else {
             return Ok(None);
         };
-        if !range_within(old_address, old_size, layout.mmap_base, layout.mmap_size) {
+        // Linux shrinks before it asks for one mapping (#3171, the native
+        // oracle on #3165): a shrink, or a same-size call, needs only a
+        // mapping at `old_address`, so only that page decides the venue.
+        let shrinks = !move_fixed && !dontunmap && new_size <= old_size;
+        let decided = if shrinks {
+            old_size.min(LINUX_PAGE_SIZE)
+        } else {
+            old_size
+        };
+        if !range_within(old_address, decided, layout.mmap_base, layout.mmap_size) {
             return Ok(None);
         }
         let mappings = MemState::root_mappings(root, old_address, old_end);
@@ -2509,9 +2536,35 @@ impl MemView<'_> {
         {
             return Ok(None);
         }
-        // mremap(2) EFAULT: the old range must be one mapping; a hole or
-        // two mappings (of any owner or attributes) is refused before any
-        // other effect.
+        if shrinks {
+            // mremap(2) EFAULT for an unmapped `old_address`, before any
+            // effect. Otherwise the tail is retired exactly as munmap
+            // retires it, across whatever mappings (of any owner) and holes
+            // it spans, and the call returns `old_address`.
+            // A root node (a retained private file node is one, and no host
+            // row describes it) or a host row maps it.
+            let head_mapped = mappings
+                .first()
+                .is_some_and(|mapping| mapping.range.start() <= old_address)
+                || self.guest_vma_overlaps(old_address, LINUX_PAGE_SIZE);
+            if !head_mapped {
+                return Ok(Some(DispatchOutcome::errno(LINUX_EFAULT)));
+            }
+            if new_size == old_size {
+                return Ok(Some(DispatchOutcome::returned_u64_or_errno(old_address)));
+            }
+            let tail = [old_address + new_size, old_size - new_size, 0, 0, 0, 0];
+            let unmapped = with_args(cx, tail, |cx| self.munmap(cx))?;
+            return Ok(Some(match unmapped {
+                DispatchOutcome::Returned { value: 0 } => {
+                    DispatchOutcome::returned_u64_or_errno(old_address)
+                }
+                other => other,
+            }));
+        }
+        // mremap(2) EFAULT: a growing or moving old range must be one
+        // mapping; a hole or two mappings (of any owner or attributes) is
+        // refused before any other effect.
         let [node] = mappings.as_slice() else {
             return Ok(Some(DispatchOutcome::errno(LINUX_EFAULT)));
         };

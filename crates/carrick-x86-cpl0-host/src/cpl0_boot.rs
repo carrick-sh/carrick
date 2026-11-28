@@ -3707,6 +3707,273 @@ mod forward_execution_tests {
             "the receipt releases exactly once"
         );
     }
+
+    /// #3132: the exec successor the stock now holds as a child, `mm` at
+    /// `root`, owner generation 2.
+    fn successor_context(mm: ReservationMm, root: u64) -> AddressContext<RootGpa> {
+        AddressContext {
+            root: RootGpa::page_aligned(FrameGpa::new(root)).expect("successor root"),
+            mm: MmGeneration::new(NonZeroU64::new(mm.raw()).expect("successor MM")),
+            generation: ContextGeneration::new(NonZeroU64::new(2).expect("generation")),
+        }
+    }
+
+    /// #3132: move `predecessor` (running in `context`) to the exec
+    /// successor `successor` at `successor_root`, through the production
+    /// fork-stock replacement. The successor becomes a stock child.
+    fn replace_for_exec(
+        fixture: &mut ForwardVenueFixture,
+        form: carrick_hal::fork_stock::ExecPredecessorForm,
+        predecessor: ReservationMm,
+        context: AddressContext<RootGpa>,
+        successor: ReservationMm,
+        successor_root: u64,
+    ) -> carrick_hal::fork_stock::ExecPredecessorReceipt<()> {
+        let carrier = fixture.custody.0.fork_stock.carrier();
+        let execution = carrick_hal::fork_stock::GrantExecution::new(
+            carrick_guest_arch::CpuId::new(0),
+            carrick_el1_abi::ExecutionBinding {
+                task: carrick_el1_abi::EntryTaskKey::from_raw(41),
+                generation: carrick_el1_abi::SnapshotGeneration::from_raw(11),
+                mm: carrick_el1_abi::EntryMmKey::from_raw(predecessor.raw()),
+                thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(101),
+            },
+            context,
+        );
+        // SAFETY: the stopped fixture owns the synthetic successor MM and
+        // uses the handle only on the production fork-stock adoption path.
+        let owner = unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                carrier,
+                successor,
+                NonZeroU64::new(2).expect("successor generation"),
+            )
+        };
+        fixture
+            .custody
+            .0
+            .fork_stock
+            .replace_for_exec_with_tables(
+                form,
+                execution,
+                owner,
+                RootGpa::page_aligned(FrameGpa::new(successor_root)).expect("successor root"),
+                carrick_hal::fork_stock::ForkHostBackingCustody::default(),
+                Vec::new(),
+            )
+            .map_err(|(error, _)| error)
+            .expect("exec replacement")
+    }
+
+    /// #3132: give `mm` (rooted in `context`) the carrier state a run gives
+    /// a child: its CR3 root and one private data memslot admitted only to
+    /// it, so its release revokes that slot.
+    fn admit_private_slot(fixture: &mut ForwardVenueFixture, context: AddressContext<RootGpa>) {
+        let key = context.mm.raw();
+        let memory = fixture.custody.memory_mut();
+        memory.install_root(key, context).expect("child root");
+        let tag = NonZeroU64::new(0x3132).expect("tag");
+        let handle = memory
+            .install(&[PreparedBacking {
+                extent: Arc::new(
+                    BackingExtent::private(FrameGpa::new(0x2_0000_0000), 4096)
+                        .expect("private extent"),
+                ),
+                identity: crate::carrier_memory::BackingIdentity {
+                    frame_id: tag,
+                    mapping_id: tag,
+                    owner_generation: tag,
+                    inventory_revision: tag,
+                },
+            }])
+            .expect("private slot")[0];
+        let edge = memory.share(handle).expect("data edge");
+        memory.attach_shared(key, &edge).expect("child admission");
+    }
+
+    /// #3132 confirming pre-review P0: a release that quarantines the
+    /// carrier ends the run from the fork quarantine drain. The stock's
+    /// release callback answers a bool, so without the drain's quarantine
+    /// check the broken invariant reads as an ordinary deferral: the drain
+    /// returns Ok and retries it forever while the guest keeps running.
+    ///
+    /// The retired child holds one private memslot; the injected failure of
+    /// the memslot unregister inside `CarrierMemory::revoke`, reached only
+    /// from the drain's release callback, quarantines the carrier.
+    #[test]
+    fn fork_quarantine_drain_ends_the_run_when_a_child_release_quarantines() {
+        use carrick_hal::fork_stock::ExecPredecessorForm;
+        let mut fixture = ForwardVenueFixture::with_pod();
+        let root = ReservationMm::new(INITIAL_MM_KEY).expect("root MM");
+        let child = ReservationMm::new(INITIAL_MM_KEY + 1).expect("child MM");
+        let root_context = fixture.root_binding.context();
+        replace_for_exec(
+            &mut fixture,
+            ExecPredecessorForm::Root,
+            root,
+            root_context,
+            child,
+            0x3000,
+        );
+        let context = successor_context(child, 0x3000);
+        admit_private_slot(&mut fixture, context);
+        let binding = carrick_el1_abi::ExecutionBinding {
+            task: carrick_el1_abi::EntryTaskKey::from_raw(41),
+            generation: carrick_el1_abi::SnapshotGeneration::from_raw(11),
+            mm: carrick_el1_abi::EntryMmKey::from_raw(child.raw()),
+            thread_generation: carrick_el1_abi::EntryThreadGeneration::from_raw(101),
+        };
+        let mut record =
+            carrick_el1_abi::NativeChildRetire::new(binding, context).expect("retire record");
+        fixture
+            .custody
+            .0
+            .fork_stock
+            .retire_child(
+                carrick_hal::fork_stock::GrantExecution::new(
+                    carrick_guest_arch::CpuId::new(0),
+                    binding,
+                    context,
+                ),
+                &mut record,
+            )
+            .expect("child retires into quarantine");
+        assert!(!fixture.custody.0._vm.is_quarantined());
+        let deferrals = fixture.custody.0.fork_stock.counters().reclaim_deferrals;
+
+        fixture.custody.0._vm.vm().fail_region_call(0);
+        let drained = fixture.custody.0.drain_fork_quarantine_in(root.into());
+        fixture.custody.0._vm.vm().clear_region_failure();
+
+        // The release ran and quarantined the carrier: the injected
+        // unregister failed inside its revoke, and the stock deferred the
+        // child the callback refused.
+        assert!(
+            fixture.custody.0._vm.is_quarantined(),
+            "the child's release revoked its slot and the unregister failed"
+        );
+        assert!(fixture.custody.0.fork_stock.is_quarantined(child));
+        assert_eq!(
+            fixture.custody.0.fork_stock.counters().reclaim_deferrals,
+            deferrals + 1,
+            "the release callback refused the child"
+        );
+        assert!(
+            drained.is_err(),
+            "a quarantined carrier must end the run, not defer the child: {drained:?}"
+        );
+    }
+
+    /// #3132 confirming pre-review P0, the exec half: a release-permitted
+    /// CHILD exec predecessor whose release quarantines the carrier ends the
+    /// run from `settle_exec_predecessors` (a root predecessor has no
+    /// release callback). Without the check the receipt goes back to
+    /// `release_permitted` and the drain returns Ok.
+    #[test]
+    fn exec_predecessor_drain_ends_the_run_when_a_child_release_quarantines() {
+        use carrick_hal::fork_stock::ExecPredecessorForm;
+        let mut fixture = ForwardVenueFixture::with_pod();
+        let root = ReservationMm::new(INITIAL_MM_KEY).expect("root MM");
+        let child = ReservationMm::new(INITIAL_MM_KEY + 1).expect("child MM");
+        let successor = ReservationMm::new(INITIAL_MM_KEY + 2).expect("successor MM");
+        let root_context = fixture.root_binding.context();
+        replace_for_exec(
+            &mut fixture,
+            ExecPredecessorForm::Root,
+            root,
+            root_context,
+            child,
+            0x3000,
+        );
+        let context = successor_context(child, 0x3000);
+        // The child execs in turn: it is the CHILD predecessor.
+        let stock_receipt = replace_for_exec(
+            &mut fixture,
+            ExecPredecessorForm::Child,
+            child,
+            context,
+            successor,
+            0x4000,
+        );
+        assert_eq!(stock_receipt.predecessor(), child);
+        admit_private_slot(&mut fixture, context);
+
+        // The neutral exec owner's settlement grants release authority.
+        let carrier = fixture.custody.0.fork_stock.carrier();
+        // SAFETY: the synthetic child MM handle names this fixture's
+        // carrier and is used only by the exec owner below.
+        let child_owner = unsafe {
+            carrick_el1_abi::El1MmHandle::from_admitted_owner(
+                carrier,
+                child,
+                NonZeroU64::new(2).expect("child generation"),
+            )
+        };
+        let identity = carrick_core_abi::service::ServiceIdentity {
+            birth: carrick_core_abi::service::ServiceBirth {
+                origin: carrick_core_abi::service::ServiceOrigin::Descendant,
+                process: carrick_sched_core::process::TaskKey {
+                    id: carrick_sched_core::process::TaskId::from_registry_allocation(
+                        core::num::NonZeroI32::new(42).expect("task id"),
+                    ),
+                    serial: carrick_sched_core::process::TaskSerial::from_registry_allocation(
+                        NonZeroU64::new(8).expect("task serial"),
+                    ),
+                },
+                thread: carrick_el1_abi::EntryThreadGeneration::from_raw(101),
+                record: carrick_sched_core::RecordRef {
+                    id: carrick_sched_core::RecordId::from_raw(1).expect("record"),
+                    incarnation: 1,
+                },
+                mm: child_owner,
+            },
+            execution: carrick_el1_abi::SnapshotGeneration::from_raw(11),
+            sequence: NonZeroU64::MIN,
+        };
+        let mut owner = carrick_hal::exec_owner::ExecPreparations::<()>::default();
+        let receipt = owner
+            .claim(
+                identity,
+                successor,
+                NonZeroU64::new(2).expect("successor generation"),
+            )
+            .expect("child exec claim")
+            .receipt();
+        owner.stage(receipt, ()).expect("child exec stage");
+        owner.seal(receipt).expect("child exec seal");
+        let adoption = owner.adopt(receipt, child).expect("child exec adoption");
+        fixture
+            .custody
+            .0
+            .exec_predecessors
+            .adopt(adoption.mm.receipt(), stock_receipt);
+        let carrick_hal::exec_owner::ExecSettlement::Child(settled) = owner
+            .settle(
+                child,
+                successor,
+                carrick_el1_abi::ExecCommitEffects::COMPLETE,
+                carrick_hal::exec_owner::ExecSettleLane::Peer,
+            )
+            .expect("child settlement")
+        else {
+            panic!("a descendant's exec settles as a child");
+        };
+        assert!(fixture.custody.0.exec_predecessors.permit_release(settled));
+        assert!(!fixture.custody.0._vm.is_quarantined());
+
+        fixture.custody.0._vm.vm().fail_region_call(0);
+        let settled = fixture.custody.0.settle_exec_predecessors();
+        fixture.custody.0._vm.vm().clear_region_failure();
+
+        assert!(
+            fixture.custody.0._vm.is_quarantined(),
+            "the predecessor's release revoked its slot and the unregister failed"
+        );
+        assert!(
+            settled.is_err(),
+            "a quarantined carrier must end the run, not keep the receipt: {settled:?}"
+        );
+    }
 }
 
 #[derive(

@@ -2680,6 +2680,10 @@ impl crate::PhysicalFrameInventory for DummyInventory {
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         Ok(0)
     }
+
+    fn frame_is_mapped(&self, _frame: crate::FrameId) -> bool {
+        false
+    }
 }
 
 #[test]

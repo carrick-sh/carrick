@@ -1321,6 +1321,69 @@ fn soft_root_engine_names_its_own_mm_on_every_run_in_one_process() {
     );
 }
 
+/// The first load's `Bind` admission imports each soft root's reservation
+/// root through the carrier's reservation provider, so the root is admitted
+/// in the carrier's shared reservation table before its first instruction,
+/// as on HVF. Without a provider the admission answers `HostSetup` and EL1
+/// refuses the root's BIND (`admitted_handle`). Two roots run one after the
+/// other in one process, so the second covers an MM other than the first.
+/// Read through the production publication sampler after the zone's start.
+#[test]
+fn soft_root_reservation_root_is_admitted_at_its_first_load() {
+    let _test_guard = lock_soft_carrier_test();
+
+    let elf = build_witness_elf(&[A64_SVC_0], &[]);
+    let mut roots = Vec::new();
+    for path in ["/reservations-first", "/reservations-second"] {
+        let mailbox = Arc::new(AtomicPtr::new(null_mut()));
+        let executor = SequenceHvc2Executor {
+            mailbox: Arc::clone(&mailbox),
+            calls: vec![(NR_EXIT_GROUP, [0; 6])],
+            returns: Arc::new(Mutex::new(Vec::new())),
+            next_seq: 1,
+        };
+        let observed = Arc::new(Mutex::new(None));
+        let observed_in_setup = Arc::clone(&observed);
+        let config = SoftSingleProcessConfig::new(&elf, path);
+        let run = run_single_process_with_executor_and_setup(&config, executor, move |engine| {
+            let mut vec_stub = [0u8; 8];
+            vec_stub[0..4].copy_from_slice(&A64_HVC_2.to_le_bytes());
+            vec_stub[4..8].copy_from_slice(&A64_ERET.to_le_bytes());
+            engine
+                .backend()
+                .write_gpa(LINUX_EL1_VECTORS_BASE + 0x400, &vec_stub)
+                .map_err(|e| format!("install witness EL1 vector stub: {e}"))?;
+            let ptr = engine
+                .backend()
+                .host_ptr(
+                    LINUX_SYSCALL_MAILBOX_BASE,
+                    AARCH64_SYSCALL_MAILBOX_SIZE as usize,
+                )
+                .ok_or_else(|| "missing stage-2 syscall mailbox host_ptr".to_owned())?;
+            mailbox.store(ptr.cast::<Aarch64SyscallMailbox>(), Ordering::Release);
+            *observed_in_setup.lock().unwrap() = Some(sample_root_publication(engine)?);
+            Ok(())
+        })
+        .expect("the root must run to exit on the production soft entry");
+        assert_eq!(run.exit_code, 0, "{path}");
+        let publication = observed
+            .lock()
+            .unwrap()
+            .expect("setup observed the root after its first load");
+        assert_ne!(
+            publication.mm_key, 0,
+            "{path}: the root's CurrentTask names its MM"
+        );
+        assert!(
+            publication.reservation_root_admitted,
+            "{path}: the root's reservation root must be admitted at its first load: \
+             {publication:?}"
+        );
+        roots.push(publication.mm_key);
+    }
+    assert_ne!(roots[0], roots[1], "the second root is a new MM");
+}
+
 enum NegativeMmCase {
     StoreAfterMprotectReadOnly,
     LoadAfterMunmap,
@@ -2782,5 +2845,61 @@ fn soft_carrier_releases_evicted_code_within_its_budget() {
         census.live.load(Ordering::Relaxed),
         0,
         "code outlived the carrier"
+    );
+}
+
+/// The soft carrier's reservation access retains its stage 2, so the EL1
+/// region its publication backing names stays mapped for as long as that
+/// backing lives, even after the run's engine drops: the shared
+/// `AddressSpaceBacking` contract, which HVF's carrier mappings keep. A
+/// weak reference let the region go with the engine while a publication
+/// mirror still held the backing.
+#[test]
+fn soft_reservation_backing_retains_the_carrier_region_past_its_engine() {
+    use carrick_kernel::dispatch::mem::el1_reservations::{
+        CarrierReservations, HostReservationProvider as _,
+    };
+    let _test_guard = lock_soft_carrier_test();
+    let elf = build_witness_elf(&[A64_SVC_0], &[]);
+    let mailbox = Arc::new(AtomicPtr::new(null_mut()));
+    let executor = SequenceHvc2Executor {
+        mailbox: Arc::clone(&mailbox),
+        calls: vec![(NR_EXIT_GROUP, [0; 6])],
+        returns: Arc::new(Mutex::new(Vec::new())),
+        next_seq: 1,
+    };
+    let config = SoftSingleProcessConfig::new(&elf, "/retained-region");
+    let run = run_single_process_with_executor_and_setup(&config, executor, |engine| {
+        install_hvc2_bridge(engine, &mailbox)
+    })
+    .expect("the root must run to exit on the production soft entry");
+    assert_eq!(run.exit_code, 0);
+    let carrier = run.engine.backend().carrier().raw();
+    let provider = CarrierReservations::new(
+        run.engine
+            .backend()
+            .retained_metadata()
+            .expect("retain the carrier's EL1 region"),
+    );
+    let backing = provider
+        .address_space_backing()
+        .expect("the live carrier has a publication backing");
+    let generation = backing
+        .region()
+        .expect("the live carrier's region")
+        .reservations
+        .storage_generation();
+    drop(provider);
+    drop(run);
+    let region = backing
+        .region()
+        .expect("the backing still names its retained carrier region");
+    assert_eq!(region.carrier, carrier);
+    // Read through the retained mapping itself: the carrier's reservation
+    // table is still mapped, with the storage generation it had.
+    assert_eq!(
+        region.reservations.storage_generation(),
+        generation,
+        "the retained reservation table is readable past the engine"
     );
 }

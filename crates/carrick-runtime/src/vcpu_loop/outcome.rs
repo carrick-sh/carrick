@@ -717,7 +717,14 @@ pub(crate) fn assemble_run_result(
 ) -> RunResult {
     crate::probes::guest_exit(exit_code);
     kernel.dispatcher.cleanup_sysv_ipc_on_process_exit();
-    let report = kernel.reporter.snapshot();
+    let mut report = kernel.reporter.snapshot();
+    // EL1 is still mapped here: its counted ring refusals join the report.
+    if let Some(counters) = crate::read_el1_counters() {
+        report.set_ring_refusals(crate::el1_census::ring_refusals(
+            &counters,
+            carrick_spec::syscall_census::CensusIsa::Aarch64,
+        ));
+    }
     let terminal_reason = if trap_limit_hit {
         Some(carrick_kernel::run_result::TerminalReason::TrapLimit)
     } else {

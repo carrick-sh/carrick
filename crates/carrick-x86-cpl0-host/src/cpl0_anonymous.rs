@@ -807,6 +807,22 @@ fn resolve_cpl0_residency<M: CarrierMemoryIo>(
     Ok(resolved)
 }
 
+/// A release that quarantined the carrier found a broken invariant (#3132:
+/// a released slot that a frame still names): that ends the run, never the
+/// deferral the stock counts and retries on its next drain, which could
+/// only loop while the guest kept running. The stock's release callbacks
+/// answer a bool, so each drain asks this once the stock returns.
+pub(super) fn fatal_if_quarantined<M: CarrierMemoryIo>(
+    memory: &CarrierMemory<M>,
+) -> Result<(), TrapError> {
+    if memory.is_quarantined() {
+        return Err(fail(
+            "carrier memory quarantined (a broken invariant) at a retired-child release drain",
+        ));
+    }
+    Ok(())
+}
+
 /// Release a reclaimed child's carrier-wide state: its frame-inventory rows
 /// and COW residency (shared composition), then its CR3/alias registrations
 /// and the memslots admitted only for it.
@@ -1408,6 +1424,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             // child (counted as `reclaim_deferral`, retried next drain).
             // What remains is a broken custody invariant, never guest input.
             .map_err(|e| fail(format!("fork quarantine custody invariant: {e:?}")))?;
+        fatal_if_quarantined(&self._vm)?;
         // An adopted exec's predecessor whose release was deferred settles
         // with the same drain.
         self.settle_exec_predecessors()

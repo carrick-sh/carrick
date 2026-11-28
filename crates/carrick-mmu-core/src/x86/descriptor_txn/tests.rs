@@ -3,7 +3,7 @@ use super::*;
 use alloc::vec;
 use core::num::NonZeroU64;
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 #[test]
 fn owner_grant_projection_preserves_prepared_neighbors_and_refuses_exhaustion() {
@@ -298,6 +298,13 @@ struct Words {
     writes: Cell<usize>,
     fail: Cell<usize>,
     invalidations: Cell<usize>,
+    /// Bits another agent ORs into a present entry just before each
+    /// successive compare-exchange on one: a sibling CPU's page walker
+    /// (`ACCESSED`/`DIRTY`), or any other change (#3133).
+    interleaved: RefCell<VecDeque<u64>>,
+    /// `(pa, n, bits)`: the walker ORs `bits` into the present entry at `pa`
+    /// just before its `n`th load (#3133, an update during planning).
+    load_walker: Cell<Option<(u64, usize, u64)>>,
 }
 impl Words {
     fn new() -> Self {
@@ -308,12 +315,24 @@ impl Words {
             writes: Cell::new(0),
             fail: Cell::new(usize::MAX),
             invalidations: Cell::new(0),
+            interleaved: RefCell::new(VecDeque::new()),
+            load_walker: Cell::new(None),
         }
     }
 }
 impl LiveDescriptorWords for Words {
     fn load(&self, pa: u64) -> Result<u64, DescriptorRefusal> {
         self.reads.set(self.reads.get() + 1);
+        if let Some((at, n, bits)) = self.load_walker.get()
+            && at == pa
+        {
+            self.load_walker.set((n > 1).then_some((at, n - 1, bits)));
+            if let (1, Some(entry)) = (n, self.words.borrow_mut().get_mut(&pa))
+                && *entry & PRESENT != 0
+            {
+                *entry |= bits;
+            }
+        }
         self.words
             .borrow()
             .get(&pa)
@@ -334,6 +353,11 @@ impl LiveDescriptorWords for Words {
         }
         let mut words = self.words.borrow_mut();
         let entry = words.get_mut(&pa).ok_or(DescriptorRefusal::MissingTable)?;
+        if *entry & PRESENT != 0
+            && let Some(bits) = self.interleaved.borrow_mut().pop_front()
+        {
+            *entry |= bits;
+        }
         if *entry != before {
             return Ok(false);
         }
@@ -432,6 +456,7 @@ fn guest_protect_refuses_host_map_leaf() {
                     user: true
                 },
                 exec: ExecAuthority::Leaf,
+                cow_ceiling: None,
                 absent: carrick_guest_arch::AbsentLeaves::Refuse,
             },
             &[]
@@ -476,6 +501,7 @@ fn guest_protect_refuses_write_and_execute_widening_past_grant() {
                     span,
                     permissions,
                     exec: ExecAuthority::Leaf,
+                    cow_ceiling: None,
                     absent: carrick_guest_arch::AbsentLeaves::Refuse
                 },
                 &[]
@@ -518,6 +544,7 @@ fn guest_protect_grants_execute_within_the_mapping_ceiling() {
                 span,
                 permissions: read_write,
                 exec: ExecAuthority::Mapping,
+                cow_ceiling: None,
                 absent: carrick_guest_arch::AbsentLeaves::Refuse,
             },
             &[]
@@ -536,6 +563,7 @@ fn guest_protect_grants_execute_within_the_mapping_ceiling() {
                 span,
                 permissions: read_exec,
                 exec: ExecAuthority::Mapping,
+                cow_ceiling: None,
                 absent: carrick_guest_arch::AbsentLeaves::Refuse,
             },
             &[]
@@ -554,6 +582,7 @@ fn guest_protect_grants_execute_within_the_mapping_ceiling() {
                     span,
                     permissions,
                     exec: ExecAuthority::Leaf,
+                    cow_ceiling: None,
                     absent: carrick_guest_arch::AbsentLeaves::Refuse,
                 },
                 &[]
@@ -591,6 +620,7 @@ fn guest_protect_can_restore_write_within_private_grant_ceiling() {
                 span,
                 permissions: readonly,
                 exec: ExecAuthority::Leaf,
+                cow_ceiling: None,
                 absent: carrick_guest_arch::AbsentLeaves::Refuse,
             },
             &[]
@@ -608,6 +638,7 @@ fn guest_protect_can_restore_write_within_private_grant_ceiling() {
                 span,
                 permissions: writable,
                 exec: ExecAuthority::Leaf,
+                cow_ceiling: None,
                 absent: carrick_guest_arch::AbsentLeaves::Refuse,
             },
             &[]
@@ -658,6 +689,7 @@ fn guest_protect_skips_absent_entries_between_resident_runs() {
                 span: PageSpan::new(0x4000, 8 * PAGE),
                 permissions: readonly,
                 exec: ExecAuthority::Leaf,
+                cow_ceiling: None,
                 absent: carrick_guest_arch::AbsentLeaves::Refuse,
             },
             &[]
@@ -672,6 +704,7 @@ fn guest_protect_skips_absent_entries_between_resident_runs() {
                 span: PageSpan::new(0x4000, 8 * PAGE),
                 permissions: readonly,
                 exec: ExecAuthority::Leaf,
+                cow_ceiling: None,
                 absent: carrick_guest_arch::AbsentLeaves::Lazy,
             },
             &[]
@@ -1373,6 +1406,7 @@ fn first_touch_cow_nx_and_protection_have_distinct_classes() {
                     user: true
                 },
                 exec: ExecAuthority::Leaf,
+                cow_ceiling: None,
                 absent: carrick_guest_arch::AbsentLeaves::Refuse,
             },
             &[]
@@ -1429,6 +1463,7 @@ fn first_touch_cow_nx_and_protection_have_distinct_classes() {
                 user: true,
             },
             exec: ExecAuthority::Leaf,
+            cow_ceiling: None,
             absent: carrick_guest_arch::AbsentLeaves::Refuse,
         },
         &[],
@@ -1620,6 +1655,7 @@ fn split_and_coalesce_preserve_pat_output_and_neighbors() {
                     span,
                     permissions,
                     exec: ExecAuthority::Leaf,
+                    cow_ceiling: None,
                     absent: carrick_guest_arch::AbsentLeaves::Refuse
                 },
                 &grants
@@ -1649,6 +1685,7 @@ fn split_and_coalesce_preserve_pat_output_and_neighbors() {
                     ..permissions
                 },
                 exec: ExecAuthority::Leaf,
+                cow_ceiling: None,
                 absent: carrick_guest_arch::AbsentLeaves::Refuse,
             },
             &[],
@@ -1708,6 +1745,7 @@ fn failed_split_restores_all_512_children_and_parent() {
                         user: true
                     },
                     exec: ExecAuthority::Leaf,
+                    cow_ceiling: None,
                     absent: carrick_guest_arch::AbsentLeaves::Refuse,
                 },
                 &[root(0x4000)]
@@ -1802,6 +1840,7 @@ fn whole_block_protection_edits_one_terminal_without_split_grants() {
                 user: true,
             },
             exec: ExecAuthority::Leaf,
+            cow_ceiling: None,
             absent: carrick_guest_arch::AbsentLeaves::Refuse,
         },
         &[],
@@ -2086,4 +2125,237 @@ fn only_an_edit_of_a_present_entry_demands_a_translation_drain() {
         }
     ));
     assert_eq!(words.invalidations.get(), 1);
+}
+
+/// #3121: fork arms COW on every leaf that may be written, a `PROT_READ`
+/// private leaf that keeps `MAY_WRITE` included; `MAY_WRITE` on the armed
+/// leaf is current write intent. A never-writable leaf stays as it is.
+#[test]
+fn fork_arms_a_read_only_leaf_that_may_be_written() {
+    let read_only = 0x800000 | PRESENT | USER | PRIVATE | NX;
+    assert_eq!(arm_cow_terminal(read_only), Ok(read_only));
+    let protected = read_only | MAY_WRITE;
+    assert_eq!(
+        arm_cow_terminal(protected).unwrap() & (COW | WRITE | MAY_WRITE | ADDRESS),
+        COW | 0x800000
+    );
+    let writable = read_only | WRITE | MAY_WRITE;
+    assert_eq!(
+        arm_cow_terminal(writable).unwrap() & (COW | WRITE | MAY_WRITE),
+        COW | MAY_WRITE
+    );
+}
+
+/// #3121: a widening of a fork-shared leaf keeps COW armed and records write
+/// as intent, under the mapping's ceiling only (the shared AArch64 rule).
+#[test]
+fn protect_widens_a_cow_armed_leaf_to_write_intent_only() {
+    let words = Words::new();
+    let span = PageSpan::new(0x4000, PAGE);
+    let rw = Permissions {
+        writable: true,
+        executable: false,
+        user: true,
+    };
+    assert!(matches!(
+        apply(
+            &words,
+            private_prepare(span, 0x800000, rw),
+            &[root(0x2000), root(0x3000), root(0x4000)]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert!(matches!(
+        apply(&words, DescriptorOp::ArmCow(span), &[]),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let protect = |cow_ceiling| DescriptorOp::Protect {
+        span,
+        permissions: rw,
+        exec: ExecAuthority::Leaf,
+        cow_ceiling,
+        absent: carrick_guest_arch::AbsentLeaves::Refuse,
+    };
+    assert_eq!(
+        apply(&words, protect(None), &[]),
+        DescriptorOutcome::Refused(DescriptorRefusal::CowArmed)
+    );
+    let read_only_ceiling = crate::aarch64::GuestPermissionCeiling {
+        readable: true,
+        writable: false,
+        executable: false,
+    };
+    assert_eq!(
+        apply(&words, protect(Some(read_only_ceiling)), &[]),
+        DescriptorOutcome::Refused(DescriptorRefusal::PermissionWidening)
+    );
+    let ceiling = crate::aarch64::GuestPermissionCeiling {
+        writable: true,
+        ..read_only_ceiling
+    };
+    assert!(matches!(
+        apply(&words, protect(Some(ceiling)), &[]),
+        DescriptorOutcome::Applied { .. }
+    ));
+    let leaf = read_terminal_descriptor(&words, root(0x1000), UserVa::new(span.va))
+        .unwrap()
+        .0;
+    assert_eq!(
+        leaf & (COW | WRITE | MAY_WRITE | USER),
+        COW | MAY_WRITE | USER
+    );
+}
+
+fn two_private_rw_pages(words: &Words) -> PageSpan {
+    let span = PageSpan::new(0x4000, 2 * PAGE);
+    let writable = Permissions {
+        writable: true,
+        executable: false,
+        user: true,
+    };
+    assert!(matches!(
+        apply(
+            words,
+            private_prepare(span, 0x800000, writable),
+            &[root(0x2000), root(0x3000), root(0x4000)]
+        ),
+        DescriptorOutcome::Applied { .. }
+    ));
+    span
+}
+
+fn leaf_at(words: &Words, va: u64) -> u64 {
+    read_terminal_descriptor(words, root(0x1000), UserVa::new(va))
+        .unwrap()
+        .0
+}
+
+fn protect_read_only(span: PageSpan) -> DescriptorOp {
+    DescriptorOp::Protect {
+        span,
+        permissions: Permissions {
+            writable: false,
+            executable: false,
+            user: true,
+        },
+        exec: ExecAuthority::Leaf,
+        cow_ceiling: None,
+        absent: carrick_guest_arch::AbsentLeaves::Refuse,
+    }
+}
+
+/// #3133: a sibling CPU's page walker may set `ACCESSED` or `DIRTY` on a
+/// live leaf between the plan's snapshot and its store. That is not
+/// contention: mprotect's edit lands, and the leaf keeps the walker's bits.
+#[test]
+fn a_walker_set_accessed_or_dirty_bit_is_not_contention() {
+    for bits in [ACCESSED, DIRTY, ACCESSED | DIRTY] {
+        let words = Words::new();
+        let span = two_private_rw_pages(&words);
+        assert_eq!(leaf_at(&words, span.va) & (ACCESSED | DIRTY), 0);
+        // The walker sets `bits` on the first leaf before its store, and
+        // `ACCESSED` again before the retried store when `bits` is DIRTY
+        // alone: two walker updates absorbed in one entry.
+        words
+            .interleaved
+            .borrow_mut()
+            .extend([bits, if bits == DIRTY { ACCESSED } else { 0 }]);
+        assert!(
+            matches!(
+                apply(&words, protect_read_only(span), &[]),
+                DescriptorOutcome::Applied { stores: 2, .. }
+            ),
+            "walker bits {bits:#x}"
+        );
+        let first = leaf_at(&words, span.va);
+        assert_eq!(first & (WRITE | MAY_WRITE | PRESENT), MAY_WRITE | PRESENT);
+        let expected = if bits == DIRTY {
+            ACCESSED | DIRTY
+        } else {
+            bits
+        };
+        assert_eq!(first & (ACCESSED | DIRTY), expected);
+        assert_eq!(
+            leaf_at(&words, span.va + PAGE) & (WRITE | (ACCESSED | DIRTY)),
+            0
+        );
+    }
+}
+
+/// #3133: any other change to a live leaf is still a real mismatch, and the
+/// undo of the leaves already stored absorbs the walker too, so the edit
+/// rolls back cleanly instead of going indeterminate.
+#[test]
+fn a_foreign_change_stays_contended_and_the_undo_absorbs_the_walker() {
+    let words = Words::new();
+    let span = two_private_rw_pages(&words);
+    let second = leaf_at(&words, span.va + PAGE);
+    // First leaf: stored. Second leaf: a bit no walker sets. Then the
+    // walker touches the first leaf before its undo.
+    words
+        .interleaved
+        .borrow_mut()
+        .extend([0, MAY_EXEC, ACCESSED]);
+    assert_eq!(
+        apply(&words, protect_read_only(span), &[]),
+        DescriptorOutcome::RolledBack(DescriptorRefusal::Contended)
+    );
+    let first = leaf_at(&words, span.va);
+    assert_eq!(
+        first & (WRITE | MAY_WRITE | ACCESSED),
+        WRITE | MAY_WRITE | ACCESSED
+    );
+    assert_eq!(leaf_at(&words, span.va + PAGE), second | MAY_EXEC);
+}
+
+/// Only a present entry gaining `ACCESSED` or `DIRTY`, and nothing else,
+/// is the walker's.
+#[test]
+fn walker_bits_are_only_added_accessed_or_dirty_on_a_present_entry() {
+    let leaf = 0x800000 | PRESENT | WRITE | USER | PRIVATE;
+    assert_eq!(walker_set_bits(leaf, leaf | DIRTY), Some(DIRTY));
+    assert_eq!(
+        walker_set_bits(leaf | ACCESSED, leaf | WALKER_SET),
+        Some(DIRTY)
+    );
+    assert_eq!(walker_set_bits(leaf, leaf), None);
+    assert_eq!(walker_set_bits(leaf | ACCESSED, leaf), None);
+    assert_eq!(walker_set_bits(leaf, leaf | NX), None);
+    assert_eq!(
+        walker_set_bits(leaf, (leaf ^ 0x800000 | 0x900000) | DIRTY),
+        None
+    );
+    assert_eq!(
+        walker_set_bits(leaf & !PRESENT, leaf & !PRESENT | ACCESSED),
+        None
+    );
+}
+
+/// #3133: the walker may also set `DIRTY` between the plan's first read of
+/// a leaf (which derives the new word) and its read of the word it replaces.
+/// The edit must not store a word that clears it.
+#[test]
+fn a_walker_update_during_planning_is_kept() {
+    let words = Words::new();
+    let span = two_private_rw_pages(&words);
+    let leaf = leaf_at(&words, span.va);
+    let pa = words
+        .words
+        .borrow()
+        .iter()
+        .find(|(_, word)| **word == leaf)
+        .map(|(pa, _)| *pa)
+        .unwrap();
+    words.load_walker.set(Some((pa, 2, DIRTY)));
+    assert!(matches!(
+        apply(&words, protect_read_only(span), &[]),
+        DescriptorOutcome::Applied { .. }
+    ));
+    assert_eq!(
+        words.load_walker.get(),
+        None,
+        "the planner read the leaf twice"
+    );
+    let first = leaf_at(&words, span.va);
+    assert_eq!(first & (WRITE | DIRTY), DIRTY);
 }

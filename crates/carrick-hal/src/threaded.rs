@@ -2619,6 +2619,11 @@ pub trait PhysicalFrameInventory: Send + Sync {
         &self,
         mm: carrick_guest_arch::MmGeneration,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>>;
+    /// Whether any MM, not just one binding's, still holds a live mapping
+    /// row (prepared or published) of `frame`. A backend asks this before
+    /// it revokes the backing a frame lives in: one row anywhere means the
+    /// backing is still in use. O(1): the frame's own mapping count.
+    fn frame_is_mapped(&self, frame: crate::FrameId) -> bool;
 }
 
 /// An unpublished apply retains the exact authority that issued its receipt.

@@ -33,6 +33,8 @@
 //!
 //! PR 1a adds the MMs (`own/mm.rs`), their editor (`own/editor.rs`) and
 //! their copy-on-write grants (`own/grant.rs`, invariants G1 to G3).
+//! `own/holds.rs` owns each backing slot's holders, so a slot is released
+//! exactly when its last holder lets go (#3127, invariants H1 to H3).
 //!
 //! The index structure is the step-1a table (#1236): records never overlap,
 //! so the only record that can hold an address is the one with the greatest
@@ -46,6 +48,7 @@ mod editor;
 #[cfg(test)]
 mod explore;
 mod grant;
+mod holds;
 mod mm;
 
 pub use editor::{ExcludedMm, HostEdit, MmEditor, NotNow};
@@ -53,6 +56,7 @@ pub use grant::{
     ChunkDemand, CowArenaGeometry, CowSupply, GrantId, GrantPayload, MmRefusal, SettleProof,
     Supplied, SupplyTicket,
 };
+pub use holds::{DrainContext, HoldError, HoldRetirement, SlotHolds};
 pub use mm::MmKey;
 #[cfg(all(test, feature = "loom"))]
 mod loom_models;
@@ -166,6 +170,23 @@ pub struct MappingId {
 pub struct ExtentId {
     carrier: CarrierId,
     raw: u64,
+}
+
+impl ExtentId {
+    /// The extent's grant token: never zero, unique in its carrier and never
+    /// reused, so a successor carved over the same range carries another.
+    pub const fn token(self) -> u64 {
+        self.raw
+    }
+}
+
+/// A read-only view of one live frame extent and its lease.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LiveExtentView<'a, B> {
+    pub id: ExtentId,
+    pub extent: GpaExtent,
+    pub host_addr: usize,
+    pub lease: &'a B,
 }
 
 /// A read-only view of one installed backend mapping.
@@ -471,6 +492,18 @@ impl<V: CoreVenue, M, B, G> CarrierCore<V, M, B, G> {
             extent: mapping.spec.extent,
             host_addr: mapping.spec.host_addr,
             host: &mapping.spec.host,
+        })
+    }
+
+    /// The live frame extent holding `ipa`, in one index probe. A retiring
+    /// or terminal extent is not found.
+    pub fn live_extent_at(&self, ipa: u64) -> Option<LiveExtentView<'_, B>> {
+        let (_, entry) = holder(&self.extents, ipa, |e| e.extent.end())?;
+        (entry.state == ExtentState::Live).then_some(LiveExtentView {
+            id: entry.id,
+            extent: entry.extent,
+            host_addr: entry.host_addr,
+            lease: &entry.lease,
         })
     }
 

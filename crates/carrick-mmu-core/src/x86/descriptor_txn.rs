@@ -84,6 +84,9 @@ pub enum DescriptorOp {
         span: PageSpan,
         permissions: Permissions,
         exec: ExecAuthority,
+        /// The mapping's ceiling from its reservation owner, which alone
+        /// authorizes a COW-armed leaf's edit (#3121).
+        cow_ceiling: Option<crate::aarch64::GuestPermissionCeiling>,
         /// Whether a page with no entry is a lazy page of a range its
         /// reservation owner proved mapped, or refuses the edit (#3073).
         absent: carrick_guest_arch::AbsentLeaves,
@@ -223,6 +226,7 @@ impl<'a> DescriptorTxn<'a> {
             } => DescriptorOp::Protect {
                 span,
                 absent,
+                cow_ceiling: ceiling,
                 permissions: permissions(requested).ok_or(DescriptorRefusal::BadEncoding)?,
                 exec: if ceiling.is_some_and(|ceiling| ceiling.executable) {
                     ExecAuthority::Mapping
@@ -536,12 +540,20 @@ pub fn split_terminal_descriptor(
     Ok((leaf_output(entry, level) + index as u64 * level_bytes(level + 1)) | flags)
 }
 
+/// Arm fork COW on one terminal. Every leaf that is writable now, or that
+/// may be written later (a private leaf keeping `MAY_WRITE` under a
+/// read-only protection), shares its frame only COW-armed: otherwise a later
+/// mprotect(2) widening on either side writes the other's page (#3121). On
+/// an armed leaf `MAY_WRITE` is current write intent, as on AArch64, and a
+/// widening takes [`crate::aarch64::cow_armed_protection`].
 pub fn arm_cow_terminal(entry: u64) -> Result<u64, DescriptorRefusal> {
     if entry & (PRESENT | PREPARED) == 0 {
         return Err(DescriptorRefusal::MissingTable);
     }
-    Ok(if entry & WRITE != 0 {
-        (entry & !WRITE) | COW | MAY_WRITE
+    let may_be_written = entry & WRITE != 0 || entry & (PRIVATE | MAY_WRITE) == PRIVATE | MAY_WRITE;
+    Ok(if entry & COW == 0 && may_be_written {
+        let intent = if entry & WRITE != 0 { MAY_WRITE } else { 0 };
+        (entry & !(WRITE | MAY_WRITE)) | COW | intent
     } else {
         entry
     })
@@ -564,6 +576,15 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
     }
     fn set(&mut self, pa: u64, after: u64) -> Result<(), DescriptorRefusal> {
         let before = self.read(pa)?;
+        // `after` may come from an earlier read of this entry: the walker
+        // may have set ACCESSED or DIRTY since (#3133). A present store
+        // never takes away the walker's bits; `replace_live_entry` carries
+        // any it sets after this read.
+        let after = if before & after & PRESENT != 0 {
+            after | before & WALKER_SET
+        } else {
+            after
+        };
         if before == after {
             return Ok(());
         }
@@ -767,6 +788,7 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
             DescriptorOp::Protect {
                 permissions: p,
                 exec,
+                cow_ceiling,
                 ..
             } => {
                 if entry & (PRESENT | PREPARED) == 0 {
@@ -776,7 +798,23 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                     return Err(DescriptorRefusal::NotPrivateAnonymous);
                 }
                 if entry & COW != 0 {
-                    return Err(DescriptorRefusal::CowArmed);
+                    // Fork-shared: COW stays armed and write stays intent.
+                    let cow = crate::aarch64::cow_armed_protection(
+                        true,
+                        p.writable,
+                        p.executable,
+                        cow_ceiling,
+                        entry & MAY_EXEC != 0 || exec == ExecAuthority::Mapping,
+                    )?;
+                    let new = (entry & !(WRITE | USER | NX | MAY_WRITE))
+                        | if cow.user { USER } else { 0 }
+                        | if cow.executable { MAY_EXEC } else { NX }
+                        | if cow.write_intent { MAY_WRITE } else { 0 };
+                    check_leaf_privilege_matches_range(
+                        UserVa::new(self.txn.op.span().va + offset),
+                        new,
+                    )?;
+                    return self.set(slot, new);
                 }
                 // Write stays a leaf fact: MAY_WRITE says the frame is this
                 // MM's own to write.
@@ -926,9 +964,14 @@ impl DescriptorTxn<'_> {
             DescriptorOp::Protect {
                 permissions: p,
                 exec,
+                cow_ceiling,
                 ..
             } => (
-                0,
+                cow_ceiling.map_or(0, |c| {
+                    1 | u64::from(c.readable) << 1
+                        | u64::from(c.writable) << 2
+                        | u64::from(c.executable) << 3
+                }),
                 u64::from(exec == ExecAuthority::Mapping),
                 permissions(p),
                 None,
@@ -971,6 +1014,50 @@ impl DescriptorTxn<'_> {
         Ok(())
     }
 }
+/// The bits an x86 page walker (the CPU, or the soft walker) stores into a
+/// live entry by itself. It only ever sets them, and only in a present
+/// entry; it never clears them or touches any other bit.
+const WALKER_SET: u64 = ACCESSED | DIRTY;
+
+/// The walker bits `seen` adds to `expected`, when that is the whole
+/// difference: the same frame and permissions, with `ACCESSED` or `DIRTY`
+/// newly set. Any other change is not the walker's (#3133).
+fn walker_set_bits(expected: u64, seen: u64) -> Option<u64> {
+    let added = seen & !expected;
+    (expected & PRESENT != 0
+        && added != 0
+        && added & !WALKER_SET == 0
+        && seen & expected == expected)
+        .then_some(added)
+}
+
+/// Replace `expected` by `new` at `pa`. The exact-MM editor excludes every
+/// other software edit, but not the page walker: a sibling's load or store
+/// on another CPU may set `ACCESSED` or `DIRTY` between the plan's snapshot
+/// and this store. That is not contention. Carry the walker's bits forward
+/// into a present `new` and store again. Each retry absorbs at least one bit
+/// of the two the walker can only set, so this stores at most three times.
+/// Returns the words actually replaced and stored, or `None` when the entry
+/// changed in any other way.
+fn replace_live_entry<W: LiveDescriptorWords + ?Sized>(
+    words: &W,
+    pa: u64,
+    expected: u64,
+    new: u64,
+) -> Result<Option<(u64, u64)>, DescriptorRefusal> {
+    let (mut before, mut after) = (expected, new);
+    while !words.compare_exchange(pa, before, after)? {
+        let Some(added) = walker_set_bits(before, words.load(pa)?) else {
+            return Ok(None);
+        };
+        before |= added;
+        if after & PRESENT != 0 {
+            after |= added;
+        }
+    }
+    Ok(Some((before, after)))
+}
+
 fn undo<W: LiveDescriptorWords + ?Sized>(
     words: &W,
     entries: &[JournalEntry],
@@ -978,7 +1065,10 @@ fn undo<W: LiveDescriptorWords + ?Sized>(
 ) -> bool {
     let mut restored = true;
     for entry in entries.iter().rev() {
-        restored &= words.compare_exchange(entry.pa, entry.after, entry.before) == Ok(true);
+        restored &= matches!(
+            replace_live_entry(words, entry.pa, entry.after, entry.before),
+            Ok(Some(_))
+        );
     }
     words.publish_barrier();
     words.invalidate_range(span.va, span.len);
@@ -1014,17 +1104,32 @@ pub fn apply_descriptor_plan<W: LiveDescriptorWords + ?Sized, J: DescriptorJourn
         let mut error = None;
         for entry in &plan.entries {
             words.publish_barrier();
-            match words.compare_exchange(entry.pa, entry.before, entry.after) {
-                Ok(true) => {
-                    if !journal.push(*entry) {
-                        let restored =
-                            words.compare_exchange(entry.pa, entry.after, entry.before) == Ok(true);
+            match replace_live_entry(words, entry.pa, entry.before, entry.after) {
+                Ok(Some((before, after))) => {
+                    // Journal the words this store replaced and wrote, so an
+                    // undo restores the walker's bits it absorbed.
+                    let entry = JournalEntry {
+                        before,
+                        after,
+                        ..*entry
+                    };
+                    if !journal.push(entry) {
+                        let restored = matches!(
+                            replace_live_entry(words, entry.pa, entry.after, entry.before),
+                            Ok(Some(_))
+                        );
                         error = Some((DescriptorRefusal::JournalCapacity, restored));
                         break;
                     }
                 }
-                _ => {
+                // Changed by something other than the walker.
+                Ok(None) => {
                     error = Some((DescriptorRefusal::Contended, true));
+                    break;
+                }
+                // A backend error keeps its own reason.
+                Err(reason) => {
+                    error = Some((reason, true));
                     break;
                 }
             }

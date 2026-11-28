@@ -87,9 +87,18 @@ fn grandchild_inherits_a_slot_after_its_parent_retired() {
     test_support::grandchild_inherits_a_slot_after_its_parent_retired(real_memory_io);
 }
 #[test]
-fn refused_retire_child_mutates_nothing_and_its_retry_completes() {
+fn a_released_slot_whose_frame_another_mm_maps_quarantines_the_carrier() {
     carrick_test_support::require_kvm!();
-    test_support::refused_retire_child_mutates_nothing_and_its_retry_completes(real_memory_io);
+    test_support::a_released_slot_whose_frame_another_mm_maps_quarantines_the_carrier(
+        real_memory_io,
+    );
+}
+#[test]
+fn a_released_slot_its_retiring_mm_still_maps_quarantines_the_carrier() {
+    carrick_test_support::require_kvm!();
+    test_support::a_released_slot_its_retiring_mm_still_maps_quarantines_the_carrier(
+        real_memory_io,
+    );
 }
 #[test]
 fn inherited_inventory_edge_survives_protect_advancing_mapping_generation() {

@@ -94,8 +94,8 @@ pub use prepared::{
     GuestWriteRange, LegacyProtectionRead, MemoryPrepareError, MemoryReadSuspension,
     MemoryReadWait, MemorySupplyRequest, OwnedMemoryWait, OwnedReadContinuation,
     OwnerMemorySelection, OwnerMemorySelectionError, PhysicalMemoryWait, PreparedGuestWrite,
-    PreparedStreamRanges, PreparedWriteLimit, UserMemoryAdmissionError, UserMemoryAdmissionGuard,
-    UserMemoryAuthority, UserMemoryVenue,
+    PreparedStreamRanges, PreparedWriteLimit, PrivateFileVenue, UserMemoryAdmissionError,
+    UserMemoryAdmissionGuard, UserMemoryAuthority, UserMemoryVenue,
 };
 
 mod deferred_anonymous;

@@ -3145,9 +3145,6 @@ impl VmaForkPolicy {
             && matches!(self.child_contents, VmaForkChildPolicy::Preserve)
     }
 }
-pub const LINUX_MREMAP_MAYMOVE: u64 = 0x01;
-pub const LINUX_MREMAP_FIXED: u64 = 0x02;
-pub const LINUX_MREMAP_DONTUNMAP: u64 = 0x04;
 pub const LINUX_MS_ASYNC: u64 = 0x01;
 pub const LINUX_MS_INVALIDATE: u64 = 0x02;
 pub const LINUX_MS_SYNC: u64 = 0x04;
@@ -3992,16 +3989,6 @@ bitflags! {
     #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
     pub struct LinuxMlock2Flags: u64 {
         const ONFAULT = 0x01;
-    }
-
-    /// `mremap(2)` flag bits. The wire word stays raw at the syscall seam;
-    /// `from_bits_retain` keeps unknown bits so the dispatcher's EINVAL
-    /// validation still sees them.
-    #[derive(::core::fmt::Debug, ::core::clone::Clone, ::core::marker::Copy, ::core::cmp::PartialEq, ::core::cmp::Eq)]
-    pub struct LinuxMremapFlags: u64 {
-        const MAYMOVE = LINUX_MREMAP_MAYMOVE;
-        const FIXED = LINUX_MREMAP_FIXED;
-        const DONTUNMAP = LINUX_MREMAP_DONTUNMAP;
     }
 
     /// `mlockall(2)` flag bits. `MCL_ONFAULT` has a semantic precondition

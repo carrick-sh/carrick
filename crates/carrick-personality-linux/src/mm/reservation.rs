@@ -210,7 +210,18 @@ fn mremap_inner<M: ReservationPolicyAccess>(
     if keep_source && new_len != source.len() {
         return Err(Refusal::Invalid);
     }
-    let node = root.run_covering(source).ok_or(Refusal::Hole)?;
+    // Linux shrinks before it asks for one mapping (mremap(2), and the
+    // native oracle on #3165): a shrink, or a same-size call, needs only a
+    // mapping at `old_address` (else EFAULT), and retires the tail across
+    // whatever mappings and holes it spans, as munmap does (#3171).
+    let shrinks = !keep_source && fixed.is_none() && new_len <= source.len();
+    let covered = if shrinks {
+        ReservationRange::new(source.start(), source.start() + source.len().min(4096))
+            .ok_or(Refusal::Invalid)?
+    } else {
+        source
+    };
+    let node = root.run_covering(covered).ok_or(Refusal::Hole)?;
     if !LinuxReservationPolicy::root_editable(&node) {
         return Err(Refusal::ForeignMapping);
     }

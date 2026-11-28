@@ -57,6 +57,13 @@ pub const TCR_EL1_BOOTSTRAP: u64 = {
         | (1 << 38) // TBI1
 };
 
+// No lane enables hardware access-flag (`HA`, bit 39) or dirty-state (`HD`,
+// bit 40) management, so no AArch64 walker ever stores into a descriptor and
+// the descriptor editor's exact compare-exchange has no hardware writer to
+// absorb. x86's walker does (`replace_live_entry`, #3133). Every lane programs
+// `TCR_EL1` from this value, and the stage-1 regime refuses both bits.
+const _: () = assert!(TCR_EL1_BOOTSTRAP & ((1 << 39) | (1 << 40)) == 0);
+
 /// `SCTLR_EL1` bootstrap value — the bits COMMON to both backends:
 /// `M`(0, stage-1 MMU on), `C`(2, data cache), `I`(12, instruction cache),
 /// `DZE`(14, EL0 `DC ZVA`), `UCT`(15, EL0 read of `CTR_EL0`),

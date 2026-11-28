@@ -38,6 +38,7 @@ use carrick_kernel::dispatch::carrier_loop::{
     publish_stopped_zone_slot, resolve_host_first_touch_with_owner_wait, run_guest,
     settle_zone_exit,
 };
+use carrick_kernel::dispatch::mem::el1_reservations::CarrierReservations;
 use carrick_kernel::dispatch::{
     CarrierBridges, DispatchOutcome, MmExecutorParticipation, SyscallDispatcher, SyscallRequest,
     boot_private_file_backings,
@@ -879,6 +880,9 @@ pub struct SoftRootPublication {
     pub carrier: NonZeroU64,
     /// The published owner-memory wait venue is this region's zone and portal.
     pub portal_is_owner_wait_venue: bool,
+    /// The root MM's reservation root is admitted in this carrier's shared
+    /// reservation table, read through its reservation provider's view.
+    pub reservation_root_admitted: bool,
 }
 
 impl SoftRootPublication {
@@ -953,6 +957,22 @@ where
     });
     let portal_is_owner_wait_venue = get_el1_region_host_ptr() == region as usize
         && carrick_kernel::dispatch::carrier_loop::OwnerWaitVenue::published().is_ok();
+    let reservation_root_admitted = {
+        use carrick_kernel::dispatch::mem::el1_reservations::HostReservationProvider as _;
+        let provider = backend
+            .retained_metadata()
+            .ok()
+            .map(CarrierReservations::new);
+        let backing = provider
+            .as_ref()
+            .and_then(|provider| provider.address_space_backing());
+        let space = backing.as_ref().and_then(|backing| backing.region());
+        space.is_some_and(|space| {
+            let index = space.zone.spaces.find(mm_key).map(|entry| entry.index());
+            let mm = carrick_el1_abi::ReservationMm::new(mm_key);
+            matches!((index, mm), (Some(index), Some(mm)) if space.reservations.admitted(index, mm))
+        })
+    };
     Ok(SoftRootPublication {
         task_tid,
         mm_key,
@@ -964,6 +984,7 @@ where
         portal_carrier: portal.carrier(),
         carrier: backend.carrier().raw(),
         portal_is_owner_wait_venue,
+        reservation_root_admitted,
     })
 }
 
@@ -1160,6 +1181,17 @@ where
             }
         }
         aperture_scope.lifecycle = Some(publish_root_lifecycle(&engine, &root_ctx)?);
+        // The first load's `Bind` admission imports the root's reservation
+        // root through this carrier's provider, as an HVF binding installs
+        // it: without one, EL1 never admits the root and refuses its BIND.
+        dispatcher
+            .install_reservation_provider(Arc::new(CarrierReservations::new(
+                engine
+                    .backend()
+                    .retained_metadata()
+                    .map_err(|e| format!("retain the soft carrier's EL1 region: {e:?}"))?,
+            )))
+            .map_err(|e| format!("install the soft carrier's reservation provider: {e:?}"))?;
         // EL1 admits the root against the zone's own PID namespace and
         // issuers: hand the kernel's births to them before the first entry,
         // as the HVF and x86 carriers bind theirs.
@@ -1239,7 +1271,12 @@ where
     X: ExecuteBlock + Send + 'static,
     X::Error: core::fmt::Debug,
 {
-    let mappings = CarrierLifecycleMappings::new(engine.backend().retained_metadata());
+    let mappings = CarrierLifecycleMappings::new(
+        engine
+            .backend()
+            .retained_metadata()
+            .map_err(|e| format!("retain the soft carrier's EL1 region: {e:?}"))?,
+    );
     let control = root.thread().control_lease();
     if control.visible_tid().is_none() {
         let tid = carrick_kernel::namespace::pid::ns_visible_thread_tid(root.thread())

@@ -117,7 +117,7 @@ struct AdmissionRows {
     backing_leases: Vec<super::host_backing::HostBackingLease>,
 }
 
-fn admission_rows(mem: &MemState) -> Result<AdmissionRows, Refusal> {
+fn admission_rows(mem: &MemState, root: &DelegatedRoot) -> Result<AdmissionRows, Refusal> {
     let mut owned = Vec::new();
     let mut backing_leases = Vec::new();
     let mut rows = Vec::new();
@@ -147,9 +147,7 @@ fn admission_rows(mem: &MemState) -> Result<AdmissionRows, Refusal> {
             let end = span[1];
             let range = ReservationRange::new(start, end).ok_or(Refusal::Invalid)?;
             let backing = mem
-                .private_file_maps
-                .iter()
-                .find(|source| source.start <= start && source.end >= end)
+                .root_file_source(root, start, end)
                 .map(|source| {
                     let lease = mem
                         .host_backing_custody
@@ -219,7 +217,7 @@ fn admit_bind(
         rows,
         owned,
         backing_leases,
-    } = admission_rows(mem)?;
+    } = admission_rows(mem, root)?;
     // Taken before the root guard (the projection must not read the root).
     // Every owned row becomes a root node, so it is never charged here.
     let host = HostCharges::at_admission(mem);
@@ -848,6 +846,9 @@ mod tests {
             mm: ReservationMm,
         }
         impl HostReservationProvider for Provider {
+            fn private_file_venue(&self) -> carrick_guest_mem::PrivateFileVenue {
+                carrick_guest_mem::PrivateFileVenue::OwnerGrant
+            }
             fn prepare(&self) -> Result<Box<dyn PreparedHostReservations>, Refusal> {
                 Ok(Box::new(View {
                     table: Arc::clone(&self.table),
@@ -1189,6 +1190,10 @@ mod tests {
 #[path = "el1_reservations/projection.rs"]
 mod projection;
 pub use projection::{NonAnonymousVmas, ReservationProcMaps};
+
+#[path = "el1_reservations/carrier.rs"]
+mod carrier;
+pub use carrier::{CarrierReservationAccess, CarrierReservations};
 
 #[path = "el1_reservations/provider.rs"]
 mod provider;

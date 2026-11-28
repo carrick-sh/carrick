@@ -6,6 +6,7 @@
 use super::*;
 use crate::dispatch::mm_authority::DispatchMmAuthority;
 use carrick_el1::memory::reservations::{NoRootWait, RootHolder, RootWait};
+use carrick_guest_mem::PrivateFileVenue;
 
 /// A refused root probe, retaining the exact release producer and the holder
 /// from that same failed acquisition. It owns no lock or execution capacity.
@@ -94,6 +95,13 @@ impl RootProbe {
 }
 
 pub trait HostReservationProvider: Send + Sync {
+    /// Who serves a delegated root's private file pages: the one answer the
+    /// MM records when this provider is installed, and which every import of
+    /// a private file row into the root reads (admission, the host-row
+    /// mirror, mmap). `OwnerGrant` only for a carrier whose owner frame grant
+    /// serves them; under `HostEager` such a row stays a host-owned node.
+    fn private_file_venue(&self) -> PrivateFileVenue;
+
     /// Exact retained carrier venue for publication and final cleanup. Providers
     /// used only for isolated root fixtures need not expose a carrier region.
     fn address_space_backing(
@@ -134,10 +142,18 @@ pub struct PreparedReservationSession {
     view: Box<dyn PreparedHostReservations>,
 }
 
+/// An installed carrier provider and the private file venue it answered,
+/// once, when it was installed.
+#[derive(::core::clone::Clone)]
+struct InstalledProvider {
+    provider: Arc<dyn HostReservationProvider>,
+    private_file_venue: PrivateFileVenue,
+}
+
 #[derive(::core::default::Default)]
 pub(in crate::dispatch) struct ReservationProviderSlot {
     published: bool,
-    provider: Option<Arc<dyn HostReservationProvider>>,
+    provider: Option<InstalledProvider>,
     /// Serializes every host venue of THIS MM's root, so the root lock's
     /// only other holder a host venue can meet is an EL1 critical section.
     /// The provider refuses that contention without polling.
@@ -167,6 +183,7 @@ impl ReservationProviderSlot {
 #[derive(::core::clone::Clone)]
 pub(in crate::dispatch) struct DelegatedRoot {
     provider: Arc<dyn HostReservationProvider>,
+    private_file_venue: PrivateFileVenue,
     host_serial: Arc<parking_lot::Mutex<()>>,
     mm: ReservationMm,
     #[cfg(test)]
@@ -263,6 +280,13 @@ impl DelegatedRoot {
         self.mm
     }
 
+    /// Whether this root takes custody of private file rows: the venue its
+    /// carrier's provider answered at install. Under `HostEager` no private
+    /// file row enters the root with its source; it stays host-owned.
+    pub(in crate::dispatch) fn takes_private_files(&self) -> bool {
+        self.private_file_venue == PrivateFileVenue::OwnerGrant
+    }
+
     /// The admission step: the exact published root before it is sealed.
     pub(in crate::dispatch) fn with_root_for_import<R>(
         &self,
@@ -282,7 +306,11 @@ impl DispatchMmAuthority {
     pub(in crate::dispatch) fn reservation_provider_for_publication(
         &self,
     ) -> Option<Arc<dyn HostReservationProvider>> {
-        self.reservation_provider.lock().provider.clone()
+        self.reservation_provider
+            .lock()
+            .provider
+            .as_ref()
+            .map(|installed| Arc::clone(&installed.provider))
     }
     /// Runtime installs its carrier/VM-generation-bound provider before the
     /// first address-space publication. Installation is one-shot; a fork/exec
@@ -298,7 +326,11 @@ impl DispatchMmAuthority {
         if slot.provider.is_some() {
             return Err(Refusal::Collision);
         }
-        slot.provider = Some(provider);
+        let private_file_venue = provider.private_file_venue();
+        slot.provider = Some(InstalledProvider {
+            provider,
+            private_file_venue,
+        });
         Ok(())
     }
 
@@ -319,8 +351,10 @@ impl DispatchMmAuthority {
     /// The handle of this exact MM's root, for its admission.
     pub(in crate::dispatch) fn delegated_root(&self) -> Result<DelegatedRoot, Refusal> {
         let slot = self.reservation_provider.lock();
+        let installed = slot.provider.clone().ok_or(Refusal::ForeignMapping)?;
         Ok(DelegatedRoot {
-            provider: slot.provider.clone().ok_or(Refusal::ForeignMapping)?,
+            provider: installed.provider,
+            private_file_venue: installed.private_file_venue,
             host_serial: Arc::clone(&slot.host_serial),
             mm: ReservationMm::new(self.mm_id.raw()).ok_or(Refusal::Invalid)?,
             #[cfg(test)]
@@ -333,7 +367,8 @@ impl DispatchMmAuthority {
             .reservation_provider
             .lock()
             .provider
-            .clone()
+            .as_ref()
+            .map(|installed| Arc::clone(&installed.provider))
             .ok_or(Refusal::ForeignMapping)?;
         // No slot lock is held across host allocation or pin resolution.
         let view = provider.prepare()?;
@@ -355,7 +390,10 @@ impl DispatchMmAuthority {
         let (installed, host_serial) = {
             let slot = self.reservation_provider.lock();
             (
-                slot.provider.clone().ok_or(Refusal::ForeignMapping)?,
+                slot.provider
+                    .as_ref()
+                    .map(|installed| Arc::clone(&installed.provider))
+                    .ok_or(Refusal::ForeignMapping)?,
                 Arc::clone(&slot.host_serial),
             )
         };
@@ -397,6 +435,9 @@ mod tests {
             release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
         }
         impl HostReservationProvider for Provisioner {
+            fn private_file_venue(&self) -> PrivateFileVenue {
+                self.inner.private_file_venue()
+            }
             fn address_space_backing(
                 &self,
             ) -> Option<Arc<dyn crate::kernel::mm_occupancy::AddressSpaceBacking>> {
