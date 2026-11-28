@@ -8,8 +8,8 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use carrick_el1::memory::reservations::{
-    HostBankInstall, Refusal, Reservations, ResolvedReservationNodes, RootReleaseVenue, RootWait,
-    SharedReservations,
+    HostBankGrant, HostBankInstall, Refusal, Reservations, ResolvedReservationNodes,
+    RootReleaseVenue, RootWait, SharedReservations,
 };
 use carrick_el1_abi::{MetadataExtentResolver, ReservationMm};
 use carrick_guest_mem::HostVa;
@@ -71,6 +71,15 @@ unsafe impl RetainedMetadataBacking for ReservationBankBacking {
     }
     fn mapped_len(&self) -> usize {
         self.0.len()
+    }
+}
+
+/// A host bank grant: one retained mapping in this carrier's aperture.
+struct RetainedBankGrant<E>(E);
+impl<E: RetainedMetadataExtent> HostBankGrant for RetainedBankGrant<E> {
+    type Pin = E::Pin;
+    fn pin(&self) -> Result<E::Pin, Refusal> {
+        self.0.pin().map_err(|_| Refusal::Stale)
     }
 }
 
@@ -160,43 +169,63 @@ impl<A: CarrierReservationAccess> HostReservationProvider for CarrierReservation
     ) -> Result<HostBankInstall, Refusal> {
         // Carrier capacity publication is serialized outside all MM locks.
         let _capacity = self.capacity.lock();
-        let view = self.prepare()?;
-        let mut root = view.lock(mm, wait)?;
-        match root.secure_host_nodes(carrick_el1::memory::reservations::HOST_RESERVE) {
+        let table = table(&*self.access)?;
+        let view = PreparedView(self.prepared()?);
+        // What this root decides against: the view's capacity. A lock
+        // refused because a bank landed after the view was read, and a root
+        // the pool cannot serve, are the same `MetadataRequired` against it,
+        // and only the table's own decision below answers either (#3085).
+        let observed = view.0.nodes.capacity();
+        match view.lock(mm, wait).and_then(|mut root| {
+            root.secure_host_nodes(carrick_el1::memory::reservations::HOST_RESERVE)
+        }) {
             // A peer's bank already serves this root: decide again.
             Ok(()) => return Ok(HostBankInstall::Redundant),
             Err(Refusal::MetadataRequired) => {}
             Err(refusal) => return Err(refusal),
         }
-        let table = table(&*self.access)?;
-        let generation = table.storage_generation();
-        drop(root);
         drop(view);
-        let bytes = SharedReservations::metadata_bank_layout().size();
-        let bytes = bytes.next_multiple_of(16 * 1024);
-        let backing = OwnedHostMapping::map_shared_anon(bytes, HostMappingKind::SharedAnon)
-            .map_err(|_| Refusal::MetadataRequired)?;
-        let mapping = self
-            .access
-            .map_retained(Arc::new(ReservationBankBacking(backing)))
-            .map_err(|_| Refusal::MetadataRequired)?;
-        let result = mapping.pin().map_err(|_| Refusal::Stale).and_then(|pin| {
-            table.provision_metadata(&pin, generation, &host_release_venue(&*self.access)?)
-        });
+        let release = host_release_venue(&*self.access)?;
+        // No host memory or no aperture slot is not an answer by itself: the
+        // table decides it, after reading whether a peer published, or holds
+        // the window, meanwhile.
+        let decision = table.install_host_bank(
+            observed,
+            || {
+                let bytes = SharedReservations::metadata_bank_layout().size();
+                let bytes = bytes.next_multiple_of(16 * 1024);
+                let backing =
+                    OwnedHostMapping::map_shared_anon(bytes, HostMappingKind::SharedAnon).ok()?;
+                self.access
+                    .map_retained(Arc::new(ReservationBankBacking(backing)))
+                    .ok()
+                    .map(RetainedBankGrant)
+            },
+            &release,
+        );
         // Only a published grant became a bank; a redundant one, or one
         // refused by a held window, is retired here.
-        if !matches!(result, Ok(HostBankInstall::Published)) {
+        if let Some(RetainedBankGrant(mapping)) = decision.unpublished {
             let _ = mapping.try_retire();
         }
-        result
+        decision.answer
     }
 
     fn prepare(&self) -> Result<Box<dyn PreparedHostReservations>, Refusal> {
+        self.prepared()
+            .map(|view| Box::new(PreparedView(view)) as _)
+    }
+}
+
+impl<A: CarrierReservationAccess> CarrierReservations<A> {
+    /// The resolved view of the table's published banks now, cached per
+    /// storage generation.
+    fn prepared(&self) -> Result<Arc<Prepared<A>>, Refusal> {
         let table = table(&*self.access)?;
         let generation = table.storage_generation();
         let mut cached = self.prepared.lock();
         if let Some(view) = cached.as_ref().filter(|view| view.generation == generation) {
-            return Ok(Box::new(PreparedView(Arc::clone(view))));
+            return Ok(Arc::clone(view));
         }
         let mut nodes = ResolvedReservationNodes::default();
         let region = self.access.region().map_err(|_| Refusal::Stale)?;
@@ -213,7 +242,7 @@ impl<A: CarrierReservationAccess> HostReservationProvider for CarrierReservation
             generation,
         });
         *cached = Some(Arc::clone(&view));
-        Ok(Box::new(PreparedView(view)))
+        Ok(view)
     }
 }
 

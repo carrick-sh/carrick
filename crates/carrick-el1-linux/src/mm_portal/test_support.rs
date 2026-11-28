@@ -106,6 +106,12 @@ impl Drop for Bank {
     }
 }
 pub struct NoPin(std::sync::Arc<Bank>);
+impl carrick_el1::memory::reservations::HostBankGrant for NoPin {
+    type Pin = NoPin;
+    fn pin(&self) -> Result<NoPin, carrick_el1::memory::reservations::Refusal> {
+        Ok(NoPin(self.0.clone()))
+    }
+}
 // SAFETY: the retained bank allocation cannot move or be freed before this pin.
 unsafe impl PinnedMetadataExtent for NoPin {
     fn extent(&self) -> MetadataExtent {
@@ -139,13 +145,16 @@ impl Region {
             ptr: NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) }).unwrap(),
             layout,
         });
-        self.table()
-            .provision_metadata(
-                &NoPin(bank.clone()),
-                self.table().storage_generation(),
-                &carrick_core_abi::NO_METADATA_WAITERS,
-            )
-            .unwrap();
+        assert_eq!(
+            self.table()
+                .install_host_bank(
+                    self.table().node_capacity(),
+                    || Some(NoPin(bank.clone())),
+                    &carrick_core_abi::NO_METADATA_WAITERS,
+                )
+                .answer,
+            Ok(carrick_el1::memory::reservations::HostBankInstall::Published)
+        );
         self.bank = Some(bank);
     }
 }
