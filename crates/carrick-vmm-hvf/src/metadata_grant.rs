@@ -384,13 +384,7 @@ fn settle_native_exec_predecessor(
         )
     };
     if let Err(carrick_hal::fork_stock::ForkStockServiceError::BrokenRelease(broken)) = settled {
-        // A broken invariant ends the run, never a deferral the next drain
-        // retries (#3132).
-        carrick_fatal::carrick_fatal!(
-            "hvf::fork_stock",
-            "exec predecessor release found a broken invariant at {}",
-            broken.site()
-        );
+        broken_release_ends_the_carrier("exec predecessor", broken);
     }
     if settled.is_err() {
         return false;
@@ -1756,13 +1750,24 @@ fn reclaim_fork_stock(
     // A broken invariant ends the run here, once for every caller, never a
     // refusal the guest sees or a deferral the next drain retries (#3132).
     if let Err(ForkStockServiceError::BrokenRelease(broken)) = reclaimed {
-        carrick_fatal::carrick_fatal!(
-            "hvf::fork_stock",
-            "fork quarantine release found a broken invariant at {}",
-            broken.site()
-        );
+        broken_release_ends_the_carrier("fork quarantine", broken);
     }
     reclaimed
+}
+
+/// The one place a retired MM's broken release ends an HVF carrier: never a
+/// deferral the next drain retries, and never a refusal the guest sees
+/// (#3132, #3061).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn broken_release_ends_the_carrier(
+    release: &str,
+    broken: carrick_core_abi::mm::BrokenRelease,
+) -> ! {
+    carrick_fatal::carrick_fatal!(
+        "hvf::fork_stock",
+        "{release} release found a broken invariant at {}",
+        broken.site()
+    )
 }
 
 /// The guest's shared reservation table in the retained carrier region,

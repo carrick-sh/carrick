@@ -36596,6 +36596,13 @@
       "owner": "carrick_softcpu_aarch64_host::facade::soft_carrier_broken",
       "lane": "shared",
       "ceiling": 1
+    },
+    {
+      "family": "fatal_carrier_fault",
+      "operation": "fatal:hvf::fork_stock",
+      "owner": "carrick_vmm_hvf::metadata_grant::broken_release_ends_the_carrier",
+      "lane": "hvf",
+      "ceiling": 1
     }
   ]
 }
