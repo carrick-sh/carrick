@@ -1590,8 +1590,9 @@ const SLOT_LOCK_SCAN_OWED: u32 = 2;
 /// lock-taking zone operation takes one, and its caller delivers it in its
 /// own venue: folded into the [`WakeEffects`] it sends
 /// ([`Self::fold_into`]), or sent slot by slot ([`Self::deliver`]). Those
-/// are the only ways to empty it, and dropping one that still owes a pass
-/// is a broken invariant (a debug assertion): a scan would sleep past work.
+/// are the only ways to empty it. Dropping one that still owes a pass is a
+/// broken invariant, fatal in every build (a panic, which the EL1 and CPL0
+/// images make fatal): a forgotten pass is a scan sleeping past work.
 #[must_use = "an owed idle-scan pass must be delivered: fold it into the sent WakeEffects or deliver it"]
 pub struct OwedPasses {
     // Plain atomics, never loom's: the sink is the caller's own, and a held
@@ -1670,10 +1671,10 @@ impl Default for OwedPasses {
 
 impl Drop for OwedPasses {
     fn drop(&mut self) {
-        debug_assert!(
+        // Not a debug assertion: a release build must not forget it either.
+        assert!(
             self.is_empty(),
-            "an owed idle-scan pass was dropped undelivered: {:?}",
-            self.slots
+            "an owed idle-scan pass was dropped undelivered"
         );
     }
 }
