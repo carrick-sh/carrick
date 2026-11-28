@@ -1,3 +1,6 @@
+# #3105 PR 2: sched-core's zone loom fixture (`loom_models.rs`) now builds
+# the zone's address spaces, which use loom atomics under loom. The models,
+# this contract's semantics, bindings and budgets are unchanged.
 # #2655: an x86 fork whose rows outgrow the residency table is refused
 # "not now" (`ForkStockRefusal::Residency`); the guest grows the table and
 # reruns the fork. Witnesses are bound under kernel.el1.fork-cow.

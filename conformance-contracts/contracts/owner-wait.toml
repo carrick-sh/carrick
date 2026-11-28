@@ -1,3 +1,9 @@
+# #3105 PR 2: sched-core `spaces.rs` adds prepared-commit shares of an
+# entry's editor word (`try_begin_commit`, `SpaceCommit`, `EditorWord`) and
+# builds on loom atomics under loom. Nothing calls a share yet; the exact
+# editor and the host pause keep their admission and their Editor release
+# wait, which the last share's release now also publishes. This contract's
+# semantics, bindings and budgets are unchanged.
 # #2645 slice A: behaviour-preserving move. The HVF BIND/open helpers
 # (enter_mm_executor_then_register, the leased-root check and
 # open_first_address_space) and the stopped zone-slot publication move to

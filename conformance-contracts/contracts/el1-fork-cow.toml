@@ -1,3 +1,9 @@
+# #3105 PR 2: the memory core's MM editor gains `GuestCommits` (the guest
+# editor word's prepared-commit shares). A host COW supply, settle, exit or
+# carrier retirement of a shared MM answers `NotNow::CommitsDrain` and
+# changes nothing, as it answers a held guest editor today; the explorer's
+# G5 checks it. Fork's COW arming and this contract's semantics, bindings
+# and budgets are unchanged.
 # #3040: a kernel copy's COW selection is leased (PortalGrantSlot::
 # lease_cow_selection / supply_cow_selection) on ARM and x86: the carrier's
 # exact take or the lane's exact withdrawal ends it, so a refused or unserved
