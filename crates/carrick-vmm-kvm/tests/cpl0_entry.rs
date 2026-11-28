@@ -5880,3 +5880,61 @@ void _start(void) {
     assert_eq!(outcome.run.terminating_signal, None);
     assert_eq!(outcome.physical.refusal_overflow_count().unwrap(), 0);
 }
+
+/// Discovery only (#3117 clone ENOSYS): a forked child's thread clone with
+/// the peer's idle pass held, and without.
+fn discovery_clone_peer_held(test: &str, flags: &[&str]) {
+    if !in_bounded_child(test, Duration::from_secs(20)) {
+        return;
+    }
+    let elf = kvm_pool_fixture::assemble_fixture("native_child_clone_peer_held.S", flags);
+    let outcome = run_instrumented_pool_fixture(&elf, 128);
+    let counters = outcome
+        .physical
+        .syscall_counters()
+        .expect("stopped counters");
+    let refused = kvm_pool_fixture::refusal_count::refusal_totals(&counters);
+    let clone = kvm_pool_fixture::refusal_count::RefusalCount::of(&counters, 56);
+    if let Some(path) = std::env::var_os("C2_DISCOVERY_OUT") {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("discovery out");
+        writeln!(
+            file,
+            "{test} exit={} refused={refused:?} clone={clone:?}",
+            outcome.run.exit_code
+        )
+        .expect("discovery write");
+    }
+    assert_eq!(
+        outcome.run.exit_code, 7,
+        "clone (150 + n is errno n): refused {refused:?}, clone {clone:?}, {:?}",
+        outcome.run
+    );
+}
+
+#[test]
+fn discovery_clone_peer_held_hold() {
+    discovery_clone_peer_held("discovery_clone_peer_held_hold", &[]);
+}
+
+#[test]
+fn discovery_clone_peer_held_no_hold() {
+    discovery_clone_peer_held("discovery_clone_peer_held_no_hold", &["-DNO_HOLD=1"]);
+}
+
+#[test]
+fn discovery_clone_peer_held_hold_touched() {
+    discovery_clone_peer_held("discovery_clone_peer_held_hold_touched", &["-DTOUCH_TID=1"]);
+}
+
+#[test]
+fn discovery_clone_peer_held_no_hold_touched() {
+    discovery_clone_peer_held(
+        "discovery_clone_peer_held_no_hold_touched",
+        &["-DNO_HOLD=1", "-DTOUCH_TID=1"],
+    );
+}
