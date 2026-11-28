@@ -2318,6 +2318,53 @@ fn mounted_static_x86_mremap_grows_shrinks_and_moves_anonymous_rows_as_native() 
     );
 }
 
+/// `mremap` of an old range that is not one mapping (#3171), in the root and
+/// in a forked child beside its live parent, answered as native Linux
+/// answers each shape: a shrink across mappings of the same type, of
+/// different protections or sharing, or over holes, returns `old_address`
+/// and retires the whole tail; a same-size call returns `old_address`;
+/// only an unmapped `old_address` is EFAULT, before any effect; growth
+/// across mappings is EFAULT. Each line carries the result and which of the
+/// four pages are vacant afterwards. Before #3171 the ring left the
+/// cross-mapping shrinks unrouted (a counted ENOSYS, `r=-38`).
+#[test]
+fn mounted_static_x86_mremap_shrink_across_mappings_answers_as_native() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("mremap-shrink-across-mappings");
+    compile_assembly_with_flags(
+        "x86_mremap_shrink_across_mappings.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native mremap shrink oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+    let native_lines = String::from_utf8_lossy(&native.stdout);
+    assert!(
+        native_lines.starts_with("child\n")
+            && native_lines.contains("rw_then_r_shrink_1 r=0 v=0111 h=1\n")
+            && native_lines.contains("hole_at_start_shrink_1 r=-14 v=1000 h=-\n"),
+        "native oracle: {native_lines}"
+    );
+    let guest = run_mounted_binary(&elf, "mremap-shrink-across-mappings", false);
+    assert_eq!(
+        (guest.status.code(), String::from_utf8_lossy(&guest.stdout)),
+        (native.status.code(), native_lines.clone()),
+        "lines after `child` are the forked child's; r=-38 is an unrouted \
+         shape. stderr: {}",
+        String::from_utf8_lossy(&guest.stderr)
+    );
+}
+
 /// A counted in-ring refusal appears in the run's compat report (#3152).
 /// The ring answers `tuxcall` (x86_64 184, never implemented by Linux)
 /// with ENOSYS, as Linux does, and counts it; before #3152 the report was built only from host

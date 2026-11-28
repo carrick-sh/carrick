@@ -2763,6 +2763,85 @@ fn delegated_mremap_shapes_stay_root_owned() {
     );
 }
 
+/// mremap(2) shrinks before it asks for one mapping (#3171, the native
+/// oracle on #3165): a shrink whose old range spans mappings of different
+/// protections and a hole returns `old_address` and retires the whole tail;
+/// a same-size call across them returns `old_address` unchanged; only an
+/// unmapped `old_address` is EFAULT, before any effect.
+#[test]
+fn delegated_mremap_shrink_spans_mappings_and_holes_as_linux() {
+    let mut dispatcher = SyscallDispatcher::new();
+    let root = Root::admit(&dispatcher);
+    let mut memory = arena_memory();
+    let a = anon_mmap(&mut dispatcher, &mut memory, 0, 6 * PAGE);
+    memory.write_bytes(a, b"root").unwrap();
+    // [a, a+2) RW, [a+2, a+3) R, [a+3, a+4) RW, [a+4, a+5) hole, [a+5, a+6) RW.
+    let protect = call(
+        &mut dispatcher,
+        &mut memory,
+        SYS_MPROTECT,
+        [a + 2 * PAGE, PAGE, 1, 0, 0, 0],
+    );
+    assert_eq!(returned(protect), 0);
+    let unmap = call(
+        &mut dispatcher,
+        &mut memory,
+        SYS_MUNMAP,
+        [a + 4 * PAGE, PAGE, 0, 0, 0, 0],
+    );
+    assert_eq!(returned(unmap), 0);
+
+    // An unmapped `old_address` is EFAULT and retires nothing.
+    assert_eq!(
+        mremap(
+            &mut dispatcher,
+            &mut memory,
+            [a + 4 * PAGE, 2 * PAGE, PAGE, 0, 0]
+        ),
+        DispatchOutcome::errno(LINUX_EFAULT)
+    );
+    assert_eq!(
+        root.node(a + 5 * PAGE),
+        Some((a + 5 * PAGE, a + 6 * PAGE, true, ANON_FLAGS))
+    );
+    // Same size across two mappings: `old_address`, no effect.
+    assert_eq!(
+        returned(mremap(
+            &mut dispatcher,
+            &mut memory,
+            [a, 4 * PAGE, 4 * PAGE, 0, 0]
+        )) as u64,
+        a
+    );
+    assert_eq!(
+        root.node(a + 2 * PAGE).map(|node| (node.0, node.1)),
+        Some((a + 2 * PAGE, a + 3 * PAGE))
+    );
+    // Growth across two mappings stays EFAULT.
+    assert_eq!(
+        mremap(
+            &mut dispatcher,
+            &mut memory,
+            [a, 4 * PAGE, 8 * PAGE, MREMAP_MAYMOVE, 0]
+        ),
+        DispatchOutcome::errno(LINUX_EFAULT)
+    );
+    // The shrink retires every mapping and hole in the tail.
+    assert_eq!(
+        returned(mremap(
+            &mut dispatcher,
+            &mut memory,
+            [a, 6 * PAGE, PAGE, 0, 0]
+        )) as u64,
+        a
+    );
+    assert_eq!(root.node(a), Some((a, a + PAGE, true, ANON_FLAGS)));
+    for page in 1..6 {
+        assert_eq!(root.node(a + page * PAGE), None, "page {page} retired");
+    }
+    assert_eq!(memory.read_bytes(a, 4).unwrap(), b"root");
+}
+
 #[test]
 fn delegated_mremap_growth_stops_at_an_adjacent_host_file_mapping() {
     // Two mappings: a root anonymous page and, right after a one-page
@@ -2932,11 +3011,13 @@ fn delegated_mremap_madvise_mlock_sequence_matches_a_host_setup_mm() {
                 ],
             ),
             mremap(&mut dispatcher, &mut memory, [a, u64::MAX, PAGE, 0, 0]),
-            // A source spanning the anonymous mapping and the file mapping.
+            // Growth of a source spanning the anonymous mapping and the
+            // file mapping. (A shrink of it is served: Linux shrinks before
+            // it asks for one mapping, #3171.)
             mremap(
                 &mut dispatcher,
                 &mut memory,
-                [a + 3 * PAGE, 2 * PAGE, PAGE, 0, 0],
+                [a + 3 * PAGE, 2 * PAGE, 3 * PAGE, MREMAP_MAYMOVE, 0],
             ),
             // A source in an unmapped hole.
             mremap(

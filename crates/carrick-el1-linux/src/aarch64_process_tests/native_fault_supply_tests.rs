@@ -457,6 +457,7 @@ enum ChildStockCase {
     FirstBirth,
     AdvisoryMmap,
     Madvise,
+    Mremap,
     Reuse,
     Pinned,
     Claimed,
@@ -480,11 +481,28 @@ fn native_fork_child_madvise_stays_in_ring() {
     child_thread_admission(0, 0, ChildStockCase::Madvise);
 }
 
+/// A live native fork child runs `mremap` through the production entry
+/// (#3152, #3171), served in ring with zero forwards or refusals, as native
+/// Linux answers each shape: shrink a row, move an untouched row past a
+/// blocker with `MREMAP_MAYMOVE`, a same-size call across two mappings,
+/// growth across them (EFAULT), an unmapped `old_address` (EFAULT, nothing
+/// retired), then a shrink across a different-protection mapping and a hole
+/// that retires the whole tail. Before #3152 every shape was a counted
+/// ENOSYS for an ARM fork child.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn native_fork_child_mremap_stays_in_ring() {
+    child_thread_admission(0, 0, ChildStockCase::Mremap);
+}
+
 #[cfg(not(target_os = "macos"))]
 fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
     const LENGTH: u64 = 256 * 1024 * 1024;
     let fixture = Box::leak(Box::new(
-        if matches!(case, ChildStockCase::AdvisoryMmap | ChildStockCase::Madvise) {
+        if matches!(
+            case,
+            ChildStockCase::AdvisoryMmap | ChildStockCase::Madvise | ChildStockCase::Mremap
+        ) {
             Fixture::with_page_and_arena(
                 0x10000,
                 asid(1),
@@ -505,7 +523,10 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
     crossing.metadata_allocations = Arc::clone(&metadata_scope.allocations);
     if !matches!(
         case,
-        ChildStockCase::FirstBirth | ChildStockCase::AdvisoryMmap | ChildStockCase::Madvise
+        ChildStockCase::FirstBirth
+            | ChildStockCase::AdvisoryMmap
+            | ChildStockCase::Madvise
+            | ChildStockCase::Mremap
     ) {
         let mut physical = super::native_retirement_tests::PhysicalStock::new(&fixture.tables);
         physical.metadata_in_el1_window = true;
@@ -585,7 +606,10 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
     ));
     let access = crate::sched::object_wait::space_access(fixture.zone, fixture.slot);
     let residency = carrick_el1::cow::test_support::residency_table();
-    if matches!(case, ChildStockCase::AdvisoryMmap | ChildStockCase::Madvise) {
+    if matches!(
+        case,
+        ChildStockCase::AdvisoryMmap | ChildStockCase::Madvise | ChildStockCase::Mremap
+    ) {
         let mut editor = FixtureMapping {
             words,
             residency: &residency,
@@ -615,6 +639,88 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
             frame.x[0] as i64
         };
         fixture.task.linux.mark_pending_host_work();
+        if case == ChildStockCase::Mremap {
+            const PAGE: u64 = 4096;
+            const EFAULT: i64 = -14;
+            let portal = super::super::aarch64_process::Portal::for_zone(
+                NonZeroU64::MIN,
+                fixture.region.table(),
+                fixture.zone,
+            );
+            let mm = ReservationMm::new(identity.mm).unwrap();
+            let rows = |start: u64, end: u64| {
+                let mut rows = Vec::new();
+                portal
+                    .root(mm, 0)
+                    .unwrap()
+                    .observe_range(
+                        carrick_el1_abi::ReservationRange::new(start, end).unwrap(),
+                        // Clipped to the query: the arena's earlier rows
+                        // may coalesce with the first one.
+                        &mut |mapping| {
+                            rows.push((
+                                mapping.range.start().max(start),
+                                mapping.range.end().min(end),
+                                mapping.protection.bits(),
+                            ))
+                        },
+                    )
+                    .unwrap();
+                rows
+            };
+            // Six pages, then [m, m+2) RW, [m+2, m+3) R, [m+3, m+4) RW,
+            // [m+4, m+5) a hole, [m+5, m+6) RW.
+            let m = call(222, [0, 6 * PAGE, 3, 0x22, u64::MAX, 0]);
+            assert!(m > 0 && (m as u64).is_multiple_of(PAGE), "mmap: {m}");
+            let m = m as u64;
+            assert_eq!(call(226, [m + 2 * PAGE, PAGE, 1, 0, 0, 0]), 0);
+            assert_eq!(call(215, [m + 4 * PAGE, PAGE, 0, 0, 0, 0]), 0);
+            // An unmapped `old_address`: EFAULT, and nothing is retired.
+            assert_eq!(
+                call(216, [m + 4 * PAGE, 2 * PAGE, PAGE, 0, 0, 0]),
+                EFAULT,
+                "unmapped old_address"
+            );
+            assert_eq!(
+                rows(m + 5 * PAGE, m + 6 * PAGE),
+                [(m + 5 * PAGE, m + 6 * PAGE, 3)]
+            );
+            // Same size across two mappings: `old_address`, no effect.
+            assert_eq!(call(216, [m, 4 * PAGE, 4 * PAGE, 0, 0, 0]), m as i64);
+            // Growth across two mappings: EFAULT.
+            assert_eq!(
+                call(216, [m, 4 * PAGE, 8 * PAGE, 1, 0, 0]),
+                EFAULT,
+                "growth across mappings"
+            );
+            assert_eq!(
+                rows(m, m + 6 * PAGE),
+                [
+                    (m, m + 2 * PAGE, 3),
+                    (m + 2 * PAGE, m + 3 * PAGE, 1),
+                    (m + 3 * PAGE, m + 4 * PAGE, 3),
+                    (m + 5 * PAGE, m + 6 * PAGE, 3),
+                ]
+            );
+            // The shrink retires every mapping and hole in the tail.
+            assert_eq!(call(216, [m, 6 * PAGE, PAGE, 0, 0, 0]), m as i64, "shrink");
+            assert_eq!(rows(m, m + 6 * PAGE), [(m, m + PAGE, 3)]);
+            // An untouched row with a blocker after it moves with MAYMOVE:
+            // a new address, and its old address is vacant.
+            assert_eq!(
+                call(222, [m + PAGE, PAGE, 1, 0x100022, u64::MAX, 0]),
+                (m + PAGE) as i64,
+                "blocker"
+            );
+            let to = call(216, [m, PAGE, 2 * PAGE, 1, 0, 0]);
+            assert!(to > 0 && to as u64 != m, "moved: {to}");
+            let to = to as u64;
+            assert_eq!(rows(to, to + 2 * PAGE), [(to, to + 2 * PAGE, 3)]);
+            assert!(rows(m, m + PAGE).is_empty(), "the moved source is vacant");
+            assert_eq!(counters.refused[216].load(Ordering::Relaxed), 0);
+            assert_eq!(counters.refused_child[216].load(Ordering::Relaxed), 0);
+            return;
+        }
         if case == ChildStockCase::Madvise {
             const CHUNK: u64 = 0x40000;
             let mapped = call(222, [0, CHUNK, 0, 0x4022, u64::MAX, 0]);
