@@ -6289,7 +6289,9 @@ mod tests {
             .unwrap();
         // The destination coalesces with the source node's surviving piece.
         assert_eq!(seen, [(0x105000, 0x109000, rw), (0x10b000, 0x10f000, rw)]);
-        // Overlapping fixed target, cross-node source and a hole are refused.
+        // An overlapping fixed target, a growing cross-node source and an
+        // unmapped `old_address` are refused. (A shrink needs only a mapping
+        // at `old_address`, as Linux shrinks, #3171.)
         assert_eq!(
             g.mremap(
                 range(0x105000, 0x106000),
@@ -6299,7 +6301,11 @@ mod tests {
             Err(Refusal::Invalid)
         );
         assert_eq!(
-            g.mremap(range(0x108000, 0x10c000), 0x1000, MoveTarget::MayMove),
+            g.mremap(range(0x108000, 0x10c000), 0x5000, MoveTarget::MayMove),
+            Err(Refusal::Hole)
+        );
+        assert_eq!(
+            g.mremap(range(0x109000, 0x10c000), 0x1000, MoveTarget::MayMove),
             Err(Refusal::Hole)
         );
         let generation = g.generation();
