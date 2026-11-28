@@ -6,7 +6,11 @@ use crate::{
 use core::alloc::Layout;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(test)]
+mod interleaving_tests;
+mod pause;
 mod transfer;
+use pause::Point;
 pub use transfer::{
     FrameGrantResidencyTransfer, ResidencyTransferRefusal, TransferRange, TransferReceipt,
 };
@@ -1234,6 +1238,7 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
             {
                 return false;
             }
+            pause::at(Point::Retired { slot: row.slot });
             dirty.fetch_and(!(1 << (row.slot % 64)), Ordering::AcqRel);
             self.storage
                 .rows()
@@ -1266,6 +1271,9 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
             record.committed[bit / 64].fetch_or(1 << (bit % 64), Ordering::Release);
         }
         dirty.fetch_or(1 << (replacement_slot % 64), Ordering::Release);
+        pause::at(Point::Published {
+            slot: replacement_slot,
+        });
         true
     }
 
@@ -1298,6 +1306,9 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
                 dirty.fetch_or(1 << (fragment_slot % 64), Ordering::Release);
             }
         }
+        pause::at(Point::Published {
+            slot: fragment_slot,
+        });
     }
 
     /// Number of addressable records in this venue's resolved view.
@@ -1574,6 +1585,7 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
             record.transfer_pins.store(0, Ordering::Release);
             return false;
         }
+        pause::at(Point::Retired { slot });
         dirty.fetch_and(!(1 << (slot % 64)), Ordering::AcqRel);
         self.storage
             .rows()
@@ -1894,6 +1906,7 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
         {
             return false;
         }
+        pause::at(Point::Retired { slot });
         dirty.fetch_and(!(1 << (slot % 64)), Ordering::AcqRel);
         self.storage
             .rows()

@@ -34,7 +34,7 @@ use core::sync::atomic::Ordering;
 use super::{
     EL1_FRAME_GRANT_TARGET_SIZE, FRAME_GRANT_RESIDENCY_SLOTS, FrameGrantResidencyIdentity,
     FrameGrantResidencyTable, GRANT_LIVE, GRANT_PAGE_SIZE, GRANT_PROBES, GRANT_RETIRED,
-    GRANT_STATE_MASK, GRANT_WRITING, ResidencyRows, TRANSFER_PIN_RETIRING, sealed,
+    GRANT_STATE_MASK, GRANT_WRITING, Point, ResidencyRows, TRANSFER_PIN_RETIRING, pause, sealed,
 };
 
 #[cfg(test)]
@@ -406,6 +406,7 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
         record
             .transfer_pins
             .store(TRANSFER_RESERVED, Ordering::Relaxed);
+        pause::at(Point::Tagged { slot });
         record.mm_key.store(identity.mm_key, Ordering::Relaxed);
         record
             .semantic_base
@@ -548,6 +549,7 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
             {
                 return false;
             }
+            pause::at(Point::Retired { slot });
         }
         receipt.rows_rekeyed += 1;
         for (index, entry) in slots.into_iter().enumerate() {
@@ -604,6 +606,7 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
         );
         // The host's walk sees the new row, committed or not.
         dirty.fetch_or(1 << (slot % 64), Ordering::Release);
+        pause::at(Point::Published { slot });
         carried
     }
 
