@@ -2549,6 +2549,7 @@ fn native_fork_child_time_result_with(
                 &mut frame,
                 &task.linux,
                 carrick_el1_abi::Action::Forward,
+                crate::cow_resolver::FaultExit::default(),
                 || owner,
                 &counters,
             ),
@@ -6916,7 +6917,7 @@ fn arm_permission_fault_keeps_signal_owner_after_admission_home_release() {
             &fixture.task,
             unmapped_action,
             unmapped_supply.outcome(),
-            || panic!("unmapped fault must forward to host"),
+            |_| panic!("unmapped fault must forward to host"),
         ),
         carrick_el1_abi::Action::Forward,
     );
@@ -6948,7 +6949,7 @@ fn arm_permission_fault_keeps_signal_owner_after_admission_home_release() {
     assert_eq!(fault_action, carrick_el1_abi::Action::Forward);
     assert_eq!(
         supply.outcome(),
-        OwnerFaultSupplyOutcome::PolicyDeclined(carrick_el1::fault::SegvCause::Access),
+        OwnerFaultSupplyOutcome::PolicyDeclined(carrick_guest_arch::SegvCause::Access),
         "mapped anonymous PROT_READ write fault must record an access decline on Mailbox owner supply"
     );
 
@@ -6966,7 +6967,7 @@ fn arm_permission_fault_keeps_signal_owner_after_admission_home_release() {
             &fixture.task,
             fault_action,
             supply.outcome(),
-            || panic!("ptrace-traced fault must forward to host ptrace stop"),
+            |_| panic!("ptrace-traced fault must forward to host ptrace stop"),
         ),
         carrick_el1_abi::Action::Forward,
     );
@@ -7016,6 +7017,7 @@ fn arm_permission_fault_keeps_signal_owner_after_admission_home_release() {
         fixture.control,
         &mut service,
         &mut frame,
+        Some(carrick_guest_arch::SegvCause::Access),
         &mut None,
         |_, _| panic!("Busy admission must not publish or deliver a signal"),
     );
@@ -7047,7 +7049,7 @@ fn arm_permission_fault_keeps_signal_owner_after_admission_home_release() {
         &fixture.task,
         fault_action,
         supply.outcome(),
-        || {
+        |cause| {
             super::dispatch::arm_deliver_declined_fault_signal_with(
                 source,
                 &fixture.task,
@@ -7057,6 +7059,7 @@ fn arm_permission_fault_keeps_signal_owner_after_admission_home_release() {
                 fixture.control,
                 &mut service,
                 &mut frame,
+                Some(cause),
                 &mut None,
                 |process, frame| {
                     super::arm_signal::deliver_on_user_return_with(
@@ -7130,10 +7133,12 @@ fn arm_declined_fault_signal_owner() -> &'static Fixture {
 
 /// #3170 on ARM: a first-touch write to a page whose mapping is read-only
 /// takes a translation fault, and the shared policy declines it as an access
-/// error. The native exit forwards the fault with that cause, so the native
-/// resume that answers the host's refusal reports `SEGV_ACCERR`, as Linux
-/// does. Red before the fix: the forwarded fault carried only the syndrome's
-/// present bit (clear for a translation fault), and the resume said MAPERR.
+/// error. The native exit forwards the fault with that cause, and the cause
+/// maps to `SEGV_ACCERR`, as Linux reports. (The resume's `(Fault, Refused)`
+/// arm reads exactly `segv_code(fault.cause.segv())`; this test does not run
+/// the transport or the resume.) Red before the fix: the forwarded fault
+/// carried only the syndrome's present bit, clear for a translation fault,
+/// which that arm answered with MAPERR.
 #[test]
 fn arm_declined_first_touch_write_forwards_its_access_cause_to_the_native_resume() {
     use carrick_el1::fault::{
@@ -7233,20 +7238,98 @@ fn arm_declined_first_touch_write_forwards_its_access_cause_to_the_native_resume
     assert_eq!(action, carrick_el1_abi::Action::Forward);
     assert_eq!(
         supply.outcome(),
-        OwnerFaultSupplyOutcome::PolicyDeclined(carrick_el1::fault::SegvCause::Access),
+        OwnerFaultSupplyOutcome::PolicyDeclined(carrick_guest_arch::SegvCause::Access),
         "a write to a read-only mapping is declined as an access error (verdict {:?})",
         supply.verdict()
     );
+    // The production composition of `cow_resolver::dispatch_fault`'s exit.
+    let mut exit = crate::cow_resolver::FaultExit::default();
+    exit.after(supply.outcome());
     let Some(carrick_core_abi::service::ServiceOperation::Fault(fault)) =
-        super::dispatch::native_service_operation(&mut frame, &fixture.task.linux, action)
+        super::dispatch::native_service_operation(&mut frame, &fixture.task.linux, action, exit)
     else {
         panic!("a forwarded fault publishes a fault service")
     };
-    // The native resume answers the host's refusal from this field (the
-    // `(Fault, Refused)` arm in `service.rs`): set is SEGV_ACCERR.
+    assert_eq!(
+        fault.cause,
+        carrick_guest_arch::FaultCause::Declined(carrick_guest_arch::SegvCause::Access)
+    );
     assert!(
-        fault.present,
-        "the native resume answers a refused declined-access fault with SEGV_ACCERR, got {fault:?}"
+        !fault.cause.awaits_supply(),
+        "a declined fault asks the host for no supply"
+    );
+    assert_eq!(
+        crate::cow_resolver::segv_code(fault.cause.segv()),
+        carrick_syscall_abi::LINUX_SEGV_ACCERR,
+        "the native resume answers a refused declined-access fault with SEGV_ACCERR"
+    );
+}
+
+/// A unit check of the `SignalOwner` delivery, not a production path: the
+/// `si_code` comes from the cause it is handed, not a constant. Production
+/// hands it only access errors today (a mailbox supply never declines a hole,
+/// see `settle_declined_owner_fault`); the access case is witnessed end to
+/// end by `arm_permission_fault_keeps_signal_owner_after_admission_home_release`.
+#[test]
+fn arm_signal_owner_delivery_reports_the_cause_it_is_given() {
+    use zerocopy::{FromBytes, IntoBytes};
+    let fixture = arm_declined_fault_signal_owner();
+    let mut service = fixture.process_service();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let far = crate::mm_portal::test_support::VA + 0x20000;
+    let mut frame = carrick_el1_abi::TrapFrame {
+        slot: u64::from(fixture.slot.raw()),
+        esr: 0x9200_0047,
+        far,
+        elr: 0x40_0200,
+        spsr: 0x3c0,
+        ..Default::default()
+    };
+    let stack = carrick_test_support::GuestUserBuffer::zeroed(16384);
+    let fp = carrick_syscall_abi::LinuxFpsimdContext::empty();
+    let mut machine = ArmWaitSignalMachine {
+        user_sp: stack.va_at(stack.len()),
+        backend: ArmWaitSignalBackend,
+    };
+    let delivered = super::dispatch::arm_deliver_declined_fault_signal_with(
+        source,
+        &fixture.task,
+        Aarch64EntryContext::saved(&after_svc(ThreadCtx::ZERO)),
+        fixture_ttbr0(fixture),
+        fixture.page,
+        fixture.control,
+        &mut service,
+        &mut frame,
+        Some(carrick_guest_arch::SegvCause::Unmapped),
+        &mut None,
+        |process, frame| {
+            super::arm_signal::deliver_on_user_return_with(
+                &fixture.task,
+                fixture.control,
+                process,
+                frame,
+                fp.as_bytes(),
+                &mut machine,
+            )
+        },
+    )
+    .unwrap();
+    assert_eq!(delivered, carrick_el1_abi::Action::Served);
+    assert_eq!(frame.elr, 0x40_0100, "the installed handler runs");
+    let offset = (frame.x[1] - stack.va().raw()) as usize;
+    let signal = carrick_personality_linux::signal::arm::SignalFrame::ref_from_bytes(
+        &stack.as_bytes()[offset
+            ..offset + core::mem::size_of::<carrick_personality_linux::signal::arm::SignalFrame>()],
+    )
+    .unwrap();
+    let info = signal.rt.siginfo;
+    let (signum, code, address) = (info.si_signo, info.si_code, info.si_addr);
+    assert_eq!(
+        (signum, code, address),
+        (11, carrick_syscall_abi::LINUX_SEGV_MAPERR, far)
     );
 }
 
@@ -7302,6 +7385,7 @@ fn arm_permission_fault_sig_dfl_terminates_through_native_owner() {
             fixture.control,
             &mut service,
             &mut frame,
+            Some(carrick_guest_arch::SegvCause::Access),
             &mut None,
             |process, frame| super::arm_signal::deliver_on_user_return_with(
                 &fixture.task,
@@ -7380,6 +7464,7 @@ fn arm_permission_fault_two_live_threads_delivers_handler_and_sig_dfl_parks_grou
             fixture.control,
             &mut service,
             &mut frame,
+            Some(carrick_guest_arch::SegvCause::Access),
             &mut None,
             |process, frame| super::arm_signal::deliver_on_user_return_with(
                 &fixture.task,
@@ -7422,6 +7507,7 @@ fn arm_permission_fault_two_live_threads_delivers_handler_and_sig_dfl_parks_grou
             fixture.control,
             &mut service,
             &mut frame,
+            Some(carrick_guest_arch::SegvCause::Access),
             &mut None,
             |process, frame| super::arm_signal::deliver_on_user_return_with(
                 &fixture.task,
@@ -17475,6 +17561,7 @@ fn arm_classified_maperr_and_bus_use_signal_owner() {
                 fixture.control,
                 &mut service,
                 &mut frame,
+                Some(carrick_guest_arch::SegvCause::Access),
                 &mut None,
                 |process, frame| super::arm_signal::deliver_on_user_return_with(
                     &fixture.task,
@@ -17573,6 +17660,7 @@ fn arm_classified_fault_default_ignored_and_blocked_return_to_host_core_path() {
                 fixture.control,
                 &mut service,
                 &mut frame,
+                Some(carrick_guest_arch::SegvCause::Access),
                 &mut None,
                 |process, frame| {
                     // A sibling changes disposition after fault publication, before
@@ -17679,6 +17767,7 @@ fn arm_classified_bus_bad_signal_stack_returns_sigsegv_to_host_core_path() {
             fixture.control,
             &mut service,
             &mut frame,
+            Some(carrick_guest_arch::SegvCause::Access),
             &mut None,
             |process, frame| super::arm_signal::deliver_on_user_return_with(
                 &fixture.task,
@@ -17783,6 +17872,7 @@ fn arm_classified_fault_racing_live_sibling_exit_group_settles() {
                 control,
                 &mut service,
                 &mut frame,
+                Some(carrick_guest_arch::SegvCause::Access),
                 &mut None,
                 |_, _| panic!("closed owner must not select a signal action")
             )
@@ -17833,6 +17923,7 @@ fn arm_classified_fault_rejects_non_fault_returns_without_clobbering_syndrome() 
             fixture.control,
             &mut service,
             &mut frame,
+            Some(carrick_guest_arch::SegvCause::Access),
             &mut None,
             |_, _| panic!("non-fault entry must fail before delivery"),
         );

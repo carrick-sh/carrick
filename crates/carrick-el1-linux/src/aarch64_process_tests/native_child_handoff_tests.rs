@@ -90,7 +90,7 @@ fn begin_prefix_write<X: ForkStockCrossing>(
         &mut stage_frame,
         task,
         carrick_el1_abi::Action::Forward,
-        None,
+        crate::cow_resolver::FaultExit::default(),
         counters,
         || super::super::native_process_runtime::NativeThreadGroupOwner::ForkChild,
         |frame| {
@@ -1290,6 +1290,7 @@ fn native_el0_sync_exceptions_have_owned_service_operations() {
             &mut frame,
             &fixture.task.linux,
             carrick_el1_abi::Action::Forward,
+            crate::cow_resolver::FaultExit::default(),
         )
         .unwrap_or_else(|| panic!("{name} must park under the shared exception owner"));
         assert_eq!(
@@ -1506,6 +1507,7 @@ fn two_native_children_service_waits(witness: ServiceWitness) {
             &mut frame,
             &fixture.task.linux,
             action,
+            crate::cow_resolver::FaultExit::default(),
         )
         .unwrap();
         if matches!(witness, ServiceWitness::ExecRefusal) {
@@ -2200,6 +2202,7 @@ fn namespace_baseline(
                         &mut frame,
                         &task.linux,
                         carrick_el1_abi::Action::Forward,
+                        crate::cow_resolver::FaultExit::default(),
                         || super::super::dispatch::arm_thread_group_owner(fixture.zone, task, page),
                         &counters,
                     ),
@@ -2365,6 +2368,7 @@ fn forked_child_futex<T>(
         &mut frame,
         &task.linux,
         action,
+        crate::cow_resolver::FaultExit::default(),
         || super::super::dispatch::arm_thread_group_owner(fixture.zone, task, page),
         &counters,
     );

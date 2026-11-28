@@ -4,6 +4,7 @@ use carrick_el1_abi::{
     Action, Counters, CurrentTask, FrameGrantMailbox, FrameGrantMailboxes, ReservationIncarnation,
     TrapFrame,
 };
+use carrick_guest_arch::SegvCause;
 use carrick_mmu_core::aarch64::descriptor_txn::{
     DescriptorOutcome, DescriptorReceipt, DescriptorTxnSlot,
 };
@@ -87,19 +88,22 @@ fn x86_fault_class(fault: carrick_guest_arch::FaultInfo) -> FaultClass {
     if fault.address.raw() >= (1 << 47) {
         return FaultClass::Other;
     }
-    match (fault.present, fault.access) {
-        (true, Access::Write) => FaultClass::WritePermission,
-        (true, Access::Read) => FaultClass::Protection(LeafAccess::Read),
-        (true, Access::Execute) => FaultClass::Protection(LeafAccess::Execute),
-        (false, Access::Read) => FaultClass::Translation {
+    use carrick_guest_arch::FaultCause;
+    match (fault.cause, fault.access) {
+        // The policy already declined it: nothing here may serve it again.
+        (FaultCause::Declined(_), _) => FaultClass::Other,
+        (FaultCause::Permission, Access::Write) => FaultClass::WritePermission,
+        (FaultCause::Permission, Access::Read) => FaultClass::Protection(LeafAccess::Read),
+        (FaultCause::Permission, Access::Execute) => FaultClass::Protection(LeafAccess::Execute),
+        (FaultCause::Translation, Access::Read) => FaultClass::Translation {
             access: LeafAccess::Read,
             grant_access: 1,
         },
-        (false, Access::Write) => FaultClass::Translation {
+        (FaultCause::Translation, Access::Write) => FaultClass::Translation {
             access: LeafAccess::Write,
             grant_access: 2,
         },
-        (false, Access::Execute) => FaultClass::Translation {
+        (FaultCause::Translation, Access::Execute) => FaultClass::Translation {
             access: LeafAccess::Execute,
             grant_access: 4,
         },
@@ -1106,18 +1110,6 @@ impl<'a> GrantMailboxes<'a> {
             owner: Some(owner),
         }
     }
-}
-
-/// Why the shared fault policy declined a fault, as Linux reports it in a
-/// `SIGSEGV`'s `si_code` (sigaction(2)). The reservation owner's mapping
-/// decides, never the hardware present bit: a `PROT_NONE` page is not
-/// present on x86 yet is an access error (#2875).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SegvCause {
-    /// A mapping covers the page and refuses this access: `SEGV_ACCERR`.
-    Access,
-    /// No mapping covers the page: `SEGV_MAPERR`.
-    Unmapped,
 }
 
 /// A CPL0 fault can request physical supply without delegating leaf publication.
@@ -2247,7 +2239,7 @@ mod tests {
                 FaultInfo {
                     address: UserVa::new(va),
                     access: Access::Read,
-                    present: false,
+                    cause: carrick_guest_arch::FaultCause::Translation,
                 },
                 &counters,
                 &tasks[0],
@@ -2300,7 +2292,7 @@ mod tests {
                 FaultInfo {
                     address: UserVa::new(va),
                     access: Access::Read,
-                    present: false,
+                    cause: carrick_guest_arch::FaultCause::Translation,
                 },
                 &counters,
                 &tasks[0],
@@ -2329,7 +2321,7 @@ mod tests {
             x86_fault_class(FaultInfo {
                 address: UserVa::new(0xffff_ffff_9000_0000),
                 access: Access::Write,
-                present: false,
+                cause: carrick_guest_arch::FaultCause::Translation,
             }),
             FaultClass::Other
         );
@@ -2629,7 +2621,7 @@ mod tests {
                 carrick_guest_arch::FaultInfo {
                     address: carrick_guest_arch::UserVa::new(VA),
                     access: carrick_guest_arch::Access::Write,
-                    present: false,
+                    cause: carrick_guest_arch::FaultCause::Translation,
                 },
                 &Counters::default(),
                 &task,

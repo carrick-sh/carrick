@@ -986,7 +986,7 @@ fn serial_host_adopted_fault_checkpoint_transfers_terminal_custody() {
                     ServiceOperation::Fault(FaultInfo {
                         address: UserVa::new(0x4000),
                         access: Access::Read,
-                        present: false,
+                        cause: carrick_guest_arch::FaultCause::Translation,
                     }),
                     None
                 ),

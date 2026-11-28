@@ -2,13 +2,14 @@
 
 #![cfg(all(target_os = "none", target_arch = "x86_64"))]
 
-use carrick_abi::{LINUX_SEGV_ACCERR, LINUX_SEGV_MAPERR, LINUX_SIGSEGV, LinuxErrno, LinuxSiginfo};
+use carrick_abi::{LINUX_SIGSEGV, LinuxErrno, LinuxSiginfo};
 use carrick_el1::isa::x86::context::native::{CpuBinding, NativeFrame, checked_scheduler_slot};
 use carrick_el1::isa::x86::context::scheduler::XsaveArea;
 use carrick_el1_abi::{
     Action, Counters, CurrentTask, DelegatedOpenFile, FileTables, HostObjectBinding,
     HostObjectReleaseCrossing, HostObjectWriteCrossing, HostReadinessCrossing, fd_map_lookup,
 };
+use carrick_el1_linux::cow_resolver::segv_code;
 use carrick_el1_linux::crossing_operand::{
     CrossingOperand, classify_fd_operand, resolve_crossing_operand,
 };
@@ -1098,12 +1099,14 @@ fn supply_syscall_fault(
         address: UserVa::new(address),
         access,
         // A write to a readable page is a permission (COW) fault.
-        present: access == carrick_guest_arch::Access::Write
-            && carrick_el1_linux::file::MemoryValidator::readable_bytes(
-                &carrick_el1_linux::file::HardwareValidator,
-                address,
-                1,
-            ) == 1,
+        cause: carrick_guest_arch::FaultCause::from_hardware(
+            access == carrick_guest_arch::Access::Write
+                && carrick_el1_linux::file::MemoryValidator::readable_bytes(
+                    &carrick_el1_linux::file::HardwareValidator,
+                    address,
+                    1,
+                ) == 1,
+        ),
     };
     supply_user_fault(&carrick_x86_carrier::entry::PreparedUserPageFault {
         fault,
@@ -1298,16 +1301,6 @@ fn supply_user_fault(
     }
 }
 
-/// The `si_code` of a fault the shared policy declined: the reservation
-/// owner's mapping decides it, not the hardware present bit (a `PROT_NONE`
-/// page is not present yet is `SEGV_ACCERR`, #2875).
-fn segv_code(cause: carrick_el1::fault::SegvCause) -> i32 {
-    match cause {
-        carrick_el1::fault::SegvCause::Access => LINUX_SEGV_ACCERR,
-        carrick_el1::fault::SegvCause::Unmapped => LINUX_SEGV_MAPERR,
-    }
-}
-
 /// A served fault's settlement of its MM's copy-on-write completions.
 ///
 /// A completion is the MM's, in its pool, and the carrier settles every one
@@ -1374,11 +1367,7 @@ fn serve_selected_window(
             if grant_slot.take_refused_fault_selection(mm_key, fault.address.raw()) {
                 return UserFaultSupply::Signal {
                     signum: LINUX_SIGSEGV,
-                    code: if fault.present {
-                        LINUX_SEGV_ACCERR
-                    } else {
-                        LINUX_SEGV_MAPERR
-                    },
+                    code: segv_code(fault.cause.segv()),
                     address: fault.address,
                 };
             }

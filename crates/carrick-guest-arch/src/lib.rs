@@ -813,11 +813,65 @@ pub enum Access {
     Write,
     Execute,
 }
+/// Why the shared fault policy declined a fault. The reservation owner's
+/// mapping decides, never the hardware present bit: a `PROT_NONE` page is not
+/// present on x86 yet is an access error (#2875), and a first-touch write to a
+/// read-only file map takes a translation fault on ARM yet is an access error
+/// too (#3170).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SegvCause {
+    /// A mapping covers the page and refuses this access (Linux `SEGV_ACCERR`).
+    Access,
+    /// No mapping covers the page (Linux `SEGV_MAPERR`).
+    Unmapped,
+}
+
+/// What a user fault is, as far as its entry knows. Every fault carries one,
+/// and every reader matches it exhaustively: there is no present bit to fall
+/// back to once the shared policy has classified the fault.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FaultCause {
+    /// The hardware found no translation (x86 `P = 0`, an ARM translation
+    /// fault), and no policy has declined it: the page may still be supplied.
+    Translation,
+    /// The hardware found a translation that denies the access (x86 `P = 1`,
+    /// an ARM permission fault), and no policy has declined it.
+    Permission,
+    /// The shared fault policy declined it, for this reason.
+    Declined(SegvCause),
+}
+
+impl FaultCause {
+    /// The cause of a fault the hardware reported, before any policy read it.
+    pub const fn from_hardware(translation_present: bool) -> Self {
+        if translation_present {
+            Self::Permission
+        } else {
+            Self::Translation
+        }
+    }
+
+    /// A fault the hardware reported without a translation, which a host
+    /// supply may still fill. A declined fault is never one.
+    pub const fn awaits_supply(self) -> bool {
+        matches!(self, Self::Translation)
+    }
+
+    /// Why the fault is a segmentation fault, if nothing supplies it.
+    pub const fn segv(self) -> SegvCause {
+        match self {
+            Self::Translation => SegvCause::Unmapped,
+            Self::Permission => SegvCause::Access,
+            Self::Declined(cause) => cause,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FaultInfo {
     pub address: UserVa,
     pub access: Access,
-    pub present: bool,
+    pub cause: FaultCause,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EntryEvent {

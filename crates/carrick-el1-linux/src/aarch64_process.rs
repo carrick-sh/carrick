@@ -783,7 +783,9 @@ pub(super) fn with_process_entry<X: ForkStockCrossing, R>(
 }
 
 /// Deliver a synchronous fault through the admitted `SignalOwner`: the host
-/// may have classified its payload, otherwise a declined reservation is ACCERR.
+/// may have classified its payload, otherwise the shared policy's cause for
+/// declining it decides the `si_code` (MAPERR for a hole, ACCERR for a
+/// mapping that refuses the access). A fault with neither is a broken entry.
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn deliver_declined_fault_signal_with<X: ForkStockCrossing, F>(
@@ -795,6 +797,7 @@ pub(crate) fn deliver_declined_fault_signal_with<X: ForkStockCrossing, F>(
     control: &'static ThreadControlSlot,
     service: &mut Aarch64NativeProcessService<'static, X>,
     far: u64,
+    declined: Option<carrick_guest_arch::SegvCause>,
     deliver: F,
 ) -> Result<carrick_el1_abi::Action, NativeProcessError>
 where
@@ -817,14 +820,15 @@ where
         control,
         service,
         |process| {
-            let classified = control.synchronous_fault();
-            let (signal, code, address) = classified
-                .map(|(signal, code, address, _)| (signal, code, address))
-                .unwrap_or((
+            let (signal, code, address) = match (control.synchronous_fault(), declined) {
+                (Some((signal, code, address, _)), _) => (signal, code, address),
+                (None, Some(cause)) => (
                     carrick_signal_core::policy::Signal::SEGV,
-                    carrick_syscall_abi::LINUX_SEGV_ACCERR,
+                    crate::cow_resolver::segv_code(cause),
                     far,
-                ));
+                ),
+                (None, None) => return Err(NativeProcessError::Invalid),
+            };
             process
                 .force_fault_info(
                     signal,
@@ -2941,7 +2945,7 @@ impl<'a, X: ForkStockCrossing> NativeProcessService<'a, Aarch64ParkedContext>
                 carrick_guest_arch::FaultInfo {
                     address,
                     access: carrick_guest_arch::Access::Write,
-                    present: false,
+                    cause: carrick_guest_arch::FaultCause::Translation,
                 },
                 NonZeroU64::new(sequence)?,
             ))

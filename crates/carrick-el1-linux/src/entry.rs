@@ -106,17 +106,16 @@ pub unsafe extern "C" fn carrick_el1_syscall(
     }
     let counters_ref =
         unsafe { &*(carrick_el1_abi::EL1_COUNTERS_BASE as *const carrick_el1_abi::Counters) };
-    let mut owner_wait = None;
+    let mut fault = carrick_el1_linux::cow_resolver::FaultExit::default();
     // This exception owns any host record its ring dispatch stages; its
     // native exit consumes it.
     let staged = carrick_el1_linux::dispatch::StagedRingRecord::open(frame_ref.slot as usize);
-    let action =
-        carrick_el1_linux::dispatch::dispatch_entry(frame_ref, counters_ref, &mut owner_wait);
+    let action = carrick_el1_linux::dispatch::dispatch_entry(frame_ref, counters_ref, &mut fault);
     let action = carrick_el1::fault::drain_before_el0_hw(frame_ref, action);
     let action = carrick_el1_linux::dispatch::capture_native_service_exit(
         frame_ref,
         action,
-        owner_wait,
+        fault,
         staged,
         counters_ref,
     );
