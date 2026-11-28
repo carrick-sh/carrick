@@ -2152,6 +2152,71 @@ fn mounted_static_x86_thread_handlers_run_on_untouched_alternate_stacks() {
     );
 }
 
+/// #3174: glibc's `pthread_cond_timedwait`, `sem_timedwait` and timed locks
+/// wait with `FUTEX_WAIT_BITSET` and an absolute deadline on MONOTONIC or
+/// (with `FUTEX_CLOCK_REALTIME`) REALTIME, and abort on an unexpected errno.
+/// The fixture runs each Linux answer of that wait between two live threads,
+/// in a fork child and then in the run root: ETIMEDOUT on both clocks (never
+/// early), a past deadline, EAGAIN, EINVAL, EFAULT, a counted wake, EINTR
+/// with and without SA_RESTART, and 16 parked timed waiters woken by a main
+/// thread that keeps running. On main the ring declined every timed bitset
+/// wait, which a fork child answers ENOSYS.
+#[test]
+fn mounted_static_x86_timed_futex_bitset_matches_native_in_root_and_fork_child() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("timed-futex-bitset");
+    compile_assembly_with_flags(
+        "x86_timed_futex_bitset.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(20))
+        .output()
+        .expect("run native timed-futex oracle");
+    let expected = |who: &str| {
+        format!(
+            "{who} mono=-110 rt=-110 past=-110 eagain=-11 einval=-22 efault=-14 wake=0 \
+             eintr=-4 sarestart=-4 pool=16\n"
+        )
+    };
+    let expected = format!("{}{}", expected("child"), expected("root"));
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+    assert_eq!(
+        String::from_utf8_lossy(&native.stdout),
+        expected,
+        "native oracle"
+    );
+
+    let guest = run_mounted_binary_within(
+        &elf,
+        "timed-futex-bitset",
+        false,
+        &empty_image_archive(),
+        None,
+        Duration::from_secs(30),
+        &[],
+    )
+    .0;
+    assert_eq!(
+        (
+            guest.status.code(),
+            String::from_utf8_lossy(&guest.stdout).into_owned()
+        ),
+        (native.status.code(), expected),
+        "a field reading -38 is the declined (ENOSYS) wait; \"early\" or \"late\" a \
+         wait that returned before or long after its deadline. Stderr: {}",
+        String::from_utf8_lossy(&guest.stderr)
+    );
+}
+
 /// #2792: a user page fault that ends in a fatal signal leaves its entry
 /// frame for the scheduler. Its CPU must stop holding that fault: the next
 /// task there takes its own page faults. Sixteen fork children die of

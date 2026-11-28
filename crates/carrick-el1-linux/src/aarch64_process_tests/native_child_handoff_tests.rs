@@ -2465,14 +2465,12 @@ fn forked_child_futex_wake_reaches_a_waiter_pinned_to_a_busy_vcpu() {
     );
 }
 
-/// #1941 review: only an admitted wake is guaranteed to finish in ring.
 /// A fork child's timed `FUTEX_WAIT_PRIVATE` is served in ring on its own
-/// timer lease (#1894), but policy still declines one whose timespec is out
-/// of range (`tv_nsec` of one second). That decline keeps the counted
-/// refusal; it is not an owned-family fatal. (Linux answers EINVAL there:
-/// the decline's errno predates this witness.)
+/// timer lease (#1894). A timespec out of range (`tv_nsec` of one second)
+/// is Linux's EINVAL, answered in ring with no refusal (#3174: the policy
+/// used to decline it, and the child answered a counted ENOSYS).
 #[test]
-fn forked_child_timed_futex_wait_decline_stays_a_counted_refusal() {
+fn forked_child_timed_futex_wait_with_an_invalid_timespec_answers_einval() {
     use carrick_personality_linux::dispatch::CompletionRoute;
     let word: &'static core::sync::atomic::AtomicU32 =
         Box::leak(Box::new(core::sync::atomic::AtomicU32::new(7)));
@@ -2494,13 +2492,9 @@ fn forked_child_timed_futex_wait_decline_stays_a_counted_refusal() {
         ];
         (wait, ())
     });
-    assert_eq!(route, CompletionRoute::Forward);
-    assert_eq!(
-        exit,
-        super::super::dispatch::NativeUnstagedExit::Refused(carrick_el1_abi::Action::Served)
-    );
-    assert_eq!(frame.x[0] as i64, -38);
-    assert_eq!(counters.refused_child[98].load(Ordering::Relaxed), 1);
+    assert_ne!(route, CompletionRoute::Forward, "exit {exit:?}");
+    assert_eq!(frame.x[0] as i64, -22, "Linux EINVAL");
+    assert_eq!(counters.refused_child[98].load(Ordering::Relaxed), 0);
 }
 
 /// #1941 review: an untimed `FUTEX_WAIT_PRIVATE` whose word matches but
