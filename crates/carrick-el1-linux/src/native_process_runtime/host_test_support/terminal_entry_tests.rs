@@ -2527,7 +2527,11 @@ fn exit_group_ends_member_sleeping_on_its_signal_channel_for<
         panic!("exit_group must wake the member sleeping on its signal channel, got {claim:?}");
     };
     assert_eq!(
-        fixture.zone.switch_in_full(slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         sibling.record.id
     );
     let saved = unsafe { fixture.runtime.record_binding(sibling.record) }
