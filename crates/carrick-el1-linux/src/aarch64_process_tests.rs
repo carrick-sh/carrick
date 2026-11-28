@@ -696,7 +696,9 @@ impl ForkStockCrossing for TestStockCrossing {
                 let total = child_pages + parent_pages;
                 let mut tables = self.grant_tables.lock().unwrap();
                 if tables.len() < total {
-                    exchange.refuse(ForkStockRefusal::Capacity);
+                    exchange.refuse(ForkStockRefusal::Capacity(
+                        carrick_el1_abi::ForkCapacityResource::Tables,
+                    ));
                     return Err(NativeProcessError::Exhausted);
                 }
                 let child_slice: Vec<_> = tables.drain(..child_pages).collect();

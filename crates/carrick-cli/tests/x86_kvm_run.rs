@@ -5747,6 +5747,165 @@ fn mounted_static_x86_xattr_crossings_in_a_fork_child_refuse_in_ring() {
     assert_eq!(ranking["rows"][0]["unrouted"], 2);
 }
 
+/// #3012: a fork the carrier refuses names the stage that refused it. The
+/// root forks live children until a fork fails (Linux forks all 64). Every
+/// EAGAIN the guest sees must be a fork stock capacity refusal in the
+/// terminal census, counted under the one resource that refused it
+/// (`capacity_refusal.<resource>`), with the last refusal's values, and
+/// `carrick debug el1-census --refusals` must print both. On main the census
+/// carries no fork refusals at all.
+#[test]
+fn mounted_static_x86_fork_refusal_names_its_resource() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("fork-until-refused");
+    compile_assembly_with_flags(
+        "x86_fork_until_refused.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-fno-builtin",
+            "-O1",
+        ],
+    );
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native fork-until-refused oracle");
+    assert_eq!(native.stdout, b"forked=64 errno=0\n", "native oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+
+    let archive = dir.path().join("image.tar");
+    std::fs::write(&archive, empty_image_archive()).unwrap();
+    let cli = assert_cmd::cargo::cargo_bin("carrick");
+    let home = dir.path().join("home");
+    let census_dir = dir.path().join("census");
+    let load = Command::new(&cli)
+        .timeout(Duration::from_secs(5))
+        .env("CARRICK_HOME", &home)
+        .args(["load", "--input", archive.to_str().unwrap()])
+        .output()
+        .expect("load local fork image");
+    assert!(
+        load.status.success(),
+        "load stderr: {}",
+        String::from_utf8_lossy(&load.stderr)
+    );
+    let scoped_run_id = match std::env::var("CARRICK_RUN_ID") {
+        Ok(scope) => format!("{scope}-x86-kvm-fork-refusal-test"),
+        Err(_) => "x86-kvm-fork-refusal-test".to_owned(),
+    };
+    let run = Command::new(&cli)
+        .timeout(Duration::from_secs(60))
+        .env("CARRICK_HOME", &home)
+        .env("CARRICK_RUN_ID", &scoped_run_id)
+        .env("CARRICK_EL1_CENSUS", &census_dir)
+        .args([
+            "run",
+            "--platform",
+            "linux/amd64",
+            "--pull",
+            "never",
+            "--volume",
+            &format!("{}:/hello:ro", elf.display()),
+            "x86-kvm-hello:latest",
+        ])
+        .output()
+        .expect("run the fork refusal witness");
+    let stdout = String::from_utf8_lossy(&run.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+    assert_eq!(
+        run.status.code(),
+        Some(7),
+        "stdout: {stdout}; stderr: {stderr}"
+    );
+    let line = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("forked="))
+        .unwrap_or_else(|| panic!("no fork report: {stdout}"));
+    let (forked, errno) = line
+        .split_once(" errno=")
+        .map(|(forked, errno)| {
+            (
+                forked.parse::<u64>().unwrap(),
+                errno.parse::<u64>().unwrap(),
+            )
+        })
+        .unwrap_or_else(|| panic!("malformed fork report: {line}"));
+    eprintln!("fork-until-refused: forked={forked} errno={errno}");
+
+    let census_files: Vec<_> = std::fs::read_dir(&census_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(census_files.len(), 1);
+    let census: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&census_files[0]).unwrap()).unwrap();
+    let fork = &census["fork_refusals"];
+    assert!(
+        fork.is_object(),
+        "the x86 census names its fork refusals: {census}"
+    );
+    let refusals = fork["refusals"].as_object().unwrap();
+    let named: Vec<(&str, u64)> = refusals
+        .iter()
+        .filter_map(|(family, count)| {
+            family
+                .strip_prefix("capacity_refusal.")
+                .map(|resource| (resource, count.as_u64().unwrap()))
+        })
+        .collect();
+    let capacity = refusals
+        .get("capacity_refusal")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    assert_eq!(
+        named.iter().map(|(_, count)| count).sum::<u64>(),
+        capacity,
+        "every capacity refusal names its resource: {fork}"
+    );
+    match errno {
+        0 => {
+            // Linux's answer: nothing refused.
+            assert_eq!(forked, 64);
+            assert_eq!(capacity, 0, "{fork}");
+        }
+        11 => {
+            assert!(
+                capacity >= 1,
+                "an EAGAIN fork is a counted stock refusal: {fork}"
+            );
+            let resource = fork["last_refusal"]["resource"]
+                .as_str()
+                .unwrap_or_else(|| panic!("the last refusal is kept: {fork}"));
+            assert!(
+                named.iter().any(|(named, _)| *named == resource),
+                "the last refusal's resource {resource} is counted: {fork}"
+            );
+            let ranked = Command::new(&cli)
+                .timeout(Duration::from_secs(5))
+                .args(["debug", "el1-census", "--refusals"])
+                .arg(&census_dir)
+                .output()
+                .expect("rank census refusals");
+            let table = String::from_utf8_lossy(&ranked.stdout);
+            assert!(ranked.status.success(), "{table}");
+            assert!(
+                table.contains(&format!("  capacity_refusal.{resource}: ")),
+                "--refusals prints the resource's count: {table}"
+            );
+            assert!(
+                table.contains(&format!("resource {resource} on cpu")),
+                "--refusals prints the last refusal: {table}"
+            );
+        }
+        other => panic!("fork answered errno {other}, which names no stock stage: {fork}"),
+    }
+}
+
 /// #2107: the mounted CLI root must share the host file authority, even
 /// though the production pool's synthetic root already owns ring stdio.
 #[test]

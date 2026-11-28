@@ -1118,19 +1118,6 @@ fn render_section<T: std::fmt::Display>(out: &mut String, name: &str, rows: &[T]
     }
 }
 
-/// The exact bounded resource that refused fork admission.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[repr(u32)]
-pub enum ForkCapacityResource {
-    PendingLoan = 1,
-    Lifecycle = 2,
-    Tables = 3,
-    LoanIdentity = 4,
-    AddressTag = 5,
-    Ledger = 6,
-    Control = 7,
-}
-
 /// Occupancy proof from the drain immediately preceding admission.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ForkQuarantineState {
@@ -1139,12 +1126,34 @@ pub struct ForkQuarantineState {
     pub carrier_released: bool,
 }
 
+/// A [`carrick_el1_abi::ForkCapacityResource`] serializes as its variant name.
+mod fork_capacity_resource_name {
+    use carrick_el1_abi::ForkCapacityResource;
+
+    pub fn serialize<S: serde::Serializer>(
+        resource: &ForkCapacityResource,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(resource.name())
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<ForkCapacityResource, D::Error> {
+        let name = <String as serde::Deserialize>::deserialize(deserializer)?;
+        ForkCapacityResource::from_name(&name).ok_or_else(|| {
+            serde::de::Error::custom(format!("unknown fork capacity resource {name}"))
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ForkAdmissionRefusal {
     pub carrier: u64,
     pub mm: u64,
     pub cpu: u32,
-    pub resource: ForkCapacityResource,
+    #[serde(with = "fork_capacity_resource_name")]
+    pub resource: carrick_el1_abi::ForkCapacityResource,
     pub child_pages: u64,
     pub parent_pages: u64,
     pub available_pages: usize,

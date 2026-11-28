@@ -676,13 +676,82 @@ pub struct ForkStockLoan {
     pub asid: Option<Asid>,
 }
 
+/// The exact bounded resource that refused fork admission (#3012). A
+/// [`ForkStockRefusal::Capacity`] always names one, so a fork that answers
+/// EAGAIN says which stage refused it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+#[repr(u32)]
+pub enum ForkCapacityResource {
+    /// The stopped CPU already holds an unsettled loan.
+    PendingLoan = 1,
+    /// No cold lifecycle record is left.
+    Lifecycle = 2,
+    /// Too few contiguous page-table pages for the child and parent.
+    Tables = 3,
+    /// The loan id space is exhausted.
+    LoanIdentity = 4,
+    /// No child address tag (ASID or untagged root) is free.
+    AddressTag = 5,
+    /// The table ledger refused a page charge.
+    Ledger = 6,
+    /// No kernel control capacity is left.
+    Control = 7,
+}
+
+impl ForkCapacityResource {
+    pub const ALL: [Self; 7] = [
+        Self::PendingLoan,
+        Self::Lifecycle,
+        Self::Tables,
+        Self::LoanIdentity,
+        Self::AddressTag,
+        Self::Ledger,
+        Self::Control,
+    ];
+
+    /// The stable variant name, as the census and run reports print it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::PendingLoan => "PendingLoan",
+            Self::Lifecycle => "Lifecycle",
+            Self::Tables => "Tables",
+            Self::LoanIdentity => "LoanIdentity",
+            Self::AddressTag => "AddressTag",
+            Self::Ledger => "Ledger",
+            Self::Control => "Control",
+        }
+    }
+
+    /// The inverse of [`Self::name`].
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|resource| resource.name() == name)
+    }
+
+    /// The dense index of this resource in [`Self::ALL`].
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self as usize - 1
+    }
+
+    fn from_wire(raw: u64) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|resource| *resource as u64 == raw)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ForkStockRefusal {
     Invalid,
     Stale,
     /// An admission limit refused the loan: the stock, ledger or a table
-    /// is at its bound. Linux `fork(2)` answers EAGAIN.
-    Capacity,
+    /// is at its bound, and the resource names which. Linux `fork(2)`
+    /// answers EAGAIN.
+    Capacity(ForkCapacityResource),
     Inventory,
     /// The carrier could not allocate the kernel memory the fork needs
     /// (#3085), distinct from [`Self::Capacity`]'s admission limit. Linux
@@ -692,6 +761,34 @@ pub enum ForkStockRefusal {
     /// publishes. Not an error: the guest grows the table through its own
     /// metadata allocator, outside every MM editor, and reruns the fork.
     Residency,
+}
+
+impl ForkStockRefusal {
+    /// The exchange word: the reason's code in the low byte, and a capacity
+    /// refusal's resource above it.
+    const fn wire(self) -> u64 {
+        match self {
+            Self::Invalid => 1,
+            Self::Stale => 2,
+            Self::Capacity(resource) => 3 | ((resource as u64) << 8),
+            Self::Inventory => 4,
+            Self::Residency => 5,
+            Self::NoMemory => 6,
+        }
+    }
+
+    /// The inverse of [`Self::wire`]; `None` for any other word.
+    fn from_wire(word: u64) -> Option<Self> {
+        Some(match word {
+            1 => Self::Invalid,
+            2 => Self::Stale,
+            4 => Self::Inventory,
+            5 => Self::Residency,
+            6 => Self::NoMemory,
+            word if word & 0xff == 3 => Self::Capacity(ForkCapacityResource::from_wire(word >> 8)?),
+            _ => return None,
+        })
+    }
 }
 
 /// All words are checked before constructing nonzero semantic domains.
@@ -812,14 +909,7 @@ impl ForkStockExchange {
         if self.status != 0 {
             return false;
         }
-        self.response[0] = match refusal {
-            ForkStockRefusal::Invalid => 1,
-            ForkStockRefusal::Stale => 2,
-            ForkStockRefusal::Capacity => 3,
-            ForkStockRefusal::Inventory => 4,
-            ForkStockRefusal::Residency => 5,
-            ForkStockRefusal::NoMemory => 6,
-        };
+        self.response[0] = refusal.wire();
         self._reserved = 0;
         self.status = 2;
         true
@@ -853,15 +943,7 @@ impl ForkStockExchange {
                     asid,
                 )?)
             }
-            2 => Err(match self.response[0] {
-                1 => ForkStockRefusal::Invalid,
-                2 => ForkStockRefusal::Stale,
-                3 => ForkStockRefusal::Capacity,
-                4 => ForkStockRefusal::Inventory,
-                5 => ForkStockRefusal::Residency,
-                6 => ForkStockRefusal::NoMemory,
-                _ => return None,
-            }),
+            2 => Err(ForkStockRefusal::from_wire(self.response[0])?),
             _ => return None,
         };
         self.status = 3;
@@ -1191,14 +1273,7 @@ impl ForkStockSettlement {
             return false;
         }
         self.words[8] = 2;
-        self.words[9] = match refusal {
-            ForkStockRefusal::Invalid => 1,
-            ForkStockRefusal::Stale => 2,
-            ForkStockRefusal::Capacity => 3,
-            ForkStockRefusal::Inventory => 4,
-            ForkStockRefusal::Residency => 5,
-            ForkStockRefusal::NoMemory => 6,
-        };
+        self.words[9] = refusal.wire();
         true
     }
 
@@ -1211,15 +1286,7 @@ impl ForkStockSettlement {
         }
         let result = match self.words[8] {
             1 => Ok(()),
-            2 => Err(match self.words[9] {
-                1 => ForkStockRefusal::Invalid,
-                2 => ForkStockRefusal::Stale,
-                3 => ForkStockRefusal::Capacity,
-                4 => ForkStockRefusal::Inventory,
-                5 => ForkStockRefusal::Residency,
-                6 => ForkStockRefusal::NoMemory,
-                _ => return None,
-            }),
+            2 => Err(ForkStockRefusal::from_wire(self.words[9])?),
             _ => return None,
         };
         self.words[8] = 3;
@@ -1612,10 +1679,32 @@ mod tests {
             lifecycle_arm(),
             None,
         ));
+        let tables = ForkStockRefusal::Capacity(ForkCapacityResource::Tables);
         let mut refused = ForkStockExchange::new(request).unwrap();
-        assert!(refused.refuse(ForkStockRefusal::Capacity));
-        assert_eq!(refused.take(request), Some(Err(ForkStockRefusal::Capacity)));
+        assert!(refused.refuse(tables));
+        assert_eq!(refused.take(request), Some(Err(tables)));
         assert!(refused.take(request).is_none());
+    }
+
+    /// #3012: a capacity refusal carries the resource that refused it across
+    /// both exchanges, and a capacity word naming no resource is malformed.
+    #[test]
+    fn capacity_refusal_round_trips_its_resource() {
+        let request = request();
+        for resource in ForkCapacityResource::ALL {
+            let refusal = ForkStockRefusal::Capacity(resource);
+            let mut refused = ForkStockExchange::new(request).unwrap();
+            assert!(refused.refuse(refusal));
+            assert_eq!(refused.take(request), Some(Err(refusal)), "{resource:?}");
+            assert_eq!(
+                ForkCapacityResource::from_name(resource.name()),
+                Some(resource)
+            );
+            assert_eq!(ForkCapacityResource::ALL[resource.index()], resource);
+        }
+        assert_eq!(ForkStockRefusal::from_wire(3), None);
+        assert_eq!(ForkStockRefusal::from_wire(3 | (8 << 8)), None);
+        assert_eq!(ForkStockRefusal::from_wire(4 | (2 << 8)), None);
     }
 
     /// #2655: the residency refusal keeps its own wire code, so the guest

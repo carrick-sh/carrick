@@ -190,6 +190,8 @@ fn publish_census(run: &carrick_softcpu_aarch64_host::SoftProcessRun) -> Result<
         scope.as_ref(),
         counters,
         carrick_spec::syscall_census::CensusIsa::Aarch64,
+        // The soft carrier lends no host fork stock (#3012).
+        None,
     )
     .context("publish the soft run's terminal census")?;
     Ok(true)

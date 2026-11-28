@@ -190,7 +190,40 @@ pub struct Census {
     /// `AnonymousLeave` name (nonzero only; absent in older files).
     #[serde(default)]
     pub anonymous_leaves: std::collections::BTreeMap<String, u64>,
+    /// The carrier's fork stock refusals (#3012). Absent where the carrier
+    /// has no host fork stock (the soft CPU) and in older files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_refusals: Option<ForkRefusalCensus>,
     pub rows: Vec<CensusRow>,
+}
+
+/// One carrier's fork stock refusals (#3012): every nonzero refusal family
+/// by its typed reason (`capacity_refusal.<resource>` names the resource
+/// that refused an EAGAIN), and the last refused admission's values.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ForkRefusalCensus {
+    pub refusals: std::collections::BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_refusal: Option<carrick_observability::compat::ForkAdmissionRefusal>,
+}
+
+impl ForkRefusalCensus {
+    /// Cut from a carrier's fork stock at terminal publication.
+    #[must_use]
+    pub fn from_stock(
+        counters: &carrick_hal::fork_stock::ForkStockCounters,
+        last_refusal: Option<carrick_observability::compat::ForkAdmissionRefusal>,
+    ) -> Self {
+        Self {
+            refusals: counters
+                .families()
+                .into_iter()
+                .filter(|(family, _)| family.contains("refusal"))
+                .map(|(family, count)| (family.to_owned(), count))
+                .collect(),
+            last_refusal,
+        }
+    }
 }
 
 fn snapshot(run_id: Option<&carrick_kernel::kernel::CarrierScopeId>) -> Census {
@@ -304,6 +337,7 @@ fn snapshot_counters(
                 })
                 .collect()
         }),
+        fork_refusals: None,
         rows,
     }
 }
@@ -417,12 +451,15 @@ pub fn ring_refusals(
 /// Publication failures fail the run instead of delivering unqualified success.
 pub fn publish_terminal(
     run_id: Option<&carrick_kernel::kernel::CarrierScopeId>,
+    fork_refusals: Option<ForkRefusalCensus>,
 ) -> std::io::Result<()> {
     init_from_env();
     if !enabled() {
         return Ok(());
     }
-    publish(snapshot(run_id), destination())
+    let mut census = snapshot(run_id);
+    census.fork_refusals = fork_refusals;
+    publish(census, destination())
 }
 
 /// Persist an ISA's exact mapped counters before terminal delivery.
@@ -430,15 +467,15 @@ pub fn publish_counters_terminal(
     run_id: Option<&carrick_kernel::kernel::CarrierScopeId>,
     counters: &carrick_el1_abi::Counters,
     isa: carrick_spec::syscall_census::CensusIsa,
+    fork_refusals: Option<ForkRefusalCensus>,
 ) -> std::io::Result<()> {
     init_from_env();
     if !enabled() {
         return Ok(());
     }
-    publish(
-        snapshot_counters(run_id, Some(counters), isa),
-        destination(),
-    )
+    let mut census = snapshot_counters(run_id, Some(counters), isa);
+    census.fork_refusals = fork_refusals;
+    publish(census, destination())
 }
 
 fn destination() -> std::path::PathBuf {
@@ -676,6 +713,18 @@ pub struct RefusalRanking {
     /// Every input run had complete refusal evidence.
     pub complete: bool,
     pub rows: Vec<RefusalRank>,
+    /// Fork stock refusals summed by family over the runs that carry them
+    /// (#3012), and each such run's last refused admission.
+    pub fork_refusals: std::collections::BTreeMap<String, u64>,
+    pub fork_last_refusals: Vec<ForkLastRefusal>,
+}
+
+/// One run's last refused fork admission.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ForkLastRefusal {
+    pub run_id: Option<String>,
+    pub pid: u32,
+    pub refusal: carrick_observability::compat::ForkAdmissionRefusal,
 }
 
 fn refusal_name(isa: carrick_spec::syscall_census::CensusIsa, native: u64) -> String {
@@ -743,11 +792,31 @@ pub fn rank_refusals(censuses: &[Census]) -> Result<RefusalRanking, String> {
     let mut rows: Vec<RefusalRank> = by_key.into_values().collect();
     // Stable within equal totals: ISA, native number, then root before child.
     rows.sort_by_key(|row| std::cmp::Reverse(row.total()));
+    let mut fork_refusals = std::collections::BTreeMap::<String, u64>::new();
+    let mut fork_last_refusals = Vec::new();
+    for census in censuses {
+        let Some(fork) = &census.fork_refusals else {
+            continue;
+        };
+        for (family, count) in &fork.refusals {
+            let total = fork_refusals.entry(family.clone()).or_default();
+            *total = total.saturating_add(*count);
+        }
+        if let Some(refusal) = &fork.last_refusal {
+            fork_last_refusals.push(ForkLastRefusal {
+                run_id: census.run_id.clone(),
+                pid: census.pid,
+                refusal: refusal.clone(),
+            });
+        }
+    }
     Ok(RefusalRanking {
         runs: censuses.len(),
         incomplete_runs,
         complete: incomplete_runs == 0,
         rows,
+        fork_refusals,
+        fork_last_refusals,
     })
 }
 
@@ -783,7 +852,39 @@ pub fn render_refusals(ranking: &RefusalRanking, limit: usize) -> String {
             if row.allowlisted { "yes" } else { "no" },
         ));
     }
+    render_fork_refusals(ranking, &mut out);
     out
+}
+
+/// The fork stock section of [`render_refusals`] (#3012): which stage
+/// refused a fork, and the last refusal's values per run.
+fn render_fork_refusals(ranking: &RefusalRanking, out: &mut String) {
+    out.push_str("\nfork stock refusals:\n");
+    if ranking.fork_refusals.is_empty() {
+        out.push_str("  none\n");
+    }
+    for (family, count) in &ranking.fork_refusals {
+        out.push_str(&format!("  {family}: {count}\n"));
+    }
+    for last in &ranking.fork_last_refusals {
+        let refusal = &last.refusal;
+        let absent = refusal.quarantine.iter().filter(|q| q.absent).count();
+        out.push_str(&format!(
+            "  last refusal ({} pid {}): resource {} on cpu {}, mm {}, child pages {}, \
+             parent pages {}, available pages {}, available lifecycles {}, \
+             quarantined children {} ({absent} absent)\n",
+            last.run_id.as_deref().unwrap_or("run"),
+            last.pid,
+            refusal.resource.name(),
+            refusal.cpu,
+            refusal.mm,
+            refusal.child_pages,
+            refusal.parent_pages,
+            refusal.available_pages,
+            refusal.available_lifecycles,
+            refusal.quarantine.len(),
+        ));
+    }
 }
 
 /// One run's census, summarised.
@@ -868,8 +969,56 @@ mod tests {
             wall_ns: 30_000,
             ipc_leaves: Default::default(),
             anonymous_leaves: Default::default(),
+            fork_refusals: None,
             rows,
         }
+    }
+
+    /// #3012: a run's fork stock refusals survive the census file by name,
+    /// and `--refusals` prints the refusing resource and the last refusal.
+    #[test]
+    fn refusals_rank_and_print_the_fork_stock_stage() {
+        use carrick_el1_abi::ForkCapacityResource;
+        let mut refused = census(Vec::new());
+        refused.run_id = Some("npm-1".to_owned());
+        refused.fork_refusals = Some(ForkRefusalCensus {
+            refusals: [
+                ("capacity_refusal".to_owned(), 3),
+                ("capacity_refusal.Lifecycle".to_owned(), 3),
+            ]
+            .into_iter()
+            .collect(),
+            last_refusal: Some(carrick_observability::compat::ForkAdmissionRefusal {
+                carrier: 1,
+                mm: 9,
+                cpu: 0,
+                resource: ForkCapacityResource::Lifecycle,
+                child_pages: 2,
+                parent_pages: 2,
+                available_pages: 40,
+                available_lifecycles: 0,
+                quarantine: Vec::new(),
+            }),
+        });
+        let json = serde_json::to_value(&refused).unwrap();
+        assert_eq!(
+            json["fork_refusals"]["last_refusal"]["resource"],
+            "Lifecycle"
+        );
+        assert_eq!(serde_json::from_value::<Census>(json).unwrap(), refused);
+        let ranking = rank_refusals(&[refused, census(Vec::new())]).unwrap();
+        assert_eq!(
+            ranking.fork_refusals.get("capacity_refusal.Lifecycle"),
+            Some(&3)
+        );
+        let text = render_refusals(&ranking, 10);
+        assert!(text.contains("  capacity_refusal.Lifecycle: 3\n"), "{text}");
+        assert!(
+            text.contains("last refusal (npm-1 pid 1): resource Lifecycle on cpu 0"),
+            "{text}"
+        );
+        let clean = render_refusals(&rank_refusals(&[census(Vec::new())]).unwrap(), 10);
+        assert!(clean.contains("fork stock refusals:\n  none\n"), "{clean}");
     }
 
     #[test]
@@ -888,7 +1037,7 @@ mod tests {
 
         const CHILD: &str = "CARRICK_CENSUS_POLICY_TEST_CHILD";
         if std::env::var_os(CHILD).is_some() {
-            publish_terminal(None).unwrap();
+            publish_terminal(None, None).unwrap();
             assert!(!enabled());
             return;
         }

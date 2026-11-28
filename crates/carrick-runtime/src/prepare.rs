@@ -1003,10 +1003,19 @@ fn run_prepared_kvm_pool_with_debug(
             .syscall_counters()
             .map_err(std::io::Error::other)
             .and_then(|counters| {
+                let fork_refusals = crate::el1_census::ForkRefusalCensus::from_stock(
+                    &physical
+                        .fork_stock_counters()
+                        .map_err(std::io::Error::other)?,
+                    physical
+                        .fork_admission_refusal()
+                        .map_err(std::io::Error::other)?,
+                );
                 crate::el1_census::publish_counters_terminal(
                     Some(&census_scope),
                     &counters,
                     carrick_spec::syscall_census::CensusIsa::X86_64,
+                    Some(fork_refusals),
                 )
             })
     } else {

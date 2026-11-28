@@ -1862,7 +1862,12 @@ pub(crate) fn service_native_fork_stock(
                 return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
             }
             if stock.ensure_control_capacity(custody).is_err() {
-                exchange.refuse(ForkStockRefusal::Capacity);
+                // Counted and named like every capacity refusal (#3012).
+                let _ = stock.owner.refuse_capacity(
+                    exchange,
+                    carrick_el1_abi::ForkCapacityResource::Control,
+                    execution.cpu,
+                );
                 return Ok([METADATA_GRANT_ERR_DENIED, 0, 0, 0]);
             }
             let result = stock.loan(&mut ledger, execution, exchange, |life| {

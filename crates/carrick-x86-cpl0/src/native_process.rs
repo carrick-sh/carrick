@@ -677,7 +677,7 @@ impl Service {
         }
         match reserve.take(loan) {
             Some(Ok(())) => {}
-            Some(Err(carrick_el1_abi::ForkStockRefusal::Capacity)) => {
+            Some(Err(carrick_el1_abi::ForkStockRefusal::Capacity(_))) => {
                 return Err(abort_published(&mut child, NativeProcessError::Exhausted));
             }
             Some(Err(carrick_el1_abi::ForkStockRefusal::NoMemory)) => {

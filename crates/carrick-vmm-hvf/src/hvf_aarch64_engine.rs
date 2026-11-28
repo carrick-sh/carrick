@@ -405,6 +405,23 @@ impl HostCowStats {
     }
 }
 
+/// The carrier fork stock, retained for its terminal census (#3012).
+#[derive(Clone)]
+pub struct ForkStockRefusalSource(Arc<crate::trap::CarrierVmCustody>);
+
+impl ForkStockRefusalSource {
+    /// The stock's counters and its last refused admission.
+    pub fn read(
+        &self,
+    ) -> (
+        carrick_hal::fork_stock::ForkStockCounters,
+        Option<carrick_hal::fork_stock::ForkAdmissionRefusal>,
+    ) {
+        let stock = self.0.fork_stock.lock();
+        (stock.owner.counters(), stock.owner.admission_refusal())
+    }
+}
+
 impl HvfAarch64Vmm {
     /// Retained physical adapter for the production EL1 UserTransfer service.
     pub fn user_transfer_custody(&self) -> crate::trap::UserTransferCustody {
@@ -424,6 +441,12 @@ impl HvfAarch64Vmm {
             Arc::clone(&self.state.carrier_foreign_mm_transport.custody),
             source,
         )
+    }
+
+    /// A retained handle on the carrier's fork stock, read at terminal
+    /// census publication after the trap engine is gone (#3012).
+    pub fn fork_stock_refusals(&self) -> ForkStockRefusalSource {
+        ForkStockRefusalSource(Arc::clone(&self.state.carrier_foreign_mm_transport.custody))
     }
 
     /// Exact-MM COW accounting; retain the handle before detaching the MM.

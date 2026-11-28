@@ -22,9 +22,9 @@ use std::num::NonZeroU64;
 
 use carrick_core_abi::mm::{BrokenRelease, ReleaseOutcome, ReleaseWait};
 use carrick_el1_abi::{
-    ChildRetireRefusal, ExecutionBinding, ForkLifecycleLoan, ForkStockExchange, ForkStockLoan,
-    ForkStockRefusal, ForkStockSettlement, MmReleaseReceipt, NativeChildRetire, ReservationMm,
-    RetiredReturns,
+    ChildRetireRefusal, ExecutionBinding, ForkCapacityResource, ForkLifecycleLoan,
+    ForkStockExchange, ForkStockLoan, ForkStockRefusal, ForkStockSettlement, MmReleaseReceipt,
+    NativeChildRetire, ReservationMm, RetiredReturns,
 };
 use carrick_guest_arch::{AddressContext, Asid, CpuId, RootGpa};
 
@@ -230,9 +230,7 @@ impl ForkHostBackingCustody {
             .or_else(|| owner().filter(matches))
     }
 }
-pub use carrick_observability::compat::{
-    ForkAdmissionRefusal, ForkCapacityResource, ForkQuarantineState,
-};
+pub use carrick_observability::compat::{ForkAdmissionRefusal, ForkQuarantineState};
 
 #[derive(Debug, Default)]
 struct QuarantinedChild {
@@ -966,6 +964,8 @@ pub struct ForkStockCounters {
     pub loans: u64,
     /// Loans refused for capacity (the guest lowers each to `EAGAIN`).
     pub capacity_refusals: u64,
+    /// [`Self::capacity_refusals`] by the resource that refused (#3012).
+    pub capacity_by_resource: ForkCapacityCounts,
     /// Loans or reservations refused because the carrier could not allocate
     /// the fork's kernel memory (the guest lowers each to `ENOMEM`, #3085).
     pub no_memory_refusals: u64,
@@ -1028,8 +1028,44 @@ impl ForkStockCounters {
             ("fork_loan_table_drawn", self.fork_loan_tables_drawn),
         ]
         .into_iter()
+        .chain(ForkCapacityResource::ALL.into_iter().map(|resource| {
+            (
+                ForkCapacityCounts::family(resource),
+                self.capacity_by_resource.get(resource),
+            )
+        }))
         .filter(|(_, count)| *count != 0)
         .collect()
+    }
+}
+
+/// Capacity refusals by [`ForkCapacityResource`] (#3012).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ForkCapacityCounts([u64; ForkCapacityResource::ALL.len()]);
+
+impl ForkCapacityCounts {
+    fn count(&mut self, resource: ForkCapacityResource) {
+        let slot = &mut self.0[resource.index()];
+        *slot = slot.saturating_add(1);
+    }
+
+    #[must_use]
+    pub fn get(&self, resource: ForkCapacityResource) -> u64 {
+        self.0[resource.index()]
+    }
+
+    /// The run-report family of one resource's refusals.
+    #[must_use]
+    pub const fn family(resource: ForkCapacityResource) -> &'static str {
+        match resource {
+            ForkCapacityResource::PendingLoan => "capacity_refusal.PendingLoan",
+            ForkCapacityResource::Lifecycle => "capacity_refusal.Lifecycle",
+            ForkCapacityResource::Tables => "capacity_refusal.Tables",
+            ForkCapacityResource::LoanIdentity => "capacity_refusal.LoanIdentity",
+            ForkCapacityResource::AddressTag => "capacity_refusal.AddressTag",
+            ForkCapacityResource::Ledger => "capacity_refusal.Ledger",
+            ForkCapacityResource::Control => "capacity_refusal.Control",
+        }
     }
 }
 
@@ -2832,14 +2868,18 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         }
     }
 
-    fn refuse_capacity(
+    /// Refuse a loan for `resource`: count it, keep its values as the last
+    /// refusal, and answer the guest's EAGAIN naming the resource (#3012).
+    /// A carrier's own admission check (HVF's control capacity) refuses
+    /// through here too, so no capacity refusal goes unnamed.
+    pub fn refuse_capacity(
         &mut self,
         exchange: &mut ForkStockExchange,
         resource: ForkCapacityResource,
         cpu: CpuId,
     ) -> Result<ForkStockLoan, ForkStockRefusal> {
         self.record_capacity(exchange, resource, cpu);
-        self.refuse(exchange, ForkStockRefusal::Capacity)
+        self.refuse(exchange, ForkStockRefusal::Capacity(resource))
     }
 
     fn refuse(
@@ -2848,7 +2888,10 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         refusal: ForkStockRefusal,
     ) -> Result<ForkStockLoan, ForkStockRefusal> {
         let counter = match refusal {
-            ForkStockRefusal::Capacity => &mut self.counters.capacity_refusals,
+            ForkStockRefusal::Capacity(resource) => {
+                self.counters.capacity_by_resource.count(resource);
+                &mut self.counters.capacity_refusals
+            }
             ForkStockRefusal::Stale => &mut self.counters.stale_refusals,
             ForkStockRefusal::Invalid => &mut self.counters.invalid_refusals,
             ForkStockRefusal::Inventory => &mut self.counters.inventory_refusals,
@@ -2866,7 +2909,10 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         refusal: ForkStockRefusal,
     ) -> ForkStockRefusal {
         let counter = match refusal {
-            ForkStockRefusal::Capacity => &mut self.counters.capacity_refusals,
+            ForkStockRefusal::Capacity(resource) => {
+                self.counters.capacity_by_resource.count(resource);
+                &mut self.counters.capacity_refusals
+            }
             ForkStockRefusal::Stale => &mut self.counters.stale_refusals,
             ForkStockRefusal::Invalid => &mut self.counters.invalid_refusals,
             ForkStockRefusal::Inventory => &mut self.counters.inventory_refusals,
@@ -3008,7 +3054,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
                     exchange,
                     reserved,
                     charged,
-                    ForkStockRefusal::Capacity,
+                    ForkStockRefusal::Capacity(ForkCapacityResource::Ledger),
                 );
             }
             charged += 1;

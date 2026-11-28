@@ -199,7 +199,7 @@ fn stock_error(
         R::Stale => E::Stale,
         // An admission limit is EAGAIN; kernel memory the carrier could
         // not allocate is ENOMEM (`fork(2)`).
-        R::Capacity => E::Exhausted,
+        R::Capacity(_) => E::Exhausted,
         R::NoMemory => E::NoMemory,
         R::Inventory => E::Busy,
         // The fork owner grows the table and answers `Busy` itself. This
@@ -566,7 +566,7 @@ mod tests {
         for reply in [
             R::Invalid,
             R::Stale,
-            R::Capacity,
+            R::Capacity(carrick_el1_abi::ForkCapacityResource::Tables),
             R::Inventory,
             R::Residency,
         ] {
@@ -772,7 +772,9 @@ mod tests {
             NativeForkCause::Fork(ForkError::Core),
             NativeForkCause::StockReservation(R::Invalid),
             NativeForkCause::StockReservation(R::Stale),
-            NativeForkCause::StockReservation(R::Capacity),
+            NativeForkCause::StockReservation(R::Capacity(
+                carrick_el1_abi::ForkCapacityResource::Tables,
+            )),
             NativeForkCause::StockReservation(R::Inventory),
             NativeForkCause::StockReservation(R::Residency),
         ] {
@@ -890,7 +892,10 @@ mod tests {
         for (reply, error) in [
             (R::Invalid, NativeProcessError::Invalid),
             (R::Stale, NativeProcessError::Stale),
-            (R::Capacity, NativeProcessError::Exhausted),
+            (
+                R::Capacity(carrick_el1_abi::ForkCapacityResource::Tables),
+                NativeProcessError::Exhausted,
+            ),
             (R::Inventory, NativeProcessError::Busy),
             (R::Residency, NativeProcessError::NoMemory),
         ] {

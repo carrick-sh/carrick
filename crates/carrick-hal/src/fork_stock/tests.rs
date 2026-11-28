@@ -971,7 +971,7 @@ fn quarantined_stock_is_never_reissued_while_its_mm_is_live() {
     // The next fork cannot borrow quarantined pages: counted EAGAIN.
     assert_eq!(
         loan(&mut stock, parent(), 303, 3, 1),
-        Err(ForkStockRefusal::Capacity)
+        Err(ForkStockRefusal::Capacity(ForkCapacityResource::Tables))
     );
     assert_eq!(stock.counters().capacity_refusals, 1);
 
@@ -995,7 +995,7 @@ fn exhaustion_with_live_children_is_a_counted_capacity_refusal() {
     for attempt in 1..=3 {
         assert_eq!(
             loan(&mut stock, parent(), 304, 1, 1),
-            Err(ForkStockRefusal::Capacity)
+            Err(ForkStockRefusal::Capacity(ForkCapacityResource::Lifecycle))
         );
         assert_eq!(stock.counters().capacity_refusals, attempt);
     }
@@ -1138,7 +1138,9 @@ fn abort_refuses_dirty_tables_and_subsequent_loan_refuses_until_scrubbed_and_abo
     let mut exchange = ForkStockExchange::new(request(exec, 302, 1, 1)).unwrap();
     assert_eq!(
         stock.loan(&mut NoTableLedger, exec, &mut exchange, |_| true),
-        Err(ForkStockRefusal::Capacity)
+        Err(ForkStockRefusal::Capacity(
+            ForkCapacityResource::PendingLoan
+        ))
     );
 
     is_clean.set(true);
@@ -1438,7 +1440,7 @@ fn kvm_unclearable_lifecycle_record_is_never_reissued_dirty() {
     assert!(window.clear(granted.lifecycle));
     assert_eq!(
         x86_loan(&mut stock, window, 303),
-        Err(ForkStockRefusal::Capacity)
+        Err(ForkStockRefusal::Capacity(ForkCapacityResource::Lifecycle))
     );
 }
 
@@ -1467,7 +1469,7 @@ fn kvm_live_children_beyond_lifecycle_records_are_counted_refusals() {
     }
     assert_eq!(
         x86_loan(&mut stock, window, 310),
-        Err(ForkStockRefusal::Capacity)
+        Err(ForkStockRefusal::Capacity(ForkCapacityResource::Lifecycle))
     );
     assert_eq!(stock.counters().capacity_refusals, 1);
     assert_eq!(stock.live_children(), 8);
@@ -2002,7 +2004,7 @@ fn every_refusal_reason_is_counted_and_named() {
     // Capacity: more table pages than the stock holds.
     assert_eq!(
         loan(&mut stock, exec, 302, 8, 1),
-        Err(ForkStockRefusal::Capacity)
+        Err(ForkStockRefusal::Capacity(ForkCapacityResource::Tables))
     );
     let counters = stock.counters();
     assert_eq!(counters.stale_refusals, 1);
@@ -2034,7 +2036,7 @@ fn refusal_reports_installed_quarantine_and_exact_lifecycle_resource() {
     assert_eq!(reclaim(&mut stock, |_| false, &cleared), 0);
     assert_eq!(
         loan(&mut stock, parent(), 303, 1, 1),
-        Err(ForkStockRefusal::Capacity)
+        Err(ForkStockRefusal::Capacity(ForkCapacityResource::Lifecycle))
     );
     let refusal = stock.admission_refusal().unwrap();
     assert_eq!(refusal.resource, ForkCapacityResource::Lifecycle);
@@ -3000,7 +3002,7 @@ fn lifecycle_alias_preparation_never_dirties_a_refused_loan() {
             aliases = window.prepare_affinity_aliases(life);
             aliases.is_some()
         }),
-        Err(ForkStockRefusal::Capacity)
+        Err(ForkStockRefusal::Capacity(ForkCapacityResource::Ledger))
     );
     assert!(aliases.is_some());
     assert!(window.is_zero(lifecycle));

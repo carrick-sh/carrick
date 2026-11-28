@@ -758,6 +758,7 @@ fn run_address_space_with_hvf_and_dispatcher(
         })?;
         let _ = stamp_identity_page(&mut trap, &dispatcher, &boot_context);
         drop(boot_context);
+        let fork_stock = trap.vm().fork_stock_refusals();
         let mut completion = run_threaded_hvf_loop(trap, dispatcher, max_traps, &carrier);
         // The control server owns an archive authority over this container's
         // mount table. Stop admission and join its synchronous worker before
@@ -783,7 +784,15 @@ fn run_address_space_with_hvf_and_dispatcher(
             },
             |terminal| carrier.record_terminal(terminal),
             |_| {
-                crate::el1_census::publish_terminal(Some(carrier.scope())).map_err(|error| {
+                let (counters, last_refusal) = fork_stock.read();
+                crate::el1_census::publish_terminal(
+                    Some(carrier.scope()),
+                    Some(crate::el1_census::ForkRefusalCensus::from_stock(
+                        &counters,
+                        last_refusal,
+                    )),
+                )
+                .map_err(|error| {
                     RuntimeError::Configuration(format!("publish terminal census: {error}"))
                 })
             },

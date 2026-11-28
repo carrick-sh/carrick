@@ -1171,7 +1171,9 @@ fn post_exec_native_fork_reserves_loaded_image_source_custody() {
         stock.loan(&mut NoTableLedger, execution, &mut next, |_| panic!(
             "no lifecycle capacity"
         )),
-        Err(ForkStockRefusal::Capacity)
+        Err(ForkStockRefusal::Capacity(
+            carrick_el1_abi::ForkCapacityResource::Lifecycle
+        ))
     );
     drop(inherited);
     // Retirement keeps physical custody through quarantine, but closes birth admission.
