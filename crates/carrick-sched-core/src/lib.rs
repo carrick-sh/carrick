@@ -4472,9 +4472,10 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         self.slot(slot).lock.load(Ordering::Acquire) & SLOT_LOCK_SCAN_OWED != 0
     }
 
-    /// An idle scan whose bounded spin on `slot`'s lock ran out: enrol on the
-    /// holder's release ([`SLOT_LOCK_SCAN_OWED`]), then probe the lock once.
-    /// Returns the guard if the lock was free at the enrolment or the probe;
+    /// An idle scan's acquisition of another slot's lock: take it if free,
+    /// else enrol on the holder's release ([`SLOT_LOCK_SCAN_OWED`]) and probe
+    /// the lock once, with no spin. Returns the guard if the lock was free at
+    /// the enrolment or the probe;
     /// `None` is "not now": the holder's release owes this scan (whose idle
     /// bit is published) another pass ([`Self::owe_scan_passes`]), never an
     /// empty queue.
@@ -4505,7 +4506,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 Err(current) => word = current,
             }
         }
-        // The probe: the holder may have released between the spin and the
+        // The probe: the holder may have released between the load and the
         // enrolment (its release then owed a pass already).
         lock.compare_exchange(0, SLOT_LOCK_HELD, Ordering::Acquire, Ordering::Relaxed)
             .ok()
@@ -5932,11 +5933,9 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
 
     fn steal_from(&self, thief: SlotId, victim: SlotId, passes: &OwedPasses) -> Option<SwitchedIn> {
         // A busy victim is "not now": the scan enrols on the holder's
-        // release, which owes it another pass (#3083).
-        let guard = match self.slot_lock(victim, &BoundedSpin(EL1_SLOT_LOCK_SPINS), passes) {
-            Some(guard) => guard,
-            None => self.slot_lock_or_enrol_scan(victim, passes)?,
-        };
+        // release, which owes it another pass, and probes once (#3083). It
+        // never spins on the lock first: the release is the event.
+        let guard = self.slot_lock_or_enrol_scan(victim, passes)?;
         let s = self.slot(victim);
         let cpu = self.slot(thief).cpu.load(Ordering::Relaxed);
         // A victim in the guest reaches its own run queue (it polls it, or
@@ -7226,11 +7225,8 @@ fn write_set_bits(out: &mut impl core::fmt::Write, words: &[AtomicU64]) -> core:
 }
 
 /// Slot-lock spins EL1 allows itself before it gives up on another slot.
-#[cfg(not(all(test, feature = "loom")))]
+/// An idle scan's steal never spins: it enrols on the release (#3083).
 const EL1_SLOT_LOCK_SPINS: u32 = 1024;
-/// One under loom: a lock busy once is a lock whose spin ran out (#3083).
-#[cfg(all(test, feature = "loom"))]
-const EL1_SLOT_LOCK_SPINS: u32 = 1;
 
 /// Spin until the lock is free: for a slot's own run queue, whose lock is
 /// only ever held for a few instructions by a party that is running.
