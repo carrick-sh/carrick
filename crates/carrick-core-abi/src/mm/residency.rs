@@ -5,6 +5,12 @@ use crate::{
 };
 use core::alloc::Layout;
 use core::sync::atomic::{AtomicU64, Ordering};
+
+mod transfer;
+pub use transfer::{
+    FrameGrantResidencyTransfer, ResidencyTransferRefusal, TransferRange, TransferReceipt,
+};
+
 pub const FRAME_GRANT_RESIDENCY_SLOTS: usize = 4096;
 const MAX_RESIDENCY_EXTENSIONS: usize = 256;
 /// Requested bulk extent: 512 Linux pages, clamped by the supplying adapter
