@@ -186,7 +186,13 @@ pub(in crate::dispatch) enum HostMetadataNeed {
 
 /// What a host mapping syscall may do once it asked for its metadata
 /// ([`SyscallDispatcher::secure_host_venue_metadata`]).
-#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug, PartialEq, Eq)]
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
 pub(in crate::dispatch) enum HostVenueMetadata {
     /// The root holds the nodes this syscall's host commits may consume.
     Secured,
@@ -1856,35 +1862,37 @@ impl MemView<'_> {
                 }
             })
         };
-        let secured = match secure() {
-            Err(RootAccessRefusal::Refused(Refusal::MetadataRequired)) => {
+        // Every MetadataRequired goes to the provider, whose table decision
+        // is the only refusal (#3085): a root refused because a bank landed
+        // after its view was read decides again, as does one the pool grew
+        // for. A pass reruns only after the pool grew or the provider filled
+        // this root's host reserve; another pass needs another syscall to
+        // have consumed it meanwhile, so each rerun is someone's progress,
+        // never a spin.
+        loop {
+            match secure() {
+                Ok(()) => return Ok(HostVenueMetadata::Secured),
                 // The failed proposal held no committed edit. No MemState
                 // or root lock is retained across carrier allocation.
-                match root.provision_metadata() {
-                    Ok(MetadataProvision::Grown) => {}
-                    // A guest fork (or any other supplier) holds the bank
-                    // window: not now, never a dispatch failure.
-                    Ok(MetadataProvision::NotNow(wait)) => {
-                        return Ok(HostVenueMetadata::NotNow(wait));
-                    }
-                    // A real capacity request has now failed. Linux also
-                    // answers ENOMEM when mapping metadata cannot be
-                    // allocated; this MM remains admitted and unchanged.
-                    Err(RootAccessRefusal::Refused(Refusal::Limit | Refusal::MetadataRequired)) => {
-                        return Ok(HostVenueMetadata::Refused(LINUX_ENOMEM));
-                    }
-                    Err(refusal) => return Err(root_refusal(refusal)),
+                Err(RootAccessRefusal::Refused(Refusal::MetadataRequired)) => {}
+                Err(refusal) => return Err(root_refusal(refusal)),
+            }
+            match root.provision_metadata() {
+                Ok(MetadataProvision::Grown) => {}
+                // A guest fork (or any other supplier) holds the bank
+                // window: not now, never a dispatch failure.
+                Ok(MetadataProvision::NotNow(wait)) => {
+                    return Ok(HostVenueMetadata::NotNow(wait));
                 }
-                secure()
+                // The table refused: nobody grew the pool, nobody holds the
+                // window, and the carrier had no bank to give. Linux also
+                // answers ENOMEM when mapping metadata cannot be allocated;
+                // this MM remains admitted and unchanged.
+                Err(RootAccessRefusal::Refused(Refusal::Limit | Refusal::MetadataRequired)) => {
+                    return Ok(HostVenueMetadata::Refused(LINUX_ENOMEM));
+                }
+                Err(refusal) => return Err(root_refusal(refusal)),
             }
-            result => result,
-        };
-        match secured {
-            Ok(()) => Ok(HostVenueMetadata::Secured),
-            Err(RootAccessRefusal::Refused(Refusal::MetadataRequired)) => {
-                Ok(HostVenueMetadata::Refused(LINUX_ENOMEM))
-            }
-            Err(refusal) => Err(root_refusal(refusal)),
         }
     }
 
