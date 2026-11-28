@@ -669,11 +669,12 @@ pub fn decide_reservation_syscall_for_origin<
 /// `mremap(2)` against the caller's admitted root (#3152). The shared Linux
 /// validator answers a malformed request first, then the same root policy
 /// the host venue uses (`ReservationRoot::mremap`) decides the shape:
-/// shrink (a `Retire` of the tail), in-place growth (a `Prepare` of the
-/// extension) or a `MREMAP_MAYMOVE` relocation (one `Move`).
+/// shrink (a `Retire` of the tail, across any mappings and holes, as
+/// Linux shrinks), in-place growth (a `Prepare` of the extension) or a
+/// `MREMAP_MAYMOVE` relocation (one `Move`).
 ///
 /// Unrouted (the caller's counted refusal) until their owner lands:
-/// a shrink across mappings or holes, `MREMAP_FIXED`, `MREMAP_DONTUNMAP`,
+/// `MREMAP_FIXED`, `MREMAP_DONTUNMAP`,
 /// a zero `old_size`, growth of a
 /// locked node (`RLIMIT_MEMLOCK` is the host venue's) and growth of a
 /// private file node (its extension's bytes, #3141). A run root whose
@@ -723,13 +724,10 @@ fn decide_mremap<G: ReservationGeometry, C: Copy + Send + Sync + zerocopy::FromZ
     model
         .mremap(source, request.new_size, target)
         .map_err(|refusal| match refusal {
-            // Linux shrinks before it asks for one mapping (mremap(2)): a
-            // shrink across mappings or holes is not this root's to answer
-            // yet, so it stays a counted refusal, never an errno.
-            Refusal::Hole if request.new_size < request.old_size => MremapLeave::Forward,
-            // mremap(2) EFAULT: the old range is not one mapping. Only the
-            // allocation layout is this root's to answer for; a source
-            // outside it is not proven unmapped.
+            // mremap(2) EFAULT: `old_address` is unmapped, or a growing old
+            // range is not one mapping (a shrink spans any mappings and
+            // holes, #3171). Only the allocation layout is this root's to
+            // answer for; a source outside it is not proven unmapped.
             Refusal::Hole => {
                 let layout = model.layout();
                 let within =
