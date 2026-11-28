@@ -4,6 +4,7 @@ use carrick_core::user_copy::{CopyOutcome, UserCopy};
 use carrick_guest_arch::CounterTick;
 use carrick_personality_linux::sched::{
     FutexCall, FutexFrequency, FutexVenue, FutexWait, MmFutexKey, RelativeFutexWait,
+    UserReadRefusal,
 };
 use core::cell::{Cell, RefCell};
 
@@ -86,17 +87,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Fu
     fn timed_wait_allowed(&self) -> bool {
         true
     }
-    fn read_u64(&self, address: UserVa) -> Option<u64> {
+    fn read_u64(&mut self, address: UserVa) -> Result<u64, UserReadRefusal> {
         let mut bytes = [0; 8];
         match self.copy.borrow_mut().copy_in(&mut bytes, address) {
-            CopyOutcome::Done => Some(u64::from_le_bytes(bytes)),
-            CopyOutcome::Fault => {
-                self.refusal.set(Some(CopyOutcome::Fault));
-                None
-            }
+            CopyOutcome::Done => Ok(u64::from_le_bytes(bytes)),
+            // Policy answers EFAULT through `invalid`.
+            CopyOutcome::Fault => Err(UserReadRefusal::Fault),
             CopyOutcome::NotYet(request) => {
                 self.refusal.set(Some(CopyOutcome::NotYet(request)));
-                None
+                Err(UserReadRefusal::Pending)
             }
         }
     }
@@ -173,6 +172,10 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Fu
         }
         if word != wait.expected {
             return Some(returned(wait.mismatch_result.raw()));
+        }
+        // An expired deadline answers before any park is published.
+        if wait.expired_at(self.now) {
+            return Some(returned(wait.timeout_result.raw()));
         }
         let start =
             carrick_core::entry::prepare_handoff(self.entry.binding, self.entry.source, record)?;

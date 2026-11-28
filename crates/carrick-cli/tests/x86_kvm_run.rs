@@ -2157,10 +2157,12 @@ fn mounted_static_x86_thread_handlers_run_on_untouched_alternate_stacks() {
 /// (with `FUTEX_CLOCK_REALTIME`) REALTIME, and abort on an unexpected errno.
 /// The fixture runs each Linux answer of that wait between two live threads,
 /// in a fork child and then in the run root: ETIMEDOUT on both clocks (never
-/// early), a past deadline, EAGAIN, EINVAL, EFAULT, a counted wake, EINTR
-/// with and without SA_RESTART, and 16 parked timed waiters woken by a main
-/// thread that keeps running. On main the ring declined every timed bitset
-/// wait, which a fork child answers ENOSYS.
+/// early), a past deadline, EAGAIN, EINVAL, EFAULT, the timespec read before
+/// an empty bitset or a misaligned word (EFAULT first, then EINVAL), a
+/// counted wake, EINTR with and without SA_RESTART, and one wake call that
+/// counts all 16 timed waiters parked at once while the main thread keeps
+/// running. On main the ring declined every timed bitset wait, which a fork
+/// child answers ENOSYS.
 #[test]
 fn mounted_static_x86_timed_futex_bitset_matches_native_in_root_and_fork_child() {
     if skip_without_kvm() {
@@ -2183,7 +2185,8 @@ fn mounted_static_x86_timed_futex_bitset_matches_native_in_root_and_fork_child()
         .expect("run native timed-futex oracle");
     let expected = |who: &str| {
         format!(
-            "{who} mono=-110 rt=-110 past=-110 eagain=-11 einval=-22 efault=-14 wake=0 \
+            "{who} mono=-110 rt=-110 past=-110 eagain=-11 einval=-22 efault=-14 \
+             zmask=-22 zmaskfault=-14 misalign=-22 misalignfault=-14 wake=0 \
              eintr=-4 sarestart=-4 pool=16\n"
         )
     };

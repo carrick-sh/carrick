@@ -4,7 +4,7 @@ use carrick_core_abi::ReservationMm;
 use carrick_guest_arch::{CounterTick, UserVa};
 use carrick_personality_linux::sched::{
     FUTEX_WAIT_BITSET_PRIVATE, FUTEX_WAIT_BITSET_PRIVATE_REALTIME, FUTEX_WAIT_PRIVATE, FutexCall,
-    FutexFrequency, FutexVenue, FutexWait, serve_futex,
+    FutexFrequency, FutexVenue, FutexWait, UserReadRefusal, serve_futex,
 };
 
 /// What the policy handed the venue: an enrolment, or an immediate answer.
@@ -33,6 +33,7 @@ struct ClockVenue {
     nanos: u64,
     realtime_offset: Option<u64>,
     waits: u64,
+    reads: u64,
 }
 impl ClockVenue {
     fn new(home_record: bool, nanos: u64) -> Self {
@@ -42,6 +43,7 @@ impl ClockVenue {
             nanos,
             realtime_offset: None,
             waits: 0,
+            reads: 0,
         }
     }
 }
@@ -53,11 +55,15 @@ impl FutexVenue for ClockVenue {
     fn timed_wait_allowed(&self) -> bool {
         self.home_record
     }
-    fn read_u64(&self, address: UserVa) -> Option<u64> {
+    /// The timespec lives at 0x2000; 0x3000 is not backed yet; anything
+    /// else is unreadable.
+    fn read_u64(&mut self, address: UserVa) -> Result<u64, UserReadRefusal> {
+        self.reads += 1;
         match address.raw() {
-            0x2000 => Some(self.secs),
-            0x2008 => Some(self.nanos),
-            _ => None,
+            0x2000 => Ok(self.secs),
+            0x2008 => Ok(self.nanos),
+            0x3000 | 0x3008 => Err(UserReadRefusal::Pending),
+            _ => Err(UserReadRefusal::Fault),
         }
     }
     fn frequency(&self) -> FutexFrequency {
@@ -184,7 +190,8 @@ fn timed_bitset_waits_carry_an_absolute_deadline_on_their_clock() {
     assert_eq!(wait.mismatch_result.raw(), -11, "EAGAIN on a changed word");
     assert_eq!(wait.timeout_result.raw(), -110, "ETIMEDOUT at the deadline");
 
-    // No realtime calibration: the realtime wait stays unserved, unread.
+    // No realtime calibration: the realtime wait stays unserved, never
+    // converted on a guessed epoch.
     assert!(serve_futex(call(FUTEX_WAIT_BITSET_PRIVATE_REALTIME), &mut venue).is_none());
     assert_eq!(venue.waits, 1);
     // Realtime 1_000_000_001.5 s with an offset of 1e9 s is monotonic 1.5 s.
@@ -257,8 +264,13 @@ fn shared_candidates_cover_every_admitted_private_spelling() {
             );
         }
     }
+    // A shared wait with an empty bitset is a candidate too: policy answers
+    // it EINVAL before any mapping authority runs.
+    assert_eq!(
+        call(9, 0, 0).shared_private_candidate().map(|c| c.args[1]),
+        Some(FUTEX_WAIT_BITSET_PRIVATE)
+    );
     for (op, timeout, mask) in [
-        (9, 0, 0),             // empty bitset
         (256, 0, 0xffff_ffff), // clock flag on plain WAIT
         (6, 0, 0),             // FUTEX_LOCK_PI
     ] {
@@ -267,4 +279,88 @@ fn shared_candidates_cover_every_admitted_private_spelling() {
             "op {op} timeout {timeout:#x} mask {mask:#x}"
         );
     }
+}
+
+/// #3174 (pre-review P0-1, P0-2): Linux copies and validates a supplied
+/// timeout before it checks the word's operands. An unreadable timespec is
+/// EFAULT and a malformed one EINVAL whatever the word and mask; with a valid
+/// timespec, a misaligned word or an empty bitset is EINVAL. Every wait
+/// spelling is admitted with any operands, so none of these declines (a
+/// fork child's decline is a counted ENOSYS). A timespec that is not backed
+/// yet leaves the call to the venue's copy continuation, never an errno.
+#[test]
+fn a_supplied_timeout_is_read_and_validated_before_the_word_operands() {
+    let mut venue = ClockVenue::new(true, 500_000_000);
+    venue.realtime_offset = Some(0);
+    for op in [
+        FUTEX_WAIT_PRIVATE,
+        FUTEX_WAIT_BITSET_PRIVATE,
+        FUTEX_WAIT_BITSET_PRIVATE_REALTIME,
+    ] {
+        // (word, mask): misaligned, empty bitset (the plain wait has none).
+        let mut bad_operands = vec![(0x1001, 0xffff_ffff)];
+        if op != FUTEX_WAIT_PRIVATE {
+            bad_operands.push((0x1000, 0));
+        }
+        for (word, mask) in bad_operands {
+            let call = |timeout| FutexCall {
+                args: [word, op, 7, timeout, 0, mask],
+            };
+            assert!(
+                call(0x10).admitted(),
+                "op {op} word {word:#x} mask {mask:#x}"
+            );
+            let answer = |venue: &mut ClockVenue, timeout| {
+                serve_futex(call(timeout), venue)
+                    .unwrap_or_else(|| panic!("op {op} timeout {timeout:#x} declined"))
+                    .invalid()
+                    .unwrap()
+            };
+            assert_eq!(answer(&mut venue, 0x10), -14, "EFAULT first, op {op}");
+            venue.nanos = 1_000_000_000;
+            assert_eq!(answer(&mut venue, 0x2000), -22, "malformed, op {op}");
+            venue.nanos = 500_000_000;
+            assert_eq!(answer(&mut venue, 0x2000), -22, "operands, op {op}");
+            assert_eq!(answer(&mut venue, 0), -22, "untimed operands, op {op}");
+            let reads = venue.reads;
+            assert!(serve_futex(call(0x3000), &mut venue).is_none());
+            assert_eq!(venue.reads, reads + 1, "a pending read stops at once");
+        }
+        // Aligned, with a mask: the fault is still EFAULT, never a decline.
+        let call = FutexCall {
+            args: [0x1000, op, 7, 0x10, 0, 0xffff_ffff],
+        };
+        assert_eq!(
+            serve_futex(call, &mut venue).unwrap().invalid().unwrap(),
+            -14,
+            "op {op}"
+        );
+    }
+    assert_eq!(venue.waits, 0, "no invalid call enrols");
+}
+
+/// #3174 (pre-review P0-4): a deadline at or before the counter has expired,
+/// the zone timer's own rule; venues answer ETIMEDOUT without parking.
+#[test]
+fn a_wait_expires_at_or_after_its_deadline_tick() {
+    let mut venue = ClockVenue::new(true, 0);
+    venue.secs = 0;
+    let wait = serve_futex(
+        FutexCall {
+            args: [0x1000, FUTEX_WAIT_BITSET_PRIVATE, 7, 0x2000, 0, 1],
+        },
+        &mut venue,
+    )
+    .unwrap()
+    .wait()
+    .unwrap();
+    assert_eq!(wait.deadline, Some(CounterTick::new(1)));
+    assert!(!wait.expired_at(CounterTick::new(0)));
+    assert!(wait.expired_at(CounterTick::new(1)));
+    assert!(wait.expired_at(CounterTick::new(2)));
+    let untimed = FutexWait {
+        deadline: None,
+        ..wait
+    };
+    assert!(!untimed.expired_at(CounterTick::new(u64::MAX)));
 }

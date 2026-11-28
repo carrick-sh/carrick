@@ -171,8 +171,25 @@ impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, '_, C, U> {
         // scheduler owner and must not escape to a nonexistent host task.
         true
     }
-    fn read_u64(&self, address: UserVa) -> Option<u64> {
-        self.sched.user.read_u64(self.sched.task, address.raw())
+    fn read_u64(
+        &mut self,
+        address: UserVa,
+    ) -> Result<u64, carrick_personality_linux::sched::UserReadRefusal> {
+        use carrick_core::user_copy::CopyOutcome;
+        use carrick_personality_linux::sched::UserReadRefusal;
+        if let Some(word) = self.sched.user.read_u64(self.sched.task, address.raw()) {
+            return Ok(word);
+        }
+        // The same classification as the futex word: outside the user half
+        // is EFAULT; an unavailable page is the memory owner's to prepare,
+        // and the caller reruns the syscall once it has.
+        match carrick_core::user_copy::copy_refusal(address, 8, carrick_guest_arch::Access::Read) {
+            CopyOutcome::NotYet(request) => {
+                self.refusal = Some(FutexRefusal::Copy(CopyOutcome::NotYet(request)));
+                Err(UserReadRefusal::Pending)
+            }
+            _ => Err(UserReadRefusal::Fault),
+        }
     }
     fn frequency(&self) -> FutexFrequency {
         FutexFrequency::from_hz(self.sched.cpu.freq())

@@ -160,21 +160,26 @@ pub enum AbsoluteDeadline {
 impl AbsoluteDeadline {
     /// The first guest counter tick at or after this deadline, for a counter
     /// running at `frequency_hz`: it never fires before the guest clock reads
-    /// the deadline. A deadline already past is tick 1, which every timer
-    /// owner sees as expired (tick 0 means "no deadline" to the zone).
+    /// the deadline. A deadline at or before the counter's epoch converts to
+    /// tick 1, the earliest tick the zone can hold (tick 0 means "no
+    /// deadline" to it); any other deadline keeps its own tick. Either is
+    /// expired once the counter has reached it, which the caller checks
+    /// against the current counter.
     ///
     /// A realtime deadline needs `realtime_offset_ns`, the zone's published
     /// calibration; without one it is `None` and the caller leaves the call
     /// unserved rather than guess an epoch.
     ///
-    /// Converting a realtime deadline once is exact only while the guest
-    /// cannot step `CLOCK_REALTIME` under a parked waiter: Linux re-arms a
-    /// realtime futex or `TIMER_ABSTIME` sleep when the clock is set. No ring
-    /// venue serves a clock step, and
-    /// `tests::no_ring_venue_steps_the_realtime_clock` holds that as a
-    /// checked fact: if a venue ever serves `clock_settime`,
-    /// `settimeofday`, `adjtimex` or `clock_adjtime`, that test fails, and
-    /// the parked realtime waits must re-arm on the step.
+    /// Converting a realtime deadline once is exact only while the realtime
+    /// offset cannot move under a parked waiter: Linux re-arms a realtime
+    /// futex or `TIMER_ABSTIME` sleep when the clock is set. The checked
+    /// claim is about the guest's syscall surface:
+    /// `tests::no_ring_venue_steps_the_realtime_clock` fails if a venue ever
+    /// routes `clock_settime`, `settimeofday`, `adjtimex` or
+    /// `clock_adjtime`, and the parked realtime waits must then re-arm on the
+    /// step. A carrier that republishes the zone's offset under a live zone
+    /// (the container clock's publisher) is outside that check, and it too
+    /// must re-arm parked realtime waits before it may move the offset.
     pub fn counter_tick(
         self,
         frequency_hz: u64,
