@@ -181,10 +181,6 @@ mod test_support {
     /// consumed the arming vector: it must still stop, never sleep past the
     /// arming with no vector left to wake it.
     pub const INJECT_ORDER_PEER_AFTER_IDLE_READ_LATE_ARM: u64 = 0xffff_ffff_ffff_fe70;
-    /// 1 once the pass that stopped at the ordering point is the one that
-    /// found [`INJECT_ORDER_PEER_AFTER_IDLE_READ_LATE_ARM`]'s arming
-    /// incomplete after taking its vector, else 0.
-    pub const INJECT_ORDER_PEER_LATE_ARM_CENSUS: u64 = 0xffff_ffff_ffff_fe71;
     /// Wake the peer CPU and stop it right after its idle slot is published
     /// IdleWfi, before HLT, until this CPU says it published (#3053). This
     /// CPU then publishes host work on the peer's task with no vector
@@ -281,16 +277,6 @@ mod test_support {
     static ORDER_SLOT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
     static ORDER_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
     static ORDER_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-    /// Idle passes begun on the ordered slot, counted before each pass's
-    /// drain of its vectors (#3136).
-    static ORDER_PASS_EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-    /// The epoch of the last pass that found its ordering point
-    /// [`ORDER_ARMING`] with no wake vector pending: its drain, or an
-    /// earlier one, took any vector sent before that pass began.
-    static ORDER_ARMING_TAKEN_EPOCH: core::sync::atomic::AtomicU64 =
-        core::sync::atomic::AtomicU64::new(0);
-    /// The epoch of the pass that stopped at its ordering point.
-    static ORDER_STOP_EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     /// Passes that found the ordering point [`ORDER_ARMING`].
     static ORDER_ARMING_PASSES: core::sync::atomic::AtomicU64 =
         core::sync::atomic::AtomicU64::new(0);
@@ -754,14 +740,6 @@ mod test_support {
         SCAN_HOLD.store(SCAN_RELEASED, Ordering::Release);
     }
 
-    /// Called at the top of each pass of the idle scheduler on `slot`,
-    /// before it drains its vectors (#3136).
-    pub fn idle_pass_begins(slot: carrick_sched_core::SlotId) {
-        if ORDER_SLOT.load(Ordering::Acquire) == slot.raw() + 1 {
-            ORDER_PASS_EPOCH.fetch_add(1, Ordering::AcqRel);
-        }
-    }
-
     /// Whether this CPU has a timer, kick or reschedule vector pending.
     fn wake_vector_pending() -> bool {
         // SAFETY: CPL0 on this CPU, with its local APIC mapped.
@@ -788,7 +766,10 @@ mod test_support {
         // same one-word handshake. Wait until it is known sent, then a wake
         // still pending (that one, or any other) would end the HLT by
         // itself: this pass goes on and the next one parks. Parked, the
-        // request's wake is taken, so only the arming's can end the sleep.
+        // request's wake is normally taken, so the arming's ends the sleep.
+        // IRR is not a receipt, though: a posted request still in flight
+        // here can end it first (#3180). That only adds a pass, so the
+        // witness's verdict is the bound alone, never which pass stopped.
         let mut park = LATE_PARK.load(Ordering::Acquire);
         while park == PARK_REQUESTED {
             core::hint::spin_loop();
@@ -848,7 +829,6 @@ mod test_support {
         {
             return;
         }
-        let epoch = ORDER_PASS_EPOCH.load(Ordering::Acquire);
         let mut state = ORDER_STATE.load(Ordering::Acquire);
         if state == ORDER_ARMING {
             // The arming CPU sent a vector this pass may already have
@@ -856,9 +836,6 @@ mod test_support {
             // here could sleep past the arming with no wake left. Its next
             // store ends the window; then the pending-vector check below
             // tells a taken vector from one still to come.
-            if !wake_vector_pending() {
-                ORDER_ARMING_TAKEN_EPOCH.store(epoch, Ordering::Release);
-            }
             ORDER_ARMING_PASSES.fetch_add(1, Ordering::AcqRel);
             while state == ORDER_ARMING {
                 core::hint::spin_loop();
@@ -889,7 +866,6 @@ mod test_support {
         {
             return;
         }
-        ORDER_STOP_EPOCH.store(epoch, Ordering::Release);
         while ORDER_STATE.load(Ordering::Acquire) != ORDER_PUBLISHED {
             core::hint::spin_loop();
         }
@@ -1657,12 +1633,6 @@ mod test_support {
                 .is_ok()
                 .then_some(0),
             INJECT_ORDER_PEER_CENSUS => Some(ORDER_PASSES.load(Ordering::Acquire)),
-            INJECT_ORDER_PEER_LATE_ARM_CENSUS => {
-                let taken = ORDER_ARMING_TAKEN_EPOCH.load(Ordering::Acquire);
-                Some(u64::from(
-                    taken != 0 && ORDER_STOP_EPOCH.load(Ordering::Acquire) == taken,
-                ))
-            }
             INJECT_MARK_PEER_HOST_WORK => {
                 if ORDER_STATE.load(Ordering::Acquire) != ORDER_REACHED {
                     return None;
