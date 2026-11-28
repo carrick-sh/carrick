@@ -1159,8 +1159,12 @@ pub enum FaultVerdict {
     ProtectionForwarded,
     NotTranslation,
     PreparedCommitRefused,
-    /// The first-touch window selector found a root hole or a limit.
+    /// The first-touch window selector found a root hole.
     WindowHole,
+    /// The first-touch window selector found the page mapped without this
+    /// access (a host-backed page the root admits whatever its protection,
+    /// or a sibling's `mprotect` after the admission).
+    WindowDenied,
     WindowRefused,
     /// The descriptor owner refused the selected backing window.
     BackingWindowRefused(carrick_mmu_core::descriptor_refusal::DescriptorRefusal),
@@ -1197,6 +1201,7 @@ impl FaultVerdict {
             Self::BackingWindowRefused(refusal) => 0x11 | ((refusal as u64) << 8),
             Self::SelectionUnavailable => 0x12,
             Self::Selected => 0x13,
+            Self::WindowDenied => 0x14,
         }
     }
 }
@@ -1882,16 +1887,22 @@ fn dispatch_classified_fault<
                 carrick_el1_abi::ReservationProtection::from_bits(access)?,
             ) {
                 Ok(window) => window,
-                Err(
-                    crate::memory::reservations::Refusal::Hole
-                    | crate::memory::reservations::Refusal::Limit,
-                ) => {
+                Err(crate::memory::reservations::Refusal::Hole) => {
                     // The root admitted the page, but its window found no
                     // mapping there.
                     owner
                         .outcome
                         .set(OwnerFaultSupplyOutcome::PolicyDeclined(SegvCause::Unmapped));
                     supply.note(FaultVerdict::WindowHole);
+                    return None;
+                }
+                Err(crate::memory::reservations::Refusal::Limit) => {
+                    // The page is mapped and its protection denies this
+                    // access: Linux's SEGV_ACCERR, never a hole (#3170).
+                    owner
+                        .outcome
+                        .set(OwnerFaultSupplyOutcome::PolicyDeclined(SegvCause::Access));
+                    supply.note(FaultVerdict::WindowDenied);
                     return None;
                 }
                 Err(_) => {
