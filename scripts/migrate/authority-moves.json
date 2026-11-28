@@ -336,6 +336,10 @@
     {
       "owner": "carrick_core::mm::own::CarrierId::allocate::CARRIERS",
       "issue": 3061
+    },
+    {
+      "owner": "carrick_vmm_hvf::metadata_grant::broken_release_ends_the_carrier",
+      "issue": 3061
     }
   ],
   "terminal_custody": []
