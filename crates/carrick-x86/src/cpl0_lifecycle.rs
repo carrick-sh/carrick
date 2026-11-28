@@ -1559,12 +1559,18 @@ impl FutexVenue for NativeLane<'_> {
         #[cfg(not(target_os = "none"))]
         false
     }
-    fn read_u64(&self, address: carrick_guest_arch::UserVa) -> Option<u64> {
+    fn read_u64(
+        &mut self,
+        address: carrick_guest_arch::UserVa,
+    ) -> Result<u64, carrick_personality_linux::sched::UserReadRefusal> {
+        // The same rule as this lane's futex word (`atomic_load_u32`): the
+        // retained, eagerly backed aperture is the whole readable range, so
+        // anything outside it is EFAULT and nothing is ever "not yet".
         if !self.valid_user_range(address.raw(), 8) {
-            return None;
+            return Err(carrick_personality_linux::sched::UserReadRefusal::Fault);
         }
         // SAFETY: checked retained readable aperture in the currently installed MM.
-        Some(unsafe { core::ptr::read_unaligned(address.raw() as *const u64) })
+        Ok(unsafe { core::ptr::read_unaligned(address.raw() as *const u64) })
     }
     fn frequency(&self) -> FutexFrequency {
         #[cfg(target_os = "none")]
@@ -1628,6 +1634,11 @@ impl FutexVenue for NativeLane<'_> {
         }
         if word != wait.expected {
             self.frame.rax = wait.mismatch_result.raw() as u64;
+            return Some(carrick_core::Served::Returned { switched: false });
+        }
+        // An expired deadline answers before any park is published.
+        if wait.expired_at(self.now()) {
+            self.frame.rax = wait.timeout_result.raw() as u64;
             return Some(carrick_core::Served::Returned { switched: false });
         }
         let record = self
@@ -1754,7 +1765,16 @@ impl<'a> PendingFamilies<'a> for NativeLane<'a> {
         let original = self.args[0];
         let call = FutexCall { args: self.args };
         let candidate = call.shared_private_candidate();
-        if candidate.is_some() && self.futex_key(UserVa::new(original)).is_none() {
+        // A shared wake outside the aperture has no key here, and its wake
+        // never declines once policy runs, so it is decided first. A shared
+        // wait reads and validates its timeout in policy before its key
+        // (`wait` declines a word outside the aperture).
+        let wake = matches!(
+            self.args[1] | 128,
+            carrick_personality_linux::sched::FUTEX_WAKE_PRIVATE
+                | carrick_personality_linux::sched::FUTEX_WAKE_BITSET_PRIVATE
+        );
+        if candidate.is_some() && wake && self.futex_key(UserVa::new(original)).is_none() {
             return FamilyCompletion::Forward;
         }
         let Some(served) =

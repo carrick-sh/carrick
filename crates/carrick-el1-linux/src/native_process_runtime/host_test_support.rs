@@ -138,7 +138,9 @@ pub(crate) fn take_return_copyouts() -> Vec<(UserVa, usize)> {
 }
 
 /// The next Physical signal clock reads, in order, before its default
-/// 1000-then-2000 clock resumes.
+/// 1000-then-1500 clock resumes. The later read stays before a one-second
+/// deadline admitted at 1000, so a retried timed wait still parks (#3174: a
+/// wait whose deadline has passed answers ETIMEDOUT without parking).
 #[cfg(all(test, not(target_os = "macos")))]
 pub(crate) fn script_signal_clock(reads: &[u64]) {
     SIGNAL_CLOCK_SCRIPT.with(|script| *script.borrow_mut() = reads.iter().copied().collect());
@@ -742,7 +744,7 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         let now = if self.zone.counters.el1_timeouts.load(Ordering::Acquire) == 0 {
             1000
         } else {
-            2000
+            1500
         };
         Ok(carrick_guest_arch::CounterTick::new(now))
     }
@@ -13084,7 +13086,7 @@ fn native_futex_atomic_owner_retry_keeps_deadline_and_key_scope() {
     assert_eq!(copy.loads, 1);
     assert!(fixture.zone.timer_deadline(fixture.slot).is_none());
     // Advance the physical clock after owner preparation, then redispatch the
-    // exact operation. Its original deadline is already 2000, not 3000.
+    // exact operation. Its original deadline is still 2000, not 2500.
     fixture
         .zone
         .counters

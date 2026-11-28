@@ -375,7 +375,7 @@ fn episode<
         assert_eq!(
             zone.timer_deadline(fixture.slot),
             Some(2000),
-            "one second admitted at tick 1000 must not restart at tick 2000"
+            "one second admitted at tick 1000 must not restart at tick 1500"
         );
     }
     FUTEX_MAPPING.with(|slot| slot.set(None));
