@@ -9,13 +9,16 @@
  * that runs here first only yields back. Then one syscall
  * (INJECT_HOLD_RUN_QUEUE_ACROSS_PEER_HLT) holds this CPU's run-queue lock,
  * lets the peer go on, and waits, with interrupts masked, until the peer
- * is published IdleWfi past its pre-HLT recheck. Every scan the peer ran
- * meanwhile found the lock busy. The syscall then releases the lock
- * through its production guard, sends what the release owes through the
- * CPU's production venue, lets the peer HLT, and returns only once an
- * idle scan has stolen from this CPU. Nothing else can wake the peer: this
- * CPU stays in that syscall, so no slice, rotation or yield here can hand
- * the worker over. A release that owes the scan nothing leaves the peer
+ * is IdleWfi past its final recheck of the durable wake words, right
+ * before `sti; hlt`. Every scan the peer ran meanwhile found the lock
+ * busy. The syscall then releases the lock through its production guard,
+ * checks that the release owes the peer its pass, sends that pass through
+ * the CPU's production venue, lets the peer HLT, and returns only once an
+ * idle scan has stolen from this CPU, resending meanwhile an IPI the busy
+ * ICR left owed. Past its recheck the peer reads no durable word again, so
+ * only the release's vector can wake it. This CPU stays in that syscall,
+ * so no slice, rotation or yield here can hand the worker over. A release
+ * that owes the scan nothing, or sends it no vector, leaves the peer
  * asleep past the worker, and the bounded child reaches its bound.
  *
  * The witness runs in a forked child (threads live in a native child
@@ -25,7 +28,7 @@
  * or its reap failed. 81: arming the
  * stop failed; 150 + n: clone failed with errno n; 83: the hold failed; 92: the worker ran
  * on this CPU; 95: the peer's scans never enrolled on the busy lock, so
- * nothing was proven.
+ * nothing was proven; 96: the release owed the peer no pass.
  */
 #define INJECT_CURRENT_CPU                    0xfffffffffffffe26
 #define INJECT_PEER_SCAN_HELD                 0xfffffffffffffe2b
@@ -116,6 +119,8 @@ stopped:
     syscall
     cmp $1, %rax
     je fail_not_enrolled
+    cmp $2, %rax
+    je fail_not_owed
     test %rax, %rax
     jnz fail_hold
 
@@ -166,6 +171,9 @@ fail_same_cpu:
     jmp die
 fail_not_enrolled:
     mov $95, %edi
+    jmp die
+fail_not_owed:
+    mov $96, %edi
 die:
     mov $231, %eax
     syscall
