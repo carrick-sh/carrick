@@ -465,3 +465,9 @@ test = "soft_zone::soft_root_rt_sigaction_refuses_a_handler_it_cannot_deliver"
 reason = "#2814: the admitted soft root now delivers a caught handler (soft_root_delivers_a_caught_sigusr1_and_returns_through_rt_sigreturn), so the refusal witness became the served shape and was renamed for what it proves."
 replaced_by = "soft_zone::soft_root_rt_sigaction_serves_a_handler_an_ignore_and_a_query_in_ring"
 pr = 3118
+
+[[retired]]
+test = "carrick_el1_linux::aarch64_process_tests::native_child_handoff_tests::forked_child_timed_futex_wait_decline_stays_a_counted_refusal"
+reason = "#3174: serve_futex now answers a timespec out of range with Linux's EINVAL in ring instead of declining it to a counted ENOSYS, so the decline witness became the EINVAL witness and was renamed for what it proves."
+replaced_by = "carrick_el1_linux::aarch64_process_tests::native_child_handoff_tests::forked_child_timed_futex_wait_with_an_invalid_timespec_answers_einval"
+pr = 3185
