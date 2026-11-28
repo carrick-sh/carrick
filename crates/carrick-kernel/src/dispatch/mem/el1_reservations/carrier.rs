@@ -11,7 +11,7 @@ use carrick_el1::memory::reservations::{
     HostBankGrant, HostBankInstall, Refusal, Reservations, ResolvedReservationNodes,
     RootReleaseVenue, RootWait, SharedReservations,
 };
-use carrick_el1_abi::{MetadataExtentResolver, ReservationMm};
+use carrick_el1_abi::{MetadataExtentResolver, MetadataResolutionError, ReservationMm};
 use carrick_guest_mem::HostVa;
 use carrick_hal::retained_metadata::{
     RetainedMetadataBacking, RetainedMetadataExtent, RetainedMetadataMapper,
@@ -46,6 +46,11 @@ pub struct CarrierReservations<A: CarrierReservationAccess> {
     access: Arc<A>,
     prepared: Mutex<Option<Arc<Prepared<A>>>>,
     capacity: Mutex<()>,
+    /// Unpublished grants whose retirement the backend refused although
+    /// nothing pinned them: a broken invariant. Their authority is kept
+    /// here, never dropped, so each occupied aperture slot stays this
+    /// carrier's, accounted until the carrier goes (#3085).
+    quarantined: Mutex<Vec<<A as RetainedMetadataMapper>::Extent>>,
 }
 
 impl<A: CarrierReservationAccess> CarrierReservations<A> {
@@ -54,6 +59,7 @@ impl<A: CarrierReservationAccess> CarrierReservations<A> {
             access: Arc::new(access),
             prepared: Mutex::new(None),
             capacity: Mutex::new(()),
+            quarantined: Mutex::new(Vec::new()),
         }
     }
 }
@@ -188,27 +194,49 @@ impl<A: CarrierReservationAccess> HostReservationProvider for CarrierReservation
         let release = host_release_venue(&*self.access)?;
         // No host memory or no aperture slot is not an answer by itself: the
         // table decides it, after reading whether a peer published, or holds
-        // the window, meanwhile.
+        // the window, meanwhile. A stale carrier generation or an invalid
+        // extent is a broken invariant, never that miss (never ENOMEM).
         let decision = table.install_host_bank(
             observed,
             || {
                 let bytes = SharedReservations::metadata_bank_layout().size();
                 let bytes = bytes.next_multiple_of(16 * 1024);
-                let backing =
-                    OwnedHostMapping::map_shared_anon(bytes, HostMappingKind::SharedAnon).ok()?;
-                self.access
+                let Ok(backing) =
+                    OwnedHostMapping::map_shared_anon(bytes, HostMappingKind::SharedAnon)
+                else {
+                    return Ok(None);
+                };
+                match self
+                    .access
                     .map_retained(Arc::new(ReservationBankBacking(backing)))
-                    .ok()
-                    .map(RetainedBankGrant)
+                {
+                    Ok(mapping) => Ok(Some(RetainedBankGrant(mapping))),
+                    Err(MetadataResolutionError::Busy) => Ok(None),
+                    Err(MetadataResolutionError::StaleOwner) => Err(Refusal::Stale),
+                    Err(MetadataResolutionError::InvalidExtent) => Err(Refusal::Invalid),
+                }
             },
             &release,
         );
         // Only a published grant became a bank; a redundant one, or one
         // refused by a held window, is retired here.
-        if let Some(RetainedBankGrant(mapping)) = decision.unpublished {
-            let _ = mapping.try_retire();
+        let Some(RetainedBankGrant(mapping)) = decision.unpublished else {
+            return decision.answer;
+        };
+        match mapping.try_retire() {
+            Ok(()) => decision.answer,
+            // Nothing pins an unpublished grant, so a refused retirement is
+            // a broken invariant (or this carrier generation is gone): fatal,
+            // and the grant is quarantined, never dropped with its slot.
+            Err(stranded) => {
+                let refusal = match self.access.region() {
+                    Ok(_) => Refusal::Invalid,
+                    Err(_) => Refusal::Stale,
+                };
+                self.quarantined.lock().push(stranded);
+                Err(refusal)
+            }
         }
-        decision.answer
     }
 
     fn prepare(&self) -> Result<Box<dyn PreparedHostReservations>, Refusal> {

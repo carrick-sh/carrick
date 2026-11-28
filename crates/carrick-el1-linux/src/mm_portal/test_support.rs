@@ -149,7 +149,7 @@ impl Region {
             self.table()
                 .install_host_bank(
                     self.table().node_capacity(),
-                    || Some(NoPin(bank.clone())),
+                    || Ok(Some(NoPin(bank.clone()))),
                     &carrick_core_abi::NO_METADATA_WAITERS,
                 )
                 .answer,
