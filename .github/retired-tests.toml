@@ -470,4 +470,4 @@ pr = 3118
 test = "authority_debt::build_program_compiler_authority_requires_a_separate_ceiling"
 reason = "#3172: build programs are outside product authority, so their host calls take no ceiling; the witness now proves they are not counted."
 replaced_by = "authority_debt::build_program_authority_is_outside_product_authority"
-pr = 0
+pr = 3189
