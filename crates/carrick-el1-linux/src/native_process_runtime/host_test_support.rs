@@ -38,6 +38,19 @@ std::thread_local! {
     };
 }
 
+std::thread_local! {
+    /// Every guest input range a `Physical` owner was asked to make readable.
+    static PREPARED_READS: std::cell::RefCell<Vec<(UserVa, carrick_guest_arch::GuestLen)>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+/// Take the input ranges `Physical` owners prepared on this thread, in order.
+#[cfg(test)]
+pub(crate) fn take_prepared_reads() -> Vec<(UserVa, carrick_guest_arch::GuestLen)> {
+    PREPARED_READS.with(|reads| core::mem::take(&mut *reads.borrow_mut()))
+}
+
 #[cfg(test)]
 std::thread_local! {
     static TEST_FAULT_SLOT: core::cell::Cell<Option<(&'static carrick_el1_abi::PortalGrantSlot, u64)>> =
@@ -138,10 +151,8 @@ pub(crate) fn take_return_copyouts() -> Vec<(UserVa, usize)> {
 }
 
 /// The next Physical signal clock reads, in order, before its default
-/// 1000-then-1500 clock resumes. The later read stays before a one-second
-/// deadline admitted at 1000, so a retried timed wait still parks (#3174: a
-/// wait whose deadline has passed answers ETIMEDOUT without parking).
-#[cfg(all(test, not(target_os = "macos")))]
+/// 1000-then-2000 clock resumes.
+#[cfg(test)]
 pub(crate) fn script_signal_clock(reads: &[u64]) {
     SIGNAL_CLOCK_SCRIPT.with(|script| *script.borrow_mut() = reads.iter().copied().collect());
 }
@@ -615,6 +626,7 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         request: carrick_core::user_copy::GuestCopyRequest,
     ) -> Result<(), NativeProcessError> {
         assert_eq!(request.access, carrick_guest_arch::Access::Read);
+        PREPARED_READS.with(|reads| reads.borrow_mut().push((request.address, request.len)));
         self.prepare_copy_error.map_or(Ok(()), Err)
     }
     #[cfg(test)]
@@ -744,7 +756,7 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
         let now = if self.zone.counters.el1_timeouts.load(Ordering::Acquire) == 0 {
             1000
         } else {
-            1500
+            2000
         };
         Ok(carrick_guest_arch::CounterTick::new(now))
     }
@@ -13161,13 +13173,10 @@ fn native_futex_atomic_owner_retry_keeps_deadline_and_key_scope() {
     ));
     assert_eq!(copy.loads, 1);
     assert!(fixture.zone.timer_deadline(fixture.slot).is_none());
-    // Advance the physical clock after owner preparation, then redispatch the
-    // exact operation. Its original deadline is still 2000, not 2500.
-    fixture
-        .zone
-        .counters
-        .el1_timeouts
-        .store(1, Ordering::Release);
+    // Advance the physical clock after owner preparation (to 1500, still
+    // before the deadline), then redispatch the exact operation. Its
+    // original deadline is still 2000, not 2500.
+    script_signal_clock(&[1500, 1500]);
     assert!(matches!(
         entry.native_futex(call, &mut copy),
         Some(LifecycleOutcome::Transferred { .. })
@@ -13216,6 +13225,110 @@ fn native_futex_atomic_owner_retry_keeps_deadline_and_key_scope() {
     assert_eq!(
         copy.loads, 2,
         "expiry must not re-read or replay the guest comparison"
+    );
+    script_signal_clock(&[]);
+}
+
+/// #3174 (pre-review): a timed wait whose word copy is refused "not yet",
+/// and whose owner then answers the copy with a synchronous fault, returns
+/// EFAULT and keeps nothing: no park, no timer and no deadline. The next,
+/// untimed wait on the same entry parks with no timer. Before the cleanup
+/// the one-second deadline (2000) stayed retained after the EFAULT, and the
+/// untimed wait inherited it: it armed a timer at 2000.
+#[test]
+#[cfg(test)]
+fn native_futex_terminal_copy_fault_keeps_no_deadline_for_the_next_wait() {
+    use carrick_core::user_copy::{CopyOutcome, GuestCopyRequest, UserCopy};
+    use carrick_guest_arch::{Access, GuestLen};
+    use carrick_personality_linux::sched::FutexCall;
+    struct Copy {
+        refuse: bool,
+        loads: usize,
+    }
+    impl UserCopy for Copy {
+        fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> CopyOutcome {
+            assert_eq!(dst.len(), 8);
+            dst.copy_from_slice(&(if src.raw() == 0x2000 { 1_u64 } else { 0 }).to_le_bytes());
+            CopyOutcome::Done
+        }
+        fn copy_out(&mut self, _: UserVa, _: &[u8]) -> CopyOutcome {
+            panic!("futex must not write guest bytes")
+        }
+        fn atomic_load_u32(&mut self, address: UserVa, out: &mut u32) -> CopyOutcome {
+            assert_eq!(address, UserVa::new(0x1000));
+            self.loads += 1;
+            if core::mem::take(&mut self.refuse) {
+                CopyOutcome::NotYet(GuestCopyRequest {
+                    address,
+                    len: GuestLen::new(4),
+                    access: Access::Read,
+                })
+            } else {
+                *out = 0;
+                CopyOutcome::Done
+            }
+        }
+    }
+    let fixture = native_exec_fixture();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    // The memory owner refuses to supply the word's page: a synchronous fault.
+    service.prepare_copy_error = Some(NativeProcessError::Fault);
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &words(fixture.address),
+            &mut service,
+        )
+        .unwrap();
+    let mut copy = Copy {
+        refuse: true,
+        loads: 0,
+    };
+    let timed = FutexCall {
+        args: [0x1000, 128, 0, 0x2000, 0, 0],
+    };
+    let _ = take_prepared_reads();
+    assert!(
+        matches!(
+            entry.native_futex(timed, &mut copy),
+            Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == -14
+        ),
+        "the owner's fault answers EFAULT"
+    );
+    assert_eq!(copy.loads, 1);
+    assert_eq!(
+        take_prepared_reads(),
+        vec![(UserVa::new(0x1000), GuestLen::new(4))],
+        "the owner was asked for exactly the word, and refused it"
+    );
+    assert!(entry.take_handoff_receipt().is_none(), "no park published");
+    assert!(entry.take_run_failure().is_none());
+    assert!(fixture.zone.timer_deadline(fixture.slot).is_none());
+    // The next call is untimed: it must park with no deadline at all.
+    let untimed = FutexCall {
+        args: [0x1000, 128, 0, 0, 0, 0],
+    };
+    assert!(matches!(
+        entry.native_futex(untimed, &mut copy),
+        Some(LifecycleOutcome::Transferred { .. })
+    ));
+    assert_eq!(copy.loads, 2);
+    assert!(
+        entry.take_handoff_receipt().is_some(),
+        "the untimed wait parked"
+    );
+    assert_eq!(
+        fixture.zone.timer_deadline(fixture.slot),
+        None,
+        "an untimed wait arms no timer: the faulted wait's deadline was not kept"
     );
 }
 

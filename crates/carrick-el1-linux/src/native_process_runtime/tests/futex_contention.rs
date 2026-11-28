@@ -342,7 +342,9 @@ fn episode<
         zone.switch_in_full(fixture.slot).unwrap().record,
         fixture.record.id
     );
-    zone.counters.el1_timeouts.store(1, Ordering::Release);
+    // The clock has moved on to 1500 (still before the deadline) when the
+    // owner's continuation reruns the call.
+    script_signal_clock(&[1500, 1500, 1500]);
     let saved = unsafe { *zone.record(fixture.record.id).ctx_mut() };
     let mut entry = fixture
         .runtime
@@ -378,6 +380,7 @@ fn episode<
             "one second admitted at tick 1000 must not restart at tick 1500"
         );
     }
+    script_signal_clock(&[]);
     FUTEX_MAPPING.with(|slot| slot.set(None));
 }
 
