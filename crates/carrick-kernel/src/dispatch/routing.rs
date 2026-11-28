@@ -255,18 +255,24 @@ impl SyscallDispatcher {
                 return Some(Ok(DispatchOutcome::errno(carrick_abi::LINUX_ENOMEM)));
             }
         }
-        if let Some(errno) = self.secure_host_venue_metadata(&ctx.request) {
-            return Some(errno.and_then(|errno| {
-                if ctx.request.number == carrick_abi::syscall::nr::BRK {
+        match self.secure_host_venue_metadata(&ctx.request) {
+            None | Some(Ok(mem::anonymous::HostVenueMetadata::Secured)) => {}
+            // Not now: nothing committed; park on the observed Metadata
+            // cause and rerun (#3085).
+            Some(Ok(mem::anonymous::HostVenueMetadata::NotNow(wait))) => {
+                return Some(Ok(DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }));
+            }
+            Some(Ok(mem::anonymous::HostVenueMetadata::Refused(errno))) => {
+                return Some(if ctx.request.number == carrick_abi::syscall::nr::BRK {
                     // Linux's raw brk ABI reports allocation failure with the
                     // unchanged break; libc translates that to ENOMEM.
-                    Ok(DispatchOutcome::returned_u64(
-                        self.mem().lock().program_break(),
-                    )?)
+                    DispatchOutcome::returned_u64(self.mem().lock().program_break())
+                        .map_err(Into::into)
                 } else {
                     Ok(DispatchOutcome::errno(errno))
-                }
-            }));
+                });
+            }
+            Some(Err(error)) => return Some(Err(error)),
         }
         Some(resources::with_captured_resources(ctx.kernel, || {
             handler(self, &mut ctx)
@@ -279,7 +285,7 @@ impl SyscallDispatcher {
     fn secure_host_venue_metadata(
         &self,
         request: &SyscallRequest,
-    ) -> Option<Result<carrick_abi::LinuxErrno, DispatchError>> {
+    ) -> Option<Result<mem::anonymous::HostVenueMetadata, DispatchError>> {
         let number = request.number.raw();
         let brk = request.number == carrick_abi::syscall::nr::BRK;
         if !brk && !mm_mutation_may_mirror(number) {
@@ -297,7 +303,7 @@ impl SyscallDispatcher {
         } else {
             mem::anonymous::HostMetadataNeed::Mapping
         };
-        view.secure_host_venue_metadata(need).transpose()
+        Some(view.secure_host_venue_metadata(need))
     }
 
     /// Focused unit-test boundary for mutation handlers. Production callers

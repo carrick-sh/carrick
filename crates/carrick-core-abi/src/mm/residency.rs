@@ -2387,11 +2387,13 @@ mod tests {
 
         // #3085: a held append window is "not now", never waited out: the
         // allocation goes back, and only the holder's close wakes waiters.
-        table
-            .storage
-            .directory
-            .publishing
-            .store(1, Ordering::Release);
+        // The holder holds the production window guard; its drop is the
+        // holder's real close, and it wakes the waiters the refused grower
+        // parked on.
+        let parked = Wakes(Cell::new(0));
+        let holder =
+            crate::MetadataPublicationWindow::open(&table.storage.directory.publishing, &parked)
+                .unwrap();
         assert_eq!(
             table.grow(&allocator, observed, &wakes),
             Err(ResidencyGrowthRefusal::Publishing)
@@ -2399,11 +2401,17 @@ mod tests {
         assert_eq!(table.extension_count(), observed);
         assert!(allocator.allocations.borrow().is_empty());
         assert_eq!(wakes.0.get(), 0);
-        table
-            .storage
-            .directory
-            .publishing
-            .store(0, Ordering::Release);
+        assert_eq!(parked.0.get(), 0);
+        drop(holder);
+        assert_eq!(
+            parked.0.get(),
+            1,
+            "the holder's close woke the parked grower"
+        );
+        assert_eq!(
+            table.storage.directory.publishing.load(Ordering::Acquire),
+            0
+        );
 
         assert_eq!(table.grow(&allocator, observed, &wakes), Ok(()));
         assert_eq!(wakes.0.get(), 1);

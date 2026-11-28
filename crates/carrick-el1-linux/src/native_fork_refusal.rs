@@ -723,9 +723,11 @@ mod tests {
         let peer = carrick_el1::alloc::MetadataStorage::new();
         peer.admit_bootstrap_region(peer_backing.as_mut_ptr() as u64, peer_backing.len())
             .unwrap();
-        table.hold_bank_window_for_test(true);
+        // The holder opens the window through the production guard; its
+        // drop is that holder's real close.
+        let holder = table.open_bank_window_for_test(&waiters).unwrap();
         let error = demand.supply(&table, &peer, Some(metadata), &waiters);
-        table.hold_bank_window_for_test(false);
+        drop(holder);
         assert_eq!(error, NativeProcessError::OwnerWait(metadata));
         assert_eq!(table.node_capacity(), observed);
         // Memory no grant can add: the demand answers ENOMEM, typed, at
