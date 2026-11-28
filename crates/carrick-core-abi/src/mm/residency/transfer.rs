@@ -27,7 +27,7 @@
 //!   slots are released and the source rows reopen.
 //!
 //! The invariants T1 to T9 of #2611 are checked by the explorer in
-//! `transfer/explore.rs`, which also kills one seeded mutant per invariant.
+//! `transfer/explore_tests.rs`, which also kills one seeded mutant per invariant.
 
 use core::sync::atomic::Ordering;
 
@@ -38,7 +38,7 @@ use super::{
 };
 
 #[cfg(test)]
-mod explore;
+mod explore_tests;
 
 /// One equal-length move of one MM's pages: `[src, src + len)` to
 /// `[dst, dst + len)`. Only [`Self::new`] makes one, so every transfer is
@@ -123,7 +123,7 @@ pub struct TransferReceipt {
 pub enum ResidencyTransferRefusal {
     /// `dst` holds a row of this MM: the move's destination is not a hole.
     /// A broken caller (first fit only offers holes), never "not now".
-    Occupied,
+    DestinationNotHole,
     /// A grant-window lease holds a source row: "not now", rerun after the
     /// lease drops.
     Leased,
@@ -254,7 +254,7 @@ impl<S: sealed::ResidencyStorage> FrameGrantResidencyTable<S> {
                 && record.state.load(Ordering::Acquire) == state
         });
         if occupied && mutant::active() != mutant::Mutant::AdmitsPopulatedDst {
-            return Err(ResidencyTransferRefusal::Occupied);
+            return Err(ResidencyTransferRefusal::DestinationNotHole);
         }
         // T3: close every source row; a held lease is "not now".
         self.close_transfer_rows(range)?;

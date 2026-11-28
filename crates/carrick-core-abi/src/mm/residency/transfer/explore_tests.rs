@@ -220,12 +220,12 @@ fn run(config: Config, stats: &mut Stats) -> Result<(), String> {
         Ok(())
     };
     let transfer = match table.begin_transfer(range) {
-        Err(ResidencyTransferRefusal::Occupied) => {
+        Err(ResidencyTransferRefusal::DestinationNotHole) => {
             stats.occupied += 1;
             if !dst_populated {
                 return Err(format!("T4: an empty dst was refused: {config:?}"));
             }
-            return unchanged(stats, "an Occupied refusal");
+            return unchanged(stats, "an DestinationNotHole refusal");
         }
         Err(ResidencyTransferRefusal::Leased) => {
             stats.leased += 1;
