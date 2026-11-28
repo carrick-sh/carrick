@@ -235,7 +235,16 @@ impl<V: CoreVenue, M, B, G: GrantPayload> CarrierCore<V, M, B, G> {
                 record.editor = MmEditor::Host(edit);
                 Ok(())
             }
+            MmEditor::GuestCommits(_)
+                if super::release::mutated(super::release::Mutant::CommitsAdmitHostEdit) =>
+            {
+                record.editor = MmEditor::Host(edit);
+                Ok(())
+            }
             MmEditor::Guest => Err(MmRefusal::NotNow(NotNow::EditorRelease(excluded.mm()))),
+            MmEditor::GuestCommits(_) => {
+                Err(MmRefusal::NotNow(NotNow::CommitsDrain(excluded.mm())))
+            }
             MmEditor::Host(_) => Err(MmRefusal::Refused(Refusal::InFlight)),
         }
     }
@@ -503,10 +512,10 @@ impl<V: CoreVenue, M, B, G: GrantPayload> CarrierCore<V, M, B, G> {
         if let Some((&mm, record)) = self.mms.iter().find(|(_, record)| {
             record.editor != MmEditor::Free || record.life == super::release::MmLife::Releasing
         }) {
-            return Err(match record.editor {
-                MmEditor::Guest => MmRefusal::NotNow(NotNow::EditorRelease(mm)),
-                _ => MmRefusal::Refused(Refusal::InFlight),
-            });
+            return Err(record
+                .editor
+                .guest_not_now(mm)
+                .map_or(MmRefusal::Refused(Refusal::InFlight), MmRefusal::NotNow));
         }
         self.mms.clear();
         self.chunks.clear();
@@ -546,6 +555,29 @@ impl<V: CoreVenue, M, B, G> CarrierCore<V, M, B, G> {
             (MmEditor::Guest, false) => record.editor = MmEditor::Free,
             _ => return false,
         }
+        true
+    }
+
+    /// The guest adversary takes or releases one prepared-commit share of an
+    /// MM's editor (explorer and loom only; in production the guest editor
+    /// word counts them). A share is taken only while the editor is free or
+    /// already shared, as the word admits it.
+    #[cfg(test)]
+    pub(super) fn guest_commit(&mut self, mm: MmKey, take: bool) -> bool {
+        use core::num::NonZeroU16;
+        let record = self.mms.entry(mm).or_insert_with(MmRecord::admitted);
+        record.editor = match (record.editor, take) {
+            (MmEditor::Free, true) => MmEditor::GuestCommits(NonZeroU16::MIN),
+            (MmEditor::GuestCommits(shares), true) => match shares.checked_add(1) {
+                Some(shares) => MmEditor::GuestCommits(shares),
+                None => return false,
+            },
+            (MmEditor::GuestCommits(shares), false) => match NonZeroU16::new(shares.get() - 1) {
+                Some(shares) => MmEditor::GuestCommits(shares),
+                None => MmEditor::Free,
+            },
+            _ => return false,
+        };
         true
     }
 

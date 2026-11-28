@@ -79,6 +79,9 @@ pub(super) mod mutant {
         EditsAfterExit,
         /// `finish_release` reads `Broken` as "not now".
         BrokenDefers,
+        /// A host edit is admitted while guest commit shares hold the MM
+        /// (G5, #3105).
+        CommitsAdmitHostEdit,
     }
 
     #[cfg(test)]
@@ -107,9 +110,10 @@ pub(super) mod mutant {
     }
 }
 
+pub(super) use mutant::Mutant;
 use mutant::Mutant as M;
 
-fn mutated(which: M) -> bool {
+pub(super) fn mutated(which: M) -> bool {
     mutant::active() == which
 }
 
@@ -130,6 +134,9 @@ impl<V: CoreVenue, M_, B, G: GrantPayload> CarrierCore<V, M_, B, G> {
                 Ok(())
             }
             (MmLife::Live, MmEditor::Guest) => Err(MmRefusal::NotNow(NotNow::EditorRelease(mm))),
+            (MmLife::Live, MmEditor::GuestCommits(_)) => {
+                Err(MmRefusal::NotNow(NotNow::CommitsDrain(mm)))
+            }
             (MmLife::Live, MmEditor::Host(_)) => Err(MmRefusal::Refused(Refusal::InFlight)),
         }
     }
