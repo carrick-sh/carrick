@@ -1735,6 +1735,7 @@ surfaces = [
   { path = "crates/carrick-x86-cpl0-host/src/cpl0_native_service.rs", contract = "kernel.native.entropy" },
   { path = "crates/carrick-x86-cpl0-host/src/cpl0_native_service.rs", contract = "kernel.native.host-file-venue" },
   { path = "crates/carrick-x86-cpl0-host/src/cpl0_private_witness.rs", contract = "kernel.el1.mm-exclusive-owner" },
+  { path = "crates/carrick-x86-cpl0-host/src/cpl0_private_witness/tests.rs", contract = "kernel.el1.mm-exclusive-owner" },
   { path = "crates/carrick-x86-cpl0-host/src/cpl0_return_settlement.rs", contract = "kernel.el1.anonymous-reservations" },
   { path = "crates/carrick-x86-cpl0-host/src/guest_ram.rs", contract = "kernel.mm.address-space-occupancy" },
   { path = "crates/carrick-x86-cpl0-host/src/guest_ram.rs", contract = "x86.mm.first-touch-stage2-fill" },
