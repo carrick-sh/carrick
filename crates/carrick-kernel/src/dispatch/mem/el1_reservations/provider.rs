@@ -303,21 +303,29 @@ impl DelegatedRoot {
     ) -> Result<R, RootAccessRefusal> {
         let _host = self.host_serial.lock();
         let probe = self.observe_probe()?;
-        let view = self.provider.prepare()?;
-        let mut model = view
-            .lock(self.mm, &probe)
-            .map_err(|error| probe.refusal(error))?;
-        if model.mm() != self.mm
-            || !model.is_admitted()
-            || model.incarnation().raw() != probe.observed.handle().incarnation().get()
-        {
-            return Err(Refusal::Stale.into());
+        // A lock refuses a view behind the table `MetadataRequired`: a bank
+        // landed after the view read the bank count. That is the pool
+        // having grown, never this root's refusal, so the view is prepared
+        // again (#3085). Each pass needs another published bank, so this is
+        // bounded by the table's banks.
+        loop {
+            let view = self.provider.prepare()?;
+            let mut model = match view.lock(self.mm, &probe) {
+                Err(Refusal::MetadataRequired) => continue,
+                locked => locked.map_err(|error| probe.refusal(error))?,
+            };
+            if model.mm() != self.mm
+                || !model.is_admitted()
+                || model.incarnation().raw() != probe.observed.handle().incarnation().get()
+            {
+                return Err(Refusal::Stale.into());
+            }
+            let result = step(&mut model).map_err(RootAccessRefusal::Refused);
+            #[cfg(test)]
+            self.node_reads
+                .fetch_add(model.work, std::sync::atomic::Ordering::Relaxed);
+            return result;
         }
-        let result = step(&mut model).map_err(RootAccessRefusal::Refused);
-        #[cfg(test)]
-        self.node_reads
-            .fetch_add(model.work, std::sync::atomic::Ordering::Relaxed);
-        result
     }
 
     /// Root node reads by this MM's host-venue steps so far.

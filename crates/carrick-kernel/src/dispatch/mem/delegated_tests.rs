@@ -10496,6 +10496,15 @@ impl Grants {
         grants.push((extent, backing));
         extent
     }
+    /// Admit an extent the aperture mapped from the provider's own backing.
+    fn register(&self, base: u64, len: usize) -> carrick_core_abi::MetadataExtent {
+        let mut grants = self.0.lock().unwrap();
+        let extent =
+            carrick_core_abi::MetadataExtent::new(base, len as u64, grants.len() as u64 + 1)
+                .unwrap();
+        grants.push((extent, Box::default()));
+        extent
+    }
 }
 struct GrantPin(carrick_core_abi::MetadataExtent);
 // SAFETY: `Grants` retains every granted allocation for the fixture's life.
@@ -10544,108 +10553,138 @@ unsafe impl carrick_core_abi::ReservationMetadataAllocator for Grants {
     fn deallocate(&self, _: *mut u8, _: core::alloc::Layout) {}
 }
 
-/// A host view that resolves the carrier's published banks, as
-/// production's prepared view does.
-struct BankView {
-    carrier: Carrier,
-    nodes: carrick_el1::memory::reservations::ResolvedReservationNodes<GrantPin>,
-}
-impl PreparedHostReservations for BankView {
-    fn lock(
-        &self,
-        mm: ReservationMm,
-        wait: &dyn carrick_el1::memory::reservations::RootWait,
-    ) -> Result<Reservations<'_>, Refusal> {
-        self.carrier
-            .table
-            .venue()
-            .lock_resolved(self.carrier.slot(mm)?, mm, &self.nodes, wait)
+/// A peer's act, run once inside a carrier access call.
+type PeerHook = Arc<std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
+fn run_hook(hook: &PeerHook) {
+    let peer = hook.lock().unwrap().take();
+    if let Some(peer) = peer {
+        peer();
     }
 }
 
-/// A carrier that grows as production's does (`CarrierReservations`): it
-/// samples the pool's generation, then installs one host bank grant through
-/// the table's own decision, outside every MM lock. `after_sample` is the
-/// window in which a peer (a guest fork's bank supply) acts.
-struct BankProvider {
+/// The fixture carrier's metadata access, bound by the production
+/// `CarrierReservations` exactly as a backend's is: its EL1 region (the
+/// fixture's `TestEl1Region`), a dynamic aperture that maps a retained
+/// backing (or has no spare slot, `full`), and the pins of the extents it
+/// mapped or the guest allocator granted. Guest and host addresses coincide,
+/// as in every VM-free fixture. A peer acts inside `on_pin` (a view refresh
+/// resolving a published bank, after it read the bank count) or `on_map`
+/// (while the provider seeks its grant).
+#[derive(Clone)]
+struct Aperture {
     carrier: Carrier,
     grants: Grants,
-    after_sample: BusyHook,
+    full: Arc<std::sync::atomic::AtomicBool>,
+    on_pin: PeerHook,
+    on_map: PeerHook,
+    maps: Arc<std::sync::atomic::AtomicUsize>,
+    retired: Arc<std::sync::atomic::AtomicUsize>,
+    /// Carrier custody: every mapped backing stays until the carrier goes,
+    /// as a backend's does; an extent's drop releases only its authority.
+    custody: Arc<
+        std::sync::Mutex<Vec<Arc<dyn carrick_hal::retained_metadata::RetainedMetadataBacking>>>,
+    >,
+}
+struct ApertureExtent {
+    extent: carrick_core_abi::MetadataExtent,
     retired: Arc<std::sync::atomic::AtomicUsize>,
 }
-impl HostReservationProvider for BankProvider {
+impl carrick_hal::retained_metadata::RetainedMetadataExtent for ApertureExtent {
+    type Pin = GrantPin;
+    fn pin(&self) -> Result<GrantPin, carrick_core_abi::MetadataResolutionError> {
+        Ok(GrantPin(self.extent))
+    }
+    fn try_retire(self) -> Result<(), Self> {
+        self.retired
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(())
+    }
+}
+impl carrick_hal::retained_metadata::RetainedMetadataMapper for Aperture {
+    type Extent = ApertureExtent;
+    fn region(&self) -> Result<std::ptr::NonNull<u8>, carrick_core_abi::MetadataResolutionError> {
+        Ok(std::ptr::NonNull::new(self.carrier.table.0.as_ptr().cast_mut().cast()).unwrap())
+    }
+    fn map_retained(
+        &self,
+        backing: Arc<dyn carrick_hal::retained_metadata::RetainedMetadataBacking>,
+    ) -> Result<ApertureExtent, carrick_core_abi::MetadataResolutionError> {
+        run_hook(&self.on_map);
+        self.maps.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if self.full.load(std::sync::atomic::Ordering::Acquire) {
+            // No spare aperture slot.
+            return Err(carrick_core_abi::MetadataResolutionError::Busy);
+        }
+        let extent = self.grants.register(
+            backing.host_base().as_mut_ptr::<u8>() as u64,
+            backing.mapped_len(),
+        );
+        self.custody.lock().unwrap().push(backing);
+        Ok(ApertureExtent {
+            extent,
+            retired: Arc::clone(&self.retired),
+        })
+    }
+}
+impl carrick_core_abi::MetadataExtentResolver for Aperture {
+    type Pin = GrantPin;
+    fn pin(
+        &self,
+        extent: carrick_core_abi::MetadataExtent,
+    ) -> Result<GrantPin, carrick_core_abi::MetadataResolutionError> {
+        run_hook(&self.on_pin);
+        self.grants.pin(extent)
+    }
+}
+impl super::el1_reservations::CarrierReservationAccess for Aperture {
+    fn carrier_identity(&self) -> std::num::NonZeroU64 {
+        self.carrier.table.identity()
+    }
+    fn guest_cow_settlement(&self) -> Option<Arc<dyn carrick_el1_abi::CowGrantSettlement>> {
+        None
+    }
     fn private_file_venue(&self) -> carrick_guest_mem::PrivateFileVenue {
         carrick_guest_mem::PrivateFileVenue::OwnerGrant
     }
-    fn address_space_backing(
-        &self,
-    ) -> Option<Arc<dyn crate::kernel::mm_occupancy::AddressSpaceBacking>> {
-        Some(self.carrier.table.clone())
-    }
-    fn prepare(&self) -> Result<Box<dyn PreparedHostReservations>, Refusal> {
-        let mut nodes = carrick_el1::memory::reservations::ResolvedReservationNodes::default();
-        // SAFETY: the carrier region retains its bootstrap metadata arena.
-        unsafe {
-            let bootstrap = std::ptr::NonNull::new(
-                self.carrier
-                    .table
-                    .0
-                    .as_ptr()
-                    .add(carrick_el1_abi::EL1_BOOTSTRAP_METADATA_OFFSET as usize)
-                    .cast_mut(),
-            )
-            .unwrap();
-            nodes.refresh(&self.carrier.table, &self.grants, bootstrap)?;
-        }
-        Ok(Box::new(BankView {
-            carrier: self.carrier.clone(),
-            nodes,
-        }))
-    }
-    fn provision_metadata(
-        &self,
-        _mm: ReservationMm,
-        _wait: &dyn carrick_el1::memory::reservations::RootWait,
-    ) -> Result<carrick_el1::memory::reservations::HostBankInstall, Refusal> {
-        let table: &SharedReservations = &self.carrier.table;
-        let generation = table.storage_generation();
-        let peer = self.after_sample.lock().unwrap().take();
-        if let Some(peer) = peer {
-            peer();
-        }
-        let result = table.provision_metadata(
-            &GrantPin(self.grants.grant()),
-            generation,
-            &self.carrier.table.release(),
-        );
-        if !matches!(
-            result,
-            Ok(carrick_el1::memory::reservations::HostBankInstall::Published)
-        ) {
-            self.retired
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        result
-    }
 }
 
-/// An admitted root on a growing carrier, with its shared pool exhausted
-/// by guest mappings.
-fn bank_root(
-    dispatcher: &SyscallDispatcher,
-) -> (Root, Grants, BusyHook, Arc<std::sync::atomic::AtomicUsize>) {
+/// A second live thread supplies one node bank to the carrier, as a guest
+/// fork's (or any guest venue's) supply does, against the pool it reads now.
+fn peer_supplies_a_bank(carrier: &Carrier, grants: &Grants) {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let table: &SharedReservations = &carrier.table;
+                table
+                    .supply_node_bank(grants, table.node_capacity(), &carrier.table.release())
+                    .unwrap();
+            })
+            .join()
+            .unwrap();
+    });
+}
+
+/// An admitted root on a carrier served by the production
+/// `CarrierReservations`, with `banks` dynamic banks published first and
+/// its shared pool then exhausted by guest mappings.
+fn bank_root(dispatcher: &SyscallDispatcher, banks: u32) -> (Root, Aperture) {
     let carrier = Carrier::new();
     let mm = carrier.publish(dispatcher);
-    let grants = Grants::default();
-    let after_sample = BusyHook::default();
-    let retired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let aperture = Aperture {
+        carrier: carrier.clone(),
+        grants: Grants::default(),
+        full: Arc::default(),
+        on_pin: PeerHook::default(),
+        on_map: PeerHook::default(),
+        maps: Arc::default(),
+        retired: Arc::default(),
+        custody: Arc::default(),
+    };
     dispatcher
-        .install_reservation_provider(Arc::new(BankProvider {
-            carrier: carrier.clone(),
-            grants: grants.clone(),
-            after_sample: after_sample.clone(),
-            retired: retired.clone(),
-        }))
+        .install_reservation_provider(Arc::new(super::el1_reservations::CarrierReservations::new(
+            aperture.clone(),
+        )))
         .unwrap();
     assert_eq!(
         admit(dispatcher, El1AdmissionOrigin::Bind, true),
@@ -10679,8 +10718,53 @@ fn bank_root(
         }
         assert_eq!(model.host_reserve(), 0);
     }
-    assert_eq!(root.carrier.table.storage_generation(), 0);
-    (root, grants, after_sample, retired)
+    count += u64::from(carrick_el1::memory::reservations::HOST_RESERVE);
+    // Then the peers' banks, each exhausted in turn through a view of the
+    // fixture's own (the provider's cached view stays at admission's, so
+    // the host mapping's first view is a fresh refresh).
+    for _ in 0..banks {
+        peer_supplies_a_bank(&root.carrier, &aperture.grants);
+        let mut nodes = carrick_el1::memory::reservations::ResolvedReservationNodes::default();
+        // SAFETY: the carrier region retains its bootstrap metadata arena.
+        unsafe {
+            let bootstrap = std::ptr::NonNull::new(
+                root.carrier
+                    .table
+                    .0
+                    .as_ptr()
+                    .add(carrick_el1_abi::EL1_BOOTSTRAP_METADATA_OFFSET as usize)
+                    .cast_mut(),
+            )
+            .unwrap();
+            nodes
+                .refresh(&root.carrier.table, &aperture.grants, bootstrap)
+                .unwrap();
+        }
+        let slot = root.carrier.slot(root.mm).unwrap();
+        let mut model = root
+            .carrier
+            .table
+            .venue()
+            .lock_resolved(
+                slot,
+                root.mm,
+                &nodes,
+                &carrick_el1::memory::reservations::NoRootWait,
+            )
+            .unwrap();
+        loop {
+            match model.mmap(Placement::Fixed(far + count * 2 * PAGE), PAGE, READ) {
+                Ok(decision) => {
+                    commit(&mut model, decision);
+                    count += 1;
+                }
+                Err(Refusal::MetadataRequired) => break,
+                Err(other) => panic!("unexpected refusal {other:?}"),
+            }
+        }
+    }
+    assert_eq!(root.carrier.table.storage_generation(), banks);
+    (root, aperture)
 }
 
 /// This MM's Metadata cause revision now.
@@ -10710,13 +10794,14 @@ fn try_host_mmap(
 
 /// #3085 P0 B: a guest fork's node bank supply holds the carrier-wide bank
 /// append window while a host `mmap` of this MM, on another thread, needs a
-/// bank. The mmap is "not now": it commits nothing and parks on its Metadata
-/// cause (`OwnerMemoryWait`), never a `ReservationAuthority(Busy)` dispatch
+/// bank. The production provider maps its grant and the table answers
+/// `WindowHeld`: the mmap commits nothing and parks on its Metadata cause
+/// (`OwnerMemoryWait`), never a `ReservationAuthority(Busy)` dispatch
 /// failure. The fork's own window close wakes it, and its rerun maps.
 #[test]
 fn delegated_host_mmap_parks_while_a_guest_fork_holds_the_bank_window() {
     let mut dispatcher = SyscallDispatcher::new();
-    let (root, _grants, _after_sample, retired) = bank_root(&dispatcher);
+    let (root, aperture) = bank_root(&dispatcher, 0);
     let mut memory = arena_memory();
     let table: &SharedReservations = &root.carrier.table;
     let (held_tx, held_rx) = std::sync::mpsc::sync_channel(0);
@@ -10745,7 +10830,12 @@ fn delegated_host_mmap_parks_while_a_guest_fork_holds_the_bank_window() {
             "nothing woke it yet"
         );
         assert_eq!(table.storage_generation(), 0, "the mmap committed nothing");
-        assert_eq!(retired.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(aperture.maps.load(std::sync::atomic::Ordering::Acquire), 1);
+        assert_eq!(
+            aperture.retired.load(std::sync::atomic::Ordering::Acquire),
+            1,
+            "the unpublished grant is retired"
+        );
         close_tx.send(()).unwrap();
         fork.join().unwrap();
         assert!(
@@ -10765,35 +10855,25 @@ fn delegated_host_mmap_parks_while_a_guest_fork_holds_the_bank_window() {
     );
 }
 
-/// #3085 P0 B: a guest fork's node bank lands after the host provider
-/// sampled the pool. The host grant is redundant; the mmap decides again
-/// and maps from the fork's bank, never `Busy`.
+/// #3085 P0 B: a guest fork's node bank lands while the production provider
+/// maps its grant, after the root was refused. The grant is redundant and
+/// retired; the mmap decides again and maps from the fork's bank, never
+/// `Busy`.
 #[test]
 fn delegated_host_mmap_maps_from_a_bank_a_guest_fork_supplied_meanwhile() {
     let mut dispatcher = SyscallDispatcher::new();
-    let (root, grants, after_sample, retired) = bank_root(&dispatcher);
+    let (root, aperture) = bank_root(&dispatcher, 0);
     let mut memory = arena_memory();
-    let carrier = root.carrier.clone();
-    *after_sample.lock().unwrap() = Some(Box::new(move || {
-        std::thread::scope(|scope| {
-            scope
-                .spawn(|| {
-                    let table: &SharedReservations = &carrier.table;
-                    table
-                        .supply_node_bank(&grants, table.node_capacity(), &carrier.table.release())
-                        .unwrap();
-                })
-                .join()
-                .unwrap();
-        });
-    }));
+    let (carrier, grants) = (root.carrier.clone(), aperture.grants.clone());
+    *aperture.on_map.lock().unwrap() =
+        Some(Box::new(move || peer_supplies_a_bank(&carrier, &grants)));
     let outcome = try_host_mmap(&mut dispatcher, &mut memory);
     let Ok(DispatchOutcome::Returned { value }) = outcome else {
         panic!("a pool a guest fork grew serves the mmap: {outcome:?}")
     };
     assert_eq!(value as u64 % PAGE, 0);
     assert!(
-        after_sample.lock().unwrap().is_none(),
+        aperture.on_map.lock().unwrap().is_none(),
         "the fork's supply ran"
     );
     let table: &SharedReservations = &root.carrier.table;
@@ -10802,5 +10882,169 @@ fn delegated_host_mmap_maps_from_a_bank_a_guest_fork_supplied_meanwhile() {
         1,
         "only the fork's bank published"
     );
-    assert_eq!(retired.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert_eq!(aperture.maps.load(std::sync::atomic::Ordering::Acquire), 1);
+    assert_eq!(
+        aperture.retired.load(std::sync::atomic::Ordering::Acquire),
+        1
+    );
+}
+
+/// Each view refresh's first pin lets a peer publish one bank, `left` times:
+/// the bank lands after that view read the bank count, before its lock.
+fn arm_stale_views(
+    aperture: &Aperture,
+    carrier: Carrier,
+    left: usize,
+    ran: Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let (grants, next) = (aperture.grants.clone(), aperture.clone());
+    *aperture.on_pin.lock().unwrap() = Some(Box::new(move || {
+        peer_supplies_a_bank(&carrier, &grants);
+        ran.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        if left > 1 {
+            arm_stale_views(&next, carrier, left - 1, ran);
+        }
+    }));
+}
+
+/// #3085 P0 C, at the provider: a peer's bank lands after the production
+/// provider's view read the bank count, before its root lock. The lock
+/// refuses the stale view `MetadataRequired`, and that is the pool having
+/// grown: the table decides `Redundant` (decide again) without seeking a
+/// grant, never the refusal the host would answer ENOMEM.
+#[test]
+fn carrier_provider_decides_again_when_a_bank_lands_between_its_view_and_its_lock() {
+    let dispatcher = SyscallDispatcher::new();
+    let (root, aperture) = bank_root(&dispatcher, 1);
+    let provider = dispatcher
+        .mm_authority()
+        .reservation_provider_for_publication()
+        .unwrap();
+    let stale = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    arm_stale_views(&aperture, root.carrier.clone(), 1, Arc::clone(&stale));
+    assert_eq!(
+        provider.provision_metadata(root.mm, &carrick_el1::memory::reservations::NoRootWait),
+        Ok(carrick_el1::memory::reservations::HostBankInstall::Redundant)
+    );
+    assert_eq!(
+        stale.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "the provider's own view went stale"
+    );
+    let table: &SharedReservations = &root.carrier.table;
+    assert_eq!(
+        table.storage_generation(),
+        2,
+        "only the peer's bank published"
+    );
+    assert_eq!(
+        aperture.maps.load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "a grown pool needs no host grant"
+    );
+}
+
+/// #3085 P0 C, end to end: a peer's bank lands after each of the host
+/// mapping's views read the bank count, before their locks. Each stale view
+/// is the pool having grown: the mmap prepares again and maps, never ENOMEM
+/// and never a `MetadataRequired` dispatch failure.
+#[test]
+fn delegated_host_mmap_maps_when_a_bank_lands_between_the_view_and_its_lock() {
+    let mut dispatcher = SyscallDispatcher::new();
+    let (root, aperture) = bank_root(&dispatcher, 1);
+    let mut memory = arena_memory();
+    let stale = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    arm_stale_views(&aperture, root.carrier.clone(), 2, Arc::clone(&stale));
+    let outcome = try_host_mmap(&mut dispatcher, &mut memory);
+    let Ok(DispatchOutcome::Returned { value }) = outcome else {
+        panic!("a bank that landed after the view serves the mmap: {outcome:?}")
+    };
+    assert_eq!(value as u64 % PAGE, 0);
+    assert_eq!(
+        stale.load(std::sync::atomic::Ordering::Acquire),
+        2,
+        "two views went stale"
+    );
+    let table: &SharedReservations = &root.carrier.table;
+    assert_eq!(
+        table.storage_generation(),
+        3,
+        "only the peers' banks published"
+    );
+    assert_eq!(
+        aperture.maps.load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "a grown pool needs no host grant"
+    );
+}
+
+/// #3085 P0 D: the carrier's metadata aperture has no spare slot, and a
+/// peer's bank lands while the provider sought its grant. The missing slot
+/// is no answer by itself: the table's fresh read finds the pool grown, and
+/// the mmap decides again and maps, never ENOMEM.
+#[test]
+fn delegated_host_mmap_maps_from_a_peer_bank_when_the_aperture_is_full() {
+    let mut dispatcher = SyscallDispatcher::new();
+    let (root, aperture) = bank_root(&dispatcher, 0);
+    let mut memory = arena_memory();
+    aperture
+        .full
+        .store(true, std::sync::atomic::Ordering::Release);
+    let (carrier, grants) = (root.carrier.clone(), aperture.grants.clone());
+    *aperture.on_map.lock().unwrap() =
+        Some(Box::new(move || peer_supplies_a_bank(&carrier, &grants)));
+    let outcome = try_host_mmap(&mut dispatcher, &mut memory);
+    let Ok(DispatchOutcome::Returned { value }) = outcome else {
+        panic!("a full aperture with a grown pool still maps: {outcome:?}")
+    };
+    assert_eq!(value as u64 % PAGE, 0);
+    assert_eq!(aperture.maps.load(std::sync::atomic::Ordering::Acquire), 1);
+    let table: &SharedReservations = &root.carrier.table;
+    assert_eq!(table.storage_generation(), 1);
+}
+
+/// #3085 P0 D: the aperture has no spare slot while a guest fork holds the
+/// bank window (it may be appending the bank this mmap needs). Not now: the
+/// mmap parks on its Metadata cause, and the holder's close wakes it. With
+/// the window closed, nothing grown and still no slot, the table refuses:
+/// that is the one ENOMEM, given before anything changed.
+#[test]
+fn delegated_host_mmap_parks_on_a_held_window_when_the_aperture_is_full() {
+    let mut dispatcher = SyscallDispatcher::new();
+    let (root, aperture) = bank_root(&dispatcher, 0);
+    let mut memory = arena_memory();
+    aperture
+        .full
+        .store(true, std::sync::atomic::Ordering::Release);
+    let table: &SharedReservations = &root.carrier.table;
+    let (held_tx, held_rx) = std::sync::mpsc::sync_channel(0);
+    let (close_tx, close_rx) = std::sync::mpsc::sync_channel::<()>(0);
+    std::thread::scope(|scope| {
+        let close_tx = close_tx;
+        let carrier = &root.carrier;
+        let fork = scope.spawn(move || {
+            let release = carrier.table.release();
+            let window = table.open_bank_window_for_test(&release).unwrap();
+            held_tx.send(()).unwrap();
+            close_rx.recv().unwrap();
+            drop(window);
+        });
+        held_rx.recv().unwrap();
+        let outcome = try_host_mmap(&mut dispatcher, &mut memory);
+        let Ok(DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }) = outcome else {
+            panic!("a full aperture under a held window parks the mmap: {outcome:?}")
+        };
+        assert_eq!(wait.cause(), carrick_el1_abi::PortalWaitCause::Metadata);
+        assert_eq!(metadata_revision(&root), wait.revision());
+        close_tx.send(()).unwrap();
+        fork.join().unwrap();
+        assert!(metadata_revision(&root) > wait.revision());
+    });
+    let outcome = try_host_mmap(&mut dispatcher, &mut memory);
+    assert_eq!(
+        outcome.unwrap(),
+        DispatchOutcome::errno(LINUX_ENOMEM),
+        "no slot, no peer, no window: ENOMEM"
+    );
+    assert_eq!(table.storage_generation(), 0);
 }
