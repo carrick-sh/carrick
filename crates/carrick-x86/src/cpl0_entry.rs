@@ -238,7 +238,7 @@ pub fn decode_user_page_fault(
         } else {
             Access::Read
         },
-        present: error & 1 != 0,
+        cause: carrick_guest_arch::FaultCause::from_hardware(error & 1 != 0),
     })
 }
 pub const OBSERVE_CPL0_UACCESS_SHOOTDOWN: u64 = u64::MAX - 12;
@@ -546,10 +546,10 @@ mod tests {
         let write = super::decode_user_page_fault(0b111, 0x7fff_e000, 0x1b).unwrap();
         assert_eq!(write.address, UserVa::new(0x7fff_e000));
         assert_eq!(write.access, Access::Write);
-        assert!(write.present);
+        assert_eq!(write.cause, carrick_guest_arch::FaultCause::Permission);
         let execute = super::decode_user_page_fault(0b10100, 0x400000, 0x1b).unwrap();
         assert_eq!(execute.access, Access::Execute);
-        assert!(!execute.present);
+        assert_eq!(execute.cause, carrick_guest_arch::FaultCause::Translation);
         assert!(super::decode_user_page_fault(0b111, 0x7fff_e000, 8).is_none());
         assert!(super::decode_user_page_fault(0b011, 0x7fff_e000, 0x1b).is_none());
         assert!(super::decode_user_page_fault(0b1111, 0x7fff_e000, 0x1b).is_none());

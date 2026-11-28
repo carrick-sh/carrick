@@ -849,7 +849,7 @@ pub fn dispatch_irq(frame: &mut TrapFrame, counters: &Counters) -> Action {
 pub fn dispatch_entry(
     frame: &mut TrapFrame,
     counters: &Counters,
-    owner_wait: &mut Option<carrick_el1_abi::PortalOwnerWait>,
+    fault: &mut super::cow_resolver::FaultExit,
 ) -> Action {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     if matches!(frame.esr, 0xfffc..=0xfffe) {
@@ -859,7 +859,7 @@ pub fn dispatch_entry(
         dispatch_irq(frame, counters)
     } else {
         match (frame.esr >> 26) & 0x3f {
-            0x20 | 0x24 => dispatch_fault(frame, counters, owner_wait),
+            0x20 | 0x24 => dispatch_fault(frame, counters, fault),
             0x15 => dispatch_syscall(frame, counters),
             // Any other EL0 synchronous exception (BRK, step, undefined
             // instruction, alignment, FP) is never a syscall (#1502). It
@@ -1041,14 +1041,14 @@ pub(super) fn final_user_return(
 pub fn capture_native_service_exit(
     frame: &mut TrapFrame,
     action: Action,
-    wait: Option<carrick_core_abi::PortalOwnerWait>,
+    fault: super::cow_resolver::FaultExit,
     staged: StagedRingRecord,
     counters: &Counters,
 ) -> Action {
     // The exception's ring record goes with its exit: only the native
     // host-file stage publishes it, and any other exit drops its owner.
     if matches!(action, Action::Forward | Action::ServedWithWork)
-        && let Some(owned) = arm_native_service_exit(frame, action, wait, staged, counters)
+        && let Some(owned) = arm_native_service_exit(frame, action, fault, staged, counters)
     {
         return owned;
     }
@@ -1153,6 +1153,7 @@ pub(super) fn native_unstaged_exit(
     frame: &mut TrapFrame,
     state: &carrick_el1_abi::LinuxTaskState,
     action: Action,
+    exit: super::cow_resolver::FaultExit,
     owner: impl FnOnce() -> super::native_process_runtime::NativeThreadGroupOwner,
     counters: &Counters,
 ) -> NativeUnstagedExit {
@@ -1174,7 +1175,7 @@ pub(super) fn native_unstaged_exit(
         }
         return NativeUnstagedExit::Refused(refuse_unclaimed_native_syscall(frame, counters));
     }
-    native_service_operation(frame, state, action)
+    native_service_operation(frame, state, action, exit)
         .map_or(NativeUnstagedExit::Declined, NativeUnstagedExit::Operation)
 }
 
@@ -1206,6 +1207,7 @@ pub(super) fn native_service_operation(
     frame: &mut TrapFrame,
     state: &carrick_el1_abi::LinuxTaskState,
     action: Action,
+    exit: super::cow_resolver::FaultExit,
 ) -> Option<carrick_core_abi::service::ServiceOperation> {
     use carrick_core_abi::service::{NativeException, NativeExceptionKind, ServiceOperation};
     use carrick_guest_arch::{Access, FaultInfo, NativeOrdinal, UserVa};
@@ -1246,7 +1248,7 @@ pub(super) fn native_service_operation(
             });
     }
     match (frame.esr >> 26) & 0x3f {
-        kind @ (0x20 | 0x24) => Some(ServiceOperation::Fault(FaultInfo {
+        kind @ (0x20 | 0x24) => Some(ServiceOperation::Fault(exit.forwarded(FaultInfo {
             address: UserVa::new(frame.far),
             access: if kind == 0x20 {
                 Access::Execute
@@ -1255,8 +1257,10 @@ pub(super) fn native_service_operation(
             } else {
                 Access::Read
             },
-            present: !(0x04..=0x07).contains(&(frame.esr & 0x3f)),
-        })),
+            cause: carrick_guest_arch::FaultCause::from_hardware(
+                !(0x04..=0x07).contains(&(frame.esr & 0x3f)),
+            ),
+        }))),
         0x15 => Some(ServiceOperation::Crossing {
             ordinal: NativeOrdinal::new(frame.x[8]),
         }),
@@ -1498,8 +1502,10 @@ fn native_host_file_fault(
         address: carrick_guest_arch::UserVa::new(address),
         access,
         // A write to a readable page is a permission (COW) fault.
-        present: access == carrick_guest_arch::Access::Write
-            && file::MemoryValidator::readable_bytes(&file::HardwareValidator, address, 1) == 1,
+        cause: carrick_guest_arch::FaultCause::from_hardware(
+            access == carrick_guest_arch::Access::Write
+                && file::MemoryValidator::readable_bytes(&file::HardwareValidator, address, 1) == 1,
+        ),
     }
 }
 
@@ -1628,7 +1634,7 @@ pub fn native_exec_stage_request<V: file::MemoryValidator>(
             NativeExecStage::Fault(carrick_guest_arch::FaultInfo {
                 address: carrick_guest_arch::UserVa::new(address),
                 access: carrick_guest_arch::Access::Read,
-                present: false,
+                cause: carrick_guest_arch::FaultCause::Translation,
             })
         }
         (Err(errno), _) => NativeExecStage::Failed(errno),
@@ -1756,7 +1762,7 @@ pub(super) fn native_service_decision(
     frame: &mut TrapFrame,
     task: &CurrentTask,
     action: Action,
-    wait: Option<carrick_core_abi::PortalOwnerWait>,
+    exit: super::cow_resolver::FaultExit,
     counters: &Counters,
     owner: impl Fn() -> super::native_process_runtime::NativeThreadGroupOwner,
     host_file: impl FnOnce(
@@ -1764,7 +1770,7 @@ pub(super) fn native_service_decision(
     ) -> Option<carrick_personality_linux::native_host_file::HostFileStage>,
 ) -> NativeServiceDecision {
     let child = || owner() == super::native_process_runtime::NativeThreadGroupOwner::ForkChild;
-    let mut service_wait = wait;
+    let mut service_wait = exit.owner_wait;
     let staged = match native_exec_stage(frame, task) {
         Some(NativeExecStage::Payload(payload)) => NativeServiceStage::Exec(payload),
         Some(NativeExecStage::Failed(errno)) => NativeServiceStage::Return(errno.guest_retval()),
@@ -1894,8 +1900,8 @@ pub(super) fn native_service_decision(
             let mut synthetic = *frame;
             synthetic.esr = native_stage_fault_syndrome(fault);
             synthetic.far = fault.address.raw();
-            let mut fault_wait = None;
-            match super::cow_resolver::dispatch_fault(&mut synthetic, counters, &mut fault_wait) {
+            let mut fault_exit = super::cow_resolver::FaultExit::default();
+            match super::cow_resolver::dispatch_fault(&mut synthetic, counters, &mut fault_exit) {
                 Action::Served => {
                     // Staging made no descriptor/IPC effect. Re-enter the
                     // ring at the same SVC rather than staging InRing into
@@ -1904,9 +1910,11 @@ pub(super) fn native_service_decision(
                     return NativeServiceDecision::Action(Action::Served);
                 }
                 Action::Forward | Action::ServedWithWork => {
-                    service_wait = fault_wait;
+                    service_wait = fault_exit.owner_wait;
                     (
-                        Some(carrick_core_abi::service::ServiceOperation::Fault(fault)),
+                        Some(carrick_core_abi::service::ServiceOperation::Fault(
+                            fault_exit.forwarded(fault),
+                        )),
                         None,
                         None,
                         None,
@@ -1920,7 +1928,7 @@ pub(super) fn native_service_decision(
             }
         }
         NativeServiceStage::Operation => {
-            match native_unstaged_exit(frame, &task.linux, action, owner, counters) {
+            match native_unstaged_exit(frame, &task.linux, action, exit, owner, counters) {
                 NativeUnstagedExit::Refused(refused) => {
                     return NativeServiceDecision::Action(refused);
                 }
@@ -2279,7 +2287,7 @@ pub use arm_ring_record::StagedRingRecord;
 fn arm_native_service_exit(
     frame: &mut TrapFrame,
     action: Action,
-    wait: Option<carrick_core_abi::PortalOwnerWait>,
+    fault: super::cow_resolver::FaultExit,
     staged: StagedRingRecord,
     counters: &Counters,
 ) -> Option<Action> {
@@ -2316,7 +2324,7 @@ fn arm_native_service_exit(
         frame,
         task,
         action,
-        wait,
+        fault,
         counters,
         || arm_thread_group_owner(zone, task, page),
         |frame| {
@@ -2489,6 +2497,7 @@ pub(crate) fn arm_deliver_declined_fault_signal_with<
     control: &'static carrick_el1_abi::ThreadControlSlot,
     service: &mut super::aarch64_process::Aarch64NativeProcessService<'static, X>,
     frame: &mut carrick_el1_abi::TrapFrame,
+    declined: Option<carrick_guest_arch::SegvCause>,
     owner_wait: &mut Option<carrick_el1_abi::PortalOwnerWait>,
     deliver: F,
 ) -> Result<carrick_el1_abi::Action, super::native_process_runtime::NativeProcessError>
@@ -2542,6 +2551,7 @@ where
             control,
             service,
             frame.far,
+            declined,
             |process| deliver(process, frame),
         ),
         owner_wait,
@@ -2655,6 +2665,7 @@ pub(crate) fn arm_deliver_declined_fault_signal<X: super::aarch64_process::ForkS
     control: &'static carrick_el1_abi::ThreadControlSlot,
     service: &mut super::aarch64_process::Aarch64NativeProcessService<'static, X>,
     frame: &mut carrick_el1_abi::TrapFrame,
+    declined: Option<carrick_guest_arch::SegvCause>,
     owner_wait: &mut Option<carrick_el1_abi::PortalOwnerWait>,
     deliver: F,
 ) -> Result<carrick_el1_abi::Action, super::native_process_runtime::NativeProcessError>
@@ -2671,7 +2682,7 @@ where
     ) -> Option<carrick_personality_linux::dispatch::CompletionRoute>,
 {
     arm_deliver_declined_fault_signal_with(
-        source, task, entry, ttbr0, page, control, service, frame, owner_wait, deliver,
+        source, task, entry, ttbr0, page, control, service, frame, declined, owner_wait, deliver,
     )
 }
 
@@ -2681,6 +2692,7 @@ where
 #[inline(never)]
 pub(crate) fn arm_deliver_declined_fault_signal_current(
     frame: &mut TrapFrame,
+    declined: Option<carrick_guest_arch::SegvCause>,
     owner_wait: &mut Option<carrick_el1_abi::PortalOwnerWait>,
 ) -> Action {
     let current_tasks: &'static [CurrentTask; EL1_STACK_SLOTS as usize] =
@@ -2709,6 +2721,7 @@ pub(crate) fn arm_deliver_declined_fault_signal_current(
         control,
         &mut service,
         frame,
+        declined,
         owner_wait,
         |process, frame| super::arm_signal::deliver_on_user_return(task, process, frame),
     )
@@ -2752,7 +2765,8 @@ fn arm_signal_user_return(frame: &mut TrapFrame) -> Action {
         }
         // This checkpoint has no fault rerun venue to park: an owner wait
         // stays Forward with the host-retained payload, as Busy does (#1083).
-        return arm_deliver_declined_fault_signal_current(frame, &mut None);
+        // The host classified it, so no policy cause applies.
+        return arm_deliver_declined_fault_signal_current(frame, None, &mut None);
     }
     let fatal_owner_cancel = frame.esr == 0xfffc;
     let Some(task) = current_tasks.get(frame.slot as usize) else {
@@ -9107,7 +9121,7 @@ mod tests {
         };
         assert_eq!(fault.address.raw(), frame.x[1]);
         assert_eq!(fault.access, carrick_guest_arch::Access::Read);
-        assert!(!fault.present);
+        assert_eq!(fault.cause, carrick_guest_arch::FaultCause::Translation);
     }
 
     #[test]
@@ -9300,6 +9314,7 @@ mod tests {
                     &mut frame,
                     &task.linux,
                     Action::Forward,
+                    crate::cow_resolver::FaultExit::default(),
                     || NativeThreadGroupOwner::ForkChild,
                     &counters,
                 ),
@@ -9332,6 +9347,7 @@ mod tests {
                     &mut frame,
                     &task.linux,
                     Action::Forward,
+                    crate::cow_resolver::FaultExit::default(),
                     || NativeThreadGroupOwner::ForkChild,
                     &counters,
                 ),
@@ -9350,6 +9366,7 @@ mod tests {
                 &mut frame,
                 &task.linux,
                 Action::Forward,
+                crate::cow_resolver::FaultExit::default(),
                 || NativeThreadGroupOwner::Root,
                 &counters,
             ),
@@ -9388,6 +9405,7 @@ mod tests {
                 &mut frame,
                 &task.linux,
                 Action::Forward,
+                crate::cow_resolver::FaultExit::default(),
                 || NativeThreadGroupOwner::ForkChild,
                 &counters,
             ),
@@ -9411,6 +9429,7 @@ mod tests {
                     &mut frame,
                     &task.linux,
                     Action::Forward,
+                    crate::cow_resolver::FaultExit::default(),
                     || owner,
                     &counters
                 ),
@@ -9434,6 +9453,7 @@ mod tests {
                 &mut frame,
                 &task.linux,
                 Action::Forward,
+                crate::cow_resolver::FaultExit::default(),
                 || panic!("an exception asks no syscall route"),
                 &counters,
             ),
@@ -9850,7 +9870,11 @@ mod tests {
             ..TrapFrame::default()
         };
 
-        let action = dispatch_entry(&mut frame, &counters, &mut None);
+        let action = dispatch_entry(
+            &mut frame,
+            &counters,
+            &mut crate::cow_resolver::FaultExit::default(),
+        );
         assert_eq!(action, Action::Forward);
         assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 1);
         // Arbitrary x8 is not treated as a syscall
@@ -9867,7 +9891,11 @@ mod tests {
             ..TrapFrame::default()
         };
         assert_eq!(
-            dispatch_entry(&mut frame, &counters, &mut None),
+            dispatch_entry(
+                &mut frame,
+                &counters,
+                &mut crate::cow_resolver::FaultExit::default()
+            ),
             Action::Forward
         );
         assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 1);
@@ -9903,7 +9931,11 @@ mod tests {
                 },
                 ..TrapFrame::default()
             };
-            let action = dispatch_entry(&mut frame, &counters, &mut None);
+            let action = dispatch_entry(
+                &mut frame,
+                &counters,
+                &mut crate::cow_resolver::FaultExit::default(),
+            );
             assert_eq!(action, Action::Forward, "esr={esr:#x}");
             assert_eq!(frame.x[0], 0, "esr={esr:#x}: no call result");
             assert_eq!(frame.elr, 0x40_1000, "esr={esr:#x}: no replay");
@@ -9921,7 +9953,11 @@ mod tests {
             ..TrapFrame::default()
         };
 
-        let action = dispatch_entry(&mut frame, &counters, &mut None);
+        let action = dispatch_entry(
+            &mut frame,
+            &counters,
+            &mut crate::cow_resolver::FaultExit::default(),
+        );
         assert_eq!(action, Action::Forward);
         assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 0);
     }
@@ -9940,7 +9976,11 @@ mod tests {
             ..TrapFrame::default()
         };
 
-        let action = dispatch_entry(&mut frame, &counters, &mut None);
+        let action = dispatch_entry(
+            &mut frame,
+            &counters,
+            &mut crate::cow_resolver::FaultExit::default(),
+        );
         assert_eq!(action, Action::Served);
         assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 0);
         assert_eq!(counters.forwarded[172].load(Ordering::Relaxed), 0);

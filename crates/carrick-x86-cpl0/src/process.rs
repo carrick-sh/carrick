@@ -510,7 +510,7 @@ fn prepare_parent_output(
             FaultInfo {
                 address,
                 access: FaultAccess::Write,
-                present: true,
+                cause: carrick_guest_arch::FaultCause::Permission,
             },
             lane.counters,
             lane.task,

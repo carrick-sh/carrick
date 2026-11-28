@@ -778,6 +778,7 @@ fn arm_declined_fault_returns_a_quarantined_delivery_refusal() {
             fixture.control,
             &mut service,
             &mut frame,
+            Some(carrick_guest_arch::SegvCause::Access),
             &mut owner_wait,
             |_, _| Some(carrick_personality_linux::dispatch::CompletionRoute::Forward),
         ),

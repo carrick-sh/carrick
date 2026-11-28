@@ -626,7 +626,7 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
                 carrick_guest_arch::FaultInfo {
                     address,
                     access: carrick_guest_arch::Access::Write,
-                    present: false,
+                    cause: carrick_guest_arch::FaultCause::Translation,
                 },
                 NonZeroU64::new(sequence)?,
             ));
@@ -635,7 +635,7 @@ impl<'a, C: ProcessContext> NativeProcessService<'a, C> for Physical<'a, C> {
             carrick_guest_arch::FaultInfo {
                 address,
                 access: carrick_guest_arch::Access::Write,
-                present: false,
+                cause: carrick_guest_arch::FaultCause::Translation,
             },
             NonZeroU64::MIN,
         ))
@@ -4412,7 +4412,7 @@ fn exit_group_cancels_exception_service_before_publishing_host_wakes() {
             Some(ServiceOperation::Fault(FaultInfo {
                 address: UserVa::new(0x4000),
                 access: Access::Read,
-                present: false,
+                cause: carrick_guest_arch::FaultCause::Translation,
             })),
         );
         // Both fixture CPUs may execute this retained member.
@@ -6706,7 +6706,7 @@ fn a_native_fault_waits_on_the_reservation_pool_and_reruns_for<
     let fault = carrick_guest_arch::FaultInfo {
         address: UserVa::new(0x10_0000),
         access: carrick_guest_arch::Access::Write,
-        present: false,
+        cause: carrick_guest_arch::FaultCause::Translation,
     };
     let (record, _) = wait.enter(|child| {
         assert!(matches!(
@@ -7556,6 +7556,7 @@ fn parent_reaps_then_execs_child(namespace_census: bool) {
                         &mut frame,
                         &fixture.task.linux,
                         carrick_el1_abi::Action::Forward,
+                        crate::cow_resolver::FaultExit::default(),
                         || if child.is_root_process() {
                             NativeThreadGroupOwner::Root
                         } else {
@@ -9633,7 +9634,7 @@ fn retained_ipc_supply_for<
                 ServiceOperation::Fault(carrick_guest_arch::FaultInfo {
                     address: UserVa::new(0x10000),
                     access: carrick_guest_arch::Access::Write,
-                    present: true,
+                    cause: carrick_guest_arch::FaultCause::Permission,
                 }),
                 None,
             );
@@ -10620,7 +10621,7 @@ fn host_request_during_fault_service_park_yields_as_exception() {
         carrick_core_abi::service::ServiceOperation::Fault(carrick_guest_arch::FaultInfo {
             address: UserVa::new(0x4000),
             access: carrick_guest_arch::Access::Read,
-            present: true,
+            cause: carrick_guest_arch::FaultCause::Permission,
         }),
         false,
     );

@@ -190,6 +190,52 @@ impl<D: carrick_mmu_core::aarch64::descriptor_txn::LiveDescriptorWords> CowResol
     }
 }
 
+/// The `si_code` Linux reports for a segmentation fault of this cause
+/// (sigaction(2)). Every ISA and venue that delivers one asks this.
+pub const fn segv_code(cause: carrick_guest_arch::SegvCause) -> i32 {
+    match cause {
+        carrick_guest_arch::SegvCause::Access => carrick_syscall_abi::LINUX_SEGV_ACCERR,
+        carrick_guest_arch::SegvCause::Unmapped => carrick_syscall_abi::LINUX_SEGV_MAPERR,
+    }
+}
+
+/// What one fault's ring dispatch leaves to the native exit that forwards it.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::default::Default,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub struct FaultExit {
+    /// The owner's release a forwarded fault waits on before it reruns.
+    pub owner_wait: Option<carrick_el1_abi::PortalOwnerWait>,
+    /// Why the shared fault policy declined the fault, when it did. The
+    /// forwarded fault carries this cause, never its syndrome's (#3170).
+    pub declined: Option<carrick_guest_arch::SegvCause>,
+}
+
+impl FaultExit {
+    /// Record the shared policy's outcome for a fault this dispatch forwards.
+    pub fn after(&mut self, outcome: carrick_el1::fault::OwnerFaultSupplyOutcome) {
+        if let carrick_el1::fault::OwnerFaultSupplyOutcome::PolicyDeclined(cause) = outcome {
+            self.declined = Some(cause);
+        }
+    }
+
+    /// The fault as its native exit forwards it: a declined fault carries the
+    /// policy's cause in place of the hardware's.
+    pub fn forwarded(self, fault: carrick_guest_arch::FaultInfo) -> carrick_guest_arch::FaultInfo {
+        carrick_guest_arch::FaultInfo {
+            cause: self
+                .declined
+                .map_or(fault.cause, carrick_guest_arch::FaultCause::Declined),
+            ..fault
+        }
+    }
+}
+
 /// Born-in-zone threads select from the MM owner instead of the legacy host
 /// grant mailbox; host-born siblings retain the mailbox request path for
 /// uncontended first touch while attaching the admitted MM owner so
@@ -232,29 +278,28 @@ pub(crate) fn admitted_fault_mm_handle(
 }
 
 /// Settle a forward fault verdict against the selected [`carrick_el1::substrate::sched::NativeEntryVenue`].
-/// A permission fault declined by an admitted anonymous reservation on an
-/// untraced `SignalOwner` thread is delivered through the native signal owner;
-/// all other non-`NativeProcess` faults retain their host forwarding path.
+/// A fault the shared policy declined on an untraced `SignalOwner` thread is
+/// delivered through the native signal owner with the policy's cause; all
+/// other non-`NativeProcess` faults retain their host forwarding path. (A
+/// `SignalOwner` supplies through the mailbox, which today declines only
+/// access errors: a hole stays `Unavailable` and forwards.)
 #[cfg(any(test, all(target_os = "none", target_arch = "aarch64")))]
 pub(crate) fn settle_declined_owner_fault(
     venue: carrick_el1::substrate::sched::NativeEntryVenue,
     task: &carrick_el1_abi::CurrentTask,
     action: Action,
     outcome: carrick_el1::fault::OwnerFaultSupplyOutcome,
-    deliver: impl FnOnce() -> Action,
+    deliver: impl FnOnce(carrick_guest_arch::SegvCause) -> Action,
 ) -> Action {
     if action == Action::Forward
-        && matches!(
-            outcome,
-            carrick_el1::fault::OwnerFaultSupplyOutcome::PolicyDeclined(_)
-        )
+        && let carrick_el1::fault::OwnerFaultSupplyOutcome::PolicyDeclined(cause) = outcome
         && matches!(
             venue,
             carrick_el1::substrate::sched::NativeEntryVenue::SignalOwner
         )
         && !task.ptrace_traced()
     {
-        return deliver();
+        return deliver(cause);
     }
     action
 }
@@ -315,11 +360,7 @@ pub(crate) fn park_fault_owner_wait<C: crate::sched::ThreadCpu, U: crate::sched:
 /// Increments `counters.fault_taken`; at EL1, requests host-published bulk
 /// frames, consumes refusals, or resolves in-guest COW faults.
 /// Host builds retain the forward-only path.
-pub fn dispatch_fault(
-    frame: &mut TrapFrame,
-    counters: &Counters,
-    owner_wait: &mut Option<carrick_el1_abi::PortalOwnerWait>,
-) -> Action {
+pub fn dispatch_fault(frame: &mut TrapFrame, counters: &Counters, exit: &mut FaultExit) -> Action {
     #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     {
         let current_tasks = unsafe {
@@ -381,7 +422,7 @@ pub fn dispatch_fault(
             );
             if let OwnerFaultSupplyOutcome::Wait(wait) = supply.outcome() {
                 if native {
-                    *owner_wait = Some(wait);
+                    exit.owner_wait = Some(wait);
                     return action;
                 }
                 if let Some(parked) = park_fault_owner_wait(
@@ -415,12 +456,14 @@ pub fn dispatch_fault(
                 );
             }
             let mut declined_wait = None;
-            let action = settle_declined_owner_fault(venue, task, action, supply.outcome(), || {
-                crate::dispatch::arm_deliver_declined_fault_signal_current(
-                    frame,
-                    &mut declined_wait,
-                )
-            });
+            let action =
+                settle_declined_owner_fault(venue, task, action, supply.outcome(), |cause| {
+                    crate::dispatch::arm_deliver_declined_fault_signal_current(
+                        frame,
+                        Some(cause),
+                        &mut declined_wait,
+                    )
+                });
             // Signal admission met an owner-memory dependency before publishing
             // anything: park on the owner's release and rerun the fault.
             if let Some(wait) = declined_wait {
@@ -438,6 +481,9 @@ pub fn dispatch_fault(
                 }
                 continue;
             }
+            if action == Action::Forward {
+                exit.after(supply.outcome());
+            }
             return action;
         }
     }
@@ -445,13 +491,13 @@ pub fn dispatch_fault(
     {
         // CPL0 enters through `dispatch_x86_fault_with_prepared` with its
         // decoded #PF. This ARM TrapFrame entry has no x86 fault provenance.
-        let _ = (frame, owner_wait);
+        let _ = (frame, exit);
         counters.fault_taken.fetch_add(1, Ordering::Relaxed);
         Action::Forward
     }
     #[cfg(not(target_os = "none"))]
     {
-        let _ = (frame, owner_wait);
+        let _ = (frame, exit);
         counters.fault_taken.fetch_add(1, Ordering::Relaxed);
         Action::Forward
     }
@@ -477,7 +523,7 @@ mod tests {
         let counters = Counters::default();
         assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 0);
 
-        let action = dispatch_fault(&mut frame, &counters, &mut None);
+        let action = dispatch_fault(&mut frame, &counters, &mut FaultExit::default());
         assert_eq!(action, Action::Forward);
         assert_eq!(counters.fault_taken.load(Ordering::Relaxed), 1);
         // Ensure arbitrary x8 was not dispatched as a syscall and syscall counters were not touched

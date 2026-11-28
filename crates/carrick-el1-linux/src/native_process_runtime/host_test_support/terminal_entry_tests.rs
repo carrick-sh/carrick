@@ -1070,7 +1070,7 @@ fn busy_service_notice_cancellation_wakes_and_retires_for<
             ServiceOperation::Fault(carrick_guest_arch::FaultInfo {
                 address: UserVa::new(0x10000),
                 access: carrick_guest_arch::Access::Write,
-                present: true,
+                cause: carrick_guest_arch::FaultCause::Permission,
             }),
             None,
         );
@@ -1405,7 +1405,7 @@ fn terminal_close_with_retained_adapter_service_entry_for<
             ServiceOperation::Fault(carrick_guest_arch::FaultInfo {
                 address: UserVa::new(0x10000),
                 access: carrick_guest_arch::Access::Write,
-                present: true,
+                cause: carrick_guest_arch::FaultCause::Permission,
             }),
             None,
         );

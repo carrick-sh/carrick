@@ -1515,7 +1515,7 @@ pub(super) fn take(
                 let (reply, reply_pin) = if let Some(address) = ticket.reply_address() {
                     match ticket.request().operation {
                         carrick_core_abi::service::ServiceOperation::Fault(fault)
-                            if !fault.present =>
+                            if fault.cause.awaits_supply() =>
                         {
                             let (pointer, pin) = retain_reply::<carrick_el1_abi::PortalGrantSlot>(
                                 custody, region, address,

@@ -2,7 +2,9 @@
 //! an exact completion or cancellation acknowledgment is consumed.
 pub mod entropy;
 use crate::{El1MmHandle, EntryThreadGeneration, ReservationMm, SnapshotGeneration};
-use carrick_guest_arch::{Access, FaultInfo, GuestLen, GuestVa, NativeOrdinal};
+use carrick_guest_arch::{
+    Access, FaultCause, FaultInfo, GuestLen, GuestVa, NativeOrdinal, SegvCause,
+};
 use carrick_sched_core::{RecordRef, object_wait::OwnerEntry, process::TaskKey};
 use core::num::{NonZeroU32, NonZeroU64};
 use core::ops::Deref;
@@ -1602,7 +1604,7 @@ impl ServiceCell {
             || (reply.is_some()
                 && !matches!(
                     operation,
-                    ServiceOperation::Fault(fault) if !fault.present && fault_sequence.is_some()
+                    ServiceOperation::Fault(fault) if fault.cause.awaits_supply() && fault_sequence.is_some()
                 )
                 && !matches!(operation, ServiceOperation::Exec { .. }))
             || reply.is_some_and(|address| address.raw() == 0)
@@ -1763,7 +1765,7 @@ impl ServiceCell {
             }
             let first = cell.words[10].load(Ordering::Relaxed);
             let operation = match cell.words[9].load(Ordering::Relaxed) {
-                1 if first <= 6 && first & 3 != 3 => ServiceOperation::Fault(FaultInfo {
+                1 if first <= 0xe && first & 3 != 3 => ServiceOperation::Fault(FaultInfo {
                     address: carrick_guest_arch::UserVa::new(
                         cell.words[11].load(Ordering::Relaxed),
                     ),
@@ -1772,7 +1774,12 @@ impl ServiceCell {
                         1 => Access::Write,
                         _ => Access::Execute,
                     },
-                    present: first & 4 != 0,
+                    cause: match first >> 2 {
+                        0 => FaultCause::Translation,
+                        1 => FaultCause::Permission,
+                        2 => FaultCause::Declined(SegvCause::Access),
+                        _ => FaultCause::Declined(SegvCause::Unmapped),
+                    },
                 }),
                 2 => ServiceOperation::Crossing {
                     ordinal: NativeOrdinal::new(first),
@@ -2203,7 +2210,8 @@ impl<P: Deref<Target = ServiceCell>> ServiceTicket<P> {
         slot.take_native_fault_selection(self)
     }
     pub fn complete_backing_fault(self) -> Result<(), (ServiceError, Self)> {
-        if !matches!(self.request().operation, ServiceOperation::Fault(fault) if !fault.present) {
+        if !matches!(self.request().operation, ServiceOperation::Fault(fault) if fault.cause.awaits_supply())
+        {
             return Err((ServiceError::Stale, self));
         }
         self.acknowledge(16, 0)
@@ -2326,7 +2334,13 @@ fn fault_bits(fault: FaultInfo) -> u64 {
         Access::Write => 1,
         Access::Execute => 2,
     };
-    access | (u64::from(fault.present) << 2)
+    let cause = match fault.cause {
+        FaultCause::Translation => 0,
+        FaultCause::Permission => 1,
+        FaultCause::Declined(SegvCause::Access) => 2,
+        FaultCause::Declined(SegvCause::Unmapped) => 3,
+    };
+    access | (cause << 2)
 }
 
 const FAILURE_TAG: u64 = 1 << 63;
@@ -2423,7 +2437,7 @@ mod tests {
         ServiceOperation::Fault(FaultInfo {
             address: UserVa::new(0x6000000fd8),
             access: Access::Write,
-            present: true,
+            cause: carrick_guest_arch::FaultCause::Permission,
         })
     }
 
@@ -3209,6 +3223,35 @@ mod tests {
         );
         assert_eq!(cell.rebind_exec_mm(old, old.mm), Err(ServiceError::Stale));
     }
+    /// Every fault cause crosses the service cell intact: the host and the
+    /// ring's resume read the declined cause, never a present bit (#3170).
+    #[test]
+    fn every_fault_cause_roundtrips_through_the_service_cell() {
+        use carrick_guest_arch::{FaultCause, SegvCause};
+        for cause in [
+            FaultCause::Translation,
+            FaultCause::Permission,
+            FaultCause::Declined(SegvCause::Access),
+            FaultCause::Declined(SegvCause::Unmapped),
+        ] {
+            for access in [Access::Read, Access::Write, Access::Execute] {
+                let cell = ServiceCell::new();
+                let birth = birth(1, 1);
+                cell.bind(birth).unwrap();
+                let operation = ServiceOperation::Fault(FaultInfo {
+                    address: UserVa::new(0x4000),
+                    access,
+                    cause,
+                });
+                let request = cell
+                    .publish(birth, SnapshotGeneration::INITIAL, operation, None)
+                    .unwrap();
+                let ticket = cell.claim(request).unwrap();
+                assert_eq!(ticket.request().operation, operation);
+                assert!(ticket.complete(false).is_ok());
+            }
+        }
+    }
     #[test]
     fn backing_reply_is_bound_to_the_claimed_request_phase() {
         let cell = ServiceCell::new();
@@ -3217,7 +3260,7 @@ mod tests {
         let operation = ServiceOperation::Fault(FaultInfo {
             address: UserVa::new(0x4000),
             access: Access::Read,
-            present: false,
+            cause: carrick_guest_arch::FaultCause::Translation,
         });
         let address = carrick_guest_arch::KernelVa::new(0x10000);
         let request = cell

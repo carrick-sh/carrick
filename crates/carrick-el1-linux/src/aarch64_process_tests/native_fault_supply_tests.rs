@@ -702,6 +702,7 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
                     &mut frame,
                     &fixture.task.linux,
                     Action::Forward,
+                    crate::cow_resolver::FaultExit::default(),
                     || arm_thread_group_owner(fixture.zone, &fixture.task, page),
                     &counters,
                 ),
@@ -3020,7 +3021,7 @@ fn composed_native_supply_with_prepared(
                             ServiceOperation::Fault(carrick_guest_arch::FaultInfo {
                                 address: UserVa::new(frame.far),
                                 access: carrick_guest_arch::Access::Write,
-                                present: true,
+                                cause: carrick_guest_arch::FaultCause::Permission,
                             }),
                             wait,
                         )
@@ -3144,7 +3145,7 @@ fn composed_native_supply_with_prepared(
     let fault = carrick_guest_arch::FaultInfo {
         address: UserVa::new(frame.far),
         access: carrick_guest_arch::Access::Write,
-        present: true,
+        cause: carrick_guest_arch::FaultCause::Permission,
     };
     assert!(matches!(
         with_process_entry(
@@ -3518,7 +3519,7 @@ fn composed_native_supply_with_prepared(
                         ServiceOperation::Fault(carrick_guest_arch::FaultInfo {
                             address: UserVa::new(frame.far),
                             access: carrick_guest_arch::Access::Write,
-                            present: false,
+                            cause: carrick_guest_arch::FaultCause::Translation,
                         }),
                         Some(window.operation.sequence),
                     )
@@ -4427,7 +4428,7 @@ fn arm_two_live_threads_wait_for_sibling_first_touch_publication() {
                     ServiceOperation::Fault(carrick_guest_arch::FaultInfo {
                         address: UserVa::new(frame.far),
                         access: carrick_guest_arch::Access::Write,
-                        present: false,
+                        cause: carrick_guest_arch::FaultCause::Translation,
                     }),
                     wait,
                 )

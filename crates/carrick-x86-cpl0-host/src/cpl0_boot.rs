@@ -2934,7 +2934,7 @@ mod forward_execution_tests {
                 ServiceOperation::Fault(FaultInfo {
                     address: UserVa::new(fault_va),
                     access: carrick_guest_arch::Access::Read,
-                    present: false,
+                    cause: carrick_guest_arch::FaultCause::Translation,
                 }),
                 Some(fault_seq),
                 Some(pod_va),
@@ -3297,7 +3297,7 @@ mod forward_execution_tests {
                     ServiceOperation::Fault(FaultInfo {
                         address: UserVa::new(fault_va),
                         access: carrick_guest_arch::Access::Read,
-                        present: false,
+                        cause: carrick_guest_arch::FaultCause::Translation,
                     }),
                     Some(fault_seq),
                     Some(pod_va),

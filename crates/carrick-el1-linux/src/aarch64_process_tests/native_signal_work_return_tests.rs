@@ -312,6 +312,7 @@ fn resident_signal_work_return(
             &mut frame,
             &fixture.task.linux,
             service_action,
+            crate::cow_resolver::FaultExit::default(),
         )
         .unwrap();
         if pending_only == Some(false) {

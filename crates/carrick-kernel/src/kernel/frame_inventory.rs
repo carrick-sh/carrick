@@ -4070,7 +4070,7 @@ mod physical_projection_tests {
                             ServiceOperation::Fault(carrick_guest_arch::FaultInfo {
                                 address: carrick_guest_arch::UserVa::new(0x4000),
                                 access: carrick_guest_arch::Access::Write,
-                                present: false,
+                                cause: carrick_guest_arch::FaultCause::Translation,
                             }),
                             None,
                         )

@@ -80,9 +80,9 @@ pub(crate) fn fault_refused(
     task: carrick_sched_core::process::TaskKey,
 ) {
     emit(format_args!(
-        "fault-refused far={:#x} present={} access={:?} {task}",
+        "fault-refused far={:#x} cause={:?} access={:?} {task}",
         fault.address.raw(),
-        fault.present,
+        fault.cause,
         fault.access,
     ));
 }

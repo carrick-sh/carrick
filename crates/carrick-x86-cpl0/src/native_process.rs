@@ -877,7 +877,7 @@ impl NativeProcessService<'static, ParkedContextWords> for Service {
             carrick_guest_arch::FaultInfo {
                 address,
                 access: carrick_guest_arch::Access::Write,
-                present: false,
+                cause: carrick_guest_arch::FaultCause::Translation,
             },
             NonZeroU64::new(sequence)?,
         ))

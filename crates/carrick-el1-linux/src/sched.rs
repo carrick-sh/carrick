@@ -59,7 +59,7 @@ impl ThreadCpu for HardwareCpu {
         super::dispatch::capture_native_service_exit(
             frame,
             action,
-            None,
+            super::cow_resolver::FaultExit::default(),
             super::dispatch::StagedRingRecord::none(),
             counters,
         )

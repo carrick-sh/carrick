@@ -886,7 +886,7 @@ impl Personality for FixturePersonality {
                     FaultInfo {
                         address: UserVa::new(0x3_3000),
                         access: Access::Read,
-                        present: false,
+                        cause: carrick_guest_arch::FaultCause::Translation,
                     },
                     counters,
                     task,
@@ -1027,7 +1027,7 @@ impl Personality for FixturePersonality {
                     FaultInfo {
                         address: UserVa::new(0x3_4000),
                         access: Access::Write,
-                        present: true,
+                        cause: carrick_guest_arch::FaultCause::Permission,
                     },
                     counters,
                     task,
@@ -1469,7 +1469,7 @@ fn shared_large_cow_fault(counters: &Counters, task: &CurrentTask) -> bool {
         FaultInfo {
             address: UserVa::new(FAR),
             access: Access::Write,
-            present: true,
+            cause: carrick_guest_arch::FaultCause::Permission,
         },
         counters,
         task,

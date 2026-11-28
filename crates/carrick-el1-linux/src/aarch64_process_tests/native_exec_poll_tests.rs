@@ -670,7 +670,7 @@ fn run_arm_fork_exec_child_socket_poll(become_ready: bool) {
             frame,
             &fixture.task,
             carrick_el1_abi::Action::Forward,
-            None,
+            crate::cow_resolver::FaultExit::default(),
             counters,
             || crate::native_process_runtime::NativeThreadGroupOwner::ForkChild,
             |frame| {

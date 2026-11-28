@@ -2120,20 +2120,35 @@ fn mounted_static_x86_host_file_reads_into_fresh_maps_beside_a_vfork() {
 /// `SEGV_MAPERR` (exit 94).
 #[test]
 fn mounted_static_x86_first_write_to_a_read_only_file_map_is_an_access_error() {
+    first_write_segv_code_matches_native(&[], "94 is SEGV_MAPERR where Linux gives SEGV_ACCERR");
+}
+
+/// #3170: the shared policy's cause decides the `si_code` of every declined
+/// fault. A write into the page unmapped between two anonymous maps is
+/// `SEGV_MAPERR` at the written byte, as Linux answers: no mapping covers it.
+#[test]
+fn mounted_static_x86_write_to_a_hole_between_maps_is_a_map_error() {
+    first_write_segv_code_matches_native(
+        &["-DHOLE"],
+        "94 is SEGV_ACCERR where Linux gives SEGV_MAPERR",
+    );
+}
+
+/// Run `x86_write_readonly_file_map.c` (with `defines`) natively and in the
+/// guest; both must take the expected SIGSEGV (exit 7).
+fn first_write_segv_code_matches_native(defines: &[&str], wrong: &str) {
     if skip_without_kvm() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
     let elf = dir.path().join("write-readonly-file-map");
-    compile_assembly_with_flags(
-        "x86_write_readonly_file_map.c",
-        &elf,
-        &[
-            "-fno-stack-protector",
-            "-fno-asynchronous-unwind-tables",
-            "-O1",
-        ],
-    );
+    let mut flags = vec![
+        "-fno-stack-protector",
+        "-fno-asynchronous-unwind-tables",
+        "-O1",
+    ];
+    flags.extend_from_slice(defines);
+    compile_assembly_with_flags("x86_write_readonly_file_map.c", &elf, &flags);
     let native = Command::new(&elf)
         .timeout(Duration::from_secs(10))
         .output()
@@ -2144,7 +2159,7 @@ fn mounted_static_x86_first_write_to_a_read_only_file_map_is_an_access_error() {
     assert_eq!(
         guest.status.code(),
         native.status.code(),
-        "94 is SEGV_MAPERR where Linux gives SEGV_ACCERR; 93 the write landed; \
+        "{wrong}; 93 the write landed; \
          95 another si_code; 96 a wrong si_addr; 90-92 setup. Stdout: {} Stderr: {}",
         String::from_utf8_lossy(&guest.stdout),
         String::from_utf8_lossy(&guest.stderr)

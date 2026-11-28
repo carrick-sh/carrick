@@ -2830,7 +2830,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 }
             });
         let mut reply = match operation {
-            ServiceOperation::Fault(fault) if !fault.present && fault_sequence.is_some() => {
+            ServiceOperation::Fault(fault)
+                if fault.cause.awaits_supply() && fault_sequence.is_some() =>
+            {
                 Some(PendingServiceReply::Fault(
                     FallibleBox::<carrick_el1_abi::PortalGrantSlot>::try_reserve()?.zeroed(),
                 ))
@@ -5352,11 +5354,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                             carrick_signal_core::SignalSet::from_bits(self.control.blocked().0),
                         ),
                         carrick_syscall_abi::LinuxSiginfo {
-                            si_code: if fault.present {
-                                carrick_syscall_abi::LINUX_SEGV_ACCERR
-                            } else {
-                                carrick_syscall_abi::LINUX_SEGV_MAPERR
-                            },
+                            si_code: crate::cow_resolver::segv_code(fault.cause.segv()),
                             si_addr: fault.address.raw(),
                             ..carrick_syscall_abi::LinuxSiginfo::empty()
                         },

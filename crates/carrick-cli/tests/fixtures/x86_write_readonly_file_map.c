@@ -7,6 +7,11 @@
 // first touch is the write, so the fault is a first-touch (translation)
 // fault, not a protection fault on a resident page.
 //
+// Built with -DHOLE it writes instead into the page unmapped between two
+// anonymous maps (three pages mapped, the middle one unmapped again). Linux
+// answers SEGV_MAPERR (1) there: no mapping covers the page. The exit codes
+// below then name SEGV_ACCERR as the wrong answer (94), and 7 is MAPERR.
+//
 // Exit status names the first step that differs from Linux:
 //   90 open failed   91 mmap failed   92 rt_sigaction failed
 //   93 the write landed (no signal)
@@ -56,20 +61,37 @@ static __attribute__((noreturn)) void finish(long code) {
     for (;;) sc(231, code, 0, 0, 0, 0, 0); // exit_group
 }
 
+#ifdef HOLE
+#define EXPECTED_CODE 1
+#define WRONG_CODE 2
+#else
+#define EXPECTED_CODE 2
+#define WRONG_CODE 1
+#endif
+
 static void handler(int sig, struct linux_siginfo *info, void *uc) {
     if (sig != SIGSEGV || !info || !uc || info->si_signo != SIGSEGV) finish(97);
-    if (info->si_code == 1) finish(94);
-    if (info->si_code != 2) finish(95);
+    if (info->si_code == WRONG_CODE) finish(94);
+    if (info->si_code != EXPECTED_CODE) finish(95);
     if (info->si_addr != (void *)target) finish(96);
     finish(7);
 }
 
 __attribute__((noreturn, used)) void start_c(long *sp) {
+#ifdef HOLE
+    (void)sp;
+    // PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS.
+    long map = sc(9, 0, 3 * 4096, 3, MAP_PRIVATE | 0x20, -1, 0); // mmap
+    if (map < 0 && map > -4096) finish(91);
+    map += 4096;
+    if (sc(11, map, 4096, 0, 0, 0, 0) != 0) finish(90); // munmap the middle
+#else
     const char *self = (const char *)sp[1]; // argv[0]
     long fd = sc(257, AT_FDCWD, (long)self, 0 /* O_RDONLY */, 0, 0, 0); // openat
     if (fd < 0) finish(90);
     long map = sc(9, 0, 4096, PROT_READ, MAP_PRIVATE, fd, 0); // mmap
     if (map < 0 && map > -4096) finish(91);
+#endif
     struct kernel_sigaction action = {
         (void *)handler,
         SA_SIGINFO | SA_RESTORER,
