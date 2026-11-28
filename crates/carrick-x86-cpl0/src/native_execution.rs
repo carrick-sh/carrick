@@ -47,367 +47,285 @@ pub fn schedule(slot: SlotId) -> ! {
     crate::test_support::release_fork_cow_editor_on_park(source);
     settle_current_work(current);
     'schedule: loop {
-        // Drain any APIC timer or reschedule vector latched while IF was masked
-        // on the outgoing thread before selecting and preparing the next one;
-        // xAPIC IA32_TSC_DEADLINE latches IRR on expiry and WRMSR(0) does not
-        // clear an already-pending IRR bit.
-        //
-        // The drain comes before every condition this pass reads (#3053), as
-        // ARM's idle pass takes its interrupts first. A reschedule vector
-        // carries no state of its own: its sender publishes the condition,
-        // then sends it. Read before the drain, a condition published after
-        // that read had its vector consumed here, and the HLT below slept
-        // past it. Read after, the condition is either visible to this pass
-        // or its vector is still pending at the `sti; hlt`, which then
-        // returns at once.
-        unsafe {
-            core::arch::asm!("sti", "nop", "cli", options(nomem, nostack));
+        // One neutral idle pass (#3061): drain, read, publish IdleWfi,
+        // recheck the durable words, halt. The switch-in tail below is this
+        // venue's own.
+        let mut venue = X86Idle {
+            source,
+            slot,
+            current,
+            deadline: None,
+        };
+        let selected = match carrick_sched_core::idle_pass(source.zone, slot, &mut venue) {
+            carrick_sched_core::IdlePass::Took(selected) => selected,
+            carrick_sched_core::IdlePass::Again => continue,
+            // This venue never leaves for a host: it has no executor.
+            carrick_sched_core::IdlePass::Leave(_) => fatal_boot!(),
+        };
+        let record = source.zone.record_ref(selected.record);
+        if let Ok(now) = carrick_guest_arch::InterruptBackend::counter(&mut x86::X86Backend) {
+            source.zone.cpu_bind_record(slot, record, now);
         }
-        // Each pass is a delivery point for the reschedule IPIs this CPU
-        // owes after a busy ICR (#3083); the HLT below never sleeps owing one.
-        let _ = carrick_el1::isa::x86::interrupt::deliver_owed_resched(
-            carrick_el1::isa::x86::interrupt::DeliveryPoint::Idle,
-        );
-        #[cfg(feature = "test-support")]
-        crate::test_support::hold_idle_scan(slot);
-        #[cfg(feature = "test-support")]
-        if crate::test_support::peer_release_pending(slot) {
-            crate::anonymous::release_injected_edit_wait(source, current);
-        }
-        #[cfg(feature = "test-support")]
-        crate::test_support::lower_injected_gate(source, slot);
-        expire_timers(slot);
-        #[cfg(feature = "test-support")]
-        crate::test_support::order_after_idle_read(slot, current);
-        // An idle scan's lock releases can owe other idle CPUs a pass (#3083).
-        let passes = carrick_sched_core::OwedPasses::new();
-        let selected = source.zone.take_idle_work(slot, &passes);
-        carrick_el1::substrate::sched::object_wait::deliver_owed_passes(source.zone, slot, passes);
-        if let Some(selected) = selected {
-            source.zone.leave_idle(slot);
-            let record = source.zone.record_ref(selected.record);
+        let runtime = native_process::runtime_for_record(source.zone, record);
+        // SAFETY: switch_in_full transferred this exact record to this slot.
+        let Some(mut state) = (unsafe { runtime.record_binding(record) }) else {
             if let Ok(now) = carrick_guest_arch::InterruptBackend::counter(&mut x86::X86Backend) {
-                source.zone.cpu_bind_record(slot, record, now);
+                source.zone.cpu_leave_slot(slot, now);
             }
-            let runtime = native_process::runtime_for_record(source.zone, record);
-            // SAFETY: switch_in_full transferred this exact record to this slot.
-            let Some(mut state) = (unsafe { runtime.record_binding(record) }) else {
-                if let Ok(now) = carrick_guest_arch::InterruptBackend::counter(&mut x86::X86Backend)
-                {
-                    source.zone.cpu_leave_slot(slot, now);
-                }
-                source.zone.clear_current(slot);
-                continue;
-            };
-            let identity = source.zone.record(selected.record).identity();
-            #[cfg(feature = "test-support")]
-            crate::test_support::raise_gate_at_switch_in(
-                source,
-                selected,
-                state.address.mm.raw().get(),
-            );
-            // Resuming the MM already installed here needs no detour through
-            // the maintenance root (the context install reloads CR3 once).
-            let mm_raw = state.address.mm.raw().get();
-            if source.zone.installed_space(slot) != mm_raw {
-                leave_space(source);
+            source.zone.clear_current(slot);
+            continue;
+        };
+        let identity = source.zone.record(selected.record).identity();
+        #[cfg(feature = "test-support")]
+        crate::test_support::raise_gate_at_switch_in(
+            source,
+            selected,
+            state.address.mm.raw().get(),
+        );
+        // Resuming the MM already installed here needs no detour through
+        // the maintenance root (the context install reloads CR3 once).
+        let mm_raw = state.address.mm.raw().get();
+        if source.zone.installed_space(slot) != mm_raw {
+            leave_space(source);
+        }
+        // A raised Gate (the host's exclusion of this MM) refuses the
+        // install: this is "not now". The record's wait is already over,
+        // so it parks on the Gate's release keeping everything it resumes
+        // with, and its next switch-in resumes as this one would have.
+        while source.zone.install_space(slot, mm_raw).is_none() {
+            match park_on_gate(source, slot, selected.record, mm_raw) {
+                RetainedDeferral::Parked => continue 'schedule,
+                RetainedDeferral::Rerun => {}
+                RetainedDeferral::Refused => fatal_boot!(),
             }
-            // A raised Gate (the host's exclusion of this MM) refuses the
-            // install: this is "not now". The record's wait is already over,
-            // so it parks on the Gate's release keeping everything it resumes
-            // with, and its next switch-in resumes as this one would have.
-            while source.zone.install_space(slot, mm_raw).is_none() {
-                match park_on_gate(source, slot, selected.record, mm_raw) {
-                    RetainedDeferral::Parked => continue 'schedule,
-                    RetainedDeferral::Rerun => {}
-                    RetainedDeferral::Refused => fatal_boot!(),
-                }
-            }
-            settle_current_work(current);
-            current.set(
-                carrick_el1_abi::El1TaskId::from_linux_tid(
-                    i32::try_from(identity.tid).unwrap_or_else(|_| fatal_boot!()),
-                ),
-                carrick_el1_abi::SnapshotGeneration::from_raw(identity.generation),
-                identity.file_table,
-            );
-            current
-                .mm
-                .key
-                .store(state.address.mm.raw().get(), Ordering::Release);
-            current
-                .mm
-                .thread_generation
-                .store(identity.serial, Ordering::Release);
-            current.publish_visible_pid(state.visible_pid);
-            current.publish_lifecycle(identity.lifecycle_page, identity.control_slot);
-            if x86::X86Backend.install_context(state.address).is_err() {
-                fatal_boot!();
-            }
-            let mut words = state.words;
-            #[cfg(feature = "test-support")]
-            crate::test_support::observe_resumed_position(&words);
-            let mut service = native_process::Service::new(current, slot);
-            native_process::drain_external_ingress(source, &mut service)
+        }
+        settle_current_work(current);
+        current.set(
+            carrick_el1_abi::El1TaskId::from_linux_tid(
+                i32::try_from(identity.tid).unwrap_or_else(|_| fatal_boot!()),
+            ),
+            carrick_el1_abi::SnapshotGeneration::from_raw(identity.generation),
+            identity.file_table,
+        );
+        current
+            .mm
+            .key
+            .store(state.address.mm.raw().get(), Ordering::Release);
+        current
+            .mm
+            .thread_generation
+            .store(identity.serial, Ordering::Release);
+        current.publish_visible_pid(state.visible_pid);
+        current.publish_lifecycle(identity.lifecycle_page, identity.control_slot);
+        if x86::X86Backend.install_context(state.address).is_err() {
+            fatal_boot!();
+        }
+        let mut words = state.words;
+        #[cfg(feature = "test-support")]
+        crate::test_support::observe_resumed_position(&words);
+        let mut service = native_process::Service::new(current, slot);
+        native_process::drain_external_ingress(source, &mut service)
+            .unwrap_or_else(|_| fatal_boot!());
+        let mut suspended = false;
+        {
+            let _copy_gate = user_fault_gate::install();
+            let mut entry = runtime
+                .enter_registered(
+                    native_process::registry(),
+                    source,
+                    current,
+                    state.address,
+                    &words,
+                    &mut service,
+                )
                 .unwrap_or_else(|_| fatal_boot!());
-            let mut suspended = false;
-            {
-                let _copy_gate = user_fault_gate::install();
-                let mut entry = runtime
-                    .enter_registered(
-                        native_process::registry(),
-                        source,
-                        current,
-                        state.address,
-                        &words,
-                        &mut service,
-                    )
-                    .unwrap_or_else(|_| fatal_boot!());
-                match entry
-                    .resume_checkpoint(|entry| {
-                        use carrick_el1_linux::native_process_runtime::{
-                            NativeFailure, NativeResume,
-                        };
-                        let position =
-                            entry.resume_context().saved_syscall_pc().ok_or_else(|| {
+            match entry
+                .resume_checkpoint(|entry| {
+                    use carrick_el1_linux::native_process_runtime::{NativeFailure, NativeResume};
+                    let position = entry.resume_context().saved_syscall_pc().ok_or_else(|| {
+                        NativeFailure::Quarantined.run_failure_reason().at_caller()
+                    })?;
+                    let native =
+                        context::context_words::into_native(*entry.resume_context(), state.address)
+                            .map_err(|_| {
                                 NativeFailure::Quarantined.run_failure_reason().at_caller()
                             })?;
-                        let native = context::context_words::into_native(
-                            *entry.resume_context(),
-                            state.address,
-                        )
-                        .map_err(|_| NativeFailure::Quarantined.run_failure_reason().at_caller())?;
-                        let mut frame = context::context_words::syscall_frame_from_native(
-                            &native,
-                            state.address,
-                            position,
-                        )
-                        .map_err(|_| NativeFailure::Quarantined.run_failure_reason().at_caller())?;
-                        let mut machine =
-                            crate::linux_personality::X86SignalMachine::new(state.address);
-                        match deliver_signal_on_syscall_return(
-                            current,
-                            entry,
-                            &mut frame,
-                            &native.xsave,
-                            &mut machine,
-                        ) {
-                            None => {
-                                *entry.resume_context_mut() = context::context_words::from_native(
-                                    &context::context_words::from_syscall(
-                                        &frame,
-                                        state.address,
-                                        native.fs_base,
-                                        native.gs_base,
-                                        &native.xsave,
-                                    )
-                                    .map_err(|_| {
-                                        NativeFailure::Quarantined.run_failure_reason().at_caller()
-                                    })?,
-                                    carrick_guest_arch::SyscallReturnFrame::syscall_position(
-                                        &frame,
-                                    )
-                                    .ok_or_else(|| {
-                                        NativeFailure::Quarantined.run_failure_reason().at_caller()
-                                    })?,
-                                );
-                                Ok(None)
-                            }
-                            Some(
-                                carrick_el1_linux::signal_delivery::SignalReturnRoute::Suspended,
-                            ) => Ok(Some(NativeResume::Left(entry.take_root_exit()))),
-                            Some(_) => {
-                                Err(NativeFailure::Quarantined.run_failure_reason().at_caller())
-                            }
-                        }
-                    })
-                    .unwrap_or_else(|reason| complete_run_failure(current, reason))
-                {
-                    carrick_el1_linux::native_process_runtime::NativeResume::Returned(result) => {
-                        words.set_syscall_return(result.raw() as u64)
-                    }
-                    carrick_el1_linux::native_process_runtime::NativeResume::Left(root_exit) => {
-                        if let Ok(now) =
-                            carrick_guest_arch::InterruptBackend::counter(&mut x86::X86Backend)
-                        {
-                            source.zone.cpu_leave_slot(slot, now);
-                        }
-                        if let Some(status) = root_exit {
-                            publish_root_exit(current, status.to_termination_status());
-                        }
-                        #[cfg(feature = "test-support")]
-                        crate::anonymous::release_injected_edit_wait(source, current);
-                        settle_current_work(current);
-                        leave_space(source);
-                        continue;
-                    }
-                    carrick_el1_linux::native_process_runtime::NativeResume::NoPending => {
-                        // SAFETY: switch_in_full still gives this slot the
-                        // exact record; a resumed fault/metadata wait clears
-                        // its token here and preserves user RAX.
-                        let metadata_resume = unsafe {
-                            source
-                                .zone
-                                .record(selected.record)
-                                .consume_metadata_operation()
-                        };
-                        // SAFETY: switch_in_full still gives this slot the
-                        // exact record; its exec commit rewrote the context.
-                        match unsafe { runtime.record_binding(record) } {
-                            // A committed exec replaced the record's image:
-                            // enter the successor's saved entry state on
-                            // its own address space. The predecessor's
-                            // syscall has no return word.
-                            Some(replaced) if replaced.address != state.address => {
-                                if x86::X86Backend.install_context(replaced.address).is_err() {
-                                    fatal_boot!();
-                                }
-                                words = replaced.words;
-                                state = replaced;
-                            }
-                            Some(_) => {
-                                if !metadata_resume && let Some(result) = selected.result {
-                                    words.set_syscall_return(result);
-                                }
-                            }
-                            None => fatal_boot!(),
-                        }
-                    }
-                    // A typed saved retry already names its x86 syscall
-                    // instruction; the parked context needs no further edit.
-                    carrick_el1_linux::native_process_runtime::NativeResume::RetrySavedSyscall => {}
-                    // Preparation completed without generating entropy. Re-enter
-                    // the saved x86 SYSCALL with its original arguments. The
-                    // context records the rewind, so a preemption before the
-                    // instruction runs cannot have it rewound again (#2851).
-                    carrick_el1_linux::native_process_runtime::NativeResume::RetrySyscall => {
-                        carrick_guest_arch::ProcessContext::restart_syscall(&mut words);
-                    }
-                    carrick_el1_linux::native_process_runtime::NativeResume::Invalid => {
-                        fatal_boot!()
-                    }
-                }
-                if !suspended {
-                    let position = words.saved_syscall_pc().unwrap_or_else(|| fatal_boot!());
-                    let native = context::context_words::into_native(words, state.address)
-                        .unwrap_or_else(|_| fatal_boot!());
                     let mut frame = context::context_words::syscall_frame_from_native(
                         &native,
                         state.address,
                         position,
                     )
-                    .unwrap_or_else(|_| fatal_boot!());
+                    .map_err(|_| NativeFailure::Quarantined.run_failure_reason().at_caller())?;
                     let mut machine =
                         crate::linux_personality::X86SignalMachine::new(state.address);
-                    if let Some(route) = deliver_signal_on_syscall_return(
+                    match deliver_signal_on_syscall_return(
                         current,
-                        &mut entry,
+                        entry,
                         &mut frame,
                         &native.xsave,
                         &mut machine,
                     ) {
-                        match route {
-                            carrick_el1_linux::signal_delivery::SignalReturnRoute::Suspended => {
-                                suspended = true
-                            }
-                            refused => fatal_boot!(refused),
+                        None => {
+                            *entry.resume_context_mut() = context::context_words::from_native(
+                                &context::context_words::from_syscall(
+                                    &frame,
+                                    state.address,
+                                    native.fs_base,
+                                    native.gs_base,
+                                    &native.xsave,
+                                )
+                                .map_err(|_| {
+                                    NativeFailure::Quarantined.run_failure_reason().at_caller()
+                                })?,
+                                carrick_guest_arch::SyscallReturnFrame::syscall_position(&frame)
+                                    .ok_or_else(|| {
+                                        NativeFailure::Quarantined.run_failure_reason().at_caller()
+                                    })?,
+                            );
+                            Ok(None)
                         }
+                        Some(carrick_el1_linux::signal_delivery::SignalReturnRoute::Suspended) => {
+                            Ok(Some(NativeResume::Left(entry.take_root_exit())))
+                        }
+                        Some(_) => Err(NativeFailure::Quarantined.run_failure_reason().at_caller()),
                     }
-                    words = context::context_words::from_native(
-                        &context::context_words::from_syscall(
-                            &frame,
-                            state.address,
-                            native.fs_base,
-                            native.gs_base,
-                            &native.xsave,
-                        )
-                        .unwrap_or_else(|_| fatal_boot!()),
-                        carrick_guest_arch::SyscallReturnFrame::syscall_position(&frame)
-                            .unwrap_or_else(|| fatal_boot!()),
-                    );
+                })
+                .unwrap_or_else(|reason| complete_run_failure(current, reason))
+            {
+                carrick_el1_linux::native_process_runtime::NativeResume::Returned(result) => {
+                    words.set_syscall_return(result.raw() as u64)
                 }
-                if let Some(status) = entry.take_root_exit() {
-                    complete_root_exit(current, status);
-                }
-            }
-            if suspended {
-                if let Ok(now) = carrick_guest_arch::InterruptBackend::counter(&mut x86::X86Backend)
-                {
-                    source.zone.cpu_leave_slot(slot, now);
-                }
-                #[cfg(feature = "test-support")]
-                crate::anonymous::release_injected_edit_wait(source, current);
-                settle_current_work(current);
-                continue;
-            }
-            carrick_x86_carrier::native_execution::migrate(slot);
-            let zone = source.zone;
-            match unsafe {
-                context::resume_parked(words, state.address, || {
+                carrick_el1_linux::native_process_runtime::NativeResume::Left(root_exit) => {
                     if let Ok(now) =
                         carrick_guest_arch::InterruptBackend::counter(&mut x86::X86Backend)
                     {
-                        zone.cpu_enter_user(slot, Some(record), now);
+                        source.zone.cpu_leave_slot(slot, now);
                     }
-                    arm_slice(zone, slot);
-                    // The return to user is the last-chance delivery point
-                    // (#3083): the migration's kicks above may have owed an
-                    // IPI, and a still-busy ICR is waited out here.
-                    carrick_el1::isa::x86::interrupt::deliver_owed_resched_before_user(
-                        carrick_el1::isa::x86::interrupt::UserReturn::Resume,
-                    );
-                })
-            } {
-                Ok(never) => match never {},
-                Err(_) => fatal_boot!(),
-            }
-        }
-        if let Ok(now) = carrick_guest_arch::InterruptBackend::counter(&mut x86::X86Backend) {
-            source.zone.cpu_leave_slot(slot, now);
-        }
-        settle_current_work(current);
-        leave_space(source);
-        let dl = source.zone.timer_deadline(slot);
-        if let Some(dl) = dl {
-            use carrick_guest_arch::{CounterTick, Deadline, InterruptBackend};
-            let _ =
-                carrick_el1::isa::x86::X86Backend.arm_timer(Some(Deadline(CounterTick::new(dl))));
-        }
-        // Send what the idle entry's lock release owes (#3083) before the
-        // pre-HLT recheck, as ARM sends it before its pre-WFI recheck.
-        let passes = carrick_sched_core::OwedPasses::new();
-        let idle = source.zone.enter_idle(slot, true, &passes);
-        carrick_el1::substrate::sched::object_wait::deliver_owed_passes(source.zone, slot, passes);
-        if idle {
-            #[cfg(feature = "test-support")]
-            crate::test_support::order_before_idle_hlt(slot, current);
-            // The slot is IdleWfi: a waker that queues here from now on sends
-            // a vector, which stays pending in the IRR. Work announced before
-            // it only by a durable word (host work published on this CPU while
-            // it was stopped in a crossing, an owed reschedule) has no such
-            // vector, so recheck those words before HLT (#3053), as ARM does
-            // before WFI. A pass that finds one runs again and settles it.
-            // A reschedule IPI this CPU still owes another (its ICR was
-            // busy, #3083) is resent here; one still busy keeps this CPU
-            // awake for another pass, so it never sleeps owing a wake.
-            if !carrick_el1::substrate::sched::idle_wake_owed(current, source.zone, slot)
-                && carrick_el1::isa::x86::interrupt::deliver_owed_resched(
-                    carrick_el1::isa::x86::interrupt::DeliveryPoint::Idle,
-                )
-            {
-                #[cfg(feature = "test-support")]
-                crate::test_support::park_after_idle_recheck(slot);
-                #[cfg(feature = "test-support")]
-                crate::test_support::order_after_idle_recheck(slot, current);
-                unsafe {
-                    core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
+                    if let Some(status) = root_exit {
+                        publish_root_exit(current, status.to_termination_status());
+                    }
+                    #[cfg(feature = "test-support")]
+                    crate::anonymous::release_injected_edit_wait(source, current);
+                    settle_current_work(current);
+                    leave_space(source);
+                    continue;
+                }
+                carrick_el1_linux::native_process_runtime::NativeResume::NoPending => {
+                    // SAFETY: switch_in_full still gives this slot the
+                    // exact record; a resumed fault/metadata wait clears
+                    // its token here and preserves user RAX.
+                    let metadata_resume = unsafe {
+                        source
+                            .zone
+                            .record(selected.record)
+                            .consume_metadata_operation()
+                    };
+                    // SAFETY: switch_in_full still gives this slot the
+                    // exact record; its exec commit rewrote the context.
+                    match unsafe { runtime.record_binding(record) } {
+                        // A committed exec replaced the record's image:
+                        // enter the successor's saved entry state on
+                        // its own address space. The predecessor's
+                        // syscall has no return word.
+                        Some(replaced) if replaced.address != state.address => {
+                            if x86::X86Backend.install_context(replaced.address).is_err() {
+                                fatal_boot!();
+                            }
+                            words = replaced.words;
+                            state = replaced;
+                        }
+                        Some(_) => {
+                            if !metadata_resume && let Some(result) = selected.result {
+                                words.set_syscall_return(result);
+                            }
+                        }
+                        None => fatal_boot!(),
+                    }
+                }
+                // A typed saved retry already names its x86 syscall
+                // instruction; the parked context needs no further edit.
+                carrick_el1_linux::native_process_runtime::NativeResume::RetrySavedSyscall => {}
+                // Preparation completed without generating entropy. Re-enter
+                // the saved x86 SYSCALL with its original arguments. The
+                // context records the rewind, so a preemption before the
+                // instruction runs cannot have it rewound again (#2851).
+                carrick_el1_linux::native_process_runtime::NativeResume::RetrySyscall => {
+                    carrick_guest_arch::ProcessContext::restart_syscall(&mut words);
+                }
+                carrick_el1_linux::native_process_runtime::NativeResume::Invalid => {
+                    fatal_boot!()
                 }
             }
-            source.zone.leave_idle(slot);
+            if !suspended {
+                let position = words.saved_syscall_pc().unwrap_or_else(|| fatal_boot!());
+                let native = context::context_words::into_native(words, state.address)
+                    .unwrap_or_else(|_| fatal_boot!());
+                let mut frame = context::context_words::syscall_frame_from_native(
+                    &native,
+                    state.address,
+                    position,
+                )
+                .unwrap_or_else(|_| fatal_boot!());
+                let mut machine = crate::linux_personality::X86SignalMachine::new(state.address);
+                if let Some(route) = deliver_signal_on_syscall_return(
+                    current,
+                    &mut entry,
+                    &mut frame,
+                    &native.xsave,
+                    &mut machine,
+                ) {
+                    match route {
+                        carrick_el1_linux::signal_delivery::SignalReturnRoute::Suspended => {
+                            suspended = true
+                        }
+                        refused => fatal_boot!(refused),
+                    }
+                }
+                words = context::context_words::from_native(
+                    &context::context_words::from_syscall(
+                        &frame,
+                        state.address,
+                        native.fs_base,
+                        native.gs_base,
+                        &native.xsave,
+                    )
+                    .unwrap_or_else(|_| fatal_boot!()),
+                    carrick_guest_arch::SyscallReturnFrame::syscall_position(&frame)
+                        .unwrap_or_else(|| fatal_boot!()),
+                );
+            }
+            if let Some(status) = entry.take_root_exit() {
+                complete_root_exit(current, status);
+            }
         }
-        if dl.is_some() {
-            use carrick_guest_arch::InterruptBackend;
-            let _ = carrick_el1::isa::x86::X86Backend.arm_timer(None);
+        if suspended {
+            if let Ok(now) = carrick_guest_arch::InterruptBackend::counter(&mut x86::X86Backend) {
+                source.zone.cpu_leave_slot(slot, now);
+            }
+            #[cfg(feature = "test-support")]
+            crate::anonymous::release_injected_edit_wait(source, current);
+            settle_current_work(current);
+            continue;
+        }
+        carrick_x86_carrier::native_execution::migrate(slot);
+        let zone = source.zone;
+        match unsafe {
+            context::resume_parked(words, state.address, || {
+                if let Ok(now) = carrick_guest_arch::InterruptBackend::counter(&mut x86::X86Backend)
+                {
+                    zone.cpu_enter_user(slot, Some(record), now);
+                }
+                arm_slice(zone, slot);
+                // The return to user is the last-chance delivery point
+                // (#3083): the migration's kicks above may have owed an
+                // IPI, and a still-busy ICR is waited out here.
+                carrick_el1::isa::x86::interrupt::deliver_owed_resched_before_user(
+                    carrick_el1::isa::x86::interrupt::UserReturn::Resume,
+                );
+            })
+        } {
+            Ok(never) => match never {},
+            Err(_) => fatal_boot!(),
         }
     }
 }
@@ -420,6 +338,132 @@ fn settle_current_work(current: &carrick_el1_abi::CurrentTask) {
         || current.linux.has_pending_host_work(),
         || notify_work(&NativeFrame::default()),
     );
+}
+
+/// The CPL0 mechanics of one neutral idle pass ([`carrick_sched_core::idle_pass`]).
+struct X86Idle {
+    source: carrick_el1_abi::BornInZoneSource<'static, carrick_sched_core::ParkedContextWords>,
+    slot: SlotId,
+    current: &'static carrick_el1_abi::CurrentTask,
+    /// The timed park's deadline armed for this pass's sleep, if any.
+    deadline: Option<u64>,
+}
+
+impl carrick_sched_core::IdleVenue for X86Idle {
+    fn drain(&mut self) {
+        // Drain any APIC timer or reschedule vector latched while IF was
+        // masked on the outgoing thread before selecting and preparing the
+        // next one; xAPIC IA32_TSC_DEADLINE latches IRR on expiry and
+        // WRMSR(0) does not clear an already-pending IRR bit.
+        unsafe {
+            core::arch::asm!("sti", "nop", "cli", options(nomem, nostack));
+        }
+        // Each pass is a delivery point for the reschedule IPIs this CPU
+        // owes after a busy ICR (#3083); the HLT never sleeps owing one.
+        let _ = carrick_el1::isa::x86::interrupt::deliver_owed_resched(
+            carrick_el1::isa::x86::interrupt::DeliveryPoint::Idle,
+        );
+    }
+
+    fn leaves_for_host(&mut self) -> bool {
+        false
+    }
+
+    fn expire_timers(&mut self) {
+        expire_timers(self.slot);
+    }
+
+    fn deliver(&mut self, passes: carrick_sched_core::OwedPasses) {
+        carrick_el1::substrate::sched::object_wait::deliver_owed_passes(
+            self.source.zone,
+            self.slot,
+            passes,
+        );
+    }
+
+    fn leaves_for_executor(&self) -> bool {
+        false
+    }
+
+    fn keep_polling(&mut self) -> bool {
+        false
+    }
+
+    fn prepare_sleep(&mut self) {
+        let (source, slot) = (self.source, self.slot);
+        if let Ok(now) = carrick_guest_arch::InterruptBackend::counter(&mut x86::X86Backend) {
+            source.zone.cpu_leave_slot(slot, now);
+        }
+        settle_current_work(self.current);
+        leave_space(source);
+        self.deadline = source.zone.timer_deadline(slot);
+        if let Some(dl) = self.deadline {
+            use carrick_guest_arch::{CounterTick, Deadline, InterruptBackend};
+            let _ =
+                carrick_el1::isa::x86::X86Backend.arm_timer(Some(Deadline(CounterTick::new(dl))));
+        }
+    }
+
+    fn sleep_published(&mut self) {}
+
+    fn recheck_refuses(&mut self) -> bool {
+        false
+    }
+
+    fn host_work_pending(&self) -> bool {
+        self.current.linux.has_pending_host_work()
+    }
+
+    fn owed_kicks_sent(&mut self) -> bool {
+        // A reschedule IPI this CPU still owes another (its ICR was busy,
+        // #3083) is resent here; one still busy keeps this CPU awake.
+        carrick_el1::isa::x86::interrupt::deliver_owed_resched(
+            carrick_el1::isa::x86::interrupt::DeliveryPoint::Idle,
+        )
+    }
+
+    fn halt(&mut self) {
+        unsafe {
+            core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
+        }
+    }
+
+    fn rejoin(&mut self) {
+        self.source.zone.leave_idle(self.slot);
+    }
+
+    fn end_pass(&mut self) {
+        if self.deadline.take().is_some() {
+            use carrick_guest_arch::InterruptBackend;
+            let _ = carrick_el1::isa::x86::X86Backend.arm_timer(None);
+        }
+    }
+
+    #[cfg_attr(not(feature = "test-support"), allow(unused_variables))]
+    fn stop(&mut self, point: carrick_sched_core::IdleStop) {
+        #[cfg(feature = "test-support")]
+        {
+            use carrick_sched_core::IdleStop;
+            let (source, slot, current) = (self.source, self.slot, self.current);
+            match point {
+                IdleStop::AfterDrain => {
+                    crate::test_support::hold_idle_scan(slot);
+                    if crate::test_support::peer_release_pending(slot) {
+                        crate::anonymous::release_injected_edit_wait(source, current);
+                    }
+                    crate::test_support::lower_injected_gate(source, slot);
+                }
+                IdleStop::BeforeScan => crate::test_support::order_after_idle_read(slot, current),
+                IdleStop::IdlePublished => {
+                    crate::test_support::order_before_idle_hlt(slot, current)
+                }
+                IdleStop::AfterFinalRecheck => {
+                    crate::test_support::park_after_idle_recheck(slot);
+                    crate::test_support::order_after_idle_recheck(slot, current);
+                }
+            }
+        }
+    }
 }
 
 /// Consume the shared timer claim; hardware only supplies a counter interrupt.

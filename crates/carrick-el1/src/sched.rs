@@ -14,19 +14,122 @@ use core::sync::atomic::Ordering;
 /// not be served (a busy lock, a full run queue) is retried after this.
 const TIMER_RETRY_NS: u64 = 50_000;
 
-/// The durable half of a wake an idle CPU can be owed after its last queue
-/// scan, rechecked once its slot is published IdleWfi and before it sleeps
-/// (WFI on ARM, HLT on x86; #3053). A host placement or completion can
-/// publish host work on a CPU stopped in a crossing, or owe it a
-/// reschedule, with no interrupt that survives to that sleep: only these
-/// words announce it. True when the CPU must run another pass instead of
-/// sleeping; an owed reschedule is consumed.
-pub fn idle_wake_owed<C: Copy + Send + Sync + zerocopy::FromZeros>(
-    task: &CurrentTask,
-    zone: &carrick_sched_core::ZoneTables<C>,
-    slot: SlotId,
-) -> bool {
-    task.linux.has_pending_host_work() || zone.take_resched(slot)
+/// The ARM mechanics of one neutral idle pass ([`carrick_sched_core::idle_pass`]).
+struct ArmIdle<'s, 'a, C: ThreadCpu, U: UserWord> {
+    sched: &'s mut Sched<'a, C, U>,
+    /// The counter value until which the idle CPU polls before WFI.
+    spin_until: u64,
+    /// The counter value this pass read its timers at.
+    now: u64,
+    timeout_result: u64,
+}
+
+impl<C: ThreadCpu, U: UserWord> carrick_sched_core::IdleVenue for ArmIdle<'_, '_, C, U> {
+    fn drain(&mut self) {
+        self.sched.take_irqs();
+    }
+
+    fn leaves_for_host(&mut self) -> bool {
+        let sched = &mut *self.sched;
+        let leaves = sched.task.linux.has_pending_host_work()
+            || sched.zone.slot(sched.slot).affinity_excludes_cpu();
+        if leaves {
+            sched.counters.exit_reasons[El1ExitReason::IdleHostWork as usize]
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        leaves
+    }
+
+    fn expire_timers(&mut self) {
+        let sched = &mut *self.sched;
+        let (zone, slot, timeout_result) = (sched.zone, sched.slot, self.timeout_result);
+        let now = sched.cpu.now();
+        self.now = now;
+        let _ = sched.owing(|passes| {
+            zone.expire_timer(
+                slot,
+                now,
+                timeout_result,
+                &|owned| {
+                    crate::substrate::sched::object_wait::deliver_host_completion(
+                        owned.zone(),
+                        owned,
+                    )
+                },
+                passes,
+            )
+        });
+    }
+
+    fn deliver(&mut self, passes: OwedPasses) {
+        self.sched.send_owed_passes(passes);
+    }
+
+    fn leaves_for_executor(&self) -> bool {
+        true
+    }
+
+    fn keep_polling(&mut self) -> bool {
+        if self.now < self.spin_until {
+            self.sched.cpu.spin();
+            return true;
+        }
+        false
+    }
+
+    fn prepare_sleep(&mut self) {
+        // Park on the maintenance root: a vCPU in WFI holds no process's
+        // translations, so no pause or retirement of that process has to
+        // wake it (the next thread it runs installs its own space).
+        self.sched.leave_space();
+    }
+
+    fn sleep_published(&mut self) {
+        self.sched.program_timer(false);
+    }
+
+    fn recheck_refuses(&mut self) -> bool {
+        // An affinity that excludes this CPU is ARM's own exit reason: the
+        // next pass leaves, and its host executor moves the thread.
+        self.sched
+            .zone
+            .slot(self.sched.slot)
+            .affinity_excludes_cpu()
+    }
+
+    fn host_work_pending(&self) -> bool {
+        self.sched.task.linux.has_pending_host_work()
+    }
+
+    fn owed_kicks_sent(&mut self) -> bool {
+        // An SGI is never owed: its send does not wait on a busy port.
+        true
+    }
+
+    fn halt(&mut self) {
+        self.sched
+            .zone
+            .counters
+            .el1_wfi_entries
+            .fetch_add(1, Ordering::Relaxed);
+        self.sched.cpu.wait_for_interrupt();
+    }
+
+    fn rejoin(&mut self) {
+        let (zone, slot) = (self.sched.zone, self.sched.slot);
+        self.sched
+            .owing(|passes| zone.enter_idle(slot, false, passes));
+    }
+
+    fn end_pass(&mut self) {}
+
+    fn stop(&mut self, point: carrick_sched_core::IdleStop) {
+        #[cfg(any(test, feature = "host-test"))]
+        if point == carrick_sched_core::IdleStop::IdlePublished {
+            self.sched.cpu.before_idle_wfi();
+        }
+        let _ = point;
+    }
 }
 
 #[path = "sched/object_wait.rs"]
@@ -841,73 +944,32 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         self.owing(|passes| zone.enter_idle(slot, false, passes));
         let spin_until = self.cpu.now().saturating_add(self.ticks(IDLE_SPIN_NS));
         loop {
-            self.take_irqs();
-            if self.task.linux.has_pending_host_work() || zone.slot(slot).affinity_excludes_cpu() {
-                self.counters.exit_reasons[El1ExitReason::IdleHostWork as usize]
-                    .fetch_add(1, Ordering::Relaxed);
-                zone.leave_idle(slot);
-                zone.counters.el1_idle_exits.fetch_add(1, Ordering::Relaxed);
-                return Served::Idle;
-            }
-            let now = self.cpu.now();
-            let _ = self.owing(|passes| {
-                zone.expire_timer(
-                    slot,
-                    now,
+            let pass = carrick_sched_core::idle_pass(
+                zone,
+                slot,
+                &mut ArmIdle {
+                    sched: self,
+                    spin_until,
+                    now: 0,
                     timeout_result,
-                    &|owned| {
-                        crate::substrate::sched::object_wait::deliver_host_completion(
-                            owned.zone(),
-                            owned,
-                        )
-                    },
-                    passes,
-                )
-            });
-            if let Some(switched) = self.owing(|passes| zone.take_idle_work(slot, passes)) {
-                zone.leave_idle(slot);
-                match self.load(frame, switched) {
+                },
+            );
+            match pass {
+                carrick_sched_core::IdlePass::Took(switched) => match self.load(frame, switched) {
                     LoadResult::Running => return Served::Returned { switched: true },
                     LoadResult::NeedsHost => return self.service_exit(),
                     LoadResult::Left => {
                         self.owing(|passes| zone.enter_idle(slot, false, passes));
-                        continue;
                     }
+                },
+                carrick_sched_core::IdlePass::Leave(carrick_sched_core::IdleLeave::Venue) => {
+                    zone.counters.el1_idle_exits.fetch_add(1, Ordering::Relaxed);
+                    return Served::Idle;
                 }
-            }
-            if zone.head_needs_host(slot) {
-                zone.leave_idle(slot);
-                return self.service_exit();
-            }
-            if now < spin_until {
-                self.cpu.spin();
-                continue;
-            }
-            // Park on the maintenance root: a vCPU in WFI holds no process's
-            // translations, so no pause or retirement of that process has
-            // to wake it (the next thread it runs installs its own space).
-            self.leave_space();
-            if self.owing(|passes| zone.enter_idle(slot, true, passes)) {
-                self.program_timer(false);
-                #[cfg(any(test, feature = "host-test"))]
-                self.cpu.before_idle_wfi();
-                // A host placement or handback can follow the last queue
-                // scan while the slot is already IdleWfi. Its exit kick may
-                // have arrived before this vCPU's next effective run. The
-                // shared pending-work and owed-reschedule words are the
-                // durable half of that wake; recheck them before WFI. An
-                // affinity that excludes this CPU is ARM's own exit reason:
-                // its host executor moves the thread.
-                if zone.slot(slot).affinity_excludes_cpu() || idle_wake_owed(self.task, zone, slot)
-                {
-                    self.owing(|passes| zone.enter_idle(slot, false, passes));
-                    continue;
-                }
-                zone.counters
-                    .el1_wfi_entries
-                    .fetch_add(1, Ordering::Relaxed);
-                self.cpu.wait_for_interrupt();
-                self.owing(|passes| zone.enter_idle(slot, false, passes));
+                carrick_sched_core::IdlePass::Leave(
+                    carrick_sched_core::IdleLeave::HeadNeedsHost,
+                ) => return self.service_exit(),
+                carrick_sched_core::IdlePass::Again => {}
             }
         }
     }

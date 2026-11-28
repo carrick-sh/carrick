@@ -99,6 +99,8 @@ mod timer_index;
 mod aarch64_context;
 pub mod completion_queue;
 pub mod cpu_time;
+pub mod idle_pass;
+pub use idle_pass::{IdleLeave, IdlePass, IdleStop, IdleVenue, idle_pass};
 pub mod object_wait;
 pub mod occupancy;
 pub mod refusal;
