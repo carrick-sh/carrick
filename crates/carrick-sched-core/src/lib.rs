@@ -4939,6 +4939,10 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
                 // Back at the tail: the order of the rest is kept.
                 self.push_locked(&guard, record, None);
                 drop(guard);
+                #[cfg(all(test, feature = "loom"))]
+                if carrick_model::mutant::is(Mutant::PutBackNoKick) {
+                    continue;
+                }
                 self.kick_idle_thieves(slot, rec, effects);
             }
         }
@@ -6892,6 +6896,19 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> LockWait<C> for SpinForever {
 
 #[cfg(all(test, feature = "loom"))]
 mod loom_models;
+
+/// This crate's seeded mutants (#3061): each restores a fixed bug at its
+/// fix site, in loom test builds only, so its model proves it would have
+/// found it.
+#[cfg(all(test, feature = "loom"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Mutant {
+    /// S1 (#3053, #3086): `migrate_queued`'s put-back skips
+    /// `kick_idle_thieves`.
+    PutBackNoKick,
+}
+#[cfg(all(test, feature = "loom"))]
+carrick_model::mutants!(Mutant { PutBackNoKick });
 #[cfg(all(test, not(feature = "loom")))]
 mod tests;
 

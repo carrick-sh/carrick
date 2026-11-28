@@ -21,4 +21,5 @@ loom = []
 test-support = []
 
 [dev-dependencies]
+carrick-model = { path = "../carrick-model", features = ["std"] }
 loom = { version = "=0.7.2", features = ["checkpoint"] }
