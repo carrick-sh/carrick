@@ -458,6 +458,7 @@ enum ChildStockCase {
     AdvisoryMmap,
     Madvise,
     Mremap,
+    MremapPopulated,
     Reuse,
     Pinned,
     Claimed,
@@ -495,13 +496,32 @@ fn native_fork_child_mremap_stays_in_ring() {
     child_thread_admission(0, 0, ChildStockCase::Mremap);
 }
 
+/// A live native fork child grows the populated first page of a private
+/// row it inherited to two pages with `MREMAP_MAYMOVE`, blocked in place
+/// by the row's own next page, through the production entry (#2611):
+/// served in ring with zero forwards or refusals, the page at a new
+/// address, its old address vacant and the rest of the row kept. The move is a
+/// custody transfer: the child's moved leaf names the same frame its old
+/// leaf did (nothing copied), and the parent's leaf is unchanged. On main
+/// the ring declines a move whose source has a terminal (`RootDeclined`),
+/// so the call is a counted refusal.
+#[cfg(not(target_os = "macos"))]
+#[test]
+#[ignore = "red until the populated move lands on the memory core's TransferRange (#2611)"]
+fn native_fork_child_mremap_moves_a_populated_row_in_ring() {
+    child_thread_admission(0, 0, ChildStockCase::MremapPopulated);
+}
+
 #[cfg(not(target_os = "macos"))]
 fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
     const LENGTH: u64 = 256 * 1024 * 1024;
     let fixture = Box::leak(Box::new(
         if matches!(
             case,
-            ChildStockCase::AdvisoryMmap | ChildStockCase::Madvise | ChildStockCase::Mremap
+            ChildStockCase::AdvisoryMmap
+                | ChildStockCase::Madvise
+                | ChildStockCase::Mremap
+                | ChildStockCase::MremapPopulated
         ) {
             Fixture::with_page_and_arena(
                 0x10000,
@@ -527,6 +547,7 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
             | ChildStockCase::AdvisoryMmap
             | ChildStockCase::Madvise
             | ChildStockCase::Mremap
+            | ChildStockCase::MremapPopulated
     ) {
         let mut physical = super::native_retirement_tests::PhysicalStock::new(&fixture.tables);
         physical.metadata_in_el1_window = true;
@@ -608,7 +629,10 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
     let residency = carrick_el1::cow::test_support::residency_table();
     if matches!(
         case,
-        ChildStockCase::AdvisoryMmap | ChildStockCase::Madvise | ChildStockCase::Mremap
+        ChildStockCase::AdvisoryMmap
+            | ChildStockCase::Madvise
+            | ChildStockCase::Mremap
+            | ChildStockCase::MremapPopulated
     ) {
         let mut editor = FixtureMapping {
             words,
@@ -626,7 +650,11 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
                 &counters,
                 Some(&mut editor),
             );
-            assert_eq!(counters.forwarded[nr as usize].load(Ordering::Relaxed), 0);
+            assert_eq!(
+                counters.forwarded[nr as usize].load(Ordering::Relaxed),
+                0,
+                "nr={nr} args={args:?} forwarded"
+            );
             use carrick_personality_linux::dispatch::CompletionRoute;
             assert!(
                 matches!(route, CompletionRoute::Served | CompletionRoute::WithWork),
@@ -639,6 +667,84 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
             frame.x[0] as i64
         };
         fixture.task.linux.mark_pending_host_work();
+        if case == ChildStockCase::MremapPopulated {
+            const PAGE: u64 = 4096;
+            let portal = super::super::aarch64_process::Portal::for_zone(
+                NonZeroU64::MIN,
+                fixture.region.table(),
+                fixture.zone,
+            );
+            let mm = ReservationMm::new(identity.mm).unwrap();
+            let rows = |start: u64, end: u64| {
+                let mut rows = Vec::new();
+                portal
+                    .root(mm, 0)
+                    .unwrap()
+                    .observe_range(
+                        carrick_el1_abi::ReservationRange::new(start, end).unwrap(),
+                        &mut |mapping| {
+                            rows.push((
+                                mapping.range.start(),
+                                mapping.range.end(),
+                                mapping.protection.bits(),
+                            ))
+                        },
+                    )
+                    .unwrap();
+                rows
+            };
+            // SAFETY: the synchronous fixture exclusively owns the selected record.
+            let child_root = unsafe { fixture.zone.record(child).ctx_mut() }
+                .address_context()
+                .unwrap()
+                .root
+                .address()
+                .raw();
+            let parent_root = fixture.address.root.address().raw();
+            // The parent's private row at VA, inherited by the child with
+            // its resident page.
+            let inherited = rows(VA, VA + PAGE);
+            let [(start, end, protection)] = inherited[..] else {
+                panic!("the child inherits one private row at VA: {inherited:?}");
+            };
+            let before = leaf(words, child_root, VA);
+            assert_eq!(before & 1, 1, "the inherited row is populated: {before:#x}");
+            let parent_before = leaf(words, parent_root, VA);
+            // Grow the row's populated page at VA to two pages: the row's
+            // own next page blocks growth in place, so MAYMOVE moves it.
+            assert!(
+                start == VA && end >= VA + 2 * PAGE,
+                "a row of two pages or more from VA: {inherited:?}"
+            );
+            let to = call(216, [VA, PAGE, 2 * PAGE, 1, 0, 0]);
+            assert!(to > 0 && to as u64 != VA, "moved: {to}");
+            let to = to as u64;
+            assert_eq!(rows(to, to + 2 * PAGE), [(to, to + 2 * PAGE, protection)]);
+            assert!(rows(VA, VA + PAGE).is_empty(), "the moved source is vacant");
+            assert_eq!(
+                rows(VA + PAGE, end),
+                [(VA + PAGE, end, protection)],
+                "the rest of the row stays"
+            );
+            // Custody transfer, not a copy: the moved leaf names the same
+            // frame, the old address has no leaf, the growth is lazy.
+            let moved = leaf(words, child_root, to);
+            assert_eq!(moved & 1, 1, "the moved page is resident: {moved:#x}");
+            assert_eq!(
+                moved & AARCH64_ROOT_ADDRESS_MASK,
+                before & AARCH64_ROOT_ADDRESS_MASK,
+                "the moved leaf names the frame the old leaf did"
+            );
+            assert_eq!(leaf(words, child_root, VA) & 1, 0, "the old leaf is gone");
+            assert_eq!(
+                leaf(words, parent_root, VA),
+                parent_before,
+                "the parent's leaf is untouched"
+            );
+            assert_eq!(counters.refused[216].load(Ordering::Relaxed), 0);
+            assert_eq!(counters.refused_child[216].load(Ordering::Relaxed), 0);
+            return;
+        }
         if case == ChildStockCase::Mremap {
             const PAGE: u64 = 4096;
             const EFAULT: i64 = -14;
