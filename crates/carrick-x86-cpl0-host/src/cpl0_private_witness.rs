@@ -13,6 +13,9 @@ pub(crate) struct SettledPrivateGrant<'a, M: crate::carrier_memory::CarrierMemor
     pub window: carrick_el1_abi::PortalGrantWindow,
     pub txn: &'a carrick_mmu_core::aarch64::descriptor_txn::DescriptorTxn,
     pub publication: carrick_el1_abi::GuestMmuPublication,
+    /// Who could edit the leaves between the guest edit and this
+    /// settlement: the same custody `CarrierMemory::publish` judged them by.
+    pub custody: crate::carrier_memory::SettlementCustody,
     pub peer: PeerActivity,
 }
 #[derive(Clone, Copy, Debug, Default)]
@@ -49,9 +52,10 @@ impl PrivateAnonymousWitness {
         &mut self,
         grant: SettledPrivateGrant<'_, M>,
     ) -> Result<(), carrick_hal::TrapError> {
+        use crate::carrier_memory::SettlementCustody;
         use carrick_guest_arch::{FrameGpa, UserVa};
         use carrick_mmu_core::x86::descriptor_txn::{
-            ADDRESS, COW, DescriptorOp, PAGE, PREPARED, PRESENT, PRIVATE, RETIRED,
+            ADDRESS, COW, DescriptorOp, PAGE, PREPARED, PRESENT, PRIVATE, RETIRED, WRITE,
             read_terminal_descriptor,
         };
         let fail = |message: &str| carrick_hal::TrapError::Hypervisor(message.to_owned());
@@ -122,10 +126,22 @@ impl PrivateAnonymousWitness {
                     let (entry, size) =
                         read_terminal_descriptor(&grant.memory.words(), txn.root, UserVa::new(va))
                             .map_err(|_| fail("private witness terminal unavailable"))?;
+                    // A COW-armed leaf is still this grant's settled page when
+                    // the ring released the editor before this settlement: a
+                    // sibling's fork (a vfork is served as one) may have armed
+                    // it in between (#3153), as `CarrierMemory::publish`
+                    // accepts (#3151). It keeps this frame and identity
+                    // (checked below) and has no hardware write. With the
+                    // editor held nobody could have armed it.
+                    let armed = match grant.custody {
+                        SettlementCustody::EditorReleased => entry & COW != 0 && entry & WRITE == 0,
+                        SettlementCustody::EditorHeld => false,
+                    };
                     if size != PAGE
                         || entry & PRIVATE == 0
                         || entry & (PRESENT | PREPARED) == 0
-                        || entry & (RETIRED | COW) != 0
+                        || entry & RETIRED != 0
+                        || (entry & COW != 0 && !armed)
                         || entry & ADDRESS != pa
                         || grant
                             .memory
@@ -412,6 +428,7 @@ mod tests {
             .unwrap();
         assert_eq!(witness.rows().len(), 2);
     }
+
     /// The physical inventory row of the one settled grant, as the
     /// production inventory reports it to the witness.
     struct SettledInventory(carrick_mmu_core::x86::descriptor_txn::BackingIdentity);
@@ -503,6 +520,7 @@ mod tests {
     /// settlement calls it.
     fn witness_owner_grant(
         fork_arms: bool,
+        custody: crate::carrier_memory::SettlementCustody,
     ) -> (Result<(), carrick_hal::TrapError>, PrivateAnonymousWitness) {
         use crate::carrier_memory::test_support;
         let settled = test_support::owner_grant_settled_after_a_fork(
@@ -540,6 +558,7 @@ mod tests {
             window,
             txn: &settled.wire,
             publication: settled.publication,
+            custody,
             peer: PeerActivity(true),
         });
         (recorded, witness)
@@ -549,7 +568,10 @@ mod tests {
     /// settled leaves are authenticated.
     #[test]
     fn an_owner_grant_settled_with_no_fork_is_witnessed() {
-        let (recorded, witness) = witness_owner_grant(false);
+        let (recorded, witness) = witness_owner_grant(
+            false,
+            crate::carrier_memory::SettlementCustody::EditorReleased,
+        );
         recorded.unwrap();
         assert_eq!(witness.private_pages(), 2);
     }
@@ -562,9 +584,26 @@ mod tests {
     /// load), though they keep the grant's frame and identity.
     #[test]
     fn an_owner_grant_a_fork_armed_before_settlement_is_witnessed() {
-        let (recorded, witness) = witness_owner_grant(true);
+        let (recorded, witness) = witness_owner_grant(
+            true,
+            crate::carrier_memory::SettlementCustody::EditorReleased,
+        );
         recorded.unwrap();
         assert_eq!(witness.private_pages(), 2);
         assert_eq!(witness.cross_mm_private_aliases(), 0);
+    }
+
+    /// With the editor held through settlement no fork could have armed the
+    /// leaves, so an armed leaf is still a broken guest.
+    #[test]
+    fn an_armed_leaf_under_a_held_editor_is_still_a_mismatch() {
+        let (recorded, witness) =
+            witness_owner_grant(true, crate::carrier_memory::SettlementCustody::EditorHeld);
+        let error = recorded.unwrap_err();
+        assert!(
+            format!("{error:?}").contains("private witness terminal/backing mismatch"),
+            "{error:?}"
+        );
+        assert_eq!(witness.private_pages(), 0);
     }
 }

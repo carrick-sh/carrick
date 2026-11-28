@@ -3168,6 +3168,7 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                     window: pending.window,
                     txn: &pending.txn,
                     publication,
+                    custody: crate::carrier_memory::SettlementCustody::EditorReleased,
                     peer: pending
                         .peer
                         .combine(crate::cpl0_private_witness::PeerActivity::observe(
