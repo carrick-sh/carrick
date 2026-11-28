@@ -174,7 +174,11 @@ pub fn carrier_publication_requires_an_already_applied_guest_edit(_make: fn() ->
         live_stores: 4,
         tables_linked: 3,
     };
-    assert!(memory.publish(&txn, forged, &mut inventory).is_err());
+    assert!(
+        memory
+            .publish(&txn, forged, SettlementCustody::EditorHeld, &mut inventory)
+            .is_err()
+    );
     assert!(memory.is_quarantined());
     assert_eq!(memory.words().load(0x1000).unwrap(), 0);
 }
@@ -288,7 +292,16 @@ pub fn inventory_failure_before_guest_edit_rolls_back_and_after_edit_quarantines
                 &mut InlineJournal::new(),
             );
             let publication = GuestMmuPublication::from_x86_receipt(&txn, &receipt).unwrap();
-            assert!(memory.publish(&txn, publication, &mut inventory).is_err());
+            assert!(
+                memory
+                    .publish(
+                        &txn,
+                        publication,
+                        SettlementCustody::EditorHeld,
+                        &mut inventory
+                    )
+                    .is_err()
+            );
             assert!(memory.is_quarantined());
             assert!(inventory.live);
             assert_eq!(memory.slot_count(), 2);
@@ -629,7 +642,14 @@ pub fn inherited_inventory_edges_authorize_only_selected_child_pages(_make: fn()
         );
         let publication = GuestMmuPublication::from_x86_receipt(&txn, &receipt).unwrap();
         if index == 0 {
-            memory.publish(&txn, publication, &mut inventory).unwrap();
+            memory
+                .publish(
+                    &txn,
+                    publication,
+                    SettlementCustody::EditorHeld,
+                    &mut inventory,
+                )
+                .unwrap();
         }
     }
     let selection = carrick_el1_abi::PortalForkCustody::Frame {
@@ -1618,7 +1638,12 @@ pub fn inherited_inventory_edge_survives_protect_advancing_mapping_generation(
     );
     let publication = GuestMmuPublication::from_x86_receipt(&map_txn, &receipt).unwrap();
     memory
-        .publish(&map_txn, publication, &mut inventory)
+        .publish(
+            &map_txn,
+            publication,
+            SettlementCustody::EditorHeld,
+            &mut inventory,
+        )
         .unwrap();
 
     // 2. Protect the page in parent (e.g. mprotect to read-only), advancing mapping generation to 2.
@@ -1672,7 +1697,12 @@ pub fn inherited_inventory_edge_survives_protect_advancing_mapping_generation(
     );
     let publication = GuestMmuPublication::from_x86_receipt(&protect_txn, &receipt).unwrap();
     memory
-        .publish(&protect_txn, publication, &mut inventory)
+        .publish(
+            &protect_txn,
+            publication,
+            SettlementCustody::EditorHeld,
+            &mut inventory,
+        )
         .unwrap();
 
     // 3. Fork: select inherited frames from parent.
@@ -1870,7 +1900,14 @@ pub fn forked_shared_file_window_leaf_is_never_an_inventoried_frame(_make: fn() 
         );
         let publication = GuestMmuPublication::from_x86_receipt(&txn, &receipt).unwrap();
         if index == 0 {
-            memory.publish(&txn, publication, &mut inventory).unwrap();
+            memory
+                .publish(
+                    &txn,
+                    publication,
+                    SettlementCustody::EditorHeld,
+                    &mut inventory,
+                )
+                .unwrap();
         }
     }
     assert_eq!(memory.holds.alias_count(window.slot), 1);
@@ -2045,7 +2082,12 @@ pub fn cow_settlement_accepts_a_replacement_a_sibling_protected_first(_make: fn(
             );
             let publication = publication.unwrap();
             if publish {
-                memory.publish(&txn, publication, inventory)
+                memory.publish(
+                    &txn,
+                    publication,
+                    SettlementCustody::EditorReleased,
+                    inventory,
+                )
             } else {
                 Ok(publication)
             }
@@ -2092,7 +2134,12 @@ pub fn cow_settlement_accepts_a_replacement_a_sibling_protected_first(_make: fn(
             tables: &[],
             op: repoint,
         };
-        let settled = memory.publish(&repoint_txn, publication, &mut inventory);
+        let settled = memory.publish(
+            &repoint_txn,
+            publication,
+            SettlementCustody::EditorReleased,
+            &mut inventory,
+        );
         assert!(
             settled.is_ok() && !memory.is_quarantined(),
             "a sibling's {sibling:?} of the replacement is an owned state, not a broken \
@@ -2110,4 +2157,182 @@ pub fn cow_settlement_accepts_a_replacement_a_sibling_protected_first(_make: fn(
             "the replacement frame, unarmed"
         );
     }
+}
+
+/// A sibling's leaf corruption for [`settle_prepare_after_a_sibling_protect`].
+#[derive(Clone, Copy)]
+enum LeafEdit {
+    /// None: the leaves keep the sibling's protect.
+    Keep,
+    /// The first leaf gets a hardware write without the MAY_WRITE ceiling,
+    /// which no protection writes.
+    WriteOutsideCeiling,
+}
+
+/// #2766: the ring applies a first touch's Prepare (RW) and releases the
+/// MM's editor before the host settles it, so a sibling thread's
+/// `mprotect` of the same pages (here RW -> RWX, which also raises the
+/// MAY_EXEC ceiling) can land between the two. Applies both through the
+/// production descriptor executor, checks that the leaves carry the
+/// protect's permissions, optionally corrupts one, and settles the Prepare
+/// through `CarrierMemory::publish` with `custody`.
+fn settle_prepare_after_a_sibling_protect(
+    make: fn() -> MemoryTestIo,
+    custody: SettlementCustody,
+    edit: LeafEdit,
+) -> (Result<GuestMmuPublication, MemoryError>, bool) {
+    let mut memory = CarrierMemory::new(make()).unwrap();
+    memory.install(&[backing(0x1000, 0x4000, 1)]).unwrap();
+    let context = AddressContext {
+        root: root(0x1000),
+        mm: MmGeneration::new(nz(1)),
+        generation: ContextGeneration::new(nz(1)),
+    };
+    memory.install_root(nz(1), context).unwrap();
+    let data = backing(0x800000, 2 * PAGE as usize, 2);
+    let tables = [root(0x2000), root(0x3000), root(0x4000)];
+    let prepare = DescriptorTxn {
+        id: DescriptorTxnId {
+            mm_key: nz(1),
+            generation: nz(1),
+        },
+        root: context.root,
+        tables: &tables,
+        op: DescriptorOp::Prepare {
+            span: PageSpan::new(0x4000, 2 * PAGE),
+            output: FrameGpa::new(0x800000),
+            permissions: Permissions {
+                writable: true,
+                executable: false,
+                user: true,
+            },
+            resident: PageSpan::new(0x4000, PAGE),
+            backing: data.identity,
+        },
+    };
+    let mut inventory = Inventory {
+        live: true,
+        fail_publish: false,
+        fail_commit: false,
+        fail_rollback: false,
+    };
+    memory.prepare(&[data], &mut inventory).unwrap();
+    let receipt = execute_descriptor_txn(
+        &memory.words(),
+        &prepare,
+        context.root,
+        &mut InlineJournal::new(),
+    );
+    let publication = GuestMmuPublication::from_x86_receipt(&prepare, &receipt).unwrap();
+    // The sibling's mprotect(PROT_READ | PROT_WRITE | PROT_EXEC), applied in
+    // the ring after the editor's release and before this settlement.
+    let protect = DescriptorTxn {
+        id: DescriptorTxnId {
+            mm_key: nz(1),
+            generation: nz(2),
+        },
+        root: context.root,
+        tables: &[],
+        op: DescriptorOp::Protect {
+            span: PageSpan::new(0x4000, 2 * PAGE),
+            permissions: Permissions {
+                writable: true,
+                executable: true,
+                user: true,
+            },
+            exec: carrick_mmu_core::x86::descriptor_txn::ExecAuthority::Mapping,
+            cow_ceiling: None,
+            absent: carrick_guest_arch::AbsentLeaves::Refuse,
+        },
+    };
+    let protected = execute_descriptor_txn(
+        &memory.words(),
+        &protect,
+        context.root,
+        &mut InlineJournal::new(),
+    );
+    assert!(
+        GuestMmuPublication::from_x86_receipt(&protect, &protected).is_some(),
+        "the sibling's protect applies: {:?}",
+        protected.outcome
+    );
+    // The leaves now carry the protect's permissions, not the Prepare's.
+    for va in [0x4000, 0x5000] {
+        let (entry, _) = read_terminal_descriptor(
+            &memory.words(),
+            context.root,
+            carrick_guest_arch::UserVa::new(va),
+        )
+        .unwrap();
+        assert!(
+            entry & MAY_EXEC != 0 && entry & NX == 0,
+            "{va:#x}: {entry:#x}"
+        );
+    }
+    if let LeafEdit::WriteOutsideCeiling = edit {
+        let words = memory.words();
+        let (entry, _) = read_terminal_descriptor(
+            &words,
+            context.root,
+            carrick_guest_arch::UserVa::new(0x4000),
+        )
+        .unwrap();
+        // The leaf word's address: the one table word holding it.
+        let pa = (0x1000..0x5000)
+            .step_by(8)
+            .find(|pa| words.load(*pa) == Ok(entry))
+            .unwrap();
+        assert!(
+            words
+                .compare_exchange(pa, entry, (entry | WRITE) & !MAY_WRITE)
+                .unwrap()
+        );
+    }
+    let settled = memory.publish(&prepare, publication, custody, &mut inventory);
+    let quarantined = memory.is_quarantined();
+    (settled, quarantined)
+}
+
+/// #2766: with the editor released, the settlement accepts the sibling's
+/// re-protected leaves: the Prepare owns their frame, PRIVATE and
+/// residency, not the permissions a later protection owns. It used to
+/// quarantine the carrier ("guest MMU publication live descriptor
+/// mismatch").
+pub fn prepare_settlement_accepts_a_sibling_protect_applied_before_it(make: fn() -> MemoryTestIo) {
+    let (settled, quarantined) = settle_prepare_after_a_sibling_protect(
+        make,
+        SettlementCustody::EditorReleased,
+        LeafEdit::Keep,
+    );
+    assert!(
+        settled.is_ok(),
+        "a Prepare settles over a sibling's later protect: {settled:?}"
+    );
+    assert!(!quarantined);
+}
+
+/// #3151's pre-review: a settlement whose editor was held through it (the
+/// initial image, a closed exec successor) has no sibling to explain a
+/// permission change, so the same leaves are still a broken guest.
+pub fn prepare_settlement_with_its_editor_held_refuses_changed_permissions(
+    make: fn() -> MemoryTestIo,
+) {
+    let (settled, quarantined) =
+        settle_prepare_after_a_sibling_protect(make, SettlementCustody::EditorHeld, LeafEdit::Keep);
+    let error = settled.unwrap_err();
+    assert_eq!(error.0, "guest MMU publication live descriptor mismatch");
+    assert!(quarantined);
+}
+
+/// With the editor released the settlement still refuses a leaf whose
+/// hardware write has no MAY_WRITE ceiling: no protection writes that.
+pub fn prepare_settlement_refuses_a_leaf_outside_its_ceiling(make: fn() -> MemoryTestIo) {
+    let (settled, quarantined) = settle_prepare_after_a_sibling_protect(
+        make,
+        SettlementCustody::EditorReleased,
+        LeafEdit::WriteOutsideCeiling,
+    );
+    let error = settled.unwrap_err();
+    assert_eq!(error.0, "guest MMU publication live descriptor mismatch");
+    assert!(quarantined);
 }

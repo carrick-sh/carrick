@@ -139,6 +139,24 @@ fn a_released_slot_its_retiring_mm_still_maps_quarantines_the_carrier() {
     });
 }
 #[test]
+fn prepare_settlement_accepts_a_sibling_protect_applied_before_it() {
+    test_support::prepare_settlement_accepts_a_sibling_protect_applied_before_it(|| {
+        test_support::MemoryTestIo::new(TestMemoryIo::default())
+    });
+}
+#[test]
+fn prepare_settlement_with_its_editor_held_refuses_changed_permissions() {
+    test_support::prepare_settlement_with_its_editor_held_refuses_changed_permissions(|| {
+        test_support::MemoryTestIo::new(TestMemoryIo::default())
+    });
+}
+#[test]
+fn prepare_settlement_refuses_a_leaf_outside_its_ceiling() {
+    test_support::prepare_settlement_refuses_a_leaf_outside_its_ceiling(|| {
+        test_support::MemoryTestIo::new(TestMemoryIo::default())
+    });
+}
+#[test]
 fn inherited_inventory_edge_survives_protect_advancing_mapping_generation() {
     test_support::inherited_inventory_edge_survives_protect_advancing_mapping_generation(|| {
         test_support::MemoryTestIo::new(TestMemoryIo::default())

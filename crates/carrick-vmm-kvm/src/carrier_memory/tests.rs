@@ -101,6 +101,23 @@ fn a_released_slot_its_retiring_mm_still_maps_quarantines_the_carrier() {
     );
 }
 #[test]
+fn prepare_settlement_accepts_a_sibling_protect_applied_before_it() {
+    carrick_test_support::require_kvm!();
+    test_support::prepare_settlement_accepts_a_sibling_protect_applied_before_it(real_memory_io);
+}
+#[test]
+fn prepare_settlement_with_its_editor_held_refuses_changed_permissions() {
+    carrick_test_support::require_kvm!();
+    test_support::prepare_settlement_with_its_editor_held_refuses_changed_permissions(
+        real_memory_io,
+    );
+}
+#[test]
+fn prepare_settlement_refuses_a_leaf_outside_its_ceiling() {
+    carrick_test_support::require_kvm!();
+    test_support::prepare_settlement_refuses_a_leaf_outside_its_ceiling(real_memory_io);
+}
+#[test]
 fn inherited_inventory_edge_survives_protect_advancing_mapping_generation() {
     carrick_test_support::require_kvm!();
     test_support::inherited_inventory_edge_survives_protect_advancing_mapping_generation(
