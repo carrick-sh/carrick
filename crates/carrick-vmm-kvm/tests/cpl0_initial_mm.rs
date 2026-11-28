@@ -9112,20 +9112,29 @@ fn production_mprotect_none_faults_a_spinning_sibling_thread_with_accerr() {
 }
 
 /// #2875: forking a `PROT_NONE` private page. Until slice B (the fork arm
-/// of a no-access leaf, through #3061's core fork), Carrick refuses the fork
-/// with EFAULT, and the refusal must be clean: `wait4(-1, WNOHANG)` is
-/// ECHILD (88 if a child was left), the parent widens the page and still
-/// reads its byte (92 if it is gone), and a second fork succeeds (89) and its
-/// child reads the byte and exits 7 (87 otherwise). Exit 120 + EFAULT; 7 once
-/// slice B makes the first fork succeed as on Linux.
+/// of a no-access leaf, through #3061's core fork), the core refuses the
+/// fork as `MmError::Core`, and the refusal must be clean: `wait4(-1,
+/// WNOHANG)` is ECHILD (88 if a child was left), the parent widens the page
+/// and still reads its byte (92 if it is gone), and a second fork succeeds
+/// (89) and its child reads the byte and exits 7 (87 otherwise). No fork
+/// refusal answers EFAULT (#3085): a core refusal is `Quarantined`, EIO, so
+/// the exit is 120 + EIO; 7 once slice B makes the first fork succeed as on
+/// Linux. The core's typing of this leaf is #3194.
 #[test]
 fn production_fork_of_a_prot_none_page_refuses_cleanly_and_keeps_the_parents_page() {
     let outcome = run_reservation_shape(22);
     assert_eq!(
         (outcome.run.exit_code, outcome.run.terminating_signal),
-        (120 + 14, None),
-        "case 22 exit (134 = a clean EFAULT refusal; 7 = Linux): {:?}",
+        (120 + 5, None),
+        "case 22 exit (125 = a clean EIO refusal; 7 = Linux): {:?}",
         outcome.run
+    );
+    // 125 is also a failed run's status; a failed run names its cause on
+    // stderr, and this one must have none.
+    assert!(
+        outcome.run.stderr.is_empty(),
+        "case 22 is the guest's exit, not a failed run: {}",
+        String::from_utf8_lossy(&outcome.run.stderr)
     );
 }
 
