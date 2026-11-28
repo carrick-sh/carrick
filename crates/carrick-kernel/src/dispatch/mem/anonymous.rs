@@ -2513,7 +2513,16 @@ impl MemView<'_> {
         let Some(old_end) = old_address.checked_add(old_size).filter(|_| old_size != 0) else {
             return Ok(None);
         };
-        if !range_within(old_address, old_size, layout.mmap_base, layout.mmap_size) {
+        // Linux shrinks before it asks for one mapping (#3171, the native
+        // oracle on #3165): a shrink, or a same-size call, needs only a
+        // mapping at `old_address`, so only that page decides the venue.
+        let shrinks = !move_fixed && !dontunmap && new_size <= old_size;
+        let decided = if shrinks {
+            old_size.min(LINUX_PAGE_SIZE)
+        } else {
+            old_size
+        };
+        if !range_within(old_address, decided, layout.mmap_base, layout.mmap_size) {
             return Ok(None);
         }
         let mappings = MemState::root_mappings(root, old_address, old_end);
@@ -2527,19 +2536,40 @@ impl MemView<'_> {
         {
             return Ok(None);
         }
+        if shrinks {
+            // mremap(2) EFAULT for an unmapped `old_address`, before any
+            // effect. Otherwise the tail is retired exactly as munmap
+            // retires it, across whatever mappings (of any owner) and holes
+            // it spans, and the call returns `old_address`.
+            // A root node (a retained private file node is one, and no host
+            // row describes it) or a host row maps it.
+            let head_mapped = mappings
+                .first()
+                .is_some_and(|mapping| mapping.range.start() <= old_address)
+                || self.guest_vma_overlaps(old_address, LINUX_PAGE_SIZE);
+            if !head_mapped {
+                return Ok(Some(DispatchOutcome::errno(LINUX_EFAULT)));
+            }
+            if new_size == old_size {
+                return Ok(Some(DispatchOutcome::returned_u64_or_errno(old_address)));
+            }
+            let tail = [old_address + new_size, old_size - new_size, 0, 0, 0, 0];
+            let unmapped = with_args(cx, tail, |cx| self.munmap(cx))?;
+            return Ok(Some(match unmapped {
+                DispatchOutcome::Returned { value: 0 } => {
+                    DispatchOutcome::returned_u64_or_errno(old_address)
+                }
+                other => other,
+            }));
+        }
         // mremap(2) EFAULT: a growing or moving old range must be one
         // mapping; a hole or two mappings (of any owner or attributes) is
-        // refused before any other effect. Linux shrinks first: a shrink,
-        // or a same-size call, needs only a mapping at `old_address`, and
-        // retires the tail across any mappings and holes (#3171).
-        let shrinks = !move_fixed && !dontunmap && new_size <= old_size;
-        let node = match mappings.as_slice() {
-            [node] => node,
-            [first, ..] if shrinks => first,
-            _ => return Ok(Some(DispatchOutcome::errno(LINUX_EFAULT))),
+        // refused before any other effect.
+        let [node] = mappings.as_slice() else {
+            return Ok(Some(DispatchOutcome::errno(LINUX_EFAULT)));
         };
         if node.range.start() > old_address
-            || (!shrinks && node.range.end() < old_end)
+            || node.range.end() < old_end
             || !node.flags.root_editable()
         {
             return Ok(Some(DispatchOutcome::errno(LINUX_EFAULT)));

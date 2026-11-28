@@ -5,7 +5,7 @@
 // and holes it spans; growth across mappings is EFAULT. The root runs every
 // shape, then a forked child (beside its live parent) runs them again.
 // One line per shape:
-//   <name> r=<ret - base, or the negative errno> v=<page 0..3 vacant after> h=<head byte kept>
+//   <name> r=<ret - base, or the negative errno> v=<page 0..3: 1 vacant, 0 occupied (EEXIST), E another answer> h=<head byte kept>
 // The child's lines follow `child`. Exit 7. No libc: built -nostdlib -static.
 static long sc(long n, long a, long b, long c, long d, long e) {
     register long r10 __asm__("r10") = d;
@@ -56,7 +56,8 @@ static void report(const char *name, long r, int head_page) {
     for (long pg = 0; pg < 4; pg++) {
         long a = sc(MMAP, base + pg * PAGE, PAGE, 3, PRIVATE_ANON | FIXED_NOREPLACE, -1);
         if (a == base + pg * PAGE) { out[at++] = '1'; sc(MUNMAP, a, PAGE, 0, 0, 0); }
-        else out[at++] = '0';
+        else if (a == -17) out[at++] = '0';
+        else out[at++] = 'E';
     }
     put(" h=");
     if (head_page < 0) out[at++] = '-';
