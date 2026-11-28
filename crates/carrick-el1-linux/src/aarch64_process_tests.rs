@@ -7099,6 +7099,157 @@ fn arm_permission_fault_keeps_signal_owner_after_admission_home_release() {
     );
 }
 
+/// A `SignalOwner` root with a SIGSEGV handler, for the declined-fault
+/// witnesses below.
+#[cfg(test)]
+fn arm_declined_fault_signal_owner() -> &'static Fixture {
+    use carrick_signal_core::policy::{Action, Disposition, HandlerAddress, Signal};
+    let fixture = Box::leak(Box::new(Fixture::new(0x10000, asid(1))));
+    let mut service = fixture.process_service();
+    let action = Action {
+        disposition: Disposition::Handler(HandlerAddress(0x40_0100)),
+        ..Default::default()
+    };
+    fixture
+        .enter(
+            fixture.control,
+            fixture_ttbr0(fixture),
+            &mut service,
+            |process| {
+                process
+                    .signal_venue()
+                    .unwrap()
+                    .rt_sigaction(Signal::SEGV, Some(action))
+                    .unwrap();
+            },
+        )
+        .unwrap();
+    assert!(fixture.control.native_signal_owner());
+    fixture
+}
+
+/// #3170 on ARM: a first-touch write to a page whose mapping is read-only
+/// takes a translation fault, and the shared policy declines it as an access
+/// error. The native exit forwards the fault with that cause, so the native
+/// resume that answers the host's refusal reports `SEGV_ACCERR`, as Linux
+/// does. Red before the fix: the forwarded fault carried only the syndrome's
+/// present bit (clear for a translation fault), and the resume said MAPERR.
+#[test]
+fn arm_declined_first_touch_write_forwards_its_access_cause_to_the_native_resume() {
+    use carrick_el1::fault::{
+        GrantMailboxes, NoopCowResolver, NoopPreparedResolver, OwnerFaultSupply,
+        OwnerFaultSupplyOutcome, PreparedFaultPath,
+    };
+    let fixture = arm_declined_fault_signal_owner();
+    let mm = carrick_el1_abi::ReservationMm::new(fixture.address.mm.raw().get()).unwrap();
+    let decision = super::aarch64_process::Portal::for_zone(
+        NonZeroU64::MIN,
+        fixture.region.table(),
+        fixture.zone,
+    )
+    .root_any(mm, 0)
+    .unwrap()
+    .mprotect(
+        carrick_el1_abi::ReservationRange::new(
+            crate::mm_portal::test_support::VA,
+            crate::mm_portal::test_support::VA + 4096,
+        )
+        .unwrap(),
+        carrick_el1_abi::ReservationProtection::READ,
+    )
+    .unwrap();
+    let carrick_el1::memory::reservations::Decision::Work(request) = decision else {
+        panic!("mprotect must stage a protection proposal")
+    };
+    let receipt = unsafe {
+        carrick_el1_abi::ReservationCompletion::after_descriptor_and_backing_commit(
+            request,
+            carrick_el1_abi::ReservationBackingReceipt {
+                receipt: request.sequence.raw(),
+                granted_bytes: 0,
+                returned_bytes: 0,
+            },
+        )
+    }
+    .unwrap();
+    super::aarch64_process::Portal::for_zone(NonZeroU64::MIN, fixture.region.table(), fixture.zone)
+        .root_any(mm, 0)
+        .unwrap()
+        .complete(receipt)
+        .unwrap();
+    let portal = unsafe {
+        &*fixture
+            .region
+            .ptr
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_MM_PORTAL_OFFSET as usize)
+            .cast::<carrick_el1_abi::MmPortalSlots>()
+    };
+    let residency = unsafe {
+        &*fixture
+            .region
+            .ptr
+            .as_ptr()
+            .add(carrick_el1_abi::EL1_FRAME_GRANT_RESIDENCY_OFFSET as usize)
+            .cast::<carrick_el1_abi::FrameGrantResidencyTable>()
+    };
+    let handle = crate::cow_resolver::admitted_fault_mm_handle(
+        fixture.zone,
+        fixture.region.table(),
+        NonZeroU64::MIN,
+        fixture.slot,
+        &fixture.task,
+    )
+    .unwrap();
+    let mailbox = carrick_el1_abi::FrameGrantMailbox::new();
+    let counters = Box::leak(Box::new(carrick_el1_abi::Counters::new()));
+    // The owner selects a window only for a bound carrier.
+    let _ = portal.bind_carrier(NonZeroU64::MIN);
+    let supply = OwnerFaultSupply::new(portal).with_handle(handle);
+    // EC 0x24 (lower-EL data abort), WnR, DFSC 0x07: a level-3 translation
+    // fault on a write, as a first touch takes.
+    let mut frame = carrick_el1_abi::TrapFrame {
+        slot: u64::from(fixture.slot.raw()),
+        esr: 0x9200_0047,
+        far: crate::mm_portal::test_support::VA,
+        elr: 0x40_0200,
+        spsr: 0x3c0,
+        ..Default::default()
+    };
+    let action = carrick_el1::fault::dispatch_fault_with_prepared(
+        &mut frame,
+        counters,
+        core::slice::from_ref(&fixture.task),
+        crate::sched::object_wait::space_access(fixture.zone, fixture.slot),
+        crate::cow_resolver::native_fault_supply(true, GrantMailboxes::own(&mailbox), &supply),
+        Some(PreparedFaultPath {
+            residency,
+            resolver: &mut NoopPreparedResolver,
+            roots: Some(fixture.region.table()),
+            file_slots: Some(portal),
+        }),
+        &mut NoopCowResolver,
+    );
+    assert_eq!(action, carrick_el1_abi::Action::Forward);
+    assert_eq!(
+        supply.outcome(),
+        OwnerFaultSupplyOutcome::PolicyDeclined(carrick_el1::fault::SegvCause::Access),
+        "a write to a read-only mapping is declined as an access error (verdict {:?})",
+        supply.verdict()
+    );
+    let Some(carrick_core_abi::service::ServiceOperation::Fault(fault)) =
+        super::dispatch::native_service_operation(&mut frame, &fixture.task.linux, action)
+    else {
+        panic!("a forwarded fault publishes a fault service")
+    };
+    // The native resume answers the host's refusal from this field (the
+    // `(Fault, Refused)` arm in `service.rs`): set is SEGV_ACCERR.
+    assert!(
+        fault.present,
+        "the native resume answers a refused declined-access fault with SEGV_ACCERR, got {fault:?}"
+    );
+}
+
 #[test]
 fn arm_permission_fault_sig_dfl_terminates_through_native_owner() {
     use carrick_signal_core::policy::{Action, Disposition, Signal};
