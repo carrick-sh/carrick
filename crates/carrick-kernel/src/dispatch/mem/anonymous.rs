@@ -2527,14 +2527,19 @@ impl MemView<'_> {
         {
             return Ok(None);
         }
-        // mremap(2) EFAULT: the old range must be one mapping; a hole or
-        // two mappings (of any owner or attributes) is refused before any
-        // other effect.
-        let [node] = mappings.as_slice() else {
-            return Ok(Some(DispatchOutcome::errno(LINUX_EFAULT)));
+        // mremap(2) EFAULT: a growing or moving old range must be one
+        // mapping; a hole or two mappings (of any owner or attributes) is
+        // refused before any other effect. Linux shrinks first: a shrink,
+        // or a same-size call, needs only a mapping at `old_address`, and
+        // retires the tail across any mappings and holes (#3171).
+        let shrinks = !move_fixed && !dontunmap && new_size <= old_size;
+        let node = match mappings.as_slice() {
+            [node] => node,
+            [first, ..] if shrinks => first,
+            _ => return Ok(Some(DispatchOutcome::errno(LINUX_EFAULT))),
         };
         if node.range.start() > old_address
-            || node.range.end() < old_end
+            || (!shrinks && node.range.end() < old_end)
             || !node.flags.root_editable()
         {
             return Ok(Some(DispatchOutcome::errno(LINUX_EFAULT)));
