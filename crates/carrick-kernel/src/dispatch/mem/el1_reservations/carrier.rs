@@ -8,7 +8,8 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use carrick_el1::memory::reservations::{
-    Refusal, Reservations, ResolvedReservationNodes, RootReleaseVenue, RootWait, SharedReservations,
+    HostBankInstall, Refusal, Reservations, ResolvedReservationNodes, RootReleaseVenue, RootWait,
+    SharedReservations,
 };
 use carrick_el1_abi::{MetadataExtentResolver, ReservationMm};
 use carrick_guest_mem::HostVa;
@@ -152,13 +153,18 @@ impl<A: CarrierReservationAccess> HostReservationProvider for CarrierReservation
             &self.access,
         ))))
     }
-    fn provision_metadata(&self, mm: ReservationMm, wait: &dyn RootWait) -> Result<(), Refusal> {
+    fn provision_metadata(
+        &self,
+        mm: ReservationMm,
+        wait: &dyn RootWait,
+    ) -> Result<HostBankInstall, Refusal> {
         // Carrier capacity publication is serialized outside all MM locks.
         let _capacity = self.capacity.lock();
         let view = self.prepare()?;
         let mut root = view.lock(mm, wait)?;
         match root.secure_host_nodes(carrick_el1::memory::reservations::HOST_RESERVE) {
-            Ok(()) => return Ok(()),
+            // A peer's bank already serves this root: decide again.
+            Ok(()) => return Ok(HostBankInstall::Redundant),
             Err(Refusal::MetadataRequired) => {}
             Err(refusal) => return Err(refusal),
         }
@@ -174,13 +180,12 @@ impl<A: CarrierReservationAccess> HostReservationProvider for CarrierReservation
             .access
             .map_retained(Arc::new(ReservationBankBacking(backing)))
             .map_err(|_| Refusal::MetadataRequired)?;
-        let result = mapping
-            .pin()
-            .map_err(|_| Refusal::Stale)
-            .and_then(|pin| {
-                table.provision_metadata(&pin, generation, &host_release_venue(&*self.access)?)
-            });
-        if result.is_err() {
+        let result = mapping.pin().map_err(|_| Refusal::Stale).and_then(|pin| {
+            table.provision_metadata(&pin, generation, &host_release_venue(&*self.access)?)
+        });
+        // Only a published grant became a bank; a redundant one, or one
+        // refused by a held window, is retired here.
+        if !matches!(result, Ok(HostBankInstall::Published)) {
             let _ = mapping.try_retire();
         }
         result

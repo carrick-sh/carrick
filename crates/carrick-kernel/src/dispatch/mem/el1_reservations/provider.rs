@@ -5,8 +5,26 @@
 
 use super::*;
 use crate::dispatch::mm_authority::DispatchMmAuthority;
-use carrick_el1::memory::reservations::{NoRootWait, RootHolder, RootWait};
+use carrick_el1::memory::reservations::{HostBankInstall, NoRootWait, RootHolder, RootWait};
 use carrick_guest_mem::PrivateFileVenue;
+
+/// What a host venue's metadata provision left it to do (#3085).
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::Eq,
+    ::core::cmp::PartialEq,
+)]
+pub(in crate::dispatch) enum MetadataProvision {
+    /// The pool grew (this grant, or a peer's bank): decide again.
+    Grown,
+    /// Another supplier, such as a guest fork's bank supply, holds the
+    /// carrier's bank append window. Not now: the syscall parks on this MM's
+    /// Metadata cause, observed before the provider sampled the pool, and
+    /// the holder's close wakes it.
+    NotNow(carrick_el1_abi::PortalOwnerWait),
+}
 
 /// A refused root probe, retaining the exact release producer and the holder
 /// from that same failed acquisition. It owns no lock or execution capacity.
@@ -120,7 +138,13 @@ pub trait HostReservationProvider: Send + Sync {
     /// storage remains `MetadataRequired` at this service boundary; after
     /// this attempt fails, the personality may answer Linux ENOMEM without
     /// transferring the admitted root back to a host placement authority.
-    fn provision_metadata(&self, _mm: ReservationMm, _wait: &dyn RootWait) -> Result<(), Refusal> {
+    /// A grant the table did not publish is the provider's to retire; its
+    /// [`HostBankInstall`] goes back unchanged, for the caller to decide.
+    fn provision_metadata(
+        &self,
+        _mm: ReservationMm,
+        _wait: &dyn RootWait,
+    ) -> Result<HostBankInstall, Refusal> {
         Err(Refusal::MetadataRequired)
     }
 }
@@ -193,6 +217,21 @@ pub(in crate::dispatch) struct DelegatedRoot {
 impl DelegatedRoot {
     fn observe_probe(&self) -> Result<RootProbe, Refusal> {
         use carrick_sched_core::spaces::notification::SpaceWaitCause;
+        Ok(RootProbe {
+            observed: self.observe(
+                carrick_el1_abi::PortalWaitCause::Reservations,
+                SpaceWaitCause::Reservations,
+            )?,
+            holder: std::cell::Cell::new(None),
+        })
+    }
+    /// Sample this exact admitted MM's `cause` before the predicate it
+    /// waits on.
+    fn observe(
+        &self,
+        portal: carrick_el1_abi::PortalWaitCause,
+        cause: carrick_sched_core::spaces::notification::SpaceWaitCause,
+    ) -> Result<carrick_el1_abi::PortalOwnerWait, Refusal> {
         use std::num::NonZeroU64;
         let backing = self
             .provider
@@ -214,17 +253,13 @@ impl DelegatedRoot {
                 source.identity().incarnation,
             )
         };
-        // SAFETY: sampled from this live source before the root predicate.
-        let observed = unsafe {
+        // SAFETY: sampled from this live source before the caller's predicate.
+        Ok(unsafe {
             carrick_el1_abi::PortalOwnerWait::from_owner(
                 handle,
-                carrick_el1_abi::PortalWaitCause::Reservations,
-                source.observe(SpaceWaitCause::Reservations).revision(),
+                portal,
+                source.observe(cause).revision(),
             )
-        };
-        Ok(RootProbe {
-            observed,
-            holder: std::cell::Cell::new(None),
         })
     }
     /// Observe before checking MM-owned proposal custody. Its adoption drops
@@ -237,12 +272,28 @@ impl DelegatedRoot {
     pub(in crate::dispatch) fn handle(&self) -> Result<carrick_el1_abi::El1MmHandle, Refusal> {
         self.observe_probe().map(|probe| probe.observed.handle())
     }
-    pub(in crate::dispatch) fn provision_metadata(&self) -> Result<(), RootAccessRefusal> {
+    /// Supply carrier node storage for this root. A bank append window held
+    /// by another supplier (a guest fork's bank supply holds the same
+    /// carrier-wide window) is "not now", never `Busy`: this MM's Metadata
+    /// cause is observed before the provider samples the pool, so the
+    /// holder's close, which wakes it, cannot be lost (#3085).
+    pub(in crate::dispatch) fn provision_metadata(
+        &self,
+    ) -> Result<MetadataProvision, RootAccessRefusal> {
+        use carrick_sched_core::spaces::notification::SpaceWaitCause;
         let _host = self.host_serial.lock();
         let probe = self.observe_probe()?;
-        self.provider
-            .provision_metadata(self.mm, &probe)
-            .map_err(|error| probe.refusal(error))
+        let metadata = self.observe(
+            carrick_el1_abi::PortalWaitCause::Metadata,
+            SpaceWaitCause::Metadata,
+        )?;
+        match self.provider.provision_metadata(self.mm, &probe) {
+            Ok(HostBankInstall::Published | HostBankInstall::Redundant) => {
+                Ok(MetadataProvision::Grown)
+            }
+            Ok(HostBankInstall::WindowHeld) => Ok(MetadataProvision::NotNow(metadata)),
+            Err(error) => Err(probe.refusal(error)),
+        }
     }
     /// One step on the exact admitted root. Observe the release source before
     /// probing; the guard lives only inside step and cannot cross suspension.
@@ -450,7 +501,7 @@ mod tests {
                 &self,
                 mm: ReservationMm,
                 wait: &dyn RootWait,
-            ) -> Result<(), Refusal> {
+            ) -> Result<HostBankInstall, Refusal> {
                 assert!(
                     self.serial.is_locked(),
                     "metadata provisioning bypassed host serialization"
@@ -464,7 +515,7 @@ mod tests {
                     .recv_timeout(Duration::from_secs(5))
                     .unwrap();
                 drop(held);
-                Ok(())
+                Ok(HostBankInstall::Published)
             }
         }
         let dispatcher = SyscallDispatcher::new();
@@ -490,7 +541,7 @@ mod tests {
             });
             started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             release_tx.send(()).unwrap();
-            assert_eq!(provision.join().unwrap(), Ok(()));
+            assert_eq!(provision.join().unwrap(), Ok(MetadataProvision::Grown));
             assert_eq!(observe.join().unwrap(), Ok(root.mm()));
         });
     }
