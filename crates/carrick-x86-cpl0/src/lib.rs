@@ -181,6 +181,10 @@ mod test_support {
     /// consumed the arming vector: it must still stop, never sleep past the
     /// arming with no vector left to wake it.
     pub const INJECT_ORDER_PEER_AFTER_IDLE_READ_LATE_ARM: u64 = 0xffff_ffff_ffff_fe70;
+    /// 1 once the pass that stopped at the ordering point is the one that
+    /// found [`INJECT_ORDER_PEER_AFTER_IDLE_READ_LATE_ARM`]'s arming
+    /// incomplete after taking its vector, else 0.
+    pub const INJECT_ORDER_PEER_LATE_ARM_CENSUS: u64 = 0xffff_ffff_ffff_fe71;
     /// Wake the peer CPU and stop it right after its idle slot is published
     /// IdleWfi, before HLT, until this CPU says it published (#3053). This
     /// CPU then publishes host work on the peer's task with no vector
@@ -277,10 +281,16 @@ mod test_support {
     static ORDER_SLOT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
     static ORDER_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
     static ORDER_PASSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-    /// Passes of the peer that found its ordering point
-    /// [`ORDER_ARMING`] (#3136).
-    static ORDER_ARMING_PASSES: core::sync::atomic::AtomicU64 =
+    /// Idle passes begun on the ordered slot, counted before each pass's
+    /// drain of its vectors (#3136).
+    static ORDER_PASS_EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    /// The epoch of the last pass that found its ordering point
+    /// [`ORDER_ARMING`] with no wake vector pending: its drain, or an
+    /// earlier one, took any vector sent before that pass began.
+    static ORDER_ARMING_TAKEN_EPOCH: core::sync::atomic::AtomicU64 =
         core::sync::atomic::AtomicU64::new(0);
+    /// The epoch of the pass that stopped at its ordering point.
+    static ORDER_STOP_EPOCH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
     /// The stopped peer's current task, published at its ordering point.
     static ORDER_PEER_TASK: core::sync::atomic::AtomicUsize =
         core::sync::atomic::AtomicUsize::new(0);
@@ -733,6 +743,28 @@ mod test_support {
         SCAN_HOLD.store(SCAN_RELEASED, Ordering::Release);
     }
 
+    /// Called at the top of each pass of the idle scheduler on `slot`,
+    /// before it drains its vectors (#3136).
+    pub fn idle_pass_begins(slot: carrick_sched_core::SlotId) {
+        if ORDER_SLOT.load(Ordering::Acquire) == slot.raw() + 1 {
+            ORDER_PASS_EPOCH.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Whether this CPU has a timer, kick or reschedule vector pending.
+    fn wake_vector_pending() -> bool {
+        // SAFETY: CPL0 on this CPU, with its local APIC mapped.
+        [
+            carrick_el1::isa::x86::interrupts::TIMER_VECTOR,
+            carrick_el1::isa::x86::interrupts::KICK_VECTOR,
+            carrick_el1::isa::x86::interrupts::RESCHED_VECTOR,
+        ]
+        .into_iter()
+        .any(|vector| unsafe {
+            carrick_el1::isa::x86::interrupts::hardware::vector_requested(vector)
+        })
+    }
+
     /// Called on each pass of the idle scheduler on `slot`, right after the
     /// pass has read its conditions (#3053).
     pub fn order_after_idle_read(
@@ -764,6 +796,7 @@ mod test_support {
         {
             return;
         }
+        let epoch = ORDER_PASS_EPOCH.load(Ordering::Acquire);
         let mut state = ORDER_STATE.load(Ordering::Acquire);
         if state == ORDER_ARMING {
             // The arming CPU sent a vector this pass may already have
@@ -771,7 +804,9 @@ mod test_support {
             // here could sleep past the arming with no wake left. Its next
             // store ends the window; then the pending-vector check below
             // tells a taken vector from one still to come.
-            ORDER_ARMING_PASSES.fetch_add(1, Ordering::AcqRel);
+            if !wake_vector_pending() {
+                ORDER_ARMING_TAKEN_EPOCH.store(epoch, Ordering::Release);
+            }
             while state == ORDER_ARMING {
                 core::hint::spin_loop();
                 state = ORDER_STATE.load(Ordering::Acquire);
@@ -783,16 +818,7 @@ mod test_support {
         // Stop only at a pass that owes no wake already: a vector still
         // pending here (the arming reschedule, a timer) would end the sleep
         // under test by itself. Such a pass goes on; the next one stops.
-        // SAFETY: CPL0 on this CPU, with its local APIC mapped.
-        if [
-            carrick_el1::isa::x86::interrupts::TIMER_VECTOR,
-            carrick_el1::isa::x86::interrupts::KICK_VECTOR,
-            carrick_el1::isa::x86::interrupts::RESCHED_VECTOR,
-        ]
-        .into_iter()
-        .any(|vector| unsafe {
-            carrick_el1::isa::x86::interrupts::hardware::vector_requested(vector)
-        }) {
+        if wake_vector_pending() {
             return;
         }
         ORDER_PEER_TASK.store(
@@ -810,6 +836,7 @@ mod test_support {
         {
             return;
         }
+        ORDER_STOP_EPOCH.store(epoch, Ordering::Release);
         while ORDER_STATE.load(Ordering::Acquire) != ORDER_PUBLISHED {
             core::hint::spin_loop();
         }
@@ -844,9 +871,18 @@ mod test_support {
         carrick_el1::isa::x86::interrupt::send_resched(peer)
             .unwrap_or_else(|_| carrick_x86_carrier::entry::fatal_boot!());
         if late {
-            // The peer's pass, woken by the vector just sent, runs before
-            // the arming completes: the event, never a count of spins.
-            while ORDER_ARMING_PASSES.load(Ordering::Acquire) == 0 {
+            // The vector must be out first: one the busy ICR left owed is
+            // resent here, this wait being a delivery point of its own.
+            while !carrick_el1::isa::x86::interrupt::deliver_owed_resched(
+                carrick_el1::isa::x86::interrupt::DeliveryPoint::KernelInterrupt,
+            ) {
+                core::hint::spin_loop();
+            }
+            // Then a peer pass begun after the send, so its drain took the
+            // vector, must find the arming incomplete with no wake pending:
+            // the event, never a count of spins.
+            let sent = ORDER_PASS_EPOCH.load(Ordering::Acquire);
+            while ORDER_ARMING_TAKEN_EPOCH.load(Ordering::Acquire) <= sent {
                 core::hint::spin_loop();
             }
         }
@@ -1558,6 +1594,12 @@ mod test_support {
                 .is_ok()
                 .then_some(0),
             INJECT_ORDER_PEER_CENSUS => Some(ORDER_PASSES.load(Ordering::Acquire)),
+            INJECT_ORDER_PEER_LATE_ARM_CENSUS => {
+                let taken = ORDER_ARMING_TAKEN_EPOCH.load(Ordering::Acquire);
+                Some(u64::from(
+                    taken != 0 && ORDER_STOP_EPOCH.load(Ordering::Acquire) == taken,
+                ))
+            }
             INJECT_MARK_PEER_HOST_WORK => {
                 if ORDER_STATE.load(Ordering::Acquire) != ORDER_REACHED {
                     return None;

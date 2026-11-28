@@ -4447,12 +4447,14 @@ fn production_idle_pass_publication_after_its_read_still_wakes_it() {
 }
 
 /// #3136 on x86 CPL0: the idle-read witness above, with the arming CPU
-/// held between its reschedule send and the end of its arming until the
-/// peer's pass, woken by that vector, has run (a loaded host descheduling
+/// held between its reschedule send and the end of its arming until a
+/// peer pass begun after the send (so its drain took the vector) has found
+/// the arming incomplete with no wake pending (a loaded host descheduling
 /// the arming vCPU at the send's exit). That pass took the only vector, so
 /// it must stop at its ordering point anyway. One that went on and slept
 /// has nothing left to wake it, and the bounded child reaches its bound
-/// with the peer IdleWfi and no kick pending.
+/// with the peer IdleWfi and no kick pending. Exit 92: the pass that
+/// stopped is not the one that took the vector.
 #[test]
 fn production_idle_order_armed_after_its_vector_was_taken_still_stops_the_peer() {
     bounded_contention_witness(
