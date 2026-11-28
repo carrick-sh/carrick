@@ -11183,32 +11183,47 @@ fn serial_host_delegated_host_mmap_enrolled_on_a_held_window_is_woken_by_its_clo
     let venue = root.owner_wait_venue();
     let parks = &root.carrier.table.zone().counters.host_parks;
     let wake_slot = Arc::new(SingleCarrierHandbackWait::for_current_thread());
+    let slot: &SingleCarrierHandbackWait = &wake_slot;
     let (held_tx, held_rx) = std::sync::mpsc::sync_channel(0);
-    let step = crate::el1_zone::with_test_handback_publisher(wake_slot.publisher(), || {
-        std::thread::scope(|scope| {
-            let carrier = &root.carrier;
-            scope.spawn(move || {
-                let release = carrier.table.release();
-                let window = table.open_bank_window_for_test(&release).unwrap();
-                held_tx.send(()).unwrap();
-                // Close only once the mmap's thread enrolled and parked, so
-                // its wake can only be this close's.
-                let deadline = Instant::now() + Duration::from_secs(10);
-                while parks.load(Ordering::Acquire) == 0 {
-                    assert!(Instant::now() < deadline, "the mmap never parked");
-                    std::hint::spin_loop();
-                }
-                drop(window);
-            });
-            held_rx.recv().unwrap();
-            let outcome = try_host_mmap(&mut dispatcher, &mut memory);
-            let Ok(DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }) = outcome else {
-                panic!("a held bank window must park the mmap: {outcome:?}")
-            };
-            assert_eq!(wait.cause(), carrick_el1_abi::PortalWaitCause::Metadata);
-            wait_for_owner_memory_release(venue, &ctx, wait, &wake_slot)
-        })
-    });
+    let (returned_tx, returned_rx) = std::sync::mpsc::sync_channel(1);
+    let (step, missed) =
+        crate::el1_zone::with_test_handback_publisher(wake_slot.publisher(), || {
+            std::thread::scope(|scope| {
+                let carrier = &root.carrier;
+                let holder = scope.spawn(move || {
+                    let release = carrier.table.release();
+                    let window = table.open_bank_window_for_test(&release).unwrap();
+                    held_tx.send(()).unwrap();
+                    // Close only once the mmap's thread enrolled and parked, so
+                    // its wake can only be this close's.
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while parks.load(Ordering::Acquire) == 0 {
+                        assert!(Instant::now() < deadline, "the mmap never parked");
+                        std::hint::spin_loop();
+                    }
+                    drop(window);
+                    // The watchdog: a close that stops waking its enrolled waiter
+                    // fails this witness, and never hangs the partition.
+                    returned_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .err()
+                        .map(|_| slot.release_missed_wake_for_test())
+                });
+                held_rx.recv().unwrap();
+                let outcome = try_host_mmap(&mut dispatcher, &mut memory);
+                let Ok(DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }) = outcome else {
+                    panic!("a held bank window must park the mmap: {outcome:?}")
+                };
+                assert_eq!(wait.cause(), carrick_el1_abi::PortalWaitCause::Metadata);
+                let step = wait_for_owner_memory_release(venue, &ctx, wait, slot);
+                let _ = returned_tx.send(());
+                (step, holder.join().unwrap())
+            })
+        });
+    assert_eq!(
+        missed, None,
+        "the holder's close never woke the enrolled waiter (released by the watchdog)"
+    );
     assert_eq!(
         step,
         Ok(OwnerMemoryWaitStep::ParkedAndWoken),
