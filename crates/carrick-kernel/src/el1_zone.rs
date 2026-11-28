@@ -2047,11 +2047,16 @@ pub mod first_entry_test_control {
                 self.0.elapsed() < std::time::Duration::from_secs(5)
             }
         }
-        super::zone_tables()?.first_entry_links_clear_for_test(
+        // The inspection takes every run-queue lock, and a release that an
+        // idle scan enrolled on owes that scan a pass: send it.
+        let passes = carrick_sched_core::OwedPasses::new();
+        let clear = super::zone_tables()?.first_entry_links_clear_for_test(
             record,
             &Deadline(std::time::Instant::now()),
-            &carrick_sched_core::OwedPasses::new(),
-        )
+            &passes,
+        );
+        passes.deliver(crate::el1_zone::resched_slot);
+        clear
     }
 }
 
