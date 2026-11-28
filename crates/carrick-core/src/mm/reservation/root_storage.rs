@@ -307,9 +307,11 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
     /// - grown past `observed` (a bank published after the view was read):
     ///   `Redundant`, decide again, and no grant is sought;
     /// - else `seek` maps the host's grant, outside every MM lock. With none
-    ///   (no host memory, no aperture slot), the table reads again: another
-    ///   supplier's window held is `WindowHeld` (not now), a pool grown
-    ///   meanwhile is `Redundant`, and only then is it `MetadataRequired`;
+    ///   (`Ok(None)`: no host memory, no aperture slot), the table reads
+    ///   again: another supplier's window held is `WindowHeld` (not now), a
+    ///   pool grown meanwhile is `Redundant`, and only then is it
+    ///   `MetadataRequired`. A broken mapper (`Err`: a stale carrier
+    ///   generation, an invalid extent) is that refusal, never a miss;
     /// - with a grant, the append decides under the window: `Published`,
     ///   `Redundant`, `WindowHeld`, or `MetadataRequired` for a full table.
     ///
@@ -320,7 +322,7 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
     pub fn install_host_bank<G: HostBankGrant>(
         &self,
         observed: NodeCapacity,
-        seek: impl FnOnce() -> Option<G>,
+        seek: impl FnOnce() -> Result<Option<G>, Refusal>,
         waiters: &impl MetadataWaiters,
     ) -> HostBankDecision<G> {
         let decided = |answer| HostBankDecision {
@@ -330,12 +332,16 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         if self.storage.capacity() > observed.0 {
             return decided(Ok(HostBankInstall::Redundant));
         }
-        let Some(grant) = seek() else {
-            return decided(match self.after_miss(observed.0) {
-                Miss::WindowHeld => Ok(HostBankInstall::WindowHeld),
-                Miss::Grown => Ok(HostBankInstall::Redundant),
-                Miss::Short => Err(Refusal::MetadataRequired),
-            });
+        let grant = match seek() {
+            Ok(Some(grant)) => grant,
+            Ok(None) => {
+                return decided(match self.after_miss(observed.0) {
+                    Miss::WindowHeld => Ok(HostBankInstall::WindowHeld),
+                    Miss::Grown => Ok(HostBankInstall::Redundant),
+                    Miss::Short => Err(Refusal::MetadataRequired),
+                });
+            }
+            Err(broken) => return decided(Err(broken)),
         };
         let answer = grant.pin().and_then(|pin| {
             let extent = pin.extent();
@@ -809,7 +815,7 @@ mod tests {
         let pin = resolver.pin(extent).unwrap();
         assert_eq!(
             table
-                .install_host_bank(table.node_capacity(), || Some(pin), &Wakes::default())
+                .install_host_bank(table.node_capacity(), || Ok(Some(pin)), &Wakes::default())
                 .answer,
             Ok(HostBankInstall::Published)
         );
@@ -1203,7 +1209,7 @@ mod tests {
             }
         };
         let pinned = |pin: Pin, observed| {
-            let decision = table.install_host_bank(observed, || Some(pin), &Wakes::default());
+            let decision = table.install_host_bank(observed, || Ok(Some(pin)), &Wakes::default());
             // A published grant is consumed; one appended to nothing is not.
             if decision.answer == Ok(HostBankInstall::Published) {
                 assert!(decision.unpublished.is_none());
@@ -1212,7 +1218,7 @@ mod tests {
         };
         let unavailable = |observed| {
             table
-                .install_host_bank(observed, || None::<Pin>, &Wakes::default())
+                .install_host_bank(observed, || Ok(None::<Pin>), &Wakes::default())
                 .answer
         };
         let observed = table.node_capacity();
@@ -1227,6 +1233,15 @@ mod tests {
         // With nobody growing the pool, no grant is the refusal: the only
         // MetadataRequired a host venue's supply gives.
         assert_eq!(unavailable(observed), Err(Refusal::MetadataRequired));
+        // P1: a broken mapper (its carrier generation went stale) is that
+        // broken invariant, never the miss that answers ENOMEM.
+        let broken = table.install_host_bank(
+            observed,
+            || Err::<Option<Pin>, _>(Refusal::Stale),
+            &Wakes::default(),
+        );
+        assert_eq!(broken.answer, Err(Refusal::Stale));
+        assert!(broken.unpublished.is_none());
         // A peer's bank lands after the observation: any grant, or none, is
         // redundant (P0 C and D: decide again, never ENOMEM).
         let mut backing = vec![0u8; 2 * 1024 * 1024];
@@ -1252,13 +1267,15 @@ mod tests {
         table.storage.count.store(0, Ordering::Release);
     }
 
-    /// #3085 P1: a supplier already parked on the Metadata cause before the
-    /// holder's close is woken by that close. The parker holds the wake
-    /// count's lock until the condvar wait releases it, and the close must
-    /// take that lock to count its wake, so the close provably lands after
-    /// the parker is waiting.
+    /// #3085 P1, at the window: a close notifies a waiter already waiting.
+    /// The parker holds the wake count's lock until the condvar wait releases
+    /// it, and the close must take that lock to count its wake, so the
+    /// notification (not the flag's clear, which precedes it) lands after the
+    /// parker waits. The production waiter, enrolled on the MM's Metadata
+    /// cause before the close, is
+    /// `delegated_host_mmap_enrolled_on_a_held_window_is_woken_by_its_close`.
     #[test]
-    fn a_supplier_parked_before_the_close_is_woken_by_it() {
+    fn a_window_close_notifies_a_waiter_already_waiting() {
         let table = table();
         let parked = Parked::default();
         let observed = table.node_capacity();
@@ -1267,7 +1284,7 @@ mod tests {
             let window = table.open_bank_window_for_test(&parked).unwrap();
             assert_eq!(
                 table
-                    .install_host_bank(observed, || None::<Pin>, &Wakes::default())
+                    .install_host_bank(observed, || Ok(None::<Pin>), &Wakes::default())
                     .answer,
                 Ok(HostBankInstall::WindowHeld)
             );

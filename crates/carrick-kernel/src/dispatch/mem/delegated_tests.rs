@@ -10698,16 +10698,24 @@ fn run_hook(hook: &PeerHook) {
 /// mapped or the guest allocator granted. Guest and host addresses coincide,
 /// as in every VM-free fixture. A peer acts inside `on_pin` (a view refresh
 /// resolving a published bank, after it read the bank count) or `on_map`
-/// (while the provider seeks its grant).
+/// (while the provider seeks its grant). A backend can refuse to retire
+/// (`refuse_retire`), or find its carrier generation gone as it maps
+/// (`stale`).
 #[derive(Clone)]
 struct Aperture {
     carrier: Carrier,
     grants: Grants,
     full: Arc<std::sync::atomic::AtomicBool>,
+    stale: Arc<std::sync::atomic::AtomicBool>,
+    refuse_retire: Arc<std::sync::atomic::AtomicBool>,
     on_pin: PeerHook,
     on_map: PeerHook,
+    /// Runs as the provider is entered (see [`EnteredProvider`]).
+    on_provision: PeerHook,
     maps: Arc<std::sync::atomic::AtomicUsize>,
     retired: Arc<std::sync::atomic::AtomicUsize>,
+    /// Extent authorities dropped, retired or not.
+    released: Arc<std::sync::atomic::AtomicUsize>,
     /// Carrier custody: every mapped backing stays until the carrier goes,
     /// as a backend's does; an extent's drop releases only its authority.
     custody: Arc<
@@ -10717,6 +10725,14 @@ struct Aperture {
 struct ApertureExtent {
     extent: carrick_core_abi::MetadataExtent,
     retired: Arc<std::sync::atomic::AtomicUsize>,
+    refuse_retire: Arc<std::sync::atomic::AtomicBool>,
+    released: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl Drop for ApertureExtent {
+    fn drop(&mut self) {
+        self.released
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 impl carrick_hal::retained_metadata::RetainedMetadataExtent for ApertureExtent {
     type Pin = GrantPin;
@@ -10724,6 +10740,13 @@ impl carrick_hal::retained_metadata::RetainedMetadataExtent for ApertureExtent {
         Ok(GrantPin(self.extent))
     }
     fn try_retire(self) -> Result<(), Self> {
+        // A refused stage-2 unmap keeps the mapping and its slot.
+        if self
+            .refuse_retire
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(self);
+        }
         self.retired
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Ok(())
@@ -10744,6 +10767,10 @@ impl carrick_hal::retained_metadata::RetainedMetadataMapper for Aperture {
             // No spare aperture slot.
             return Err(carrick_core_abi::MetadataResolutionError::Busy);
         }
+        if self.stale.load(std::sync::atomic::Ordering::Acquire) {
+            // This carrier generation is gone.
+            return Err(carrick_core_abi::MetadataResolutionError::StaleOwner);
+        }
         let extent = self.grants.register(
             backing.host_base().as_mut_ptr::<u8>() as u64,
             backing.mapped_len(),
@@ -10752,6 +10779,8 @@ impl carrick_hal::retained_metadata::RetainedMetadataMapper for Aperture {
         Ok(ApertureExtent {
             extent,
             retired: Arc::clone(&self.retired),
+            refuse_retire: Arc::clone(&self.refuse_retire),
+            released: Arc::clone(&self.released),
         })
     }
 }
@@ -10774,6 +10803,37 @@ impl super::el1_reservations::CarrierReservationAccess for Aperture {
     }
     fn private_file_venue(&self) -> carrick_guest_mem::PrivateFileVenue {
         carrick_guest_mem::PrivateFileVenue::OwnerGrant
+    }
+}
+
+/// The production provider, every call passed through to it, with a peer's
+/// act (`on_provision`) as dispatch enters its `provision_metadata`: after
+/// the preflight root was refused, before the provider reads its own view.
+struct EnteredProvider {
+    provider: super::el1_reservations::CarrierReservations<Aperture>,
+    on_provision: PeerHook,
+}
+impl super::el1_reservations::HostReservationProvider for EnteredProvider {
+    fn private_file_venue(&self) -> carrick_guest_mem::PrivateFileVenue {
+        self.provider.private_file_venue()
+    }
+    fn address_space_backing(
+        &self,
+    ) -> Option<Arc<dyn crate::kernel::mm_occupancy::AddressSpaceBacking>> {
+        self.provider.address_space_backing()
+    }
+    fn prepare(
+        &self,
+    ) -> Result<Box<dyn super::el1_reservations::PreparedHostReservations>, Refusal> {
+        self.provider.prepare()
+    }
+    fn provision_metadata(
+        &self,
+        mm: carrick_el1_abi::ReservationMm,
+        wait: &dyn carrick_el1::memory::reservations::RootWait,
+    ) -> Result<carrick_el1::memory::reservations::HostBankInstall, Refusal> {
+        run_hook(&self.on_provision);
+        self.provider.provision_metadata(mm, wait)
     }
 }
 
@@ -10803,16 +10863,21 @@ fn bank_root(dispatcher: &SyscallDispatcher, banks: u32) -> (Root, Aperture) {
         carrier: carrier.clone(),
         grants: Grants::default(),
         full: Arc::default(),
+        stale: Arc::default(),
+        refuse_retire: Arc::default(),
         on_pin: PeerHook::default(),
         on_map: PeerHook::default(),
+        on_provision: PeerHook::default(),
         maps: Arc::default(),
         retired: Arc::default(),
+        released: Arc::default(),
         custody: Arc::default(),
     };
     dispatcher
-        .install_reservation_provider(Arc::new(super::el1_reservations::CarrierReservations::new(
-            aperture.clone(),
-        )))
+        .install_reservation_provider(Arc::new(EnteredProvider {
+            provider: super::el1_reservations::CarrierReservations::new(aperture.clone()),
+            on_provision: aperture.on_provision.clone(),
+        }))
         .unwrap();
     assert_eq!(
         admit(dispatcher, El1AdmissionOrigin::Bind, true),
@@ -11174,5 +11239,173 @@ fn delegated_host_mmap_parks_on_a_held_window_when_the_aperture_is_full() {
         DispatchOutcome::errno(LINUX_ENOMEM),
         "no slot, no peer, no window: ENOMEM"
     );
+    assert_eq!(table.storage_generation(), 0);
+}
+
+/// #3085 P0 C, at the provider's own view, through dispatch: the preflight
+/// root, on a fresh view of one bank, is refused. A peer's bank lands as
+/// dispatch enters the provider, so the provider prepares a view of its own,
+/// and another lands after that view read the bank count, before its lock. The
+/// provider's stale lock is the pool having grown: the table decides
+/// `Redundant` without a grant, and the mmap maps, never ENOMEM.
+#[test]
+fn delegated_host_mmap_maps_when_a_bank_lands_between_the_providers_view_and_its_lock() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let mut dispatcher = SyscallDispatcher::new();
+    let (root, aperture) = bank_root(&dispatcher, 1);
+    let mut memory = arena_memory();
+    let (observed, stale) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let (peer, carrier) = (aperture.clone(), root.carrier.clone());
+    let (observed_in, stale_in) = (Arc::clone(&observed), Arc::clone(&stale));
+    *aperture.on_provision.lock().unwrap() = Some(Box::new(move || {
+        peer_supplies_a_bank(&carrier, &peer.grants);
+        observed_in.fetch_add(1, Ordering::AcqRel);
+        arm_stale_views(&peer, carrier, 1, stale_in);
+    }));
+    let outcome = try_host_mmap(&mut dispatcher, &mut memory);
+    let Ok(DispatchOutcome::Returned { value }) = outcome else {
+        panic!("a bank that landed after the provider's view serves the mmap: {outcome:?}")
+    };
+    assert_eq!(value as u64 % PAGE, 0);
+    assert_eq!(
+        observed.load(Ordering::Acquire),
+        1,
+        "a bank landed after the preflight root was refused"
+    );
+    assert_eq!(
+        stale.load(Ordering::Acquire),
+        1,
+        "the provider's own view went stale"
+    );
+    let table: &SharedReservations = &root.carrier.table;
+    assert_eq!(
+        table.storage_generation(),
+        3,
+        "only the peers' banks published"
+    );
+    assert_eq!(
+        aperture.maps.load(Ordering::Acquire),
+        0,
+        "a grown pool needs no host grant"
+    );
+}
+
+/// #3085 P0 B, with a production waiter: a host `mmap` meets a guest fork's
+/// held bank window, parks, and its carrier thread enrols on the MM's
+/// Metadata cause (`wait_for_owner_memory_release`, the KVM and soft
+/// carriers' owner wait) before the holder closes. The close wakes that
+/// enrolled waiter (`ParkedAndWoken`, never `ProbeOnceReady`), and the rerun
+/// maps. Process-global handback publisher: serial.
+#[test]
+fn serial_host_delegated_host_mmap_enrolled_on_a_held_window_is_woken_by_its_close() {
+    use crate::dispatch::carrier_loop::{
+        OwnerMemoryWaitStep, SingleCarrierHandbackWait, wait_for_owner_memory_release,
+    };
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    let mut dispatcher = SyscallDispatcher::new();
+    let (root, _aperture) = bank_root(&dispatcher, 0);
+    let mut memory = arena_memory();
+    let table: &SharedReservations = &root.carrier.table;
+    let ctx = dispatcher.capture_one_task_context().unwrap();
+    let venue = root.owner_wait_venue();
+    let parks = &root.carrier.table.zone().counters.host_parks;
+    let wake_slot = Arc::new(SingleCarrierHandbackWait::for_current_thread());
+    let (held_tx, held_rx) = std::sync::mpsc::sync_channel(0);
+    let step = crate::el1_zone::with_test_handback_publisher(wake_slot.publisher(), || {
+        std::thread::scope(|scope| {
+            let carrier = &root.carrier;
+            scope.spawn(move || {
+                let release = carrier.table.release();
+                let window = table.open_bank_window_for_test(&release).unwrap();
+                held_tx.send(()).unwrap();
+                // Close only once the mmap's thread enrolled and parked, so
+                // its wake can only be this close's.
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while parks.load(Ordering::Acquire) == 0 {
+                    assert!(Instant::now() < deadline, "the mmap never parked");
+                    std::hint::spin_loop();
+                }
+                drop(window);
+            });
+            held_rx.recv().unwrap();
+            let outcome = try_host_mmap(&mut dispatcher, &mut memory);
+            let Ok(DispatchOutcome::OwnerMemoryWait { wait, committed: 0 }) = outcome else {
+                panic!("a held bank window must park the mmap: {outcome:?}")
+            };
+            assert_eq!(wait.cause(), carrick_el1_abi::PortalWaitCause::Metadata);
+            wait_for_owner_memory_release(venue, &ctx, wait, &wake_slot)
+        })
+    });
+    assert_eq!(
+        step,
+        Ok(OwnerMemoryWaitStep::ParkedAndWoken),
+        "the enrolled waiter is woken by the holder's close"
+    );
+    assert_eq!(parks.load(Ordering::Acquire), 1);
+    let outcome = try_host_mmap(&mut dispatcher, &mut memory);
+    let Ok(DispatchOutcome::Returned { value }) = outcome else {
+        panic!("the rerun maps: {outcome:?}")
+    };
+    assert_eq!(value as u64 % PAGE, 0);
+    assert_eq!(
+        table.storage_generation(),
+        1,
+        "the rerun published its bank"
+    );
+}
+
+/// #3085 P0 3: a guest fork's bank makes the provider's grant redundant,
+/// and the backend refuses to retire it although nothing pins it (a refused
+/// stage-2 unmap). That is a broken invariant: the mmap fails
+/// `ReservationAuthority(Invalid)`, and the grant is quarantined in the
+/// provider, its authority kept with its aperture slot, never dropped.
+#[test]
+fn delegated_host_mmap_quarantines_a_grant_its_backend_refused_to_retire() {
+    use std::sync::atomic::Ordering;
+    let mut dispatcher = SyscallDispatcher::new();
+    let (root, aperture) = bank_root(&dispatcher, 0);
+    let mut memory = arena_memory();
+    aperture.refuse_retire.store(true, Ordering::Release);
+    let (carrier, grants) = (root.carrier.clone(), aperture.grants.clone());
+    *aperture.on_map.lock().unwrap() =
+        Some(Box::new(move || peer_supplies_a_bank(&carrier, &grants)));
+    let outcome = try_host_mmap(&mut dispatcher, &mut memory);
+    assert!(
+        matches!(
+            outcome,
+            Err(DispatchError::ReservationAuthority(Refusal::Invalid))
+        ),
+        "a refused retirement of an unpinned grant is a broken invariant: {outcome:?}"
+    );
+    assert_eq!(aperture.maps.load(Ordering::Acquire), 1);
+    assert_eq!(aperture.retired.load(Ordering::Acquire), 0);
+    assert_eq!(
+        aperture.released.load(Ordering::Acquire),
+        0,
+        "the stranded grant's authority is quarantined, never dropped"
+    );
+}
+
+/// #3085 P1: the carrier generation is gone as the provider maps its grant.
+/// That is `Stale`, a broken invariant and a fatal dispatch, never the
+/// missing slot the table would answer `MetadataRequired` (ENOMEM).
+#[test]
+fn delegated_host_mmap_fails_stale_when_its_carrier_generation_is_gone_at_map() {
+    use std::sync::atomic::Ordering;
+    let mut dispatcher = SyscallDispatcher::new();
+    let (root, aperture) = bank_root(&dispatcher, 0);
+    let mut memory = arena_memory();
+    aperture.stale.store(true, Ordering::Release);
+    let outcome = try_host_mmap(&mut dispatcher, &mut memory);
+    assert!(
+        matches!(
+            outcome,
+            Err(DispatchError::ReservationAuthority(Refusal::Stale))
+        ),
+        "a stale carrier generation is never ENOMEM: {outcome:?}"
+    );
+    assert_eq!(aperture.maps.load(Ordering::Acquire), 1);
+    let table: &SharedReservations = &root.carrier.table;
     assert_eq!(table.storage_generation(), 0);
 }
