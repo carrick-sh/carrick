@@ -397,6 +397,8 @@ pub fn schedule(slot: SlotId) -> ! {
             {
                 #[cfg(feature = "test-support")]
                 crate::test_support::park_after_idle_recheck(slot);
+                #[cfg(feature = "test-support")]
+                crate::test_support::order_after_idle_recheck(slot, current);
                 unsafe {
                     core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack));
                 }
