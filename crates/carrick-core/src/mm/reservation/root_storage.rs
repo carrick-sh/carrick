@@ -43,6 +43,29 @@ pub enum NodeBankShortfall {
     Invalid,
 }
 
+/// What a host bank grant installed by [`SharedReservations::provision_metadata`]
+/// decided (#3085). Only `Published` consumes the grant; the caller retires
+/// it on either other answer.
+#[derive(
+    ::core::clone::Clone,
+    ::core::marker::Copy,
+    ::core::fmt::Debug,
+    ::core::cmp::PartialEq,
+    ::core::cmp::Eq,
+)]
+pub enum HostBankInstall {
+    /// This grant is now a bank: decide again.
+    Published,
+    /// The pool already grew past the generation the caller sampled (a
+    /// guest fork's bank, or another host venue's): this grant is redundant,
+    /// and the pool serves the caller as well as it would have. Decide again.
+    Redundant,
+    /// Another supplier holds the bank append window. Not now: its close
+    /// wakes every space's `SpaceWaitCause::Metadata`, which the caller
+    /// observed before it sampled the generation.
+    WindowHeld,
+}
+
 /// The one decision an append makes under the bank window.
 enum Append {
     /// This bank is published.
@@ -242,14 +265,16 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
     /// Publish a retained carrier extent allocated outside every MM lock.
     /// The pin authenticates both the host alias and the EL1 address; these
     /// domains need not be numerically equal. A concurrent publication makes
-    /// this grant redundant and leaves it unpublished.
+    /// this grant redundant and leaves it unpublished; a held append window
+    /// leaves it unpublished too ([`HostBankInstall`]). Neither is a refusal:
+    /// only a full table (`MetadataRequired`) or a bad grant is.
     /// `waiters` are woken when this call's append window closes.
     pub fn provision_metadata<P: PinnedMetadataExtent>(
         &self,
         pin: &P,
         expected_generation: u32,
         waiters: &impl MetadataWaiters,
-    ) -> Result<(), Refusal> {
+    ) -> Result<HostBankInstall, Refusal> {
         let extent = pin.extent();
         let capacity = expected_generation
             .checked_mul(BANK_NODES as u32)
@@ -266,10 +291,9 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
             capacity,
             waiters,
         )? {
-            Append::Published => Ok(()),
-            // Redundant, or the window is held: the caller retires its
-            // grant and decides again.
-            Append::Grown | Append::WindowHeld => Err(Refusal::Busy),
+            Append::Published => Ok(HostBankInstall::Published),
+            Append::Grown => Ok(HostBankInstall::Redundant),
+            Append::WindowHeld => Ok(HostBankInstall::WindowHeld),
             Append::Full => Err(Refusal::MetadataRequired),
         }
     }
@@ -414,13 +438,16 @@ impl<Policy: ReservationPolicy, Geometry: ReservationGeometry>
         Ok(Append::Published)
     }
 
-    /// Hold (or release) the bank append window as another supplier would,
-    /// for a host test of the contended supply (#3085).
+    /// Open the bank append window through the production guard, as another
+    /// supplier's append does, for a test of the contended supply (#3085).
+    /// Dropping it is that holder's real close: it releases the flag and
+    /// wakes `waiters`. `None` when the window is already held.
     #[cfg(any(test, feature = "host-test"))]
-    pub fn hold_bank_window_for_test(&self, held: bool) {
-        self.storage
-            .publishing
-            .store(u32::from(held), Ordering::Release);
+    pub fn open_bank_window_for_test<'a, W: MetadataWaiters>(
+        &'a self,
+        waiters: &'a W,
+    ) -> Option<impl Drop + 'a> {
+        MetadataPublicationWindow::open(&self.storage.publishing, waiters)
     }
 
     #[cfg(any(test, feature = "host-test"))]
@@ -692,9 +719,10 @@ mod tests {
             calls: Cell::new(0),
         };
         let pin = resolver.pin(extent).unwrap();
-        table
-            .provision_metadata(&pin, 0, &Wakes::default())
-            .unwrap();
+        assert_eq!(
+            table.provision_metadata(&pin, 0, &Wakes::default()),
+            Ok(HostBankInstall::Published)
+        );
         let mut host = ResolvedReservationNodes::default();
         unsafe { host.refresh(&table, &resolver, NonNull::dangling()) }.unwrap();
         let mut model = table.lock_resolved(0, mm, &host, &NoRootWait).unwrap();
@@ -981,12 +1009,42 @@ mod tests {
         }
     }
 
+    /// A supplier parked on the Metadata cause: its holder's close wakes it.
+    #[derive(Default)]
+    struct Parked {
+        wakes: std::sync::Mutex<usize>,
+        woken: std::sync::Condvar,
+    }
+    impl MetadataWaiters for Parked {
+        fn wake_metadata_waiters(&self) {
+            *self.wakes.lock().unwrap() += 1;
+            self.woken.notify_all();
+        }
+    }
+    impl Parked {
+        /// Park until a wake after `observed`; the bound only stops a broken
+        /// close from hanging the suite.
+        fn park(&self, observed: usize) -> usize {
+            let (wakes, _) = self
+                .woken
+                .wait_timeout_while(
+                    self.wakes.lock().unwrap(),
+                    std::time::Duration::from_secs(30),
+                    |wakes| *wakes == observed,
+                )
+                .unwrap();
+            *wakes
+        }
+    }
+
     /// #3085: a supply that meets another supplier's bank window held is
-    /// "not now" (`Publishing`), returns its bank and wakes nobody; the
-    /// holder's close is what wakes the Metadata waiters, and the rerun
-    /// then publishes (contention once, then success).
+    /// "not now" (`Publishing`), returns its bank and wakes nobody. The
+    /// holder is a second live thread holding the production window guard;
+    /// its own close (the guard's drop) is what wakes the parked supplier,
+    /// and the supplier's rerun then publishes (contention once, then
+    /// success).
     #[test]
-    fn node_bank_supply_refuses_a_held_window_and_the_close_wakes() {
+    fn node_bank_supply_refuses_a_held_window_and_the_holders_close_wakes_it() {
         let table = table();
         let mut backing = vec![0u8; 4 * 1024 * 1024];
         let allocator = MetadataStorage::new();
@@ -994,29 +1052,95 @@ mod tests {
             .admit_bootstrap_region(backing.as_mut_ptr() as u64, backing.len())
             .unwrap();
         let wakes = Wakes::default();
+        let parked = Parked::default();
         let observed = table.node_capacity();
         let before = allocator.diagnostics().allocated_bytes;
-        table.storage.publishing.store(1, Ordering::Release);
-        assert_eq!(
-            table.supply_node_bank(&allocator, observed, &wakes),
-            Err(NodeBankShortfall::Publishing)
-        );
-        assert_eq!(table.storage.bank_count(), 0);
-        assert_eq!(wakes.0.get(), 0);
-        assert_eq!(allocator.diagnostics().allocated_bytes, before);
-        // The holder may have taken the last extent: a miss under a held
-        // window is the same "not now", never ENOMEM.
-        assert_eq!(
-            table.supply_node_bank(&MetadataStorage::new(), observed, &wakes),
-            Err(NodeBankShortfall::Publishing)
-        );
-        // This test stands in for the holder by storing the flag; a real
-        // holder closes through the window guard, which wakes.
-        table.storage.publishing.store(0, Ordering::Release);
+        let (held_tx, held_rx) = std::sync::mpsc::sync_channel(0);
+        let (close_tx, close_rx) = std::sync::mpsc::sync_channel::<()>(0);
+        std::thread::scope(|scope| {
+            // Owned here, so a failed assertion drops it and frees the holder.
+            let close_tx = close_tx;
+            let table = &*table;
+            let parked = &parked;
+            let holder = scope.spawn(move || {
+                let window = table.open_bank_window_for_test(parked).unwrap();
+                held_tx.send(()).unwrap();
+                close_rx.recv().unwrap();
+                drop(window);
+            });
+            held_rx.recv().unwrap();
+            let seen = *parked.wakes.lock().unwrap();
+            assert_eq!(
+                table.supply_node_bank(&allocator, observed, &wakes),
+                Err(NodeBankShortfall::Publishing)
+            );
+            assert_eq!(table.storage.bank_count(), 0);
+            assert_eq!(wakes.0.get(), 0);
+            assert_eq!(allocator.diagnostics().allocated_bytes, before);
+            // The holder may have taken the last extent: a miss under a
+            // held window is the same "not now", never ENOMEM.
+            assert_eq!(
+                table.supply_node_bank(&MetadataStorage::new(), observed, &wakes),
+                Err(NodeBankShortfall::Publishing)
+            );
+            // Nothing but the holder's close can wake the parked supplier.
+            assert_eq!(*parked.wakes.lock().unwrap(), seen);
+            close_tx.send(()).unwrap();
+            assert_eq!(parked.park(seen), seen + 1, "the holder's close woke");
+            holder.join().unwrap();
+        });
+        assert_eq!(table.storage.publishing.load(Ordering::Acquire), 0);
         assert_eq!(table.supply_node_bank(&allocator, observed, &wakes), Ok(()));
         assert_eq!(table.storage.bank_count(), 1);
         assert_eq!(wakes.0.get(), 1);
-        assert_eq!(table.storage.publishing.load(Ordering::Acquire), 0);
+        table.storage.count.store(0, Ordering::Release);
+    }
+
+    /// #3085 P0 B: a host bank grant that meets a held window, or a pool a
+    /// peer already grew, is a decision, never `Busy`: `WindowHeld` (not
+    /// now, the holder's close wakes the caller) or `Redundant` (decide
+    /// again). Neither consumes the grant.
+    #[test]
+    fn host_bank_install_answers_a_held_window_and_a_grown_pool() {
+        let table = table();
+        let bytes = SharedReservations::metadata_bank_layout().size();
+        let grant = |token| {
+            let owner = Rc::new(Backing(UnsafeCell::new(vec![0u128; bytes / 16])));
+            let base = unsafe { (&mut *owner.0.get()).as_mut_ptr() } as u64;
+            Pin {
+                extent: MetadataExtent::new(base, bytes as u64, token).unwrap(),
+                owner,
+            }
+        };
+        let sampled = table.storage_generation();
+        let parked = Parked::default();
+        let window = table.open_bank_window_for_test(&parked).unwrap();
+        assert_eq!(
+            table.provision_metadata(&grant(93), sampled, &Wakes::default()),
+            Ok(HostBankInstall::WindowHeld)
+        );
+        assert_eq!(table.storage_generation(), sampled);
+        drop(window);
+        assert_eq!(*parked.wakes.lock().unwrap(), 1);
+        // A peer's bank lands after the sample: this grant is redundant.
+        let mut backing = vec![0u8; 2 * 1024 * 1024];
+        let allocator = MetadataStorage::new();
+        allocator
+            .admit_bootstrap_region(backing.as_mut_ptr() as u64, backing.len())
+            .unwrap();
+        table
+            .supply_node_bank(&allocator, table.node_capacity(), &Wakes::default())
+            .unwrap();
+        assert_eq!(
+            table.provision_metadata(&grant(94), sampled, &Wakes::default()),
+            Ok(HostBankInstall::Redundant)
+        );
+        assert_eq!(table.storage_generation(), sampled + 1);
+        assert_eq!(
+            table.provision_metadata(&grant(95), sampled + 1, &Wakes::default()),
+            Ok(HostBankInstall::Published)
+        );
+        assert_eq!(table.storage_generation(), sampled + 2);
         table.storage.count.store(0, Ordering::Release);
     }
 }

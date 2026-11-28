@@ -1192,7 +1192,7 @@ pub use projection::{NonAnonymousVmas, ReservationProcMaps};
 
 #[path = "el1_reservations/provider.rs"]
 mod provider;
-pub(in crate::dispatch) use provider::{DelegatedRoot, ReservationProviderSlot};
+pub(in crate::dispatch) use provider::{DelegatedRoot, MetadataProvision, ReservationProviderSlot};
 pub use provider::{
     HostReservationProvider, ObservationBusy, PreparedHostReservations, PreparedReservationSession,
     ReservationBusy, RootAccessRefusal,
