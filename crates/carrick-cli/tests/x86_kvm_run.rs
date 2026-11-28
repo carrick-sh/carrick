@@ -2365,6 +2365,156 @@ fn mounted_static_x86_mremap_shrink_across_mappings_answers_as_native() {
     );
 }
 
+/// The census row of one syscall by name, from the run's single census file.
+fn census_row(census_dir: &std::path::Path, name: &str) -> serde_json::Value {
+    let census_files: Vec<_> = std::fs::read_dir(census_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(census_files.len(), 1, "one carrier census emitted");
+    let census: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&census_files[0]).unwrap()).unwrap();
+    census["rows"]
+        .as_array()
+        .expect("census rows")
+        .iter()
+        .find(|row| row["name"] == name)
+        .cloned()
+        .unwrap_or_else(|| panic!("no census row for {name}: {census}"))
+}
+
+/// Asserts the census served every `mremap` of the run in ring: at least
+/// `served` calls, none forwarded to the host and none refused.
+fn assert_mremap_served_in_ring(census_dir: &std::path::Path, served: u64) {
+    let row = census_row(census_dir, "mremap");
+    assert!(
+        row["el1_served"].as_u64().is_some_and(|n| n >= served)
+            && row["el1_forwarded"] == 0
+            && row["refused"] == 0
+            && row["venue_refused"] == 0,
+        "every mremap is served in ring, at least {served}: {row}"
+    );
+}
+
+/// `mremap(MREMAP_MAYMOVE)` of a populated private anonymous row (#2611),
+/// in the root and in a forked child beside its live parent: a written
+/// two-page row with a blocker after it grows to four pages at a new
+/// address, keeps both bytes, reads 0 in the growth and takes a store
+/// there, and its old address is vacant again. The child also moves a
+/// populated row it still shares with its parent, and the parent's copy
+/// keeps its address and bytes. The census must show every call served in
+/// ring. On main the ring refuses a move whose source has pages (#3165
+/// serves only an untouched source), so the root's move answers a counted
+/// ENOSYS (exit 11, `-38`).
+#[test]
+#[ignore = "red until the populated move lands on the memory core's TransferRange (#2611)"]
+fn mounted_static_x86_mremap_moves_a_populated_row_as_native() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("mremap-populated-move");
+    compile_assembly_with_flags(
+        "x86_mremap_populated_move.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native populated mremap oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+    assert_eq!(native.stdout, b"populated move ok\n", "native oracle");
+    let census_dir = dir.path().join("census");
+    let (guest, _) = run_mounted_binary_within(
+        &elf,
+        "mremap-populated-move",
+        false,
+        &empty_image_archive(),
+        Some(&census_dir),
+        Duration::from_secs(5),
+        &[],
+    );
+    assert_eq!(
+        (guest.status.code(), String::from_utf8_lossy(&guest.stdout)),
+        (
+            native.status.code(),
+            String::from_utf8_lossy(&native.stdout)
+        ),
+        "11-15 the root's move (11 the call, 12 a lost byte, 13 the growth, \
+         14 the source not vacant, 15 the blocker), 21-25 the child's, 26-27 \
+         the child's move of a row shared with its parent, 33 the parent's \
+         shared row changed, 34 the parent's moved row changed, 9 a setup \
+         call; the errno or bad value is printed. stderr: {}",
+        String::from_utf8_lossy(&guest.stderr)
+    );
+    // Three moves (root, child, child's shared row), each served in ring.
+    assert_mremap_served_in_ring(&census_dir, 3);
+}
+
+/// apt's package-cache growth through static glibc (#2611): a filled 24 MiB
+/// private anonymous map grows 1 MiB at a time with `MREMAP_MAYMOVE`, 28
+/// times, in the root and then in a forked child (apt-get's own case). A
+/// blocker one MiB past the map keeps the first step in place and makes
+/// the second move, as in apt's native trace. Every step must keep each
+/// byte written so far and zero-fill the new MiB, against native Linux.
+/// On main the second step's populated move is a counted ENOSYS, so the
+/// run prints `FAIL root step=2 mremap errno 38` where apt-get stops with
+/// `Dynamic MMap ran out of room`.
+#[test]
+#[ignore = "red until the populated move lands on the memory core's TransferRange (#2611)"]
+fn mounted_static_x86_glibc_apt_cache_growth_matches_native() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("glibc-apt-cache-growth");
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/x86_glibc_apt_cache_growth.c");
+    x86_process_entry::compile_static_fixture(&source, &elf, &["-O2"]);
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(20))
+        .output()
+        .expect("run native apt cache growth oracle");
+    let native_lines = String::from_utf8_lossy(&native.stdout).into_owned();
+    assert_eq!(
+        (native.status.code(), native_lines.as_str()),
+        (
+            Some(7),
+            "root steps=28 bytes=54525952 in_place_then_moved moved=yes\n\
+             child steps=28 bytes=54525952 in_place_then_moved moved=yes\n\
+             apt cache growth ok\n"
+        ),
+        "native oracle"
+    );
+    let census_dir = dir.path().join("census");
+    // Two runs of 28 steps over a 52 MiB map: first touch of about 26,000
+    // pages, so the fixture has its own deadline.
+    let (guest, _) = run_mounted_binary_within(
+        &elf,
+        "glibc-apt-cache-growth",
+        false,
+        &empty_image_archive(),
+        Some(&census_dir),
+        Duration::from_secs(60),
+        &[],
+    );
+    assert_eq!(
+        (
+            guest.status.code(),
+            String::from_utf8_lossy(&guest.stdout).into_owned()
+        ),
+        (native.status.code(), native_lines),
+        "stderr: {}",
+        String::from_utf8_lossy(&guest.stderr)
+    );
+    assert_mremap_served_in_ring(&census_dir, 2 * 28);
+}
+
 /// A counted in-ring refusal appears in the run's compat report (#3152).
 /// The ring answers `tuxcall` (x86_64 184, never implemented by Linux)
 /// with ENOSYS, as Linux does, and counts it; before #3152 the report was built only from host
