@@ -660,7 +660,9 @@ pub struct CompatSummary {
     pub unknown_syscall_flag_invocations: u64,
     #[serde(default)]
     pub fast_path_blind_spots: u64,
-    /// Distinct (canonical syscall, caller) rows the ring refused.
+    /// Ring-refusal rows: one per (native ordinal, caller). A syscall that
+    /// both callers hit counts twice, and the overflow bucket (native 512)
+    /// is one row for every ordinal the ring could not name.
     #[serde(default)]
     pub distinct_ring_refused_syscalls: u64,
     #[serde(default)]
