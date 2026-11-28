@@ -1,0 +1,17 @@
+[package]
+name = "carrick-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared model-check vocabulary, explorer, wait ledger and mutant runner for Carrick's not-now protocols (#3061 H0)"
+
+# A leaf crate: no dependencies. The vocabulary is `no_std`, with no alloc,
+# and always compiled; the explorer, the wait ledger, `mutants!` and replay
+# sit behind `std`, which only dev-dependencies enable.
+[dependencies]
+
+[features]
+std = []
+
+[lints]
+workspace = true

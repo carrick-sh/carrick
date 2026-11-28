@@ -18,6 +18,9 @@ NON_GUEST_CRATES = {
     "crates/carrick-conformance-next",
     "crates/carrick-coordinator",
     "crates/carrick-investigation",
+    # The model-check vocabulary and explorer (#3061): no guest behaviour of
+    # its own; the protocols it models carry their own contracts.
+    "crates/carrick-model",
     "crates/carrick-test-support",
     "crates/carrick-observability",
     "crates/carrick-xtask",

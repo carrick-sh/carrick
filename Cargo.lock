@@ -917,6 +917,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "carrick-model"
+version = "0.1.0"
+
+[[package]]
 name = "carrick-observability"
 version = "0.1.0"
 dependencies = [
