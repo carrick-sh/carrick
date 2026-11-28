@@ -3334,7 +3334,7 @@ fn build_program_authority_is_outside_product_authority() {
     // Compiler discovery: a build program's host call takes no ceiling.
     let root = build_program_fixture(
         "fn main() { let _ = std::fs::read(\"input\"); }",
-        "pub fn runtime() {}",
+        "pub fn runtime() { let _ = std::fs::read(\"input\"); }",
     );
     let census = load_census(root.path()).unwrap();
     let empty = AuthorityDebtCeilings {
@@ -3348,10 +3348,49 @@ fn build_program_authority_is_outside_product_authority() {
     verify_host(&result, &empty, &census).unwrap();
     // The same call in production is still product authority.
     let production = serde_json::json!({"rows":[{
-        "source":{"file":"crates/carrick-build-fixture/src/lib.rs","line_start":1,"column_start":1},
+        "source":{"file":"crates/carrick-build-fixture/src/lib.rs","line_start":1,"column_start":28},
         "expansion":null,"operation":"std::fs::read","profiles":["linux-cli"]
     }]});
-    assert!(verify_host(&production, &empty, &census).is_err());
+    let error = verify_host(&production, &empty, &census)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains(
+            "unknown authority API/owner cohort: std::fs::read at carrick_build_fixture::runtime"
+        ),
+        "{error}"
+    );
+}
+
+/// #3172: build programs are outside product authority only because the
+/// census sees every product source. A product target rooted outside a
+/// `crates/<crate>/src` tree could share build source unseen, so the census
+/// refuses it.
+#[test]
+fn product_target_outside_the_census_tree_is_refused() {
+    let root = build_program_fixture(
+        "#[path = \"tool/main.rs\"] mod tool; fn main() {}",
+        "pub fn runtime() {}",
+    );
+    std::fs::create_dir_all(root.path().join("crates/carrick-build-fixture/tool")).unwrap();
+    write_source(
+        root.path()
+            .join("crates/carrick-build-fixture/tool/main.rs"),
+        "fn main() { let _ = std::fs::read(\"input\"); }",
+    )
+    .unwrap();
+    write_source(
+        root.path().join("crates/carrick-build-fixture/Cargo.toml"),
+        "[package]\nname = \"carrick-build-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[[bin]]\nname = \"tool\"\npath = \"tool/main.rs\"\n",
+    )
+    .unwrap();
+    let error = load_census(root.path()).unwrap_err().to_string();
+    assert!(
+        error.contains(
+            "product target outside the census tree: crates/carrick-build-fixture/tool/main.rs"
+        ),
+        "{error}"
+    );
 }
 
 /// #3172: a base from before the change still holds `build_time` cohorts;
@@ -3367,6 +3406,15 @@ fn base_build_time_cohorts_leave_the_ratchet() {
     )
     .unwrap();
     assert_eq!(base.counters.len(), 1);
+    // The reader stays as strict as the typed one.
+    for malformed in [
+        r#"{"schema":1,"counters":[{"family":"k1_epoll_wait","family":"raw_lock","operation":"x","owner":"carrick_kernel::poll","lane":"shared","ceiling":1}]}"#,
+        r#"{"schema":1,"counters":[{"family":"k1_epoll_wait","operation":"x","owner":"carrick_kernel::poll","lane":"shared","ceiling":1,"extra":0}]}"#,
+        r#"{"schema":1,"counters":[{"family":"no_such_family","operation":"x","owner":"carrick_kernel::poll","lane":"shared","ceiling":1}]}"#,
+        "7",
+    ] {
+        assert!(base_ceilings(malformed).is_err(), "{malformed}");
+    }
     ceilings(3).ratchet(&base, &MoveMap::default()).unwrap();
     assert!(ceilings(4).ratchet(&base, &MoveMap::default()).is_err());
 }

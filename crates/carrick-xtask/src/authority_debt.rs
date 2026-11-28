@@ -619,11 +619,41 @@ pub(crate) fn comparison_base(
 /// cohorts leave the ratchet rather than reading as removed debt. Delete
 /// this filter once no open PR's base predates #3172.
 pub fn base_ceilings(text: &str) -> Result<AuthorityDebtCeilings, DebtError> {
-    let mut value: Value = serde_json::from_str(text)?;
-    if let Some(counters) = value["counters"].as_array_mut() {
-        counters.retain(|counter| counter["family"] != "build_time");
+    // As strict as `Counter`: unknown and duplicate fields are errors.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct BaseCounter {
+        family: String,
+        operation: String,
+        owner: String,
+        lane: String,
+        ceiling: u64,
     }
-    Ok(serde_json::from_value(value)?)
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct BaseCeilings {
+        schema: u32,
+        counters: Vec<BaseCounter>,
+    }
+    let base: BaseCeilings = serde_json::from_str(text)?;
+    let counters = base
+        .counters
+        .into_iter()
+        .filter(|counter| counter.family != "build_time")
+        .map(|counter| {
+            Ok(Counter {
+                family: serde_json::from_value(Value::String(counter.family))?,
+                operation: counter.operation,
+                owner: counter.owner,
+                lane: serde_json::from_value(Value::String(counter.lane))?,
+                ceiling: counter.ceiling,
+            })
+        })
+        .collect::<Result<_, DebtError>>()?;
+    Ok(AuthorityDebtCeilings {
+        schema: base.schema,
+        counters,
+    })
 }
 fn base_policy(
     root: &Path,
@@ -656,7 +686,17 @@ fn base_policy(
             tar::Archive::new(output.stdout.as_slice()).unpack(temporary.path())?;
             let source = SourceCensus::load(temporary.path())?;
             let mut counters = BTreeMap::new();
-            for site in source.contention_variants {
+            let build_sites: Vec<bool> = source
+                .contention_variants
+                .iter()
+                .map(|site| source.is_build_file(&site.file))
+                .collect();
+            for (site, _) in source
+                .contention_variants
+                .into_iter()
+                .zip(build_sites)
+                .filter(|(_, build)| !build)
+            {
                 *counters
                     .entry((site.operation, site.owner, site.lane))
                     .or_insert(0) += 1;
