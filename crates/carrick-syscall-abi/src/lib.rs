@@ -839,6 +839,22 @@ impl LinuxWaitOptions {
 /// Linux 64-bit rusage contains two timevals and fourteen signed counters.
 pub const LINUX_RUSAGE_BYTES: usize = 144;
 
+pub const LINUX_MREMAP_MAYMOVE: u64 = 0x01;
+pub const LINUX_MREMAP_FIXED: u64 = 0x02;
+pub const LINUX_MREMAP_DONTUNMAP: u64 = 0x04;
+
+bitflags! {
+    /// `mremap(2)` flag bits. The wire word stays raw at the syscall seam;
+    /// `from_bits_retain` keeps unknown bits so the dispatcher's EINVAL
+    /// validation still sees them.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LinuxMremapFlags: u64 {
+        const MAYMOVE = LINUX_MREMAP_MAYMOVE;
+        const FIXED = LINUX_MREMAP_FIXED;
+        const DONTUNMAP = LINUX_MREMAP_DONTUNMAP;
+    }
+}
+
 pub const LINUX_MADV_NORMAL: u64 = 0;
 pub const LINUX_MADV_RANDOM: u64 = 1;
 pub const LINUX_MADV_SEQUENTIAL: u64 = 2;

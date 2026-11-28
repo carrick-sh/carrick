@@ -5,8 +5,7 @@
 //! errno before any lookup or effect. Authority:
 //! <https://man7.org/linux/man-pages/man2/mremap.2.html>.
 
-use carrick_abi::LinuxMremapFlags;
-use carrick_syscall_abi::{LINUX_EINVAL, LINUX_ENOMEM, LinuxErrno};
+use carrick_syscall_abi::{LINUX_EINVAL, LINUX_ENOMEM, LinuxErrno, LinuxMremapFlags};
 
 /// A well-formed `mremap(2)` request: page-rounded sizes and decoded flags.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -108,7 +107,7 @@ fn overlaps(a: u64, a_len: u64, b: u64, b_len: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use carrick_abi::{LINUX_MREMAP_DONTUNMAP, LINUX_MREMAP_FIXED, LINUX_MREMAP_MAYMOVE};
+    use carrick_syscall_abi::{LINUX_MREMAP_DONTUNMAP, LINUX_MREMAP_FIXED, LINUX_MREMAP_MAYMOVE};
 
     const PAGE: u64 = 4096;
 
