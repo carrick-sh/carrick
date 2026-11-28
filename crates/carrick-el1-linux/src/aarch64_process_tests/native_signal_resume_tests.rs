@@ -61,11 +61,19 @@ fn retained_signal_copy(input_wait: bool, check_stale: bool) {
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, owner_record)
+            .requeue_preempted(
+                fixture.slot,
+                owner_record,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         peer.id
     );
     run_as(fixture, 42, 12, 102, peer_control);
@@ -88,11 +96,19 @@ fn retained_signal_copy(input_wait: bool, check_stale: bool) {
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, peer.id)
+            .requeue_preempted(
+                fixture.slot,
+                peer.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         owner_record
     );
     run_as_leader(fixture);
@@ -366,11 +382,19 @@ fn retained_signal_copy(input_wait: bool, check_stale: bool) {
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, peer_record)
+            .requeue_preempted(
+                fixture.slot,
+                peer_record,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         member.id
     );
     run_as_leader(fixture);
@@ -489,11 +513,19 @@ fn run_arm_signal_user_return_wait_witness(mode: SignalFrameWaitMode) {
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, owner_record)
+            .requeue_preempted(
+                fixture.slot,
+                owner_record,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         owner_record
     );
     run_as_leader(fixture);
@@ -1018,11 +1050,19 @@ fn signal_stack_real_fault_forces_sigsegv_with_oracle_si_code_128() {
         assert!(
             fixture
                 .zone
-                .requeue_preempted(fixture.slot, owner_record)
+                .requeue_preempted(
+                    fixture.slot,
+                    owner_record,
+                    &carrick_sched_core::OwedPasses::new()
+                )
                 .is_queued()
         );
         assert_eq!(
-            fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+            fixture
+                .zone
+                .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record,
             owner_record
         );
         run_as_leader(fixture);
@@ -1358,11 +1398,19 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, owner_record)
+            .requeue_preempted(
+                fixture.slot,
+                owner_record,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         owner_record
     );
     run_as_leader(fixture);
@@ -1473,8 +1521,16 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
     }
 
     let sibling_slot = SlotId::new(1);
-    fixture.zone.drive(sibling_slot, 2);
-    fixture.zone.publish_slot(sibling_slot, 1, Some(1), 1);
+    fixture
+        .zone
+        .drive(sibling_slot, 2, &carrick_sched_core::OwedPasses::new());
+    fixture.zone.publish_slot(
+        sibling_slot,
+        1,
+        Some(1),
+        1,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     fixture.zone.enter_guest(sibling_slot);
     fixture
         .zone
@@ -1484,7 +1540,11 @@ fn two_threads_concurrent_mmap_munmap_delivers_thousand_signals_without_sigsegv(
         id.affinity = 1 << sibling_slot.raw();
     });
     assert_eq!(
-        fixture.zone.switch_in_full(sibling_slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(sibling_slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         peer.id
     );
     let sibling_source = BornInZoneSource {
@@ -1985,11 +2045,19 @@ fn arm_checkpoint_delivers_usr1(
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, owner_record)
+            .requeue_preempted(
+                fixture.slot,
+                owner_record,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         owner_record
     );
     run_as_leader(fixture);
@@ -2174,11 +2242,19 @@ fn new_live_position_fixture() -> LivePositionFixture {
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, owner_record)
+            .requeue_preempted(
+                fixture.slot,
+                owner_record,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         owner_record
     );
     run_as_leader(fixture);

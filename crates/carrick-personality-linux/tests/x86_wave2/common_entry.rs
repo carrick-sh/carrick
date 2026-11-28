@@ -993,6 +993,7 @@ fn compact_common_entry_suspends_only_after_authenticated_park() {
                     start,
                     &guard,
                     carrick_core_abi::EntryRecordGeneration(sequence),
+                    &carrick_sched_core::OwedPasses::new(),
                 )
                 .unwrap(),
             );
@@ -1025,8 +1026,14 @@ fn compact_common_entry_suspends_only_after_authenticated_park() {
             lifecycle_page: 0x1000,
             control_slot: 0x2000,
         };
-        zone.drive(slot, 3);
-        zone.publish_slot(slot, identity.mm, None, 0);
+        zone.drive(slot, 3, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(
+            slot,
+            identity.mm,
+            None,
+            0,
+            &carrick_sched_core::OwedPasses::new(),
+        );
         let here = ExecutionSlot::zone(slot);
         zone.occupancy.vacate_any(here);
         assert!(zone.occupancy.replace(here, 0, identity.mm));
@@ -1038,8 +1045,14 @@ fn compact_common_entry_suspends_only_after_authenticated_park() {
         zone.spaces.open(space);
         assert!(zone.install_space(slot, identity.mm).is_some());
         let record = zone.alloc_record(identity).unwrap();
-        assert!(zone.requeue_preempted(slot, record).is_queued());
-        assert_eq!(zone.switch_in(slot), Some(record));
+        assert!(
+            zone.requeue_preempted(slot, record, &carrick_sched_core::OwedPasses::new())
+                .is_queued()
+        );
+        assert_eq!(
+            zone.switch_in(slot, &carrick_sched_core::OwedPasses::new()),
+            Some(record)
+        );
         let binding = carrick_core_abi::ExecutionBinding {
             task: carrick_core_abi::EntryTaskKey::from_raw(identity.tid),
             generation: carrick_core_abi::SnapshotGeneration::from_raw(identity.generation),

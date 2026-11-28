@@ -3843,9 +3843,9 @@ pub const EL1_NAME_CACHE_SIZE: u64 = 0x1_0000;
 pub use carrick_sched_core::{
     Aarch64ParkedContext, AddressSpaces, BoundedSpin, Claim, CurrentHandback, CurrentRelease,
     ExcludedEditor, Exhausted, FirstEntryActivation, Handback, HostClaim, HostPlacement,
-    HostTransfer, LockWait, ParkedContextRead, RecordId, RecordRef, Requeue, ServiceHead,
-    SlotDrain, SlotId, SlotState, SwitchedIn, ThreadCtx, ThreadIdentity, WakeEffects, WakeRecord,
-    Waker, ZONE_SLOTS,
+    HostTransfer, LockWait, OwedPasses, ParkedContextRead, RecordId, RecordRef, Requeue,
+    ServiceHead, SlotDrain, SlotId, SlotState, SwitchedIn, ThreadCtx, ThreadIdentity, WakeEffects,
+    WakeRecord, Waker, ZONE_SLOTS,
 };
 
 /// The ARM guest and its carrier share one record context type. Every zone

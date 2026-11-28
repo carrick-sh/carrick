@@ -1314,6 +1314,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'_, C> {
 
 impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'a, C> {
     fn drain_completion(&self, waker: Waker, effects: &mut WakeEffects, handed: &mut u32) {
+        let passes = OwedPasses::new();
         let mut cursor = self.queue().head.load(Ordering::Relaxed);
         while let Some(record) = RecordId::from_raw(cursor) {
             let rec = self.zone.record(record);
@@ -1331,12 +1332,17 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'a, C> {
                         true,
                     ),
                     Waker::Host => {
-                        match self
-                            .zone
-                            .place_in_guest(record, from, None, &BoundedSpin(0), |rec| {
+                        match self.zone.place_in_guest(
+                            record,
+                            from,
+                            None,
+                            &BoundedSpin(0),
+                            |rec| {
                                 self.unlink(record);
                                 self.zone.mark_woken(rec, 0);
-                            }) {
+                            },
+                            &passes,
+                        ) {
                             Placement::Placed(placement) => {
                                 if placement.resched {
                                     effects.push_sgi(placement.slot);
@@ -1369,6 +1375,7 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'a, C> {
                 let _ = transfer;
             }
         }
+        passes.fold_into(effects);
     }
     fn queue(&self) -> &ObjectQueue {
         self.zone.object_queue(self.key.index as usize)
@@ -1394,6 +1401,7 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'a, C> {
         &self,
         handed: &mut impl FnMut(RecordRef),
         placed: &mut impl FnMut(HostPlacement),
+        passes: &OwedPasses,
     ) -> Result<HostObjectWakeReport, ObjectWaitError> {
         self.queue()
             .epoch
@@ -1410,12 +1418,17 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'a, C> {
             let from @ Claim::Parked { .. } = rec.claim() else {
                 continue;
             };
-            match self
-                .zone
-                .place_in_guest(record, from, None, &SpinForever, |rec| {
+            match self.zone.place_in_guest(
+                record,
+                from,
+                None,
+                &SpinForever,
+                |rec| {
                     self.unlink(record);
                     self.zone.mark_woken(rec, 0);
-                }) {
+                },
+                passes,
+            ) {
                 Placement::Placed(placement) => {
                     report.queued += 1;
                     placed(placement);
@@ -1728,12 +1741,18 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'a, C> {
     /// End exactly one owned park under its queue authority. Readiness keeps
     /// the existing guest placement; interruption retains an owned handback
     /// for publication after unlock through the carrier completion boundary.
+    ///
+    /// A readiness claim takes the target slot's queue lock, and releasing it
+    /// can owe idle scans a pass (#3083) even when the claim is lost and this
+    /// returns `None`: those go into `passes`, which the caller delivers on
+    /// every outcome.
     pub fn wake_owner_operation(
         &self,
         record: RecordRef,
         operation: &OperationToken,
         waker: SlotId,
         kind: Handback,
+        passes: &OwedPasses,
     ) -> Option<OwnedObjectWakeEffects<'a, C>> {
         let rec = self.zone.live(record)?;
         if rec.object.queue.load(Ordering::Acquire) != self.key.index
@@ -1749,12 +1768,14 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'a, C> {
         let mut effects = WakeEffects::default();
         let handed = match kind {
             Handback::Resumed => {
-                if !self
-                    .zone
-                    .claim_for_el1(record.id, seq, 0, waker, &mut effects, || {
-                        self.unlink(record.id)
-                    })
-                {
+                if !self.zone.claim_for_el1_owing(
+                    (record.id, seq, 0),
+                    waker,
+                    &mut effects,
+                    || self.unlink(record.id),
+                    false,
+                    passes,
+                ) {
                     return None;
                 }
                 0
@@ -2732,6 +2753,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         exact: RecordRef,
         seq: u32,
         completion: &dyn Fn(OwnedObjectWakeEffects<'_, C>),
+        passes: &OwedPasses,
     ) -> Result<bool, ()> {
         let record = exact.id;
         let Some(rec) = self.live(exact) else {
@@ -2749,7 +2771,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             Err(ObjectWaitError::Busy) => return Err(()),
             Err(_) => return Ok(false),
         };
-        let Some(slot_guard) = self.slot_lock(slot, &SpinForever) else {
+        let Some(slot_guard) = self.slot_lock(slot, &SpinForever, passes) else {
             return Err(());
         };
         if self.live(exact).is_none()
@@ -2822,8 +2844,8 @@ mod host_tests {
             Box::from_raw(ptr.cast::<ZoneTables>())
         };
         if running {
-            zone.drive(SLOT, u64::from(SLOT.raw()) + 1);
-            zone.publish_slot(SLOT, MM, None, 0);
+            zone.drive(SLOT, u64::from(SLOT.raw()) + 1, &OwedPasses::new());
+            zone.publish_slot(SLOT, MM, None, 0, &OwedPasses::new());
             assert!(zone.occupancy.replace(ExecutionSlot::zone(SLOT), 0, MM));
             zone.enter_guest(SLOT);
         }
@@ -3152,7 +3174,8 @@ mod host_tests {
                 None,
                 Handback::Cancelled,
                 &BoundedSpin(0),
-                &completion
+                &completion,
+                &OwedPasses::new()
             ),
             HostClaim::Deferred
         );
@@ -3294,7 +3317,7 @@ mod host_tests {
         let report = queue.notify_object(SLOT, &mut effects).unwrap();
         assert_eq!(report.visited, 1);
         drop(queue);
-        assert_eq!(zone.switch_in(SLOT), Some(record));
+        assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), Some(record));
         assert_eq!(
             zone.record(record).resume_disposition(),
             ResumeDisposition::OwnerContinuation(OwnerEntry::Exception)
@@ -3316,8 +3339,11 @@ mod host_tests {
         let zone = fixture(true);
         let record = allocate(&zone, 101);
         let record_ref = zone.record_ref(record);
-        assert!(zone.requeue_preempted(SLOT, record).is_queued());
-        assert_eq!(zone.switch_in(SLOT), Some(record));
+        assert!(
+            zone.requeue_preempted(SLOT, record, &OwedPasses::new())
+                .is_queued()
+        );
+        assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), Some(record));
         let key = ObjectWaitKey::native_service(record_ref).unwrap();
         zone.bind_object_wait(key, &SpinForever, &|owned| {
             let _ = owned.into_parts();
@@ -3338,7 +3364,8 @@ mod host_tests {
                     &SpinForever,
                     &|owned| {
                         let _ = owned.into_parts();
-                    }
+                    },
+                    &OwedPasses::new()
                 ),
                 HostClaim::El1Held { slot: SLOT }
             );
@@ -3368,7 +3395,7 @@ mod host_tests {
         drop(queue);
         // Busy once, then success: the owner leaves, the host takes it, and a
         // later park from a fresh OnCpu custody enrolls normally.
-        assert!(zone.unswitch(SLOT, record));
+        assert!(zone.unswitch(SLOT, record, &OwedPasses::new()));
         assert_eq!(
             zone.claim_for_host(
                 record_ref,
@@ -3377,12 +3404,13 @@ mod host_tests {
                 &SpinForever,
                 &|owned| {
                     let _ = owned.into_parts();
-                }
+                },
+                &OwedPasses::new()
             ),
             HostClaim::Claimed
         );
-        assert!(zone.requeue_on(SLOT, record).is_some());
-        assert_eq!(zone.switch_in(SLOT), Some(record));
+        assert!(zone.requeue_on(SLOT, record, &OwedPasses::new()).is_some());
+        assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), Some(record));
         let queue = zone
             .object_wait(key, &SpinForever, &|owned| {
                 let _ = owned.into_parts();
@@ -3428,8 +3456,8 @@ mod host_tests {
         // hands that record back; it must not receive the metadata wake.
         let occupant = park(&zone, 1, 202);
         notify(&zone, 1);
-        assert_eq!(zone.switch_in(SLOT), Some(occupant));
-        zone.leave_guest(SLOT, &SpinForever);
+        assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), Some(occupant));
+        zone.leave_guest(SLOT, &SpinForever, &OwedPasses::new());
         assert_eq!(
             zone.handback_current(SLOT, occupant),
             CurrentHandback::HandedBack
@@ -3442,7 +3470,11 @@ mod host_tests {
             .unwrap();
         let mut handed = Vec::new();
         let report = queue
-            .notify_object_host(&mut |record| handed.push(record), &mut |_| {})
+            .notify_object_host(
+                &mut |record| handed.push(record),
+                &mut |_| {},
+                &OwedPasses::new(),
+            )
             .unwrap();
         assert_eq!(report.visited, 1);
         assert_eq!(handed.as_slice(), &[original_ref]);
@@ -3496,7 +3528,7 @@ mod host_tests {
         drop(queue);
         // Cancellation loses the park race: the operation is already unlinked
         // and executing, so its current slot owns terminal settlement.
-        assert_eq!(zone.switch_in(SLOT), Some(record));
+        assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), Some(record));
         assert_eq!(
             zone.claim_for_host(
                 reference,
@@ -3505,22 +3537,23 @@ mod host_tests {
                 &SpinForever,
                 &|owned| {
                     let _ = owned.into_parts();
-                }
+                },
+                &OwedPasses::new()
             ),
             HostClaim::El1Held { slot: SLOT }
         );
         assert_eq!(
-            zone.release_current(SLOT, record, &SpinForever),
+            zone.release_current(SLOT, record, &SpinForever, &OwedPasses::new()),
             CurrentRelease::Requeued
         );
         let mut handed = Vec::new();
         assert_eq!(
-            zone.take_host_wanted(SLOT, &mut |r| handed.push(r)),
+            zone.take_host_wanted(SLOT, &mut |r| handed.push(r), &OwedPasses::new()),
             0,
             "an anonymous replay has no IPC authority on the host"
         );
         assert!(handed.is_empty());
-        assert_eq!(zone.sweep_cancelled(SLOT), 1);
+        assert_eq!(zone.sweep_cancelled(SLOT, &OwedPasses::new()), 1);
         assert!(zone.live(reference).is_none());
         assert!(!zone.record(record).has_object_operation());
     }
@@ -3602,7 +3635,8 @@ mod host_tests {
                     &SpinForever,
                     &|owned| {
                         let _ = owned.into_parts();
-                    }
+                    },
+                    &OwedPasses::new()
                 ),
                 if anonymous {
                     HostClaim::Stale
@@ -3633,7 +3667,8 @@ mod host_tests {
                 &SpinForever,
                 &|owned| {
                     let _ = owned.into_parts();
-                }
+                },
+                &OwedPasses::new()
             ),
             HostClaim::Stale
         );
@@ -3671,7 +3706,8 @@ mod host_tests {
                 &SpinForever,
                 &|owned| {
                     let _ = owned.into_parts();
-                }
+                },
+                &OwedPasses::new()
             ),
             HostClaim::Claimed
         );
@@ -3684,7 +3720,8 @@ mod host_tests {
             queue
                 .notify_object_host(
                     &mut |_| panic!("cancelled metadata record woke"),
-                    &mut |_| {}
+                    &mut |_| {},
+                    &OwedPasses::new()
                 )
                 .unwrap()
                 .visited,
@@ -3736,7 +3773,7 @@ mod host_tests {
             })
             .unwrap();
         let report = guard
-            .notify_object_host(&mut |r| handed.push(r.id), &mut |_| {})
+            .notify_object_host(&mut |r| handed.push(r.id), &mut |_| {}, &OwedPasses::new())
             .unwrap();
         (report, handed)
     }
@@ -4276,7 +4313,8 @@ mod host_tests {
                     &BoundedSpin(0),
                     &|owned| {
                         let _ = owned.into_parts();
-                    }
+                    },
+                    &OwedPasses::new()
                 ),
                 HostClaim::Deferred
             );
@@ -4458,11 +4496,12 @@ mod host_tests {
                     )
                     .unwrap();
             }
+            let held_passes = OwedPasses::new();
             let slot = if held {
-                Some(zone.slot_lock(SLOT, &BoundedSpin(0)).unwrap())
+                Some(zone.slot_lock(SLOT, &BoundedSpin(0), &held_passes).unwrap())
             } else {
-                zone.leave_guest(SLOT, &SpinForever);
-                zone.drive(SLOT, 999); // Original waker executor was detached/replaced.
+                zone.leave_guest(SLOT, &SpinForever, &OwedPasses::new());
+                zone.drive(SLOT, 999, &OwedPasses::new()); // Original waker executor was detached/replaced.
                 None
             };
             ticket.publish(Waker::El1 { slot: SLOT }, &completion);
@@ -4539,7 +4578,8 @@ mod host_tests {
                 &Venue(&completion),
                 &|owned| {
                     let _ = owned.into_parts();
-                }
+                },
+                &OwedPasses::new()
             ),
             HostClaim::Deferred
         );
@@ -4661,7 +4701,7 @@ mod host_tests {
                 0
             );
             for _ in 0..n {
-                let switched = zone.switch_in_full(SLOT).unwrap();
+                let switched = zone.switch_in_full(SLOT, &OwedPasses::new()).unwrap();
                 assert_eq!(switched.result, None);
                 let rec = zone.record(switched.record);
                 // SAFETY: the test owns the switched-in context.
@@ -4670,7 +4710,7 @@ mod host_tests {
                     rec.identity().tid
                 );
                 assert_eq!(
-                    zone.release_current(SLOT, switched.record, &SpinForever),
+                    zone.release_current(SLOT, switched.record, &SpinForever, &OwedPasses::new()),
                     crate::CurrentRelease::Released
                 );
             }
@@ -4735,7 +4775,8 @@ mod host_tests {
                             &SpinForever,
                             &|owned| {
                                 let _ = owned.into_parts();
-                            }
+                            },
+                            &OwedPasses::new()
                         ),
                         HostClaim::Claimed
                     );
@@ -4805,16 +4846,28 @@ mod host_tests {
         let record = park_home_until(&zone, 1, 1_000);
         assert_eq!(zone.timer_deadline(SLOT), Some(1_000));
         assert_eq!(
-            zone.expire_timer(SLOT, 999, 0, &|owned| {
-                let _ = owned.into_parts();
-            }),
+            zone.expire_timer(
+                SLOT,
+                999,
+                0,
+                &|owned| {
+                    let _ = owned.into_parts();
+                },
+                &OwedPasses::new()
+            ),
             Ok(false),
             "not yet"
         );
         assert_eq!(
-            zone.expire_timer(SLOT, 1_000, 0, &|owned| {
-                let _ = owned.into_parts();
-            }),
+            zone.expire_timer(
+                SLOT,
+                1_000,
+                0,
+                &|owned| {
+                    let _ = owned.into_parts();
+                },
+                &OwedPasses::new()
+            ),
             Ok(true)
         );
         let rec = zone.record(record);
@@ -4824,7 +4877,7 @@ mod host_tests {
         assert_eq!(rec.handback(), Some(Handback::Resumed));
         assert_eq!(notify(&zone, 1).0.visited, 0, "unlinked from its queue");
         assert_eq!(zone.timer_deadline(SLOT), None);
-        let switched = zone.switch_in_full(SLOT).unwrap();
+        let switched = zone.switch_in_full(SLOT, &OwedPasses::new()).unwrap();
         assert_eq!(switched.record, record);
         assert_eq!(
             switched.result, None,
@@ -4839,12 +4892,18 @@ mod host_tests {
     fn switched_in_expired_operation(zone: &ZoneTables) -> RecordId {
         let record = park_home_until(zone, 1, 1_000);
         assert_eq!(
-            zone.expire_timer(SLOT, 1_000, 0, &|owned| {
-                let _ = owned.into_parts();
-            }),
+            zone.expire_timer(
+                SLOT,
+                1_000,
+                0,
+                &|owned| {
+                    let _ = owned.into_parts();
+                },
+                &OwedPasses::new()
+            ),
             Ok(true)
         );
-        let switched = zone.switch_in_full(SLOT).unwrap();
+        let switched = zone.switch_in_full(SLOT, &OwedPasses::new()).unwrap();
         assert_eq!(switched.record, record);
         assert_eq!(switched.result, None);
         // A word no release writes, so an overwritten result is visible.
@@ -4909,7 +4968,7 @@ mod host_tests {
         assert_eq!(notify(&zone, 2).0.queued, 1);
         assert!(matches!(rec.claim(), Claim::Queued { slot, .. } if slot == SLOT));
         assert_eq!(retained_state(rec), before);
-        let switched = zone.switch_in_full(SLOT).unwrap();
+        let switched = zone.switch_in_full(SLOT, &OwedPasses::new()).unwrap();
         assert_eq!(switched.record, record);
         assert_eq!(
             switched.result, None,
@@ -4942,7 +5001,7 @@ mod host_tests {
         drop(guard);
         assert!(!rec.object.retained_wait());
         assert_eq!(rec.handback(), Some(Handback::Woken));
-        let switched = zone.switch_in_full(SLOT).unwrap();
+        let switched = zone.switch_in_full(SLOT, &OwedPasses::new()).unwrap();
         assert_eq!(
             switched.result,
             Some(0x55),
@@ -5008,6 +5067,7 @@ mod host_tests {
                 &|owned| {
                     let _ = owned.into_parts();
                 },
+                &OwedPasses::new(),
             ),
             crate::HostClaim::Claimed
         );
@@ -5047,9 +5107,15 @@ mod host_tests {
         let record = park_home_until(&zone, 1, 1_000);
         assert_eq!(notify(&zone, 1).0.queued, 1);
         assert_eq!(
-            zone.expire_timer(SLOT, 5_000, 0, &|owned| {
-                let _ = owned.into_parts();
-            }),
+            zone.expire_timer(
+                SLOT,
+                5_000,
+                0,
+                &|owned| {
+                    let _ = owned.into_parts();
+                },
+                &OwedPasses::new()
+            ),
             Ok(false)
         );
         assert_eq!(
@@ -5078,9 +5144,15 @@ mod host_tests {
                 });
                 barrier.wait();
                 let expired = loop {
-                    match zone.expire_timer(SLOT, 1_000, 0, &|owned| {
-                        let _ = owned.into_parts();
-                    }) {
+                    match zone.expire_timer(
+                        SLOT,
+                        1_000,
+                        0,
+                        &|owned| {
+                            let _ = owned.into_parts();
+                        },
+                        &OwedPasses::new(),
+                    ) {
                         Ok(expired) => break expired,
                         Err(()) => core::hint::spin_loop(),
                     }
@@ -5125,18 +5197,30 @@ mod host_tests {
         let earlier = park_foreign_until(&zone, 2, 311, 1_000);
         assert_eq!(zone.timer_deadline(SLOT), Some(1_000));
         assert_eq!(
-            zone.expire_timer(SLOT, 1_000, 0, &|owned| {
-                let _ = owned.into_parts();
-            }),
+            zone.expire_timer(
+                SLOT,
+                1_000,
+                0,
+                &|owned| {
+                    let _ = owned.into_parts();
+                },
+                &OwedPasses::new()
+            ),
             Ok(true)
         );
         assert!(matches!(zone.record(earlier).claim(), Claim::Queued { .. }));
         assert!(matches!(zone.record(later).claim(), Claim::Parked { .. }));
         assert_eq!(zone.timer_deadline(SLOT), Some(2_000));
         assert_eq!(
-            zone.expire_timer(SLOT, 2_000, 0, &|owned| {
-                let _ = owned.into_parts();
-            }),
+            zone.expire_timer(
+                SLOT,
+                2_000,
+                0,
+                &|owned| {
+                    let _ = owned.into_parts();
+                },
+                &OwedPasses::new()
+            ),
             Ok(true)
         );
         assert!(matches!(zone.record(later).claim(), Claim::Queued { .. }));
@@ -5165,7 +5249,7 @@ mod host_tests {
             )
             .unwrap();
         drop(guard);
-        zone.leave_guest(SLOT, &SpinForever);
+        zone.leave_guest(SLOT, &SpinForever, &OwedPasses::new());
         assert_eq!(zone.take_foreign_timer(SLOT).unwrap().record, exact);
         assert!(zone.reset_slot(SLOT));
         assert_eq!(
@@ -5263,7 +5347,8 @@ mod host_tests {
                 &SpinForever,
                 &|owned| {
                     let _ = owned.into_parts();
-                }
+                },
+                &OwedPasses::new()
             ),
             HostClaim::Claimed
         );
@@ -5345,18 +5430,32 @@ mod host_tests {
             let zone = fixture(true);
             let record = park(&zone, 1, 1);
             notify(&zone, 1);
-            assert_eq!(zone.switch_in(SLOT), Some(record));
+            assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), Some(record));
             let exact = zone.record_ref(record);
             assert_eq!(
-                zone.claim_for_host(exact, None, Handback::GroupStop, &SpinForever, &|owned| {
-                    let _ = owned.into_parts();
-                }),
+                zone.claim_for_host(
+                    exact,
+                    None,
+                    Handback::GroupStop,
+                    &SpinForever,
+                    &|owned| {
+                        let _ = owned.into_parts();
+                    },
+                    &OwedPasses::new()
+                ),
                 HostClaim::El1Held { slot: SLOT }
             );
             // A later ordinary control nudge cannot erase the stop cause.
-            zone.claim_for_host(exact, None, Handback::Control, &SpinForever, &|owned| {
-                let _ = owned.into_parts();
-            });
+            zone.claim_for_host(
+                exact,
+                None,
+                Handback::Control,
+                &SpinForever,
+                &|owned| {
+                    let _ = owned.into_parts();
+                },
+                &OwedPasses::new(),
+            );
             if completed {
                 // SAFETY: this slot owns the operation as its EL1 adapter.
                 unsafe {
@@ -5567,17 +5666,32 @@ mod host_tests {
             })
             .unwrap();
         let from = zone.record(record).claim();
-        let held_slot = zone.slot_lock(SLOT, &BoundedSpin(0)).unwrap();
+        let held_passes = OwedPasses::new();
+        let held_slot = zone.slot_lock(SLOT, &BoundedSpin(0), &held_passes).unwrap();
         let attempts = NoWait(Cell::new(0));
         assert!(matches!(
-            zone.place_in_guest(record, from, None, &attempts, |_| guard.unlink(record)),
+            zone.place_in_guest(
+                record,
+                from,
+                None,
+                &attempts,
+                |_| guard.unlink(record),
+                &OwedPasses::new()
+            ),
             Placement::NoSlot
         ));
         assert_eq!(attempts.0.get(), 1, "duplicate candidates do not retry");
         assert_eq!(zone.record(record).claim(), from);
         drop(held_slot);
         assert!(matches!(
-            zone.place_in_guest(record, from, None, &attempts, |_| guard.unlink(record)),
+            zone.place_in_guest(
+                record,
+                from,
+                None,
+                &attempts,
+                |_| guard.unlink(record),
+                &OwedPasses::new()
+            ),
             Placement::Placed(_)
         ));
         assert_eq!(attempts.0.get(), 1);
@@ -5612,7 +5726,8 @@ mod host_tests {
                 OperationToken::new(491, 11).unwrap(),
             )
             .unwrap();
-        let held_slot = zone.slot_lock(SLOT, &BoundedSpin(0)).unwrap();
+        let held_passes = OwedPasses::new();
+        let held_slot = zone.slot_lock(SLOT, &BoundedSpin(0), &held_passes).unwrap();
         std::thread::scope(|scope| {
             let (release, released) = std::sync::mpsc::channel();
             let holder = scope.spawn(move || {
@@ -5643,9 +5758,9 @@ mod host_tests {
         zone.take_completion_handbacks(&SpinForever, &mut |r| handed.push(r));
         assert_eq!(handed, [zone.record_ref(record)]);
         assert!(matches!(zone.record(record).claim(), Claim::Host { .. }));
-        let placement = zone.place_from_host(record).unwrap();
+        let placement = zone.place_from_host(record, &OwedPasses::new()).unwrap();
         assert_eq!(placement.slot, SLOT);
-        assert!(zone.place_from_host(record).is_none());
+        assert!(zone.place_from_host(record, &OwedPasses::new()).is_none());
         let mut duplicate = Vec::new();
         zone.take_completion_handbacks(&SpinForever, &mut |r| duplicate.push(r));
         assert!(duplicate.is_empty());

@@ -920,6 +920,15 @@ pub trait NativeProcessService<'a, C: ProcessContext> {
         }
     }
     fn wake_effects(&mut self, effects: WakeEffects);
+    /// Send the idle-scan passes a lock-taking zone operation owed (#3083)
+    /// through [`Self::wake_effects`], the image's SGI or IPI venue.
+    fn send_owed_passes(&mut self, passes: carrick_sched_core::OwedPasses) {
+        let mut effects = WakeEffects::default();
+        passes.fold_into(&mut effects);
+        if effects.sgi.iter().any(|word| *word != 0) {
+            self.wake_effects(effects);
+        }
+    }
     /// A guest drain opened ingress capacity for an owned host admission.
     fn request_ingress_producer_boundary(&mut self);
     /// Plain fork copies descriptors into a graph-issued table identity.
@@ -5791,7 +5800,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .current()
             .or_else(|| self.source.zone.slot(self.source.slot).host_record())
         {
-            self.handoff = carrick_core::entry::retire_current(self.binding, self.source, record);
+            self.handoff = {
+                let passes = carrick_sched_core::OwedPasses::new();
+                let owed =
+                    carrick_core::entry::retire_current(self.binding, self.source, record, &passes);
+                self.service.send_owed_passes(passes);
+                owed
+            };
         }
         // No graph exit or MM retirement is claimed. Even if lane retirement
         // refuses, the authenticated carrier report stops this incomplete run.
@@ -5908,7 +5923,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .cancel_service(record, self.source.slot, self.service)?;
         if !self.runtime.graph.lock().has_member_wait(&record) {
             let mut effects = WakeEffects::default();
-            if self.source.zone.interrupt_parked_futex(
+            let passes = carrick_sched_core::OwedPasses::new();
+            let claimed = self.source.zone.interrupt_parked_futex(
                 record,
                 self.source.slot,
                 carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64,
@@ -5918,7 +5934,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     probe: self.publication_wait_probe,
                 },
                 &mut effects,
-            ) {
+                &passes,
+            );
+            // A lost claim still owes the passes its queue-lock release did.
+            self.service.send_owed_passes(passes);
+            if claimed {
                 self.service.wake_effects(effects);
                 return Ok(());
             }
@@ -6780,11 +6800,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 deadline,
             }),
         );
-        let receipt = carrick_core::entry::publish_handoff_park(
-            start,
-            &guard,
-            carrick_el1_abi::EntryRecordGeneration(sequence),
-        );
+        let receipt = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = carrick_core::entry::publish_handoff_park(
+                start,
+                &guard,
+                carrick_el1_abi::EntryRecordGeneration(sequence),
+                &passes,
+            );
+            self.service.send_owed_passes(passes);
+            owed
+        };
         if receipt.is_none() {
             drop(guard);
             zone.cancel_timer_admission(self.record);
@@ -7156,11 +7182,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .lock()
             .pending
             .insert_child_wait(self.key, owner, continuation);
-        let receipt = carrick_core::entry::publish_handoff_park(
-            start,
-            &guard,
-            carrick_el1_abi::EntryRecordGeneration(sequence),
-        );
+        let receipt = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = carrick_core::entry::publish_handoff_park(
+                start,
+                &guard,
+                carrick_el1_abi::EntryRecordGeneration(sequence),
+                &passes,
+            );
+            self.service.send_owed_passes(passes);
+            owed
+        };
         if receipt.is_none() {
             drop(guard);
             if carrick_core::entry::host_requested_running(self.binding, self.source, record) {
@@ -7203,7 +7235,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     ) -> Result<(), NativeFailure> {
         let start = carrick_core::entry::prepare_handoff(self.binding, self.source, record)
             .ok_or(NativeFailure::Stale)?;
-        let requeue = self.source.zone.requeue_preempted(self.source.slot, record);
+        let requeue = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = self
+                .source
+                .zone
+                .requeue_preempted(self.source.slot, record, &passes);
+            self.service.send_owed_passes(passes);
+            owed
+        };
         if !requeue.is_queued() {
             return Err(NativeFailure::Quarantined);
         }
@@ -7447,11 +7487,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             }),
         );
         drop(graph);
-        let receipt = carrick_core::entry::publish_handoff_park(
-            start,
-            &guard,
-            carrick_el1_abi::EntryRecordGeneration(sequence),
-        );
+        let receipt = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = carrick_core::entry::publish_handoff_park(
+                start,
+                &guard,
+                carrick_el1_abi::EntryRecordGeneration(sequence),
+                &passes,
+            );
+            self.service.send_owed_passes(passes);
+            owed
+        };
         if receipt.is_none() {
             drop(guard);
             zone.cancel_timer_admission(self.record);
@@ -7855,12 +7901,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
     pub(crate) fn yield_terminal_host_custody(
         &mut self,
     ) -> Result<(), carrick_core::entry::HostYieldRefusal> {
-        let receipt = carrick_core::entry::yield_current_to_host(
-            self.binding,
-            self.source,
-            self.record.id,
-            &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
-        )?;
+        let receipt = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = carrick_core::entry::yield_current_to_host(
+                self.binding,
+                self.source,
+                self.record.id,
+                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+                &passes,
+            );
+            self.service.send_owed_passes(passes);
+            owed
+        }?;
         self.handoff = Some(receipt);
         self.current.linux.mark_pending_host_work();
         Ok(())
@@ -8010,11 +8062,17 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             // passes user-return gates that must not deliver a signal.
             graph.member_wait_state(self.record).raw_exit = true;
         }
-        let receipt = carrick_core::entry::publish_handoff_park(
-            start,
-            &guard,
-            carrick_el1_abi::EntryRecordGeneration(sequence),
-        );
+        let receipt = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = carrick_core::entry::publish_handoff_park(
+                start,
+                &guard,
+                carrick_el1_abi::EntryRecordGeneration(sequence),
+                &passes,
+            );
+            self.service.send_owed_passes(passes);
+            owed
+        };
         if receipt.is_none() {
             drop(guard);
             if carrick_core::entry::host_requested_running(self.binding, self.source, record) {
@@ -8326,15 +8384,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             Err(_) => return Err(NativeFailure::Quarantined),
         };
         self.service.vacate_terminal_space(self.source)?;
-        let receipt = custody
-            .retire_zone_current(
+        let receipt = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = custody.retire_zone_current(
                 self.control,
                 &mut membership,
                 self.binding,
                 self.source,
                 self.record.id,
-            )
-            .map_err(|_| NativeFailure::Quarantined)?;
+                &passes,
+            );
+            self.service.send_owed_passes(passes);
+            owed
+        }
+        .map_err(|_| NativeFailure::Quarantined)?;
         self.service.release_terminal_space(self.source);
         carrick_core::lifecycle::retire_cancelled_pool_member(
             page,
@@ -8448,12 +8511,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             unsafe {
                 *record.ctx_mut() = *self.words;
             }
-            self.handoff = carrick_core::entry::yield_current_to_host(
-                self.binding,
-                self.source,
-                self.record.id,
-                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
-            )
+            self.handoff = {
+                let passes = carrick_sched_core::OwedPasses::new();
+                let owed = carrick_core::entry::yield_current_to_host(
+                    self.binding,
+                    self.source,
+                    self.record.id,
+                    &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    },
+                    &passes,
+                );
+                self.service.send_owed_passes(passes);
+                owed
+            }
             .ok();
             if self.take_handoff_receipt().is_none() {
                 return Err(NativeFailure::Quarantined.run_failure_reason().at_caller());
@@ -8601,14 +8672,20 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 // An adopted host member has no pool entry to retire in the
                 // ring. Its cancelled fault has completed, but its exact host
                 // terminal owner still owes Kernel thread retirement.
-                self.handoff = carrick_core::entry::yield_current_to_host(
-                    self.binding,
-                    self.source,
-                    self.record.id,
-                    &|owned| {
-                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-                    },
-                )
+                self.handoff = {
+                    let passes = carrick_sched_core::OwedPasses::new();
+                    let owed = carrick_core::entry::yield_current_to_host(
+                        self.binding,
+                        self.source,
+                        self.record.id,
+                        &|owned| {
+                            crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                        },
+                        &passes,
+                    );
+                    self.service.send_owed_passes(passes);
+                    owed
+                }
                 .ok();
                 if self.take_handoff_receipt().is_none() {
                     return Err(NativeFailure::Quarantined.run_failure_reason().at_caller());
@@ -8669,13 +8746,19 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             // The host may still own this live member. Keep its installed
             // translation until the neutral owner licenses exact release;
             // then detach before the retirement receipt becomes visible.
-            match carrick_core::terminal::settle_losing_zone_current_before_release(
-                self.control,
-                self.binding,
-                self.source,
-                record,
-                || self.service.vacate_terminal_space(self.source),
-            )?
+            match {
+                let passes = carrick_sched_core::OwedPasses::new();
+                let owed = carrick_core::terminal::settle_losing_zone_current_before_release(
+                    self.control,
+                    self.binding,
+                    self.source,
+                    record,
+                    || self.service.vacate_terminal_space(self.source),
+                    &passes,
+                );
+                self.service.send_owed_passes(passes);
+                owed
+            }?
             .ok_or(NativeFailure::Quarantined)?
             {
                 carrick_core::terminal::LosingMemberSettlement::HostCustody => {
@@ -8710,8 +8793,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             zone.record(record).publish_owner_continuation(entry);
         }
         let sequence = carrick_el1_abi::EntryRecordGeneration(sequence);
-        let receipt = carrick_core::terminal::park_process_exit(start, &guard, sequence)
-            .ok_or(NativeFailure::Quarantined)?;
+        let receipt = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = carrick_core::terminal::park_process_exit(start, &guard, sequence, &passes);
+            self.service.send_owed_passes(passes);
+            owed
+        }
+        .ok_or(NativeFailure::Quarantined)?;
         drop(guard);
         zone.clear_current(self.source.slot);
         self.handoff = Some(receipt);
@@ -9396,8 +9484,18 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .current()
             .or_else(|| self.source.zone.slot(self.source.slot).host_record())
             .ok_or(NativeFailure::Quarantined)?;
-        self.handoff =
-            settled.retire_caller_zone_current(self.control, self.binding, self.source, record);
+        self.handoff = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = settled.retire_caller_zone_current(
+                self.control,
+                self.binding,
+                self.source,
+                record,
+                &passes,
+            );
+            self.service.send_owed_passes(passes);
+            owed
+        };
         if self.handoff.is_none() {
             return Err(NativeFailure::Quarantined);
         }
@@ -9411,19 +9509,28 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .effects
             .cancel_members(|member| {
                 if member.zone.live(member.record).is_some() {
-                    let _ = member.zone.claim_for_host(
-                        member.record,
-                        None,
-                        Handback::Cancelled,
-                        &NativeBucketWait {
-                            lifetime: core::marker::PhantomData,
-                            #[cfg(test)]
-                            probe: self.publication_wait_probe,
-                        },
-                        &|owned| {
-                            crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-                        },
-                    );
+                    let _ = {
+                        let passes = carrick_sched_core::OwedPasses::new();
+                        let owed = member.zone.claim_for_host(
+                            member.record,
+                            None,
+                            Handback::Cancelled,
+                            &NativeBucketWait {
+                                lifetime: core::marker::PhantomData,
+                                #[cfg(test)]
+                                probe: self.publication_wait_probe,
+                            },
+                            &|owned| {
+                                crate::sched::object_wait::deliver_host_completion(
+                                    owned.zone(),
+                                    owned,
+                                )
+                            },
+                            &passes,
+                        );
+                        self.service.send_owed_passes(passes);
+                        owed
+                    };
                 }
             })
             .map_err(|_| NativeFailure::Quarantined)?;
@@ -10332,11 +10439,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         }
         // The child's only owner is this queue entry: a refusal would leave
         // the published child on no run queue (#1100).
-        if !self
-            .source
-            .zone
-            .requeue_preempted(self.source.slot, record)
-            .is_queued()
+        if !{
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = self
+                .source
+                .zone
+                .requeue_preempted(self.source.slot, record, &passes);
+            self.service.send_owed_passes(passes);
+            owed
+        }
+        .is_queued()
         {
             unrow(self.runtime);
             return Err(NativeProcessError::ServiceQuarantined(
@@ -10795,10 +10907,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             }
             Err(_) => return BornEnqueue::Refused,
         }
-        let queued = self
-            .source
-            .zone
-            .requeue_preempted(self.source.slot, record.id);
+        let queued = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = self
+                .source
+                .zone
+                .requeue_preempted(self.source.slot, record.id, &passes);
+            self.service.send_owed_passes(passes);
+            owed
+        };
         if queued.is_queued() {
             self.service.wake_effects(WakeEffects {
                 queued_own: true,
@@ -10819,7 +10936,12 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
         unsafe {
             *zone.record(record).ctx_mut() = self.words.with_syscall_return(0);
         }
-        let requeue = zone.requeue_preempted(slot, record);
+        let requeue = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = zone.requeue_preempted(slot, record, &passes);
+            self.service.send_owed_passes(passes);
+            owed
+        };
         let Some(receipt) = carrick_core::entry::publish_handoff_yield(start, requeue) else {
             return Some(self.run_failed(carrick_core_abi::NativeRunFailureReason::NativeStale));
         };
@@ -10862,9 +10984,13 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Pr
             self.run_failure = Some(error.run_failure_reason().at_caller());
             return false;
         }
-        self.handoff = retirement
-            .retire_current(self.binding, self.source, record.id)
-            .ok();
+        self.handoff = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = retirement.retire_current(self.binding, self.source, record.id, &passes);
+            self.service.send_owed_passes(passes);
+            owed
+        }
+        .ok();
         if self.handoff.is_some() {
             self.service.release_terminal_space(self.source);
         }
@@ -13309,8 +13435,8 @@ mod tests {
             let slot = carrick_sched_core::SlotId::new(0);
             let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
             zone.spaces.open(space);
-            zone.drive(slot, 1);
-            zone.publish_slot(slot, 1, Some(0), 1);
+            zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+            zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
             zone.enter_guest(slot);
             zone.install_space(slot, 1).unwrap();
             zone.current_or_new(
@@ -13385,7 +13511,10 @@ mod tests {
                 .or_else(|| zone.slot(slot).host_record())
                 .unwrap();
             drop(parent);
-            assert!(zone.requeue_preempted(slot, parent_record).is_queued());
+            assert!(
+                zone.requeue_preempted(slot, parent_record, &carrick_sched_core::OwedPasses::new())
+                    .is_queued()
+            );
             activate(&runtime, source, &task, child_key);
             let child_words = runtime.task_binding(child_key).unwrap().words;
             let contended = child_copy_error == Some(NativeProcessError::Busy);
@@ -13405,8 +13534,20 @@ mod tests {
                 child.service.child_copy_error = None;
                 drop(child);
                 // The parent was queued first; run it, then reselect the child.
-                assert_eq!(zone.switch_in_full(slot).unwrap().record, parent_record);
-                assert!(zone.requeue_preempted(slot, parent_record).is_queued());
+                assert_eq!(
+                    zone.switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+                        .unwrap()
+                        .record,
+                    parent_record
+                );
+                assert!(
+                    zone.requeue_preempted(
+                        slot,
+                        parent_record,
+                        &carrick_sched_core::OwedPasses::new()
+                    )
+                    .is_queued()
+                );
                 activate(&runtime, source, &task, child_key);
                 let child_record = runtime.task_binding(child_key).unwrap().record;
                 // SAFETY: the child's record was selected just above.
@@ -13489,11 +13630,21 @@ mod tests {
                 drop(child);
                 let child_record = runtime.task_binding(child_key).unwrap().record;
                 loop {
-                    let selected = zone.switch_in_full(slot).unwrap().record;
+                    let selected = zone
+                        .switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+                        .unwrap()
+                        .record;
                     if selected == child_record.id {
                         break;
                     }
-                    assert!(zone.requeue_preempted(slot, selected).is_queued());
+                    assert!(
+                        zone.requeue_preempted(
+                            slot,
+                            selected,
+                            &carrick_sched_core::OwedPasses::new()
+                        )
+                        .is_queued()
+                    );
                 }
                 // SAFETY: the child's record was selected just above.
                 let child_words = unsafe { runtime.record_binding(child_record) }
@@ -13599,8 +13750,14 @@ mod tests {
             };
             let space = zone.spaces.publish_closed(mm, root, 0).unwrap();
             zone.spaces.open(space);
-            zone.drive(slot, 1);
-            zone.publish_slot(slot, 1, Some(index as u32), 1);
+            zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+            zone.publish_slot(
+                slot,
+                1,
+                Some(index as u32),
+                1,
+                &carrick_sched_core::OwedPasses::new(),
+            );
             zone.enter_guest(slot);
             zone.install_space(slot, mm).unwrap();
             zone.current_or_new(
@@ -14138,8 +14295,14 @@ mod tests {
             };
             let space = zone.spaces.publish_closed(mm.raw().get(), root, 0).unwrap();
             zone.spaces.open(space);
-            zone.drive(slot, 1);
-            zone.publish_slot(slot, 1, Some(index as u32), 1);
+            zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+            zone.publish_slot(
+                slot,
+                1,
+                Some(index as u32),
+                1,
+                &carrick_sched_core::OwedPasses::new(),
+            );
             zone.enter_guest(slot);
             zone.install_space(slot, mm.raw().get()).unwrap();
             zone.current_or_new(
@@ -14364,8 +14527,14 @@ mod tests {
             };
             let space = zone.spaces.publish_closed(mm.raw().get(), root, 0).unwrap();
             zone.spaces.open(space);
-            zone.drive(slot, 1);
-            zone.publish_slot(slot, 1, Some(index as u32), 1);
+            zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+            zone.publish_slot(
+                slot,
+                1,
+                Some(index as u32),
+                1,
+                &carrick_sched_core::OwedPasses::new(),
+            );
             zone.enter_guest(slot);
             zone.install_space(slot, mm.raw().get()).unwrap();
             zone.current_or_new(
@@ -14510,8 +14679,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -14634,8 +14803,16 @@ mod tests {
             })
             .unwrap();
         thread_control.bind_zone_record(zone.record_ref(record));
-        assert!(zone.requeue_preempted(slot, record).is_queued());
-        assert_eq!(zone.switch_in_full(slot).unwrap().record, record);
+        assert!(
+            zone.requeue_preempted(slot, record, &carrick_sched_core::OwedPasses::new())
+                .is_queued()
+        );
+        assert_eq!(
+            zone.switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record,
+            record
+        );
         thread.set(
             carrick_el1_abi::El1TaskId::from_linux_tid(42),
             carrick_el1_abi::SnapshotGeneration::INITIAL,
@@ -14708,13 +14885,31 @@ mod tests {
         // Retire the registered observer, retaining the leader and its process.
         process.retire_thread_identity(42);
         assert!(registry.for_external_event(&zone, event).is_some());
-        let retired = carrick_core::entry::retire_current(observed, source, record).unwrap();
+        let retired = carrick_core::entry::retire_current(
+            observed,
+            source,
+            record,
+            &carrick_sched_core::OwedPasses::new(),
+        )
+        .unwrap();
         let _ = retired;
         drop(observer_claim);
         drop(process);
         let leader_record = runtime.task_binding(process_key).unwrap().record;
-        assert!(zone.requeue_preempted(slot, leader_record.id).is_queued());
-        assert_eq!(zone.switch_in_full(slot).unwrap().record, leader_record.id);
+        assert!(
+            zone.requeue_preempted(
+                slot,
+                leader_record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
+            .is_queued()
+        );
+        assert_eq!(
+            zone.switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record,
+            leader_record.id
+        );
         let mut leader_entry = runtime
             .enter_registered(
                 registry,
@@ -14870,8 +15065,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -14955,8 +15150,16 @@ mod tests {
             })
             .unwrap();
         thread_control.bind_zone_record(zone.record_ref(record));
-        assert!(zone.requeue_preempted(slot, record).is_queued());
-        assert_eq!(zone.switch_in_full(slot).unwrap().record, record);
+        assert!(
+            zone.requeue_preempted(slot, record, &carrick_sched_core::OwedPasses::new())
+                .is_queued()
+        );
+        assert_eq!(
+            zone.switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record,
+            record
+        );
         thread.set(
             carrick_el1_abi::El1TaskId::from_linux_tid(43),
             carrick_el1_abi::SnapshotGeneration::from_raw(13),
@@ -15070,8 +15273,8 @@ mod tests {
             let slot = carrick_sched_core::SlotId::new(0);
             let space = zone.spaces.publish_closed(1, register, 0).unwrap();
             zone.spaces.open(space);
-            zone.drive(slot, 1);
-            zone.publish_slot(slot, 1, Some(0), 1);
+            zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+            zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
             zone.enter_guest(slot);
             zone.install_space(slot, 1).unwrap();
             zone.current_or_new(
@@ -15161,8 +15364,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -15334,18 +15537,32 @@ mod tests {
             carrick_sched_core::Claim::Parked { .. }
         ));
         assert_eq!(
-            zone.expire_timer(slot, 1999, (-11i64) as u64, &|owned| {
-                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-            }),
+            zone.expire_timer(
+                slot,
+                1999,
+                (-11i64) as u64,
+                &|owned| {
+                    crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                },
+                &carrick_sched_core::OwedPasses::new()
+            ),
             Ok(false)
         );
         assert_eq!(
-            zone.expire_timer(slot, 2000, (-11i64) as u64, &|owned| {
-                crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-            }),
+            zone.expire_timer(
+                slot,
+                2000,
+                (-11i64) as u64,
+                &|owned| {
+                    crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                },
+                &carrick_sched_core::OwedPasses::new()
+            ),
             Ok(true)
         );
-        let selected = zone.switch_in_full(slot).unwrap();
+        let selected = zone
+            .switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap();
         assert_eq!(zone.record_ref(selected.record), timer.record);
         let mut entry = runtime
             .enter(source, &task, words(address), &mut service)
@@ -15519,8 +15736,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -15637,8 +15854,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -15792,8 +16009,8 @@ mod tests {
             let slot = carrick_sched_core::SlotId::new(0);
             let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
             zone.spaces.open(space);
-            zone.drive(slot, 1);
-            zone.publish_slot(slot, 1, Some(0), 1);
+            zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+            zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
             zone.enter_guest(slot);
             zone.install_space(slot, 1).unwrap();
             zone.current_or_new(
@@ -16013,7 +16230,9 @@ mod tests {
                 matches!(entry.fork(ProcessForkChildTid::NONE), LifecycleOutcome::Returned { result, .. } if result.raw() == -11)
             );
             drop(entry);
-            let selected = zone.switch_in_full(slot).unwrap();
+            let selected = zone
+                .switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap();
             assert_eq!(selected.record, home);
             let mut entry = runtime
                 .enter(source, &task, words(address), &mut service)
@@ -16072,8 +16291,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -16317,8 +16536,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -16492,7 +16711,12 @@ mod tests {
             11,
             "fork inherits the root task's retained file/loader capability"
         );
-        assert_eq!(zone.switch_in_full(slot).unwrap().record, child_record.id);
+        assert_eq!(
+            zone.switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record,
+            child_record.id
+        );
         zone.install_space(slot, child_address.mm.raw().get())
             .unwrap();
         let child_identity = zone.record(child_record.id).identity();
@@ -16744,7 +16968,12 @@ mod tests {
             .native()
             .resources()
             .record;
-        assert_eq!(zone.switch_in_full(slot).unwrap().record, parent_record.id);
+        assert_eq!(
+            zone.switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record,
+            parent_record.id
+        );
         zone.install_space(slot, address.mm.raw().get()).unwrap();
         let parent_identity = zone.record(parent_record.id).identity();
         task.set(
@@ -16885,7 +17114,9 @@ mod tests {
         let resources = row.native().resources();
         let zone = source.zone;
         assert_eq!(
-            zone.switch_in_full(source.slot).unwrap().record,
+            zone.switch_in_full(source.slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record,
             resources.record.id
         );
         zone.install_space(source.slot, resources.address.mm.raw().get())
@@ -16947,8 +17178,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -17144,8 +17375,14 @@ mod tests {
             .resources()
             .address;
         let peer_slot = carrick_sched_core::SlotId::new(1);
-        zone.drive(peer_slot, 1);
-        zone.publish_slot(peer_slot, 1, Some(1), 1);
+        zone.drive(peer_slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(
+            peer_slot,
+            1,
+            Some(1),
+            1,
+            &carrick_sched_core::OwedPasses::new(),
+        );
         zone.enter_guest(peer_slot);
         assert_eq!(
             zone.claim_for_host(
@@ -17153,11 +17390,19 @@ mod tests {
                 None,
                 Handback::Resumed,
                 &BoundedSpin(0),
-                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+                &carrick_sched_core::OwedPasses::new()
             ),
             carrick_sched_core::HostClaim::Claimed
         );
-        assert!(zone.requeue_on(peer_slot, child_record.id).is_some());
+        assert!(
+            zone.requeue_on(
+                peer_slot,
+                child_record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
+            .is_some()
+        );
         let peer_source = BornInZoneSource {
             zone: &zone,
             slot: peer_slot,
@@ -17397,8 +17642,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -17596,8 +17841,8 @@ mod tests {
             let slot = carrick_sched_core::SlotId::new(0);
             let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
             zone.spaces.open(space);
-            zone.drive(slot, 1);
-            zone.publish_slot(slot, 1, Some(0), 1);
+            zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+            zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
             zone.enter_guest(slot);
             zone.install_space(slot, 1).unwrap();
             zone.current_or_new(
@@ -17834,8 +18079,8 @@ mod tests {
             let slot = carrick_sched_core::SlotId::new(0);
             let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
             zone.spaces.open(space);
-            zone.drive(slot, 1);
-            zone.publish_slot(slot, 1, Some(0), 1);
+            zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+            zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
             zone.enter_guest(slot);
             zone.install_space(slot, 1).unwrap();
             zone.current_or_new(
@@ -18014,7 +18259,8 @@ mod tests {
                         &|owned| crate::sched::object_wait::deliver_host_completion(
                             owned.zone(),
                             owned
-                        )
+                        ),
+                        &carrick_sched_core::OwedPasses::new()
                     ),
                     carrick_sched_core::HostClaim::Claimed
                 ));
@@ -18121,8 +18367,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -18361,8 +18607,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -18470,8 +18716,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -18613,8 +18859,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -18718,8 +18964,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -18791,7 +19037,14 @@ mod tests {
             .expect("fork child succeeds") as i32;
         drop(entry);
 
-        assert!(zone.requeue_preempted(slot, parent_record.id).is_queued());
+        assert!(
+            zone.requeue_preempted(
+                slot,
+                parent_record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
+            .is_queued()
+        );
         let child_key = {
             let graph = runtime.graph.lock();
             graph
@@ -18812,7 +19065,12 @@ mod tests {
                 row.native().resources().record,
             )
         };
-        assert_eq!(zone.switch_in_full(slot).unwrap().record, child_record.id);
+        assert_eq!(
+            zone.switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+                .unwrap()
+                .record,
+            child_record.id
+        );
         zone.install_space(slot, child_address.mm.raw().get())
             .unwrap();
         let child_identity = zone.record(child_record.id).identity();
@@ -18877,8 +19135,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -19330,8 +19588,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -19488,8 +19746,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -19710,12 +19968,20 @@ mod tests {
         if operation == 4 {
             assert_eq!(zone.timer_deadline(slot), Some(1001));
             assert_eq!(
-                zone.expire_timer(slot, 1001, (-11_i64) as u64, &|owned| {
-                    crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
-                }),
+                zone.expire_timer(
+                    slot,
+                    1001,
+                    (-11_i64) as u64,
+                    &|owned| {
+                        crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                    },
+                    &carrick_sched_core::OwedPasses::new()
+                ),
                 Ok(true)
             );
-            let selected = zone.switch_in_full(slot).expect("timer must wake semop");
+            let selected = zone
+                .switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+                .expect("timer must wake semop");
             assert_eq!(zone.record_ref(selected.record), entry.record);
             assert!(
                 matches!(entry.resume_pending_wait(), Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == carrick_syscall_abi::LINUX_EAGAIN.guest_retval())
@@ -19729,7 +19995,9 @@ mod tests {
                 entry.msgsnd(queue, 1, &[7], 0),
                 Ok(IpcOutcome::Returned(_))
             ));
-            let selected = zone.switch_in_full(slot).expect("message must wake msgrcv");
+            let selected = zone
+                .switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+                .expect("message must wake msgrcv");
             assert_eq!(zone.record_ref(selected.record), entry.record);
             assert!(
                 matches!(entry.resume_pending_wait(), Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == carrick_syscall_abi::LINUX_EFAULT.guest_retval())
@@ -19770,7 +20038,7 @@ mod tests {
                 .unwrap();
         }
         let selected = zone
-            .switch_in_full(slot)
+            .switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
             .expect("signal must wake the owned IPC continuation");
         assert_eq!(zone.record_ref(selected.record), entry.record);
         assert!(
@@ -20026,8 +20294,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -20250,8 +20518,8 @@ mod tests {
         let slot = carrick_sched_core::SlotId::new(0);
         let space = zone.spaces.publish_closed(1, 0x1000, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, 1).unwrap();
         zone.current_or_new(
@@ -20311,7 +20579,9 @@ mod tests {
         assert_eq!(child_pid.raw(), 42);
         assert_eq!(entry.service.committed_children.len(), 1);
         let (committed_task, committed_execution) = entry.service.committed_children[0];
-        let switched = zone.switch_in_full(slot).expect("runnable forked child");
+        let switched = zone
+            .switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+            .expect("runnable forked child");
         let child_identity = zone.record(switched.record).identity();
         assert_eq!(committed_task.get(), 102);
         assert_ne!(

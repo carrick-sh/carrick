@@ -142,8 +142,12 @@ impl World {
     fn new(hatches: LifecycleHatches) -> Self {
         let zone = zone();
         // The executor loads the leader and publishes the slot.
-        zone.drive(SLOT, u64::from(SLOT.raw()) + 1);
-        zone.publish_slot(SLOT, MM, None, 0);
+        zone.drive(
+            SLOT,
+            u64::from(SLOT.raw()) + 1,
+            &carrick_sched_core::OwedPasses::new(),
+        );
+        zone.publish_slot(SLOT, MM, None, 0, &carrick_sched_core::OwedPasses::new());
         let here = ExecutionSlot::zone(SLOT);
         zone.occupancy.vacate_any(here);
         assert!(zone.occupancy.replace(here, 0, MM));
@@ -1673,12 +1677,23 @@ fn exit_keeps_a_migrated_host_job_while_the_other_process_exits_in_zone() {
             SLOT,
             record,
             &carrick_sched_core::BoundedSpin(carrick_el1_abi::EL1_GUEST_LOCK_SPINS),
+            &carrick_sched_core::OwedPasses::new(),
         ),
         carrick_sched_core::CurrentRelease::Released,
     );
     let record = hosted.zone.alloc_record(identity).unwrap();
-    assert!(hosted.zone.requeue_preempted(SLOT, record).is_queued());
-    assert_eq!(hosted.zone.switch_in(SLOT), Some(record));
+    assert!(
+        hosted
+            .zone
+            .requeue_preempted(SLOT, record, &carrick_sched_core::OwedPasses::new())
+            .is_queued()
+    );
+    assert_eq!(
+        hosted
+            .zone
+            .switch_in(SLOT, &carrick_sched_core::OwedPasses::new()),
+        Some(record)
+    );
     hosted.task().execution.generation.store(
         carrick_el1_abi::SnapshotGeneration::from_raw(identity.generation),
         Ordering::Release,
@@ -3315,7 +3330,11 @@ fn native_exit_group_leaves_the_woken_successor_to_the_scheduler() {
         })
         .unwrap();
     assert!(w.zone.mark_native_owned(record));
-    assert!(w.zone.requeue_preempted(SLOT, record).is_queued());
+    assert!(
+        w.zone
+            .requeue_preempted(SLOT, record, &carrick_sched_core::OwedPasses::new())
+            .is_queued()
+    );
     let mut owner = Exiting {
         binding: crate::common_entry::execution_binding(w.task()),
     };
@@ -3505,7 +3524,7 @@ fn managed_clone_copyout_fault_unbinds_birth_before_retry() {
         ) -> carrick_personality_linux::lifecycle::BornEnqueue {
             // SAFETY: World retains this scheduler for the whole witness.
             unsafe { &*self.zone }
-                .requeue_preempted(SLOT, record.id)
+                .requeue_preempted(SLOT, record.id, &carrick_sched_core::OwedPasses::new())
                 .into()
         }
         fn bind_thread_birth(

@@ -258,7 +258,11 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, parent_binding.record.id)
+            .requeue_preempted(
+                fixture.slot,
+                parent_binding.record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     let sender_slot = SlotId::new(1);
@@ -285,16 +289,20 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
                 None,
                 carrick_sched_core::Handback::Resumed,
                 &ShortLockSpin,
-                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+                &|owned| crate::sched::object_wait::deliver_host_completion(owned.zone(), owned),
+                &carrick_sched_core::OwedPasses::new()
             ),
             carrick_sched_core::HostClaim::Claimed
         );
-        fixture.zone.drive(sender_slot, 2);
+        fixture
+            .zone
+            .drive(sender_slot, 2, &carrick_sched_core::OwedPasses::new());
         fixture.zone.publish_slot(
             sender_slot,
             parent_binding.address.mm.raw().get(),
             Some(1),
             3,
+            &carrick_sched_core::OwedPasses::new(),
         );
         fixture.zone.enter_guest(sender_slot);
         fixture
@@ -303,7 +311,11 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
             .unwrap();
         fixture
             .zone
-            .requeue_on(sender_slot, parent_binding.record.id)
+            .requeue_on(
+                sender_slot,
+                parent_binding.record.id,
+                &carrick_sched_core::OwedPasses::new(),
+            )
             .unwrap();
         activate_target(sender_source, &sender_task, &parent_binding);
         Some(
@@ -394,7 +406,11 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
             // The real write may wake a foreign MM on its driver's queue.
             // Model its ordinary host boundary: the shipping relocation and
             // handback owners place the readers, retaining the live sender.
-            fixture.zone.leave_guest(sender_slot, &ShortLockSpin);
+            fixture.zone.leave_guest(
+                sender_slot,
+                &ShortLockSpin,
+                &carrick_sched_core::OwedPasses::new(),
+            );
             carrick_kernel::el1_zone::with_test_zone(fixture.zone, || {
                 fixture.zone.relocate(
                     sender_slot,
@@ -408,6 +424,7 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
                             carrick_kernel::el1_zone::resched_slot(placement.slot);
                         }
                     },
+                    &carrick_sched_core::OwedPasses::new(),
                 );
             });
             if let Some(work) = sender_task.linux.take_host_work_doorbell() {
@@ -487,7 +504,11 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
                 .unwrap(),
         );
     }
-    fixture.zone.leave_guest(fixture.slot, &ShortLockSpin);
+    fixture.zone.leave_guest(
+        fixture.slot,
+        &ShortLockSpin,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     let mut vacated = Vec::new();
     if away {
         assert!(fixture.zone.step_away(
@@ -511,10 +532,16 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
                 assert_eq!(record, parent_binding.record);
             },
             &mut |_| panic!("the fixture has no second driver"),
+            &carrick_sched_core::OwedPasses::new(),
         ));
         assert!(!fixture.zone.slot(fixture.slot).is_live());
         for record in vacated {
-            assert!(fixture.zone.place_native_handback(record).is_some());
+            assert!(
+                fixture
+                    .zone
+                    .place_native_handback(record, &carrick_sched_core::OwedPasses::new())
+                    .is_some()
+            );
         }
     }
     if signal.is_some() {
@@ -610,7 +637,9 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
             work.settled();
         }
         if away {
-            fixture.zone.step_back(fixture.slot, 1);
+            fixture
+                .zone
+                .step_back(fixture.slot, 1, &carrick_sched_core::OwedPasses::new());
         }
         fixture.zone.enter_guest(fixture.slot);
         for (index, child) in children.iter().enumerate() {
@@ -772,7 +801,11 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
             assert!(
                 fixture
                     .zone
-                    .requeue_preempted(fixture.slot, child.record.id)
+                    .requeue_preempted(
+                        fixture.slot,
+                        child.record.id,
+                        &carrick_sched_core::OwedPasses::new()
+                    )
                     .is_queued()
             );
         }
@@ -819,7 +852,9 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
         assert_eq!(resumed.queue, 0);
     }
     if away {
-        fixture.zone.step_back(fixture.slot, 1);
+        fixture
+            .zone
+            .step_back(fixture.slot, 1, &carrick_sched_core::OwedPasses::new());
     }
     fixture.zone.enter_guest(fixture.slot);
     for child in &children {
@@ -842,7 +877,11 @@ fn two_native_children_pipe_eof_wake(away: bool, signal: Option<SignalCase>) {
         assert!(
             fixture
                 .zone
-                .requeue_preempted(fixture.slot, child.record.id)
+                .requeue_preempted(
+                    fixture.slot,
+                    child.record.id,
+                    &carrick_sched_core::OwedPasses::new()
+                )
                 .is_queued()
         );
     }
@@ -902,7 +941,11 @@ fn serial_host_deliverable_signal_does_not_cancel_mm_edit_conflict() {
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, binding.record.id)
+            .requeue_preempted(
+                fixture.slot,
+                binding.record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     activate_target(source, &fixture.task, &binding);

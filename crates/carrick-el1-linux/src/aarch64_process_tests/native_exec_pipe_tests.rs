@@ -811,7 +811,11 @@ fn fork_exec_probe_copy_alignment(
         assert!(
             fixture
                 .zone
-                .requeue_preempted(fixture.slot, parent_binding.record.id)
+                .requeue_preempted(
+                    fixture.slot,
+                    parent_binding.record.id,
+                    &carrick_sched_core::OwedPasses::new()
+                )
                 .is_queued()
         );
     }
@@ -1538,7 +1542,11 @@ fn fork_exec_probe_copy_alignment(
         assert!(
             fixture
                 .zone
-                .requeue_preempted(fixture.slot, parent_binding.record.id)
+                .requeue_preempted(
+                    fixture.slot,
+                    parent_binding.record.id,
+                    &carrick_sched_core::OwedPasses::new()
+                )
                 .is_queued()
         );
 
@@ -1868,7 +1876,11 @@ fn fork_exec_probe_copy_alignment(
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, child_binding.record.id)
+            .requeue_preempted(
+                fixture.slot,
+                child_binding.record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     activate_target(source, &fixture.task, &parent_binding);
@@ -2001,7 +2013,11 @@ fn serial_host_parked_pipe_read_resumes_at_saved_svc() {
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, parent_binding.record.id)
+            .requeue_preempted(
+                fixture.slot,
+                parent_binding.record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     activate_target(source, &fixture.task, &child_binding);
@@ -2100,14 +2116,22 @@ fn serial_host_parked_pipe_read_resumes_at_saved_svc() {
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, child_binding.record.id)
+            .requeue_preempted(
+                fixture.slot,
+                child_binding.record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     activate_target(source, &fixture.task, &parent_binding);
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, parent_binding.record.id)
+            .requeue_preempted(
+                fixture.slot,
+                parent_binding.record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     activate_target(source, &fixture.task, &child_binding);
@@ -2232,7 +2256,7 @@ fn serial_host_parked_pipe_read_resumes_at_saved_svc() {
         assert!(
             fixture
                 .zone
-                .requeue_preempted(fixture.slot, other)
+                .requeue_preempted(fixture.slot, other, &carrick_sched_core::OwedPasses::new())
                 .is_queued()
         );
     }
@@ -2253,7 +2277,11 @@ fn serial_host_parked_pipe_read_resumes_at_saved_svc() {
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, child_binding.record.id)
+            .requeue_preempted(
+                fixture.slot,
+                child_binding.record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     let mut resume_cpu = ResumeCpu {
@@ -2286,7 +2314,7 @@ fn serial_host_parked_pipe_read_resumes_at_saved_svc() {
         assert!(
             fixture
                 .zone
-                .requeue_preempted(fixture.slot, other)
+                .requeue_preempted(fixture.slot, other, &carrick_sched_core::OwedPasses::new())
                 .is_queued()
         );
     }
@@ -2610,7 +2638,11 @@ fn child_futex<'a>(
     word.available.set(true);
     access.lower(space.index());
     assert_eq!(
-        fixture.zone.switch_in_full(fixture.slot).unwrap().record,
+        fixture
+            .zone
+            .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         binding.record.id
     );
     let mut entry = runtime
@@ -3128,7 +3160,11 @@ fn child_futex<'a>(
         // The executor departs; the deadline survives on the carrier
         // driver's heap and expires exactly once at its original tick.
         let depart_and_expire = || {
-            fixture.zone.leave_guest(fixture.slot, &ShortLockSpin);
+            fixture.zone.leave_guest(
+                fixture.slot,
+                &ShortLockSpin,
+                &carrick_sched_core::OwedPasses::new(),
+            );
             carrick_kernel::el1_zone::with_test_zone(fixture.zone, || {
                 carrick_kernel::el1_zone::hand_back_foreign_timer(fixture.slot);
             });
@@ -3410,11 +3446,19 @@ fn child_futex<'a>(
         // The sibling has executed gettid while the exec leader is parked.
         // Model the stopped carrier boundary using the same public entry
         // points as reconcile_zone_exit and executor slot reuse.
-        fixture.zone.leave_guest(fixture.slot, &ShortLockSpin);
+        fixture.zone.leave_guest(
+            fixture.slot,
+            &ShortLockSpin,
+            &carrick_sched_core::OwedPasses::new(),
+        );
         assert!(
             fixture
                 .zone
-                .requeue_preempted(fixture.slot, worker.record.id)
+                .requeue_preempted(
+                    fixture.slot,
+                    worker.record.id,
+                    &carrick_sched_core::OwedPasses::new()
+                )
                 .is_queued()
         );
         carrick_kernel::el1_zone::with_test_zone(fixture.zone, || {
@@ -3585,7 +3629,11 @@ fn child_futex<'a>(
         assert!(
             fixture
                 .zone
-                .requeue_preempted(fixture.slot, worker.record.id)
+                .requeue_preempted(
+                    fixture.slot,
+                    worker.record.id,
+                    &carrick_sched_core::OwedPasses::new()
+                )
                 .is_queued()
         );
         let selected = activate_target(source, &fixture.task, &binding);
@@ -3726,7 +3774,11 @@ fn serial_host_child_of_an_execed_root_execs_through_the_installed_capability() 
     assert!(
         fixture
             .zone
-            .requeue_preempted(fixture.slot, parent_binding.record.id)
+            .requeue_preempted(
+                fixture.slot,
+                parent_binding.record.id,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_queued()
     );
     activate_target(source, &fixture.task, &child_binding);

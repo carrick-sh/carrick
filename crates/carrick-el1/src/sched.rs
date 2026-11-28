@@ -5,8 +5,8 @@ use carrick_el1_abi::{
     ZoneTables,
 };
 use carrick_sched_core::{
-    IDLE_SPIN_NS, PREEMPT_SLICE_NS, ShortLockSpin, SwitchedIn, WakeEffects, WakeMechanics,
-    WakerQueue, YieldTurn,
+    IDLE_SPIN_NS, OwedPasses, PREEMPT_SLICE_NS, ShortLockSpin, SwitchedIn, WakeEffects,
+    WakeMechanics, WakerQueue, YieldTurn,
 };
 use core::sync::atomic::Ordering;
 
@@ -522,11 +522,14 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             return Ok(Some(Served::Returned { switched: false }));
         }
         zone.set_deadline(record, deadline.unwrap_or(0));
-        let receipt = carrick_core::entry::publish_handoff_park(
-            start,
-            &guard,
-            carrick_el1_abi::EntryRecordGeneration(seq),
-        );
+        let receipt = self.owing(|passes| {
+            carrick_core::entry::publish_handoff_park(
+                start,
+                &guard,
+                carrick_el1_abi::EntryRecordGeneration(seq),
+                passes,
+            )
+        });
         if receipt.is_none() {
             drop(guard);
             if fresh {
@@ -560,7 +563,8 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             return Some(served);
         }
         loop {
-            if let Some(switched) = self.zone.switch_in_full(self.slot) {
+            let (zone, slot) = (self.zone, self.slot);
+            if let Some(switched) = self.owing(|passes| zone.switch_in_full(slot, passes)) {
                 match self.load(frame, switched) {
                     LoadResult::Running => return Some(Served::Returned { switched: true }),
                     LoadResult::NeedsHost => return Some(self.service_exit()),
@@ -598,7 +602,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     /// would never run (#1100).
     pub fn enqueue_born(&mut self, record: carrick_el1_abi::RecordId) -> carrick_el1_abi::Requeue {
         let (zone, slot) = (self.zone, self.slot);
-        let queued = zone.requeue_preempted(slot, record);
+        let queued = self.owing(|passes| zone.requeue_preempted(slot, record, passes));
         if queued.is_queued() {
             self.arm_published_runnable();
         }
@@ -680,14 +684,14 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         if zone.current_affinity_excludes_cpu(slot) {
             // The frame still belongs to the previous task. Requeue the
             // target's saved context without saving these old registers.
-            zone.unswitch(slot, switched.record);
+            self.owing(|passes| zone.unswitch(slot, switched.record, passes));
             let mut effects = WakeEffects::default();
             zone.migrate_queued(slot, &mut effects);
             self.send_sgis(&effects);
             return LoadResult::NeedsHost;
         }
         if !self.enter_space(rec.identity().mm, rec.has_native_execution_owner()) {
-            zone.unswitch(slot, switched.record);
+            self.owing(|passes| zone.unswitch(slot, switched.record, passes));
             return LoadResult::NeedsHost;
         }
         zone.cpu_bind_record(
@@ -834,7 +838,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             .fetch_add(1, Ordering::Relaxed);
         zone.cpu_leave_slot(slot, carrick_sched_core::CounterTick::new(self.cpu.now()));
         zone.slot(slot).set_sgi_target(self.cpu.own_sgi_target());
-        zone.enter_idle(slot, false);
+        self.owing(|passes| zone.enter_idle(slot, false, passes));
         let spin_until = self.cpu.now().saturating_add(self.ticks(IDLE_SPIN_NS));
         loop {
             self.take_irqs();
@@ -846,16 +850,27 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
                 return Served::Idle;
             }
             let now = self.cpu.now();
-            let _ = zone.expire_timer(slot, now, timeout_result, &|owned| {
-                crate::substrate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+            let _ = self.owing(|passes| {
+                zone.expire_timer(
+                    slot,
+                    now,
+                    timeout_result,
+                    &|owned| {
+                        crate::substrate::sched::object_wait::deliver_host_completion(
+                            owned.zone(),
+                            owned,
+                        )
+                    },
+                    passes,
+                )
             });
-            if let Some(switched) = zone.take_idle_work(slot) {
+            if let Some(switched) = self.owing(|passes| zone.take_idle_work(slot, passes)) {
                 zone.leave_idle(slot);
                 match self.load(frame, switched) {
                     LoadResult::Running => return Served::Returned { switched: true },
                     LoadResult::NeedsHost => return self.service_exit(),
                     LoadResult::Left => {
-                        zone.enter_idle(slot, false);
+                        self.owing(|passes| zone.enter_idle(slot, false, passes));
                         continue;
                     }
                 }
@@ -872,7 +887,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
             // translations, so no pause or retirement of that process has
             // to wake it (the next thread it runs installs its own space).
             self.leave_space();
-            if zone.enter_idle(slot, true) {
+            if self.owing(|passes| zone.enter_idle(slot, true, passes)) {
                 self.program_timer(false);
                 #[cfg(any(test, feature = "host-test"))]
                 self.cpu.before_idle_wfi();
@@ -885,14 +900,14 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
                 // its host executor moves the thread.
                 if zone.slot(slot).affinity_excludes_cpu() || idle_wake_owed(self.task, zone, slot)
                 {
-                    zone.enter_idle(slot, false);
+                    self.owing(|passes| zone.enter_idle(slot, false, passes));
                     continue;
                 }
                 zone.counters
                     .el1_wfi_entries
                     .fetch_add(1, Ordering::Relaxed);
                 self.cpu.wait_for_interrupt();
-                zone.enter_idle(slot, false);
+                self.owing(|passes| zone.enter_idle(slot, false, passes));
             }
         }
     }
@@ -1006,8 +1021,19 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         }
         let (zone, slot) = (self.zone, self.slot);
         let now = self.cpu.now();
-        let _ = zone.expire_timer(slot, now, timeout_result, &|owned| {
-            crate::substrate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
+        let _ = self.owing(|passes| {
+            zone.expire_timer(
+                slot,
+                now,
+                timeout_result,
+                &|owned| {
+                    crate::substrate::sched::object_wait::deliver_host_completion(
+                        owned.zone(),
+                        owned,
+                    )
+                },
+                passes,
+            )
         });
         if zone.slot(slot).queued() != 0 {
             let mut since = zone.slot(slot).queued_since();
@@ -1097,7 +1123,7 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         // SAFETY: `prev` holds the running thread (a fresh home record, or
         // the switched-in OnCpu one): this vCPU is its only owner.
         self.cpu.save(frame, unsafe { zone.record(prev).ctx_mut() });
-        requeue_owned(zone, slot, prev)
+        self.owing(|passes| requeue_owned(zone, slot, prev, passes))
     }
 
     /// Preempt the running thread: it goes to the tail of this vCPU's run
@@ -1126,9 +1152,9 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
         // SAFETY: `prev` holds the running thread (a fresh home record, or
         // the switched-in OnCpu one): this vCPU is its only owner.
         self.cpu.save(frame, unsafe { zone.record(prev).ctx_mut() });
-        match zone.switch_in_full(slot) {
+        match self.owing(|passes| zone.switch_in_full(slot, passes)) {
             Some(switched) => {
-                if !requeue_owned(zone, slot, prev) {
+                if !self.owing(|passes| requeue_owned(zone, slot, prev, passes)) {
                     // Hosted builds only: the target build failed closed.
                     return (
                         false,
@@ -1197,6 +1223,28 @@ impl<C: ThreadCpu, U: UserWord> Sched<'_, C, U> {
     fn send_sgis(&mut self, effects: &WakeEffects) {
         effects.send_kicks(self.zone, self);
     }
+
+    /// Run one lock-taking zone operation and send the idle-scan passes its
+    /// releases owe (#3083) through this vCPU's SGI route, before anything
+    /// else (a WFI above all) can follow.
+    fn owing<R>(&mut self, op: impl FnOnce(&OwedPasses) -> R) -> R {
+        let passes = OwedPasses::new();
+        let result = op(&passes);
+        self.send_owed_passes(passes);
+        result
+    }
+
+    /// Send the idle-scan passes `passes` owes (#3083) through this vCPU's
+    /// SGI route.
+    pub fn send_owed_passes(&mut self, passes: OwedPasses) {
+        if passes.is_empty() {
+            passes.fold_into(&mut WakeEffects::default());
+            return;
+        }
+        let mut effects = WakeEffects::default();
+        passes.fold_into(&mut effects);
+        self.send_sgis(&effects);
+    }
 }
 
 /// ARM's mechanics for the one shared wake-effect applier
@@ -1230,8 +1278,13 @@ pub mod hw;
 /// is a broken invariant, never contention. The target fails closed rather
 /// than leave the thread on no run queue (#1100); hosted builds report it.
 #[track_caller]
-fn requeue_owned(zone: &ZoneTables, slot: SlotId, record: carrick_el1_abi::RecordId) -> bool {
-    match zone.requeue_preempted(slot, record) {
+fn requeue_owned(
+    zone: &ZoneTables,
+    slot: SlotId,
+    record: carrick_el1_abi::RecordId,
+    passes: &OwedPasses,
+) -> bool {
+    match zone.requeue_preempted(slot, record, passes) {
         carrick_el1_abi::Requeue::Queued => true,
         carrick_el1_abi::Requeue::Refused(_) => {
             #[cfg(target_os = "none")]

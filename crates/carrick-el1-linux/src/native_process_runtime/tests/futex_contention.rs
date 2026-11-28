@@ -70,8 +70,8 @@ impl<C: ProcessContext + 'static> Fixture<C> {
         seed_fixture_namespace(zone, task, page);
         let space = zone.spaces.publish_closed(mm, root, 0).unwrap();
         zone.spaces.open(space);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 1, Some(0), 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 1, Some(0), 1, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         zone.install_space(slot, mm).unwrap();
         zone.current_or_new(
@@ -339,7 +339,9 @@ fn episode<
     service.prepare_copy_error = None;
     access.lower(space.index());
     assert_eq!(
-        zone.switch_in_full(fixture.slot).unwrap().record,
+        zone.switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         fixture.record.id
     );
     zone.counters.el1_timeouts.store(1, Ordering::Release);
@@ -455,7 +457,9 @@ fn busy_once_episode<C: ProcessContext + 'static, B: carrick_mmu_core::owner_mmu
         carrick_core_abi::service::ServiceOperation::CarrierWork { .. }
     ));
     assert_eq!(
-        zone.switch_in_full(fixture.slot).unwrap().record,
+        zone.switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         fixture.record.id
     );
     let saved = unsafe { *zone.record(fixture.record.id).ctx_mut() };
@@ -659,8 +663,14 @@ fn clear_tid_stopped_join_driver<C, B>(
         ns.reserve_exact(42, ClaimKind::Thread).unwrap();
     });
     let child_slot = SlotId::new(1);
-    zone.drive(child_slot, 2);
-    zone.publish_slot(child_slot, 1, Some(1), 2);
+    zone.drive(child_slot, 2, &carrick_sched_core::OwedPasses::new());
+    zone.publish_slot(
+        child_slot,
+        1,
+        Some(1),
+        2,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     zone.enter_guest(child_slot);
     zone.install_space(child_slot, 1).unwrap();
     let child = zone
@@ -682,8 +692,16 @@ fn clear_tid_stopped_join_driver<C, B>(
     unsafe {
         *zone.record(child).ctx_mut() = make(fixture.address);
     }
-    assert!(zone.requeue_preempted(child_slot, child).is_queued());
-    assert_eq!(zone.switch_in_full(child_slot).unwrap().record, child);
+    assert!(
+        zone.requeue_preempted(child_slot, child, &carrick_sched_core::OwedPasses::new())
+            .is_queued()
+    );
+    assert_eq!(
+        zone.switch_in_full(child_slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
+        child
+    );
     control.bind_zone_record(zone.record_ref(child));
     let child_source = BornInZoneSource {
         zone,
@@ -742,12 +760,17 @@ fn clear_tid_stopped_join_driver<C, B>(
         assert!(entry.take_handoff_receipt().is_some());
         assert!(entry.take_run_failure().is_none());
     }
-    zone.leave_guest(fixture.slot, &ShortLockSpin);
+    zone.leave_guest(
+        fixture.slot,
+        &ShortLockSpin,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     assert!(zone.step_away(
         fixture.slot,
         1,
         &mut |_| panic!("no ready records"),
-        &mut |_| panic!("no placement")
+        &mut |_| panic!("no placement"),
+        &carrick_sched_core::OwedPasses::new()
     ));
     struct Venue<'a> {
         page: &'a ThreadLifecyclePage,
@@ -872,10 +895,12 @@ fn clear_tid_stopped_join_driver<C, B>(
     service.waker_slot = fixture.slot;
     // Fixed scheduler steps only: no polling or host blocking waits. The guest
     // wait above is timed, and returning the driver consumes one completion.
-    zone.step_back(fixture.slot, 1);
+    zone.step_back(fixture.slot, 1, &carrick_sched_core::OwedPasses::new());
     zone.enter_guest(fixture.slot);
     zone.install_space(fixture.slot, 1).unwrap();
-    let selected = zone.switch_in_full(fixture.slot).unwrap();
+    let selected = zone
+        .switch_in_full(fixture.slot, &carrick_sched_core::OwedPasses::new())
+        .unwrap();
     assert_eq!(selected.record, fixture.record.id);
     assert_eq!(selected.result, Some(0));
     if join[3] != 0 {
@@ -887,6 +912,7 @@ fn clear_tid_stopped_join_driver<C, B>(
                 &|owned| {
                     crate::sched::object_wait::deliver_host_completion(owned.zone(), owned)
                 },
+                &carrick_sched_core::OwedPasses::new(),
             ),
             Ok(false),
             "the old timed wait must not complete a second time",
@@ -1258,8 +1284,18 @@ fn spawn_registered_born_member<C: ProcessContext + 'static>(
     let serial = 102 + stock_index as u64;
     let zone = fixture.zone;
     let affinity = 1u64 << cpu_id;
-    zone.drive(slot, u64::from(cpu_id + 1));
-    zone.publish_slot(slot, 1, Some(cpu_id), affinity);
+    zone.drive(
+        slot,
+        u64::from(cpu_id + 1),
+        &carrick_sched_core::OwedPasses::new(),
+    );
+    zone.publish_slot(
+        slot,
+        1,
+        Some(cpu_id),
+        affinity,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     zone.enter_guest(slot);
     zone.install_space(slot, 1).unwrap();
 
@@ -1343,8 +1379,16 @@ fn spawn_registered_born_member<C: ProcessContext + 'static>(
     unsafe {
         *zone.record(record).ctx_mut() = make(fixture.address);
     }
-    assert!(zone.requeue_preempted(slot, record).is_queued());
-    assert_eq!(zone.switch_in_full(slot).unwrap().record, record);
+    assert!(
+        zone.requeue_preempted(slot, record, &carrick_sched_core::OwedPasses::new())
+            .is_queued()
+    );
+    assert_eq!(
+        zone.switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
+        record
+    );
     control.bind_zone_record(zone.record_ref(record));
     fixture
         .registry
@@ -1647,7 +1691,9 @@ fn closing_group_raw_exit_retires_in_ring<C, B>(
         .expect("final member retirement wakes the closing leader");
     zone.install_space(woken_slot, 1).unwrap();
     assert_eq!(
-        zone.switch_in_full(woken_slot).unwrap().record,
+        zone.switch_in_full(woken_slot, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
         fixture.record.id
     );
     let mut leader_service = Physical {
@@ -1739,7 +1785,12 @@ fn concurrent_raw_exit_floor_race_becomes_process_exit<C, B>(
     let (task, _member) = spawn_registered_born_member(&fixture, &make, control, 0);
     assert_eq!(fixture.page.live(), 2);
     assert_eq!(
-        zone.release_current(fixture.slot, fixture.record.id, &ShortLockSpin),
+        zone.release_current(
+            fixture.slot,
+            fixture.record.id,
+            &ShortLockSpin,
+            &carrick_sched_core::OwedPasses::new()
+        ),
         carrick_sched_core::CurrentRelease::Released
     );
 
@@ -1946,7 +1997,12 @@ fn refundable_peer_raw_exit_parks_then_retires_as_thread_exit<C, B>(
     // Retire the leader's membership so the two ring-born members own the final
     // two live units (`page.live() == 2`).
     assert_eq!(
-        zone.release_current(fixture.slot, fixture.record.id, &ShortLockSpin),
+        zone.release_current(
+            fixture.slot,
+            fixture.record.id,
+            &ShortLockSpin,
+            &carrick_sched_core::OwedPasses::new()
+        ),
         carrick_sched_core::CurrentRelease::Released
     );
     fixture.page.reserve_nonfinal_exit().unwrap().publish();
@@ -2188,7 +2244,12 @@ fn refundable_peer_raw_exit_parks_then_retires_as_thread_exit<C, B>(
 
     // Caller B resumes its parked SYS_exit(38) and retires only itself in ring.
     zone.install_space(slot2, 1).unwrap();
-    assert_eq!(zone.switch_in_full(slot2).unwrap().record, member2);
+    assert_eq!(
+        zone.switch_in_full(slot2, &carrick_sched_core::OwedPasses::new())
+            .unwrap()
+            .record,
+        member2
+    );
     // SAFETY: `member2` was just selected on `slot2`.
     let saved_b = unsafe { fixture.runtime.record_binding(member2_ref) }
         .unwrap()
@@ -2361,7 +2422,12 @@ fn refundable_peer_rebound_before_enrol_probes_once_and_retires<C, B>(
     assert_eq!(fixture.page.live(), 3);
 
     assert_eq!(
-        zone.release_current(fixture.slot, fixture.record.id, &ShortLockSpin),
+        zone.release_current(
+            fixture.slot,
+            fixture.record.id,
+            &ShortLockSpin,
+            &carrick_sched_core::OwedPasses::new()
+        ),
         carrick_sched_core::CurrentRelease::Released
     );
     fixture.page.reserve_nonfinal_exit().unwrap().publish();

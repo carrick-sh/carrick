@@ -186,7 +186,7 @@ mod tests {
         zone.set_deadline(record, deadline);
         zone.publish_park(record, seq);
         drop(guard);
-        zone.leave_guest(slot, &ShortLockSpin);
+        zone.leave_guest(slot, &ShortLockSpin, &carrick_sched_core::OwedPasses::new());
         let (tx, rx) = mpsc::sync_channel(1);
         let (waiting_tx, waiting_rx) = mpsc::sync_channel(1);
         let target = Arc::new(NativeTarget {

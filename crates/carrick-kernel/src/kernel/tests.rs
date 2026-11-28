@@ -1875,8 +1875,18 @@ mod futex_queue_authority {
             let mm = thread.shared().mm_id().raw();
             let zone = self.zone;
             if zone.slot(EL1_SLOT).mm() == 0 {
-                zone.drive(EL1_SLOT, u64::from(EL1_SLOT.raw()) + 1);
-                zone.publish_slot(EL1_SLOT, mm, None, 0);
+                zone.drive(
+                    EL1_SLOT,
+                    u64::from(EL1_SLOT.raw()) + 1,
+                    &carrick_sched_core::OwedPasses::new(),
+                );
+                zone.publish_slot(
+                    EL1_SLOT,
+                    mm,
+                    None,
+                    0,
+                    &carrick_sched_core::OwedPasses::new(),
+                );
                 let here = carrick_sched_core::ExecutionSlot::zone(EL1_SLOT);
                 zone.occupancy.vacate_any(here);
                 assert!(zone.occupancy.replace(here, 0, mm));

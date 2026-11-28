@@ -35,8 +35,8 @@ fn exercise_anonymous_wait_event(event: AnonymousWaitEvent) {
     let zone = zone();
     let slot = SlotId::new(0);
     let mm = 77;
-    zone.drive(slot, 1);
-    zone.publish_slot(slot, mm, None, 0);
+    zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+    zone.publish_slot(slot, mm, None, 0, &carrick_sched_core::OwedPasses::new());
     let here = ExecutionSlot::zone(slot);
     zone.occupancy.vacate_any(here);
     assert!(zone.occupancy.replace(here, 0, mm));
@@ -132,6 +132,7 @@ fn exercise_anonymous_wait_event(event: AnonymousWaitEvent) {
         &|owned| {
             let _ = owned.into_parts();
         },
+        &carrick_sched_core::OwedPasses::new(),
     );
     assert_eq!(
         claim,
@@ -187,8 +188,8 @@ fn anonymous_release_after_enrollment_reprobes_before_park() {
     let zone = zone();
     let slot = SlotId::new(0);
     let mm = 77;
-    zone.drive(slot, 1);
-    zone.publish_slot(slot, mm, None, 0);
+    zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+    zone.publish_slot(slot, mm, None, 0, &carrick_sched_core::OwedPasses::new());
     let here = ExecutionSlot::zone(slot);
     zone.occupancy.vacate_any(here);
     assert!(zone.occupancy.replace(here, 0, mm));
@@ -345,8 +346,8 @@ fn suspended_turn_completes_only_through_exact_wait_owner() {
             let zone = zone();
             let slot = SlotId::new(0);
             let mm = 7 + generation;
-            zone.drive(slot, 3);
-            zone.publish_slot(slot, mm, None, 0);
+            zone.drive(slot, 3, &carrick_sched_core::OwedPasses::new());
+            zone.publish_slot(slot, mm, None, 0, &carrick_sched_core::OwedPasses::new());
             let here = ExecutionSlot::zone(slot);
             zone.occupancy.vacate_any(here);
             assert!(zone.occupancy.replace(here, 0, mm));
@@ -422,7 +423,12 @@ fn suspended_turn_completes_only_through_exact_wait_owner() {
                 .queued,
                 0
             );
-            assert_eq!(zone.switch_in_full(slot).unwrap().record, record);
+            assert_eq!(
+                zone.switch_in_full(slot, &carrick_sched_core::OwedPasses::new())
+                    .unwrap()
+                    .record,
+                record
+            );
             for _ in 0..2 {
                 if let Some(taken) = take_object_operation(&zone, slot, identity).unwrap() {
                     assert_eq!(taken, OperationToken::new(17, generation).unwrap());
@@ -487,8 +493,8 @@ fn record_owned_entry_does_not_require_host_adoption_generation() {
         lifecycle_page: 0x1000,
         control_slot: 0x2000,
     };
-    zone.drive(slot, 3);
-    zone.publish_slot(slot, id.mm, None, 0);
+    zone.drive(slot, 3, &carrick_sched_core::OwedPasses::new());
+    zone.publish_slot(slot, id.mm, None, 0, &carrick_sched_core::OwedPasses::new());
     let here = ExecutionSlot::zone(slot);
     zone.occupancy.vacate_any(here);
     assert!(zone.occupancy.replace(here, 0, id.mm));
@@ -497,8 +503,14 @@ fn record_owned_entry_does_not_require_host_adoption_generation() {
     zone.spaces.open(space);
     assert!(zone.install_space(slot, id.mm).is_some());
     let record = zone.alloc_record(id).unwrap();
-    assert!(zone.requeue_preempted(slot, record).is_queued());
-    assert_eq!(zone.switch_in(slot), Some(record));
+    assert!(
+        zone.requeue_preempted(slot, record, &carrick_sched_core::OwedPasses::new())
+            .is_queued()
+    );
+    assert_eq!(
+        zone.switch_in(slot, &carrick_sched_core::OwedPasses::new()),
+        Some(record)
+    );
     let binding = ExecutionBinding {
         task: EntryTaskKey::from_raw(id.tid),
         generation: SnapshotGeneration::from_raw(0),
@@ -530,7 +542,8 @@ fn record_owned_entry_does_not_require_host_adoption_generation() {
             &carrick_sched_core::BoundedSpin(1024),
             &|owned| {
                 let _ = owned.into_parts();
-            }
+            },
+            &carrick_sched_core::OwedPasses::new()
         ),
         carrick_sched_core::HostClaim::El1Held { slot }
     );
@@ -559,8 +572,14 @@ fn record_owned_entry_does_not_require_host_adoption_generation() {
         }
     );
     let record = zone.alloc_record(id).unwrap();
-    assert!(zone.requeue_preempted(slot, record).is_queued());
-    assert_eq!(zone.switch_in(slot), Some(record));
+    assert!(
+        zone.requeue_preempted(slot, record, &carrick_sched_core::OwedPasses::new())
+            .is_queued()
+    );
+    assert_eq!(
+        zone.switch_in(slot, &carrick_sched_core::OwedPasses::new()),
+        Some(record)
+    );
     let stale = admit_born_in_zone(binding, source).unwrap();
     let key = ObjectWaitKey::new(1, 13).unwrap();
     let wait = carrick_sched_core::BoundedSpin(1024);
@@ -602,7 +621,10 @@ fn record_owned_entry_does_not_require_host_adoption_generation() {
         .queued,
         1
     );
-    assert_eq!(zone.switch_in(slot), Some(record));
+    assert_eq!(
+        zone.switch_in(slot, &carrick_sched_core::OwedPasses::new()),
+        Some(record)
+    );
     assert_eq!(
         complete_born_in_zone(stale, binding, source),
         Err(CompletionError::WrongGeneration),
@@ -612,8 +634,14 @@ fn record_owned_entry_does_not_require_host_adoption_generation() {
     let token = admit_born_in_zone(binding, source).unwrap();
     let other = zone.alloc_record(id).unwrap();
     zone.clear_current(slot);
-    assert!(zone.requeue_preempted(slot, other).is_queued());
-    assert_eq!(zone.switch_in(slot), Some(other));
+    assert!(
+        zone.requeue_preempted(slot, other, &carrick_sched_core::OwedPasses::new())
+            .is_queued()
+    );
+    assert_eq!(
+        zone.switch_in(slot, &carrick_sched_core::OwedPasses::new()),
+        Some(other)
+    );
     assert_eq!(
         complete_born_in_zone(token, binding, source),
         Err(CompletionError::WrongGeneration)
@@ -640,8 +668,14 @@ fn record_owned_entry_does_not_require_host_adoption_generation() {
         })
         .unwrap();
     zone.clear_current(slot);
-    assert!(zone.requeue_preempted(slot, record).is_queued());
-    assert_eq!(zone.switch_in(slot), Some(record));
+    assert!(
+        zone.requeue_preempted(slot, record, &carrick_sched_core::OwedPasses::new())
+            .is_queued()
+    );
+    assert_eq!(
+        zone.switch_in(slot, &carrick_sched_core::OwedPasses::new()),
+        Some(record)
+    );
     assert!(admit_born_in_zone(binding, source).is_none());
     assert!(admit_born_in_zone(adopted, source).is_none());
 }
@@ -662,8 +696,8 @@ fn ordinary_handoff_rejects_foreign_scheduler_owner() {
         ..ThreadIdentity::default()
     };
     for zone in [&first, &second] {
-        zone.drive(slot, 3);
-        zone.publish_slot(slot, 7, None, 0);
+        zone.drive(slot, 3, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 7, None, 0, &carrick_sched_core::OwedPasses::new());
         let here = ExecutionSlot::zone(slot);
         zone.occupancy.vacate_any(here);
         assert!(zone.occupancy.replace(here, 0, 7));
@@ -695,7 +729,13 @@ fn ordinary_handoff_rejects_foreign_scheduler_owner() {
     second
         .enqueue(&guard, record, sequence, 7, 0x1000, u32::MAX, 0)
         .unwrap();
-    let receipt = publish_handoff_park(start, &guard, EntryRecordGeneration(sequence)).unwrap();
+    let receipt = publish_handoff_park(
+        start,
+        &guard,
+        EntryRecordGeneration(sequence),
+        &carrick_sched_core::OwedPasses::new(),
+    )
+    .unwrap();
     assert_eq!(
         handoff(token, receipt),
         Err(CompletionError::WrongGeneration)
@@ -739,8 +779,14 @@ fn running_compact_with_identity(
         control_slot: 0x2000,
     };
     edit(&mut identity);
-    zone.drive(slot, 3);
-    zone.publish_slot(slot, identity.mm, None, 0);
+    zone.drive(slot, 3, &carrick_sched_core::OwedPasses::new());
+    zone.publish_slot(
+        slot,
+        identity.mm,
+        None,
+        0,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     let here = ExecutionSlot::zone(slot);
     zone.occupancy.vacate_any(here);
     assert!(zone.occupancy.replace(here, 0, identity.mm));
@@ -752,8 +798,14 @@ fn running_compact_with_identity(
     zone.spaces.open(space);
     assert!(zone.install_space(slot, identity.mm).is_some());
     let record = zone.alloc_record(identity).unwrap();
-    assert!(zone.requeue_preempted(slot, record).is_queued());
-    assert_eq!(zone.switch_in(slot), Some(record));
+    assert!(
+        zone.requeue_preempted(slot, record, &carrick_sched_core::OwedPasses::new())
+            .is_queued()
+    );
+    assert_eq!(
+        zone.switch_in(slot, &carrick_sched_core::OwedPasses::new()),
+        Some(record)
+    );
     (
         slot,
         record,
@@ -786,7 +838,7 @@ fn terminal_park_hands_back_only_an_exact_requested_owner() {
         let start = prepare_handoff(binding, source, record).unwrap();
         let reference = zone.record_ref(record);
         assert!(
-            matches!(zone.claim_for_host(reference, None, Handback::Control, &ShortLockSpin, &|owned| { let _ = owned.into_parts(); }),
+            matches!(zone.claim_for_host(reference, None, Handback::Control, &ShortLockSpin, &|owned| { let _ = owned.into_parts(); }, &carrick_sched_core::OwedPasses::new()),
             HostClaim::El1Held { slot: owner } if owner == slot)
         );
         if owner_continuation {
@@ -811,16 +863,25 @@ fn terminal_park_hands_back_only_an_exact_requested_owner() {
                 start,
                 selected_guard,
                 EntryRecordGeneration(sequence),
+                &carrick_sched_core::OwedPasses::new(),
             )
         } else {
-            publish_handoff_park(start, selected_guard, EntryRecordGeneration(sequence))
+            publish_handoff_park(
+                start,
+                selected_guard,
+                EntryRecordGeneration(sequence),
+                &carrick_sched_core::OwedPasses::new(),
+            )
         };
         let accepted = terminal && owner_continuation && !wrong_guard;
         assert_eq!(receipt.is_some(), accepted);
         if accepted {
             assert_eq!(zone.slot(slot).current(), None);
             assert_eq!(zone.record(record).entry_count(), 0);
-            assert_eq!(zone.take_service_head(slot), Some(reference));
+            assert_eq!(
+                zone.take_service_head(slot, &carrick_sched_core::OwedPasses::new()),
+                Some(reference)
+            );
             assert!(zone.live(reference).is_some());
         } else {
             assert_eq!(zone.slot(slot).current(), Some(record));
@@ -870,7 +931,13 @@ fn compact_born_entry_parks_with_actual_handoff_receipt() {
         0,
     )
     .unwrap();
-    let receipt = publish_handoff_park(start, &guard, EntryRecordGeneration(sequence)).unwrap();
+    let receipt = publish_handoff_park(
+        start,
+        &guard,
+        EntryRecordGeneration(sequence),
+        &carrick_sched_core::OwedPasses::new(),
+    )
+    .unwrap();
     assert!(
         matches!(zone.record(record).claim(), carrick_sched_core::Claim::Parked { seq } if seq == sequence)
     );
@@ -896,10 +963,24 @@ fn compact_ordinary_entry_retires_with_actual_handoff_receipt() {
         )
         .is_none()
     );
-    let receipt = retire_current(binding, source, record).unwrap();
+    let receipt = retire_current(
+        binding,
+        source,
+        record,
+        &carrick_sched_core::OwedPasses::new(),
+    )
+    .unwrap();
     assert!(zone.slot(slot).current().is_none());
     handoff(token, receipt).unwrap();
-    assert!(retire_current(binding, source, record).is_none());
+    assert!(
+        retire_current(
+            binding,
+            source,
+            record,
+            &carrick_sched_core::OwedPasses::new()
+        )
+        .is_none()
+    );
 }
 
 #[test]
@@ -911,7 +992,13 @@ fn compact_handoff_rejects_stale_record_incarnation_receipt() {
     let source = BornInZoneSource { zone: &zone, slot };
     let first = admit_born_in_zone(binding, source).unwrap();
     let captured_record = first.record();
-    let receipt = retire_current(binding, source, record).unwrap();
+    let receipt = retire_current(
+        binding,
+        source,
+        record,
+        &carrick_sched_core::OwedPasses::new(),
+    )
+    .unwrap();
     handoff_born_in_zone(first, receipt).unwrap();
     let identity = ThreadIdentity {
         tid: binding.task.raw(),
@@ -925,8 +1012,14 @@ fn compact_handoff_rejects_stale_record_incarnation_receipt() {
         control_slot: 0x2000,
     };
     let replacement = zone.alloc_record(identity).unwrap();
-    assert!(zone.requeue_preempted(slot, replacement).is_queued());
-    assert_eq!(zone.switch_in(slot), Some(replacement));
+    assert!(
+        zone.requeue_preempted(slot, replacement, &carrick_sched_core::OwedPasses::new())
+            .is_queued()
+    );
+    assert_eq!(
+        zone.switch_in(slot, &carrick_sched_core::OwedPasses::new()),
+        Some(replacement)
+    );
     let second = admit_born_in_zone(binding, source).unwrap();
     assert_ne!(captured_record, second.record());
     // SAFETY: test-only adversarial reconstruction of old authenticated bytes;
@@ -1062,12 +1155,26 @@ fn terminal_member_proof_precedes_lifecycle_receipt_after_record_release() {
     };
     assert!(
         custody
-            .retire_zone_current(&member, &mut _membership, foreign, source, record)
+            .retire_zone_current(
+                &member,
+                &mut _membership,
+                foreign,
+                source,
+                record,
+                &carrick_sched_core::OwedPasses::new()
+            )
             .is_err()
     );
     assert_eq!(classify(), MissingContinuationVerdict::InvariantViolation);
     custody
-        .retire_zone_current(&member, &mut _membership, binding, source, record)
+        .retire_zone_current(
+            &member,
+            &mut _membership,
+            binding,
+            source,
+            record,
+            &carrick_sched_core::OwedPasses::new(),
+        )
         .unwrap();
     assert!(zone.live(reference).is_none());
     assert_eq!(
@@ -1181,7 +1288,10 @@ fn terminal_attempt(mode: TerminalAttempt) {
     peer_identity.tid += 1;
     peer_identity.serial += 1;
     let peer = zone.alloc_record(peer_identity).unwrap();
-    assert!(zone.requeue_preempted(SlotId::new(2), peer).is_queued());
+    assert!(
+        zone.requeue_preempted(SlotId::new(2), peer, &carrick_sched_core::OwedPasses::new())
+            .is_queued()
+    );
     let page = ThreadLifecyclePage::new();
     assert_eq!(page.thread_born(), Some(2));
     let entry = page.reserve_stock(0).unwrap();
@@ -1199,7 +1309,12 @@ fn terminal_attempt(mode: TerminalAttempt) {
     let record = if host_home {
         let id = zone.record(record).identity();
         assert_eq!(
-            zone.release_current(slot, record, &BoundedSpin(1024)),
+            zone.release_current(
+                slot,
+                record,
+                &BoundedSpin(1024),
+                &carrick_sched_core::OwedPasses::new()
+            ),
             carrick_sched_core::CurrentRelease::Released
         );
         zone.current_or_new(slot, id).unwrap()
@@ -1238,7 +1353,10 @@ fn terminal_attempt(mode: TerminalAttempt) {
                 1
             );
         }
-        assert_eq!(zone.switch_in(slot), Some(record));
+        assert_eq!(
+            zone.switch_in(slot, &carrick_sched_core::OwedPasses::new()),
+            Some(record)
+        );
         record
     };
     let identity = ThreadTerminalIdentity::from_exit(
@@ -1286,13 +1404,16 @@ fn terminal_attempt(mode: TerminalAttempt) {
         let zone = &*zone;
         std::thread::scope(|scope| {
             let actor = scope.spawn(move || {
-                let guard = zone.slot_lock(slot, &BoundedSpin(1024)).unwrap();
+                let passes = carrick_sched_core::OwedPasses::new();
+                let guard = zone.slot_lock(slot, &BoundedSpin(1024), &passes).unwrap();
                 let before = zone.record(record).claim();
                 held.send(()).unwrap();
                 blocked
                     .recv_timeout(std::time::Duration::from_secs(5))
                     .unwrap();
                 drop(guard);
+                passes
+                    .deliver(|slot| panic!("no idle scan runs here, yet {slot:?} was owed a pass"));
                 // SAFETY: the release lane is paused before its claim CAS;
                 // this actor exclusively advances the fixture's native record.
                 assert!(unsafe { zone.record(record).take_object_operation() }.is_some());
@@ -1330,7 +1451,10 @@ fn terminal_attempt(mode: TerminalAttempt) {
                         1
                     );
                 }
-                assert_eq!(zone.switch_in(slot), Some(record));
+                assert_eq!(
+                    zone.switch_in(slot, &carrick_sched_core::OwedPasses::new()),
+                    Some(record)
+                );
                 assert_ne!(zone.record(record).claim().seq(), before.seq());
                 resume.send(()).unwrap();
             });
@@ -1338,22 +1462,38 @@ fn terminal_attempt(mode: TerminalAttempt) {
                 .recv_timeout(std::time::Duration::from_secs(5))
                 .unwrap();
             assert_eq!(
-                zone.release_current_with(slot, record, &wait, retirement),
+                zone.release_current_with(
+                    slot,
+                    record,
+                    &wait,
+                    retirement,
+                    &carrick_sched_core::OwedPasses::new()
+                ),
                 Some(carrick_sched_core::CurrentRelease::Released)
             );
             actor.join().unwrap();
         });
     } else if refuse_lock {
-        let _guard = zone.slot_lock(slot, &BoundedSpin(1024)).unwrap();
+        let passes = carrick_sched_core::OwedPasses::new();
+        let guard = zone.slot_lock(slot, &BoundedSpin(1024), &passes).unwrap();
         assert_eq!(
-            zone.release_current_with(slot, record, &BoundedSpin(0), retirement),
+            zone.release_current_with(
+                slot,
+                record,
+                &BoundedSpin(0),
+                retirement,
+                &carrick_sched_core::OwedPasses::new()
+            ),
             Some(carrick_sched_core::CurrentRelease::Released)
         );
+        drop(guard);
+        passes.deliver(|slot| panic!("no idle scan runs here, yet {slot:?} was owed a pass"));
     } else {
         let released = retirement.retire_current(
             binding,
             carrick_core_abi::BornInZoneSource { zone: &zone, slot },
             record,
+            &carrick_sched_core::OwedPasses::new(),
         );
         assert_eq!(released.is_ok(), host_home);
     }
@@ -1479,7 +1619,14 @@ fn pool_cancellation_refuses_record_release_before_terminal_gate() {
         .reserve_member(&page, &member)
         .unwrap_or_else(|_| panic!("nonfinal member"));
     assert!(matches!(
-        custody.retire_zone_current(&member, &mut membership, binding, source, record),
+        custody.retire_zone_current(
+            &member,
+            &mut membership,
+            binding,
+            source,
+            record,
+            &carrick_sched_core::OwedPasses::new()
+        ),
         Err(carrick_core::terminal::ZoneRetirementRefusal::HostCustody)
     ));
     assert!(
@@ -1503,7 +1650,14 @@ fn pool_cancellation_refuses_record_release_before_terminal_gate() {
         .reserve_member(&page, &member)
         .unwrap_or_else(|_| panic!("nonfinal closing member"));
     custody
-        .retire_zone_current(&member, &mut membership, binding, source, record)
+        .retire_zone_current(
+            &member,
+            &mut membership,
+            binding,
+            source,
+            record,
+            &carrick_sched_core::OwedPasses::new(),
+        )
         .unwrap();
     carrick_core::lifecycle::retire_cancelled_pool_member(&page, entry, &member, membership)
         .unwrap();
@@ -1853,8 +2007,14 @@ fn fork_loan_outliving_finish_wakes_and_serves_the_original_mapping() {
             .unwrap();
             root.complete_deferring_return(receipt, owed).unwrap();
         }
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, mm.raw(), None, 0);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(
+            slot,
+            mm.raw(),
+            None,
+            0,
+            &carrick_sched_core::OwedPasses::new(),
+        );
         let here = ExecutionSlot::zone(slot);
         zone.occupancy.vacate_any(here);
         assert!(zone.occupancy.replace(here, 0, mm.raw()));
@@ -1961,7 +2121,10 @@ fn fork_loan_outliving_finish_wakes_and_serves_the_original_mapping() {
                 zone.record(record).claim(),
                 carrick_sched_core::Claim::Parked { .. }
             ));
-            assert_eq!(zone.switch_in(slot), Some(record));
+            assert_eq!(
+                zone.switch_in(slot, &carrick_sched_core::OwedPasses::new()),
+                Some(record)
+            );
             let resumed = OperationToken::anonymous_edit(pending).unwrap();
             let replay: EditWaitOutcome<()> =
                 coordinate_anonymous_edit_wait(&source, Some(resumed), &mut probe, |_, _, _| {
@@ -2146,8 +2309,14 @@ fn full_table_waiter_parks_on_the_busy_holders_release_until_it_comes() {
     let zone = zone();
     let slot = SlotId::new(0);
     let (waiter, holder) = (77u64, 78u64);
-    zone.drive(slot, 1);
-    zone.publish_slot(slot, waiter, None, 0);
+    zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+    zone.publish_slot(
+        slot,
+        waiter,
+        None,
+        0,
+        &carrick_sched_core::OwedPasses::new(),
+    );
     let here = ExecutionSlot::zone(slot);
     zone.occupancy.vacate_any(here);
     assert!(zone.occupancy.replace(here, 0, waiter));
@@ -2289,8 +2458,8 @@ fn two_processes_at_a_full_table_both_park_on_the_holder_and_both_wake() {
         let _ = effects.deliver_handbacks(&mut |_| {});
     };
     for (slot, mm, _) in waiters {
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, mm, None, 0);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, mm, None, 0, &carrick_sched_core::OwedPasses::new());
         let here = ExecutionSlot::zone(slot);
         zone.occupancy.vacate_any(here);
         assert!(zone.occupancy.replace(here, 0, mm));

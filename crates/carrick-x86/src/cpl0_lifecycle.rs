@@ -264,12 +264,13 @@ mod process_exit_tests {
             lifecycle_page: 0,
             control_slot: 0,
         };
-        zone.drive(slot, 1);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
         zone.publish_slot_with_affinity(
             slot,
             parent.mm,
             Some(0),
             carrick_sched_core::AffinitySource::UNBOUND,
+            &carrick_sched_core::OwedPasses::new(),
         );
         let space = zone
             .spaces
@@ -277,7 +278,10 @@ mod process_exit_tests {
             .expect("space");
         zone.spaces.open(space);
         let id = zone.alloc_record(parent).expect("runnable parent");
-        assert!(zone.requeue_preempted(slot, id).is_queued());
+        assert!(
+            zone.requeue_preempted(slot, id, &carrick_sched_core::OwedPasses::new())
+                .is_queued()
+        );
         let mut lane = LifecycleLane {
             contexts: [const { NativeBirthContext::EMPTY }; 2],
             parent,
@@ -491,8 +495,18 @@ mod process_exit_tests {
             };
             for &(slot, cpu) in core::iter::once(&(Self::WAKER, 0)).chain(busy) {
                 assert!(zone.reset_slot(slot));
-                zone.drive(slot, u64::from(cpu) + 1);
-                zone.publish_slot(slot, Self::MM, Some(cpu), 0);
+                zone.drive(
+                    slot,
+                    u64::from(cpu) + 1,
+                    &carrick_sched_core::OwedPasses::new(),
+                );
+                zone.publish_slot(
+                    slot,
+                    Self::MM,
+                    Some(cpu),
+                    0,
+                    &carrick_sched_core::OwedPasses::new(),
+                );
                 assert!(zone.occupancy.replace(
                     carrick_sched_core::ExecutionSlot::zone(slot),
                     0,
@@ -682,12 +696,21 @@ mod process_exit_tests {
         );
         zone.take_completion_handbacks(&carrick_sched_core::ShortLockSpin, &mut |_| {});
         assert_eq!(
-            zone.place_native_handback(zone.record_ref(fixture.waiter)),
+            zone.place_native_handback(
+                zone.record_ref(fixture.waiter),
+                &carrick_sched_core::OwedPasses::new()
+            ),
             Some(carrick_sched_core::NativePlacement::Held)
         );
         let peer = SlotId::new(1);
-        zone.drive(peer, 2);
-        zone.publish_slot(peer, LaneWake::MM, Some(1), 0);
+        zone.drive(peer, 2, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(
+            peer,
+            LaneWake::MM,
+            Some(1),
+            0,
+            &carrick_sched_core::OwedPasses::new(),
+        );
         assert_eq!(
             zone.record(fixture.waiter).claim(),
             Claim::Queued {
@@ -885,8 +908,24 @@ impl NativeLane<'_> {
         self.frame.rax = u64::from(count);
         self.lane.wakes += u64::from(count);
     }
+    /// Send the idle-scan passes a lock-taking zone operation owed (#3083)
+    /// through this lane's wake venue (its IPI route).
+    fn send_owed_passes(&mut self, passes: carrick_sched_core::OwedPasses) {
+        let (zone, slot) = (self.zone, self.lane.slot);
+        let mut effects = WakeEffects::default();
+        passes.fold_into(&mut effects);
+        if effects.sgi.iter().any(|word| *word != 0) {
+            let before = WakerQueue::observe(zone, slot);
+            effects.apply(zone, slot, before, &mut self.wake_cpu());
+        }
+    }
     fn switch_next(&mut self) -> Option<carrick_core::Served> {
-        let switched = self.zone.switch_in_full(self.lane.slot)?;
+        let switched = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = self.zone.switch_in_full(self.lane.slot, &passes);
+            self.send_owed_passes(passes);
+            owed
+        }?;
         let reference = self.zone.record_ref(switched.record);
         let index = self
             .lane
@@ -1190,7 +1229,14 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         );
     }
     fn enqueue_born(&mut self, record: RecordRef) -> BornEnqueue {
-        let queued = BornEnqueue::from(self.zone.requeue_preempted(self.lane.slot, record.id));
+        let queued = BornEnqueue::from({
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = self
+                .zone
+                .requeue_preempted(self.lane.slot, record.id, &passes);
+            self.send_owed_passes(passes);
+            owed
+        });
         if queued == BornEnqueue::Queued {
             self.lane.births += 1;
         }
@@ -1231,16 +1277,21 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         if self.zone.live(record).is_none() {
             return false;
         }
-        self.handoff = retirement
-            .retire_current(
+        self.handoff = {
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = retirement.retire_current(
                 carrick_core::entry::binding(&self.task.execution, &self.task.mm),
                 carrick_core_abi::BornInZoneSource {
                     zone: self.zone,
                     slot: self.lane.slot,
                 },
                 record.id,
-            )
-            .ok();
+                &passes,
+            );
+            self.send_owed_passes(passes);
+            owed
+        }
+        .ok();
         if self.handoff.is_some() {
             self.lane.retirements += 1;
             true
@@ -1458,17 +1509,20 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         self.frame.rax = wait_result as u64;
         self.lane.contexts[0] = context;
         crate::process::publish_wait_outputs(outputs);
+        let passes = carrick_sched_core::OwedPasses::new();
         self.handoff = Some(committed(
             carrick_core::entry::publish_handoff_park(
                 start,
                 &guard.bucket,
                 carrick_core_abi::EntryRecordGeneration(seq),
+                &passes,
             ),
             LifecycleInvariant::WaitPublication,
         ));
         pending.published();
         self.zone.clear_current(self.lane.slot);
         drop(guard);
+        self.send_owed_passes(passes);
         let progress = committed(self.switch_next(), LifecycleInvariant::WaitSwitch);
         Some(LifecycleOutcome::Transferred {
             progress,
@@ -1524,6 +1578,7 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
         // This bounded fixture's child-exit owner published above. Its sidecar
         // has no host executor claim or saved TaskCpuResidency; pool-member
         // membership and missing-load authority belong to the shared runtime.
+        let passes = carrick_sched_core::OwedPasses::new();
         self.handoff = Some(committed(
             carrick_core::entry::retire_current(
                 carrick_core::entry::binding(&self.task.execution, &self.task.mm),
@@ -1532,9 +1587,11 @@ impl<'a> LifecycleNative<'a> for NativeLane<'a> {
                     slot: self.lane.slot,
                 },
                 record,
+                &passes,
             ),
             LifecycleInvariant::ExitRetirement,
         ));
+        self.send_owed_passes(passes);
         self.lane.retirements += 1;
         Some(committed(
             self.resume_after_child_exit(),
@@ -1695,11 +1752,17 @@ impl FutexVenue for NativeLane<'_> {
         }
         self.zone
             .set_deadline(record, wait.deadline.map_or(0, |deadline| deadline.raw()));
-        self.handoff = Some(carrick_core::entry::publish_handoff_park(
-            start,
-            &guard,
-            carrick_core_abi::EntryRecordGeneration(seq),
-        )?);
+        self.handoff = Some({
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owed = carrick_core::entry::publish_handoff_park(
+                start,
+                &guard,
+                carrick_core_abi::EntryRecordGeneration(seq),
+                &passes,
+            );
+            self.send_owed_passes(passes);
+            owed
+        }?);
         self.zone.clear_current(self.lane.slot);
         drop(guard);
         self.switch_next()

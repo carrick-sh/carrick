@@ -169,6 +169,25 @@ mod test_support {
     static SCAN_HOLD: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
     /// The held slot, plus one (0: none).
     static SCAN_HOLD_SLOT: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+    /// Wake the peer CPU and stop its next idle pass at its top, before it
+    /// looks for work, as [`INJECT_HOLD_PEER_SCAN`] but with no time bound
+    /// (#3117): only [`INJECT_HOLD_RUN_QUEUE_ACROSS_PEER_HLT`] lets it go
+    /// on, and the test's own bound fails a run that never does.
+    pub const INJECT_STOP_PEER_SCAN: u64 = 0xffff_ffff_ffff_fe66;
+    /// With the peer stopped by [`INJECT_STOP_PEER_SCAN`] and a thread
+    /// queued here (#3117): hold this CPU's run-queue lock, let the peer go
+    /// on, and wait until it is IdleWfi past its final recheck of the
+    /// durable wake words (every scan it ran meanwhile met the busy lock).
+    /// Then release the lock through its guard, send what the release owes
+    /// through this CPU's production venue, let the peer HLT, and return
+    /// only once an idle scan stole from this CPU. 0: the peer's scans had
+    /// enrolled on the busy lock and the release owed the peer its pass; 1:
+    /// they had not enrolled, so nothing was proven; 2: the release owed
+    /// the peer nothing.
+    pub const INJECT_HOLD_RUN_QUEUE_ACROSS_PEER_HLT: u64 = 0xffff_ffff_ffff_fe67;
+    /// The armed scan hold ends only on its release, never on a clock.
+    static SCAN_HOLD_UNBOUNDED: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
     /// Wake the peer CPU and stop its next idle pass right after the pass
     /// has read its conditions (the scan hold above, timers), until this
     /// CPU says it published (#3053). The peer's pass then goes on only
@@ -263,6 +282,9 @@ mod test_support {
     }
     const ORDER_AFTER_READ: u8 = 1;
     const ORDER_BEFORE_HLT: u8 = 2;
+    /// Past the idle pass's final recheck of its durable wake words, right
+    /// before `sti; hlt`: from here only a vector ends the sleep (#3117).
+    const ORDER_AFTER_RECHECK: u8 = 3;
     /// Armed, with the arming reschedule not yet known sent: a pass that
     /// sees this waits for [`ORDER_ARMED`], never goes on (#3136).
     const ORDER_ARMING: u8 = 1;
@@ -722,6 +744,12 @@ mod test_support {
         {
             return;
         }
+        if SCAN_HOLD_UNBOUNDED.load(Ordering::Acquire) {
+            while SCAN_HOLD.load(Ordering::Acquire) != SCAN_RELEASED {
+                core::hint::spin_loop();
+            }
+            return;
+        }
         let mut backend = carrick_el1::isa::x86::X86Backend;
         let now = |backend: &mut carrick_el1::isa::x86::X86Backend| {
             backend
@@ -807,6 +835,15 @@ mod test_support {
         task: &'static carrick_el1_abi::CurrentTask,
     ) {
         order_peer(slot, task, ORDER_AFTER_READ);
+    }
+
+    /// Called once the idle scheduler on `slot` has passed its final
+    /// recheck of the durable wake words, right before `sti; hlt` (#3117).
+    pub fn order_after_idle_recheck(
+        slot: carrick_sched_core::SlotId,
+        task: &'static carrick_el1_abi::CurrentTask,
+    ) {
+        order_peer(slot, task, ORDER_AFTER_RECHECK);
     }
 
     /// Called once the idle scheduler on `slot` has published it IdleWfi,
@@ -929,6 +966,72 @@ mod test_support {
         }
         ORDER_STATE.store(ORDER_ARMED, Ordering::Release);
         Some(0)
+    }
+
+    /// [`INJECT_HOLD_RUN_QUEUE_ACROSS_PEER_HLT`]. Runs in this CPU's syscall
+    /// with interrupts masked, so nothing here hands the queued thread over
+    /// but the peer's own idle scan: no slice, rotation or yield can run it
+    /// here, and no migration moves it.
+    fn hold_run_queue_across_peer_hlt(
+        binding: &carrick_el1::isa::x86::context::native::CpuBinding,
+    ) -> Option<u64> {
+        let own = carrick_sched_core::SlotId::new(u8::try_from(binding.cpu_slot).ok()?);
+        let peer = carrick_sched_core::SlotId::new(u8::from(binding.cpu_slot == 0));
+        if SCAN_HOLD.load(Ordering::Acquire) != SCAN_HELD
+            || !SCAN_HOLD_UNBOUNDED.load(Ordering::Acquire)
+            || ORDER_STATE.load(Ordering::Acquire) != 0
+        {
+            return None;
+        }
+        let zone = carrick_x86_carrier::native_execution::source(own).zone;
+        let steals = zone.counters.el1_steals.load(Ordering::Acquire);
+        let passes = carrick_sched_core::OwedPasses::new();
+        let guard = loop {
+            if let Some(guard) =
+                zone.slot_lock(own, &carrick_sched_core::BoundedSpin(1024), &passes)
+            {
+                break guard;
+            }
+            core::hint::spin_loop();
+        };
+        // Stop the peer once it is past its final recheck of the durable
+        // wake words, at a pass that owes no wake already (`order_peer`):
+        // from there only the release's vector can end its sleep, never the
+        // durable bit the release also sets (#3117 pre-review P0 1).
+        ORDER_SLOT.store(peer.raw() + 1, Ordering::Release);
+        ORDER_POINT.store(ORDER_AFTER_RECHECK, Ordering::Release);
+        ORDER_STATE.store(ORDER_ARMED, Ordering::Release);
+        SCAN_HOLD.store(SCAN_RELEASED, Ordering::Release);
+        while ORDER_STATE.load(Ordering::Acquire) != ORDER_REACHED {
+            core::hint::spin_loop();
+        }
+        let enrolled = zone.scan_enrolled(own);
+        drop(guard);
+        let owes_peer = passes.owes(peer);
+        carrick_el1::substrate::sched::object_wait::deliver_owed_passes(zone, own, passes);
+        ORDER_STATE
+            .compare_exchange(
+                ORDER_REACHED,
+                ORDER_PUBLISHED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .ok()?;
+        // A release IPI that found this CPU's ICR busy is owed, not lost
+        // (#3083): this wait is a delivery point of its own, so it resends
+        // it here, as the interrupt paths do, and never strands it while it
+        // waits with interrupts masked (#3117 pre-review P0 2).
+        while zone.counters.el1_steals.load(Ordering::Acquire) == steals {
+            let _ = carrick_el1::isa::x86::interrupt::deliver_owed_resched(
+                carrick_el1::isa::x86::interrupt::DeliveryPoint::KernelInterrupt,
+            );
+            core::hint::spin_loop();
+        }
+        Some(match (enrolled, owes_peer) {
+            (true, true) => 0,
+            (false, _) => 1,
+            (true, false) => 2,
+        })
     }
 
     fn ordered_peer_task() -> Option<&'static carrick_el1_abi::CurrentTask> {
@@ -1619,6 +1722,21 @@ mod test_support {
             INJECT_PEER_SCAN_HELD => {
                 Some(u64::from(SCAN_HOLD.load(Ordering::Acquire) >= SCAN_HELD))
             }
+            INJECT_STOP_PEER_SCAN => {
+                let peer = carrick_sched_core::SlotId::new(u8::from(binding.cpu_slot == 0));
+                if SCAN_HOLD
+                    .compare_exchange(0, SCAN_ARMED, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    return None;
+                }
+                SCAN_HOLD_UNBOUNDED.store(true, Ordering::Release);
+                SCAN_HOLD_SLOT.store(peer.raw() + 1, Ordering::Release);
+                carrick_el1::isa::x86::interrupt::send_resched(peer)
+                    .unwrap_or_else(|_| carrick_x86_carrier::entry::fatal_boot!());
+                Some(0)
+            }
+            INJECT_HOLD_RUN_QUEUE_ACROSS_PEER_HLT => hold_run_queue_across_peer_hlt(binding),
             INJECT_ORDER_PEER_AFTER_IDLE_READ => arm_peer_order(binding, ORDER_AFTER_READ, false),
             INJECT_ORDER_PEER_AFTER_IDLE_READ_LATE_ARM => {
                 arm_peer_order(binding, ORDER_AFTER_READ, true)

@@ -94,6 +94,23 @@ fn control(port: u16) {
     // SAFETY: declared fixture control/observation, no semantic request.
     unsafe { core::arch::asm!("out dx, al", in("dx") port, in("al") 0u8, options(nostack)) };
 }
+/// Switch in `SLOT`'s next task. This fixture has one vCPU, so no idle scan
+/// can meet its run-queue lock (#3083).
+fn switch_in() -> Option<carrick_sched_core::RecordId> {
+    let passes = carrick_sched_core::OwedPasses::new();
+    let next = zone().switch_in(SLOT, &passes);
+    no_pass_owed(passes);
+    next
+}
+
+/// The single fixture vCPU runs no idle scan, so an owed pass is a broken
+/// invariant: stop with code 16.
+fn no_pass_owed(passes: carrick_sched_core::OwedPasses) {
+    if passes.expect_none().is_err() {
+        stop(16);
+    }
+}
+
 fn stop(code: u64) -> ! {
     let state = state();
     // SAFETY: the carrier initializes and retains `PROGRESS_STATE` for this
@@ -144,7 +161,7 @@ extern "C" fn carrick_progress_initialize() -> InitialReturn {
     // Enables the local APIC SVR/TPR while `cli` in `carrick_progress_start`
     // keeps RFLAGS.IF=0 until `iretq` enters user mode.
     unsafe { interrupts::hardware::enable() };
-    let record = zone().switch_in(SLOT).unwrap_or_else(|| stop(2));
+    let record = switch_in().unwrap_or_else(|| stop(2));
     let state = state();
     // SAFETY: `tasks` and `maintenance_root` are initialized by the stopped
     // carrier before boot and never mutated in CPL0.
@@ -292,10 +309,13 @@ extern "C" fn carrick_progress_interrupt(
         carrick_x86_carrier::entry::halt();
     }
     // Shared FIFO/claims decide the next task; there is no x86 run queue.
-    if !zone().requeue_preempted(SLOT, record).is_queued() {
+    let passes = carrick_sched_core::OwedPasses::new();
+    let queued = zone().requeue_preempted(SLOT, record, &passes).is_queued();
+    no_pass_owed(passes);
+    if !queued {
         stop(15);
     }
-    let next = zone().switch_in(SLOT).unwrap_or_else(|| stop(11));
+    let next = switch_in().unwrap_or_else(|| stop(11));
     // SAFETY: `tasks` and `maintenance_root` are initialized before boot and
     // never mutated in CPL0.
     let (next_index, maintenance_root) = unsafe {

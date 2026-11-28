@@ -574,8 +574,13 @@ impl SocketEpollLockWait<'_> {
     ) {
         let zone = self.0.zone();
         let (waker, effects) = owned.deliver_handbacks(&mut |record| {
-            if let Some(handback) = zone.place_host_handback(record)
-                && let carrick_sched_core::NativePlacement::Placed(placement) = handback.placement
+            if let Some(handback) = {
+                let passes = carrick_sched_core::OwedPasses::new();
+                let owed = zone.place_host_handback(record, &passes);
+                // This carrier's own kick, as for the placement below.
+                passes.deliver(|slot| self.0.resched(slot));
+                owed
+            } && let carrick_sched_core::NativePlacement::Placed(placement) = handback.placement
             {
                 self.0.resched(placement.slot);
             }
@@ -1857,8 +1862,16 @@ mod tests {
         fn release_places_parked_reader_on_idle_guest_cpu() {
             let carrier = carrier();
             let peer = SlotId::new(1);
-            carrier.zone.drive(peer, 1);
-            carrier.zone.publish_slot(peer, MM, Some(1), 1 << 1);
+            carrier
+                .zone
+                .drive(peer, 1, &carrick_sched_core::OwedPasses::new());
+            carrier.zone.publish_slot(
+                peer,
+                MM,
+                Some(1),
+                1 << 1,
+                &carrick_sched_core::OwedPasses::new(),
+            );
             let here = carrick_sched_core::ExecutionSlot::zone(peer);
             carrier.zone.occupancy.vacate_any(here);
             assert!(carrier.zone.occupancy.replace(here, 0, MM));
@@ -1898,9 +1911,16 @@ mod tests {
                 MM,
                 Some(1),
                 carrick_sched_core::AffinitySource::UNBOUND,
+                &carrick_sched_core::OwedPasses::new(),
             );
             assert_eq!(queued_on(&carrier, record), Some(slot));
-            carrier.zone.publish_slot(slot, MM, Some(1), 1 << 1);
+            carrier.zone.publish_slot(
+                slot,
+                MM,
+                Some(1),
+                1 << 1,
+                &carrick_sched_core::OwedPasses::new(),
+            );
             assert_eq!(carrier.zone.slot(slot).queued(), 1);
         }
 
@@ -1950,6 +1970,7 @@ mod tests {
                 MM,
                 Some(1),
                 carrick_sched_core::AffinitySource::UNBOUND,
+                &carrick_sched_core::OwedPasses::new(),
             );
             assert_eq!(queued_on(&carrier, record), Some(slot));
             assert_eq!(carrier.zone.slot(slot).queued(), 1);
@@ -1980,8 +2001,16 @@ mod tests {
             // The waker is the ring on CPU 0, running another process; the
             // waiter's affinity excludes CPU 0 and no executor drives CPU 1.
             let here = SlotId::new(0);
-            carrier.zone.drive(here, 1);
-            carrier.zone.publish_slot(here, MM + 1, Some(0), 1);
+            carrier
+                .zone
+                .drive(here, 1, &carrick_sched_core::OwedPasses::new());
+            carrier.zone.publish_slot(
+                here,
+                MM + 1,
+                Some(0),
+                1,
+                &carrick_sched_core::OwedPasses::new(),
+            );
             carrier.zone.enter_guest(here);
             let waker = carrick_el1_abi::CurrentTask::new();
             let deferred = std::cell::Cell::new(false);
@@ -2031,6 +2060,7 @@ mod tests {
                 MM,
                 Some(1),
                 carrick_sched_core::AffinitySource::UNBOUND,
+                &carrick_sched_core::OwedPasses::new(),
             );
             assert_eq!(queued_on(&carrier, record), Some(peer));
         }

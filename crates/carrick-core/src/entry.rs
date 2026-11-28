@@ -288,8 +288,9 @@ pub fn publish_handoff_park<C: EntryContext>(
     start: HandoffStart<'_, C>,
     guard: &carrick_sched_core::BucketGuard<'_, C>,
     sequence: EntryRecordGeneration,
+    passes: &carrick_sched_core::OwedPasses,
 ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
-    publish_handoff_park_with(start, guard, sequence, ParkCustody::Interruptible)
+    publish_handoff_park_with(start, guard, sequence, ParkCustody::Interruptible, passes)
 }
 
 enum ParkCustody {
@@ -303,8 +304,9 @@ pub(crate) fn publish_terminal_park<C: EntryContext>(
     start: HandoffStart<'_, C>,
     guard: &carrick_sched_core::BucketGuard<'_, C>,
     sequence: EntryRecordGeneration,
+    passes: &carrick_sched_core::OwedPasses,
 ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
-    publish_handoff_park_with(start, guard, sequence, ParkCustody::Terminal)
+    publish_handoff_park_with(start, guard, sequence, ParkCustody::Terminal, passes)
 }
 
 fn publish_handoff_park_with<C: EntryContext>(
@@ -312,6 +314,7 @@ fn publish_handoff_park_with<C: EntryContext>(
     guard: &carrick_sched_core::BucketGuard<'_, C>,
     sequence: EntryRecordGeneration,
     custody: ParkCustody,
+    passes: &carrick_sched_core::OwedPasses,
 ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
     if !core::ptr::eq(start.source.zone, guard.zone())
         || record_binding(start.binding, start.source, start.record.record) != Some(start.record)
@@ -335,7 +338,7 @@ fn publish_handoff_park_with<C: EntryContext>(
                 carrick_sched_core::Claim::OnCpuRequested { slot, .. }
                     if slot == start.source.slot)
             || record_binding(start.binding, start.source, record) != Some(start.record)
-            || !zone.unswitch(start.source.slot, record)
+            || !zone.unswitch(start.source.slot, record, passes)
         {
             return None;
         }
@@ -400,6 +403,7 @@ pub fn yield_current_to_host<C: EntryContext>(
     source: BornInZoneSource<'_, C>,
     record: carrick_sched_core::RecordId,
     completion: &dyn Fn(carrick_sched_core::object_wait::OwnedObjectWakeEffects<'_, C>),
+    passes: &carrick_sched_core::OwedPasses,
 ) -> Result<carrick_core_abi::EntryHandoffReceipt<C>, HostYieldRefusal> {
     let start = prepare_handoff(binding, source, record).ok_or(HostYieldRefusal::Binding)?;
     let retained = source.zone.record(record);
@@ -417,6 +421,7 @@ pub fn yield_current_to_host<C: EntryContext>(
         carrick_sched_core::Handback::Control,
         &carrick_sched_core::ShortLockSpin,
         completion,
+        passes,
     ) {
         carrick_sched_core::HostClaim::El1Held { slot } if slot == source.slot => {}
         claim => return Err(HostYieldRefusal::Claim(claim)),
@@ -425,7 +430,7 @@ pub fn yield_current_to_host<C: EntryContext>(
     // the row immediately after the queue lock is released. Do not reread
     // its now independently owned custody to decide whether we handed off.
     start
-        .published_yield(source.zone.unswitch(source.slot, record))
+        .published_yield(source.zone.unswitch(source.slot, record, passes))
         .ok_or(HostYieldRefusal::Unpublished)
 }
 
@@ -449,8 +454,9 @@ pub fn retire_current<C: EntryContext>(
     binding: ExecutionBinding,
     source: BornInZoneSource<'_, C>,
     record: carrick_sched_core::RecordId,
+    passes: &carrick_sched_core::OwedPasses,
 ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
-    retire_current_with(binding, source, record, || true)
+    retire_current_with(binding, source, record, || true, passes)
 }
 
 /// The terminal owner commits provenance at the scheduler's release seam.
@@ -459,6 +465,7 @@ pub(crate) fn retire_current_with<C: EntryContext>(
     source: BornInZoneSource<'_, C>,
     record: carrick_sched_core::RecordId,
     finish: impl carrick_sched_core::RecordRelease,
+    passes: &carrick_sched_core::OwedPasses,
 ) -> Option<carrick_core_abi::EntryHandoffReceipt<C>> {
     let start = prepare_handoff(binding, source, record)?;
     let identity = source.zone.record(record).identity();
@@ -472,6 +479,7 @@ pub(crate) fn retire_current_with<C: EntryContext>(
             record,
             &carrick_sched_core::ShortLockSpin,
             finish,
+            passes,
         )? == carrick_sched_core::CurrentRelease::Released
     };
     if !released {
@@ -557,8 +565,8 @@ mod tests {
             mm: EntryMmKey::from_raw(13),
             thread_generation: EntryThreadGeneration::from_raw(17),
         };
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 0, Some(0), 0);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 0, Some(0), 0, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         let space = zone.spaces.publish_closed(13, 0x1000, 0x1000).unwrap();
         zone.spaces.open(space);
@@ -576,8 +584,14 @@ mod tests {
             })
             .unwrap();
         assert!(zone.mark_native_owned(record));
-        assert!(zone.requeue_preempted(slot, record).is_queued());
-        assert_eq!(zone.switch_in(slot), Some(record));
+        assert!(
+            zone.requeue_preempted(slot, record, &carrick_sched_core::OwedPasses::new())
+                .is_queued()
+        );
+        assert_eq!(
+            zone.switch_in(slot, &carrick_sched_core::OwedPasses::new()),
+            Some(record)
+        );
         assert!(zone.install_space(slot, 13).is_some());
         let source = BornInZoneSource { zone: &zone, slot };
         let start = prepare_handoff(binding, source, record).unwrap();
@@ -590,11 +604,12 @@ mod tests {
                 &ShortLockSpin,
                 &|owned| {
                     let _ = owned.into_parts();
-                }
+                },
+                &carrick_sched_core::OwedPasses::new()
             ),
             HostClaim::El1Held { .. }
         ));
-        let published = zone.unswitch(slot, record);
+        let published = zone.unswitch(slot, record, &carrick_sched_core::OwedPasses::new());
         // Deterministically interleave the host claimant before receipt completion.
         assert!(matches!(
             zone.claim_for_host(
@@ -604,7 +619,8 @@ mod tests {
                 &ShortLockSpin,
                 &|owned| {
                     let _ = owned.into_parts();
-                }
+                },
+                &carrick_sched_core::OwedPasses::new()
             ),
             HostClaim::Claimed
         ));

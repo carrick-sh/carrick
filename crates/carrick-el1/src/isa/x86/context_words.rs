@@ -421,8 +421,8 @@ mod tests {
             std::boxed::Box::from_raw(ptr)
         };
         let slot = SlotId::new(0);
-        zone.drive(slot, 1);
-        zone.publish_slot(slot, 11, Some(0), 0);
+        zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+        zone.publish_slot(slot, 11, Some(0), 0, &carrick_sched_core::OwedPasses::new());
         zone.enter_guest(slot);
         let space = zone.spaces.publish_closed(11, 0x6000, 0).unwrap();
         zone.spaces.open(space);
@@ -438,8 +438,14 @@ mod tests {
         // SAFETY: the newly allocated record is owned by this fixture until
         // requeue; no other actor can read or write its context yet.
         unsafe { *zone.record(record).ctx_mut() = ParkedContextWords::ZERO };
-        assert!(zone.requeue_preempted(slot, record).is_queued());
-        assert_eq!(zone.switch_in(slot), Some(record));
+        assert!(
+            zone.requeue_preempted(slot, record, &carrick_sched_core::OwedPasses::new())
+                .is_queued()
+        );
+        assert_eq!(
+            zone.switch_in(slot, &carrick_sched_core::OwedPasses::new()),
+            Some(record)
+        );
         // SAFETY: this fixture is the only driver of the on-CPU slot.
         assert!(matches!(
             into_native(

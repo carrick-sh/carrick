@@ -2789,8 +2789,8 @@ mod tests {
             };
             let slot = carrick_sched_core::SlotId::new(0);
             let mm = root.shared().mm().id().raw();
-            zone.drive(slot, 1);
-            zone.publish_slot(slot, mm, None, 0);
+            zone.drive(slot, 1, &carrick_sched_core::OwedPasses::new());
+            zone.publish_slot(slot, mm, None, 0, &carrick_sched_core::OwedPasses::new());
             zone.enter_guest(slot);
             let space = zone.spaces.publish_closed(mm, 0x1000, 0x1000).unwrap();
             zone.spaces.open(space);
@@ -2808,8 +2808,14 @@ mod tests {
                     control_slot: 0,
                 })
                 .unwrap();
-            assert!(zone.requeue_preempted(slot, record).is_queued());
-            assert_eq!(zone.switch_in(slot), Some(record));
+            assert!(
+                zone.requeue_preempted(slot, record, &carrick_sched_core::OwedPasses::new())
+                    .is_queued()
+            );
+            assert_eq!(
+                zone.switch_in(slot, &carrick_sched_core::OwedPasses::new()),
+                Some(record)
+            );
             let binding = carrick_el1_abi::ExecutionBinding {
                 task: carrick_core_abi::EntryTaskKey::from_raw(identity.tid as u64),
                 generation: carrick_core_abi::SnapshotGeneration::from_raw(1),
@@ -2839,6 +2845,7 @@ mod tests {
                     binding,
                     carrick_el1_abi::BornInZoneSource { zone, slot },
                     record,
+                    &carrick_sched_core::OwedPasses::new(),
                 )
                 .unwrap();
             // Actual raw-exit release has completed, but its ABI publication

@@ -150,13 +150,16 @@ fn current_handback_preserves_birth_incarnation_for_mint() {
                 let record = zone.record_ref(id);
                 // A host-owned thread switches in only on a slot whose
                 // executor has a task of its address space loaded.
-                zone.publish_slot(SLOT, 7, None, 0);
+                zone.publish_slot(SLOT, 7, None, 0, &OwedPasses::new());
                 assert!(
                     zone.occupancy
                         .replace(occupancy::ExecutionSlot::zone(SLOT), 0, 7)
                 );
-                assert!(zone.requeue_preempted(SLOT, id).is_queued());
-                assert_eq!(zone.switch_in(SLOT), Some(id));
+                assert!(
+                    zone.requeue_preempted(SLOT, id, &OwedPasses::new())
+                        .is_queued()
+                );
+                assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), Some(id));
                 let seq = zone.record(id).claim().seq();
                 if requested {
                     assert_eq!(
@@ -167,7 +170,8 @@ fn current_handback_preserves_birth_incarnation_for_mint() {
                             &SpinForever,
                             &|owned| {
                                 let _ = owned.into_parts();
-                            }
+                            },
+                            &OwedPasses::new()
                         ),
                         HostClaim::El1Held { slot: SLOT }
                     );
@@ -218,14 +222,23 @@ fn release_races_closing_without_losing_custody() {
         let custody = zone.claim_first_entry_placement(record).unwrap();
         let producer_zone = zone.clone();
         let producer = thread::spawn(move || {
-            let custody = producer_zone.place_first_entry(custody).unwrap_err();
+            let custody = producer_zone
+                .place_first_entry(custody, &OwedPasses::new())
+                .unwrap_err();
             producer_zone.release_first_entry_placement(custody)
         });
         let closing_zone = zone.clone();
         let closing = thread::spawn(move || {
-            closing_zone.claim_for_host(record, None, Handback::Control, &SpinForever, &|owned| {
-                let _ = owned.into_parts();
-            })
+            closing_zone.claim_for_host(
+                record,
+                None,
+                Handback::Control,
+                &SpinForever,
+                &|owned| {
+                    let _ = owned.into_parts();
+                },
+                &OwedPasses::new(),
+            )
         });
         let released = producer.join().unwrap();
         closing.join().unwrap();
@@ -248,14 +261,24 @@ fn requested_fallback_on_wfi_owes_a_kick() {
             .store(SLOT.plus_one(), Ordering::Relaxed);
         let custody = zone.claim_first_entry_placement(record).unwrap();
         // The sleeping/away last driver is ineligible for normal placement.
-        assert!(zone.enter_idle(SLOT, true));
+        assert!(zone.enter_idle(SLOT, true, &OwedPasses::new()));
         assert_eq!(
-            zone.claim_for_host(record, None, Handback::Control, &SpinForever, &|owned| {
-                let _ = owned.into_parts();
-            }),
+            zone.claim_for_host(
+                record,
+                None,
+                Handback::Control,
+                &SpinForever,
+                &|owned| {
+                    let _ = owned.into_parts();
+                },
+                &OwedPasses::new()
+            ),
             HostClaim::Deferred
         );
-        let placement = zone.place_first_entry(custody).ok().unwrap();
+        let placement = zone
+            .place_first_entry(custody, &OwedPasses::new())
+            .ok()
+            .unwrap();
         assert!(placement.resched, "WFI receipt must force the vCPU out");
         assert_eq!(placement.slot, SLOT);
         assert!(
@@ -320,7 +343,7 @@ fn finish(zone: &ZoneTables, custody: FirstEntryActivation, deliveries: &AtomicU
     let record = custody.record();
     assert_eq!(zone.record(record.id).incarnation(), record.incarnation);
     assert!(
-        zone.first_entry_links_clear_for_test(record, &SpinForever)
+        zone.first_entry_links_clear_for_test(record, &SpinForever, &OwedPasses::new())
             .unwrap()
     );
     assert_eq!(
@@ -363,7 +386,8 @@ fn producer_closing_executor_and_second_birth_complete_once() {
             let producer_zone = zone.clone();
             let producer = thread::spawn(move || {
                 if let Some(custody) = producer_zone.claim_first_entry_placement(record)
-                    && let Err(custody) = producer_zone.place_first_entry(custody)
+                    && let Err(custody) =
+                        producer_zone.place_first_entry(custody, &OwedPasses::new())
                 {
                     assert!(producer_zone.release_first_entry_placement(custody));
                 }
@@ -378,6 +402,7 @@ fn producer_closing_executor_and_second_birth_complete_once() {
                     &|owned| {
                         let _ = owned.into_parts();
                     },
+                    &OwedPasses::new(),
                 )
             });
             if let Some(custody) = zone.claim_current_first_entry_activation(record) {
@@ -419,9 +444,9 @@ fn two_executors_take_mint_and_retire_one_service_delivery() {
     model(|| {
         let zone = zone();
         let record = birth(&zone);
-        zone.drive(SLOT, 1);
+        zone.drive(SLOT, 1, &OwedPasses::new());
         let custody = zone.claim_first_entry_placement(record).unwrap();
-        assert!(zone.place_first_entry(custody).is_ok());
+        assert!(zone.place_first_entry(custody, &OwedPasses::new()).is_ok());
         let deliveries = Arc::new(AtomicU32::new(0));
         let peer_zone = zone.clone();
         let peer_deliveries = deliveries.clone();
@@ -430,7 +455,7 @@ fn two_executors_take_mint_and_retire_one_service_delivery() {
                 finish(&peer_zone, custody, &peer_deliveries);
             }
         });
-        if let Some(head) = zone.take_service_head_for_executor(SLOT) {
+        if let Some(head) = zone.take_service_head_for_executor(SLOT, &OwedPasses::new()) {
             match head {
                 ServiceHead::FirstEntry(custody) => finish(&zone, custody, &deliveries),
                 ServiceHead::Record(_) => panic!("birth lost activation custody"),
@@ -449,8 +474,11 @@ fn wfi_entry_races_fallback_publication() {
         let zone = zone();
         let record = birth(&zone);
         let sleeper_zone = zone.clone();
-        let sleeper = thread::spawn(move || sleeper_zone.enter_idle(SLOT, true));
-        let placement = zone.requeue_on(SLOT, record.id).unwrap();
+        let sleeper =
+            thread::spawn(move || sleeper_zone.enter_idle(SLOT, true, &OwedPasses::new()));
+        let placement = zone
+            .requeue_on(SLOT, record.id, &OwedPasses::new())
+            .unwrap();
         let sleeping = sleeper.join().unwrap();
         assert!(
             !sleeping || placement.resched,
@@ -472,14 +500,14 @@ fn closing_producer_executor_sleep_and_reuse_preserve_delivery() {
         zone.record(record.id)
             .last_slot
             .store(SLOT.plus_one(), Ordering::Relaxed);
-        zone.drive(SLOT, 1);
+        zone.drive(SLOT, 1, &OwedPasses::new());
         let deliveries = AtomicU32::new(0);
         let kicks = Arc::new(AtomicU32::new(0));
         let producer_zone = zone.clone();
         let producer_kicks = kicks.clone();
         let producer = thread::spawn(move || {
             if let Some(custody) = producer_zone.claim_first_entry_placement(record) {
-                match producer_zone.place_first_entry(custody) {
+                match producer_zone.place_first_entry(custody, &OwedPasses::new()) {
                     Ok(placement) => {
                         if placement.resched {
                             assert!(producer_zone.take_resched(placement.slot));
@@ -492,12 +520,21 @@ fn closing_producer_executor_sleep_and_reuse_preserve_delivery() {
         });
         let closing_zone = zone.clone();
         let closing = thread::spawn(move || {
-            closing_zone.claim_for_host(record, None, Handback::Control, &SpinForever, &|owned| {
-                let _ = owned.into_parts();
-            })
+            closing_zone.claim_for_host(
+                record,
+                None,
+                Handback::Control,
+                &SpinForever,
+                &|owned| {
+                    let _ = owned.into_parts();
+                },
+                &OwedPasses::new(),
+            )
         });
-        zone.enter_idle(SLOT, true);
-        if let Some(ServiceHead::FirstEntry(custody)) = zone.take_service_head_for_executor(SLOT) {
+        zone.enter_idle(SLOT, true, &OwedPasses::new());
+        if let Some(ServiceHead::FirstEntry(custody)) =
+            zone.take_service_head_for_executor(SLOT, &OwedPasses::new())
+        {
             finish(&zone, custody, &deliveries);
         }
         producer.join().unwrap();
@@ -510,7 +547,10 @@ fn closing_producer_executor_sleep_and_reuse_preserve_delivery() {
                         || kicks.load(Ordering::Acquire) == 1,
                     "queued behind WFI with neither owed nor delivered kick"
                 );
-                match zone.take_service_head_for_executor(slot).unwrap() {
+                match zone
+                    .take_service_head_for_executor(slot, &OwedPasses::new())
+                    .unwrap()
+                {
                     ServiceHead::FirstEntry(custody) => finish(&zone, custody, &deliveries),
                     ServiceHead::Record(_) => panic!("birth escaped activation custody"),
                 }
@@ -562,6 +602,7 @@ fn stale_placement_releases_replacement_despite_its_closing_request() {
                     &|owned| {
                         let _ = owned.into_parts();
                     },
+                    &OwedPasses::new(),
                 )
             });
             closing.join().unwrap();
@@ -579,7 +620,7 @@ fn closing_republishes_while_producer_and_executor_contend() {
     model_composed(|| {
         let zone = zone();
         let record = birth(&zone);
-        zone.drive(SLOT, 1);
+        zone.drive(SLOT, 1, &OwedPasses::new());
         zone.record(record.id)
             .last_slot
             .store(SLOT.plus_one(), Ordering::Relaxed);
@@ -587,7 +628,7 @@ fn closing_republishes_while_producer_and_executor_contend() {
         let producer_zone = zone.clone();
         let producer = thread::spawn(move || {
             if let Some(custody) = producer_zone.claim_first_entry_placement(record)
-                && let Err(custody) = producer_zone.place_first_entry(custody)
+                && let Err(custody) = producer_zone.place_first_entry(custody, &OwedPasses::new())
             {
                 assert!(producer_zone.release_first_entry_placement(custody));
             }
@@ -602,17 +643,20 @@ fn closing_republishes_while_producer_and_executor_contend() {
                 &|owned| {
                     let _ = owned.into_parts();
                 },
+                &OwedPasses::new(),
             );
             // The real handback adapter routes Claimed/AlreadyHost records
             // through first-entry admission; Deferred belongs to its owner.
             if matches!(claim, HostClaim::Claimed | HostClaim::AlreadyHost)
                 && let Some(custody) = closing_zone.claim_first_entry_placement(record)
-                && let Err(custody) = closing_zone.place_first_entry(custody)
+                && let Err(custody) = closing_zone.place_first_entry(custody, &OwedPasses::new())
             {
                 assert!(closing_zone.release_first_entry_placement(custody));
             }
         });
-        if let Some(ServiceHead::FirstEntry(custody)) = zone.take_service_head_for_executor(SLOT) {
+        if let Some(ServiceHead::FirstEntry(custody)) =
+            zone.take_service_head_for_executor(SLOT, &OwedPasses::new())
+        {
             finish(&zone, custody, &deliveries);
         } else if let Some(custody) = zone.claim_current_first_entry_activation(record) {
             finish(&zone, custody, &deliveries);
@@ -621,7 +665,10 @@ fn closing_republishes_while_producer_and_executor_contend() {
         closing.join().unwrap();
         match zone.record(record.id).claim() {
             Claim::Queued { slot, .. } => {
-                match zone.take_service_head_for_executor(slot).unwrap() {
+                match zone
+                    .take_service_head_for_executor(slot, &OwedPasses::new())
+                    .unwrap()
+                {
                     ServiceHead::FirstEntry(custody) => finish(&zone, custody, &deliveries),
                     ServiceHead::Record(_) => panic!("republished birth lost activation custody"),
                 }
@@ -645,7 +692,7 @@ fn stale_mint_cannot_consume_reused_service_head_delivery() {
     model(|| {
         let zone = zone();
         let old = birth(&zone);
-        zone.drive(SLOT, 1);
+        zone.drive(SLOT, 1, &OwedPasses::new());
         let stale_zone = zone.clone();
         let stale = thread::spawn(move || {
             if let Some(custody) = stale_zone.claim_current_first_entry_activation(old) {
@@ -657,11 +704,14 @@ fn stale_mint_cannot_consume_reused_service_head_delivery() {
             assert!(zone.free_first_entry_activation(custody));
             let replacement = birth(&zone);
             assert_eq!(replacement.id, old.id);
-            assert!(zone.place_from_host(replacement.id).is_some());
+            assert!(
+                zone.place_from_host(replacement.id, &OwedPasses::new())
+                    .is_some()
+            );
             // A stale caller owns no adoption of the replacement. Taking its
             // real service head therefore owes a real first-entry delivery,
             // not merely an unqueued Host state that nobody will rediscover.
-            match zone.take_service_head_for_executor(SLOT) {
+            match zone.take_service_head_for_executor(SLOT, &OwedPasses::new()) {
                 Some(ServiceHead::FirstEntry(custody)) => {
                     finish(&zone, custody, &AtomicU32::new(0));
                 }
@@ -680,11 +730,20 @@ fn delayed_closing_cannot_overwrite_replacement_handback() {
         let custody = zone.claim_first_entry_placement(old).unwrap();
         let closing_zone = zone.clone();
         let closing = thread::spawn(move || {
-            closing_zone.claim_for_host(old, None, Handback::Control, &SpinForever, &|owned| {
-                let _ = owned.into_parts();
-            })
+            closing_zone.claim_for_host(
+                old,
+                None,
+                Handback::Control,
+                &SpinForever,
+                &|owned| {
+                    let _ = owned.into_parts();
+                },
+                &OwedPasses::new(),
+            )
         });
-        let custody = zone.place_first_entry(custody).unwrap_err();
+        let custody = zone
+            .place_first_entry(custody, &OwedPasses::new())
+            .unwrap_err();
         assert!(zone.release_first_entry_placement(custody));
         finish(
             &zone,
@@ -716,7 +775,7 @@ fn delayed_closing_cannot_overwrite_replacement_handback() {
 fn concurrent_group_exit_keeps_direct_load_terminal_intent_before_release() {
     model_composed(|| {
         let zone = zone();
-        zone.publish_slot(SLOT, 7, None, 0);
+        zone.publish_slot(SLOT, 7, None, 0, &OwedPasses::new());
         assert!(
             zone.occupancy
                 .replace(occupancy::ExecutionSlot::zone(SLOT), 0, 7)
@@ -735,8 +794,11 @@ fn concurrent_group_exit_keeps_direct_load_terminal_intent_before_release() {
             })
             .unwrap();
         let record = zone.record_ref(id);
-        assert!(zone.requeue_preempted(SLOT, id).is_queued());
-        assert_eq!(zone.switch_in(SLOT), Some(id));
+        assert!(
+            zone.requeue_preempted(SLOT, id, &OwedPasses::new())
+                .is_queued()
+        );
+        assert_eq!(zone.switch_in(SLOT, &OwedPasses::new()), Some(id));
         let owner = Arc::new(AtomicU32::new(0));
         let live = Arc::new(AtomicU32::new(2));
         let intent = Arc::new(AtomicU32::new(0));
@@ -753,16 +815,29 @@ fn concurrent_group_exit_keeps_direct_load_terminal_intent_before_release() {
             let _ = owner.compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire);
             assert!(member_live.fetch_sub(1, Ordering::AcqRel) > 0);
             assert_eq!(
-                member_zone.release_current_with(SLOT, id, &SpinForever, || {
-                    member_intent.fetch_or(1, Ordering::Release);
-                    true
-                }),
+                member_zone.release_current_with(
+                    SLOT,
+                    id,
+                    &SpinForever,
+                    || {
+                        member_intent.fetch_or(1, Ordering::Release);
+                        true
+                    },
+                    &OwedPasses::new()
+                ),
                 Some(CurrentRelease::Released)
             );
         });
-        let _ = zone.claim_for_host(record, None, Handback::Control, &SpinForever, &|owned| {
-            let _ = owned.into_parts();
-        });
+        let _ = zone.claim_for_host(
+            record,
+            None,
+            Handback::Control,
+            &SpinForever,
+            &|owned| {
+                let _ = owned.into_parts();
+            },
+            &OwedPasses::new(),
+        );
         if zone.live(record).is_none() {
             assert_eq!(
                 intent.load(Ordering::Acquire),
@@ -798,16 +873,33 @@ fn native_hold_races_driver_cpu_publication() {
         zone.publish_park(id, seq);
         let record = zone.record_ref(id);
         assert_eq!(
-            zone.claim_for_host(record, None, Handback::Woken, &SpinForever, &|owned| {
-                let _ = owned.into_parts();
-            }),
+            zone.claim_for_host(
+                record,
+                None,
+                Handback::Woken,
+                &SpinForever,
+                &|owned| {
+                    let _ = owned.into_parts();
+                },
+                &OwedPasses::new()
+            ),
             HostClaim::Claimed
         );
         let publisher = zone.clone();
         let actor = thread::spawn(move || {
-            publisher.drive_and_publish(SLOT, 1, 7, Some(1), AffinitySource::UNBOUND);
+            publisher.drive_and_publish(
+                SLOT,
+                1,
+                7,
+                Some(1),
+                AffinitySource::UNBOUND,
+                &OwedPasses::new(),
+            );
         });
-        assert!(zone.place_native_handback(record).is_some());
+        assert!(
+            zone.place_native_handback(record, &OwedPasses::new())
+                .is_some()
+        );
         actor.join().unwrap();
         assert_eq!(zone.slot(SLOT).driver(), Some(1));
         assert_eq!(zone.slot(SLOT).cpu.load(Ordering::Acquire), 2);
@@ -834,8 +926,8 @@ fn migration_and_idle_scan_never_lose_the_queued_thread() {
         let zone = zone();
         let thief = SlotId::new(1);
         for (slot, cpu) in [(SLOT, 0u32), (thief, 1u32)] {
-            zone.drive(slot, u64::from(slot.raw()) + 1);
-            zone.publish_slot(slot, 7, Some(cpu), 0);
+            zone.drive(slot, u64::from(slot.raw()) + 1, &OwedPasses::new());
+            zone.publish_slot(slot, 7, Some(cpu), 0, &OwedPasses::new());
             let here = ExecutionSlot::zone(slot);
             zone.occupancy.vacate_any(here);
             assert!(zone.occupancy.replace(here, 0, 7));
@@ -854,13 +946,19 @@ fn migration_and_idle_scan_never_lose_the_queued_thread() {
                 affinity: 0,
             })
             .unwrap();
-        assert!(zone.requeue_preempted(SLOT, record).is_queued());
+        assert!(
+            zone.requeue_preempted(SLOT, record, &OwedPasses::new())
+                .is_queued()
+        );
         let scan_zone = zone.clone();
         let scanner = thread::spawn(move || {
-            if scan_zone.take_idle_work(thief).is_some() {
+            if scan_zone
+                .take_idle_work(thief, &OwedPasses::new())
+                .is_some()
+            {
                 return false;
             }
-            scan_zone.enter_idle(thief, true)
+            scan_zone.enter_idle(thief, true, &OwedPasses::new())
         });
         let mut effects = WakeEffects::default();
         zone.migrate_queued(SLOT, &mut effects);
@@ -868,6 +966,78 @@ fn migration_and_idle_scan_never_lose_the_queued_thread() {
         assert!(
             !sleeping || effects.sgi_slots().any(|slot| slot == thief),
             "the idle slot sleeps with no kick while {:?} waits on slot 0",
+            zone.record(record).claim()
+        );
+    });
+}
+
+/// #3083: an idle scan that finds a victim's run-queue lock busy must not
+/// read the victim's queue as empty. `steal_from` takes the victim's lock
+/// with a bounded spin and returns `None` when the spin runs out, so the
+/// scan reports nothing to steal and its `enter_idle(_, true)` sleeps while
+/// the victim's thread stays queued. The holder here only takes and drops
+/// the lock (any short critical section on the victim: a waker's push, a
+/// peer thief's steal), so it owes the thief nothing. Contention is "not
+/// now": the scan must stay owed, never end empty.
+#[test]
+fn busy_victim_lock_never_lets_an_idle_scan_sleep_past_its_thread() {
+    model(|| {
+        let zone = zone();
+        let thief = SlotId::new(1);
+        for (slot, cpu) in [(SLOT, 0u32), (thief, 1u32)] {
+            zone.drive(slot, u64::from(slot.raw()) + 1, &OwedPasses::new());
+            zone.publish_slot(slot, 7, Some(cpu), 0, &OwedPasses::new());
+            let here = ExecutionSlot::zone(slot);
+            zone.occupancy.vacate_any(here);
+            assert!(zone.occupancy.replace(here, 0, 7));
+            zone.enter_guest(slot);
+        }
+        let record = zone
+            .alloc_record(ThreadIdentity {
+                tid: 2,
+                serial: 20,
+                mm: 7,
+                file_table: 1,
+                generation: 1,
+                lifecycle_page: 0,
+                control_slot: 0,
+                affinity_source: crate::AffinitySource::UNBOUND,
+                affinity: 0,
+            })
+            .unwrap();
+        assert!(
+            zone.requeue_preempted(SLOT, record, &OwedPasses::new())
+                .is_queued()
+        );
+        let holder_zone = zone.clone();
+        let holder = thread::spawn(move || {
+            // The release fills the holder's own sink; the holder's caller
+            // sends what it owes.
+            let passes = OwedPasses::new();
+            drop(holder_zone.slot_lock(SLOT, &SpinForever, &passes));
+            let mut sent = WakeEffects::default();
+            passes.fold_into(&mut sent);
+            sent
+        });
+        let scan_zone = zone.clone();
+        let scanner = thread::spawn(move || {
+            if scan_zone
+                .take_idle_work(thief, &OwedPasses::new())
+                .is_some()
+            {
+                return false;
+            }
+            scan_zone.enter_idle(thief, true, &OwedPasses::new())
+        });
+        let sent = holder.join().unwrap();
+        let sleeping = scanner.join().unwrap();
+        // A scan that gave up on the busy lock is owed another pass by its
+        // release: the reschedule its pre-WFI recheck reads, and the SGI
+        // (for a WFI that already began) in the releaser's own effects.
+        let owed = sent.sgi_slots().any(|slot| slot == thief) && zone.take_resched(thief);
+        assert!(
+            !sleeping || owed,
+            "the idle slot sleeps after a busy victim lock, owed no pass, while {:?} waits on slot 0",
             zone.record(record).claim()
         );
     });
