@@ -1805,4 +1805,102 @@ mod tests {
         ));
         assert_eq!(zone.spaces.gate(index), super::super::GATE_CLOSED);
     }
+
+    /// #3105: prepared-commit shares run together, an exact editor is "not
+    /// now" while they hold the space, and only the last share's release
+    /// publishes the `Editor` release it enrolled on; then it is admitted.
+    #[test]
+    fn commit_shares_run_together_and_the_last_release_admits_the_editor() {
+        use super::super::{EditAdmissionRefusal, EditorWord};
+        let zone = zone();
+        let entry = admitted(&zone);
+        let index = entry.index();
+        let access = access(&zone);
+        access.open(index);
+        let observer = entry.notifications(NonZeroU64::MIN).unwrap();
+        let first = zone
+            .spaces
+            .try_begin_commit(index, 77, access.venue())
+            .expect("an open space admits a commit share");
+        let second = zone
+            .spaces
+            .try_begin_commit(index, 77, access.venue())
+            .expect("a second share runs beside the first");
+        assert!(matches!(
+            zone.spaces.editor_word(index),
+            EditorWord::Commits { shares, draining: false } if shares.get() == 2
+        ));
+        let owner = NonZeroU64::new(11).unwrap();
+        let refused = zone
+            .spaces
+            .try_begin_edit_cause(index, 77, owner, access.venue());
+        assert!(matches!(refused, Err(EditAdmissionRefusal::Editor)));
+        let enrolled = observer.observe(SpaceWaitCause::Editor);
+        assert!(
+            matches!(
+                zone.spaces.editor_word(index),
+                EditorWord::Commits { draining: true, .. }
+            ),
+            "the refused editor asks the shares to drain"
+        );
+        assert!(
+            matches!(
+                zone.spaces.try_begin_commit(index, 77, access.venue()),
+                Err(EditAdmissionRefusal::Editor)
+            ),
+            "no new share overtakes a draining editor"
+        );
+        assert!(
+            access.try_exclude_editor(index, 77).is_err(),
+            "a host pause can't exclude the space while shares hold it"
+        );
+        drop(first);
+        assert_eq!(
+            observer.observe(SpaceWaitCause::Editor),
+            enrolled,
+            "a share that leaves another holding the word publishes nothing"
+        );
+        drop(second);
+        assert_ne!(
+            observer.observe(SpaceWaitCause::Editor),
+            enrolled,
+            "the last share's release publishes the editor's wake"
+        );
+        assert_eq!(zone.spaces.editor_word(index), EditorWord::Free);
+        let editor = zone
+            .spaces
+            .try_begin_edit_cause(index, 77, owner, access.venue())
+            .expect("the rerun after the wake is admitted");
+        assert!(matches!(
+            zone.spaces.try_begin_commit(index, 77, access.venue()),
+            Err(EditAdmissionRefusal::Editor)
+        ));
+        drop(editor);
+        assert_eq!(zone.spaces.editor_word(index), EditorWord::Free);
+    }
+
+    /// A share is visible before its gate read: one admitted under a host
+    /// pause releases and refuses as `Gate`, leaving the word free.
+    #[test]
+    fn a_commit_share_under_a_raised_gate_releases_and_refuses() {
+        use super::super::{EditAdmissionRefusal, EditorWord};
+        let zone = zone();
+        let entry = admitted(&zone);
+        let index = entry.index();
+        let access = access(&zone);
+        access.open(index);
+        let exclusion = access.try_exclude_editor(index, 77).unwrap();
+        assert!(matches!(
+            zone.spaces.try_begin_commit(index, 77, access.venue()),
+            Err(EditAdmissionRefusal::Gate)
+        ));
+        assert_eq!(zone.spaces.editor_word(index), EditorWord::Free);
+        drop(exclusion);
+        assert!(
+            zone.spaces
+                .try_begin_commit(index, 77, access.venue())
+                .is_ok()
+        );
+        assert_eq!(zone.spaces.editor_word(index), EditorWord::Free);
+    }
 }

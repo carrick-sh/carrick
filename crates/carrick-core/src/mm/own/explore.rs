@@ -430,7 +430,15 @@ struct GrantWorld {
     /// Each MM had a release answered "not now", and was released since.
     not_now_then_released: [bool; 2],
     deferred: [bool; 2],
+    /// Each MM was refused "not now" for its commit shares, and a host edit
+    /// was admitted for it since (#3105).
+    refused_drain: [bool; 2],
+    drained_then_supplied: [bool; 2],
 }
+
+/// Shares the guest adversary holds at once on one MM: two shares make the
+/// last-share release distinct from the first.
+const MAX_SHARES: u16 = 2;
 
 impl Drop for GrantWorld {
     fn drop(&mut self) {
@@ -442,6 +450,10 @@ impl Drop for GrantWorld {
 enum GrantOp {
     GuestHold(usize),
     GuestRelease(usize),
+    /// A guest member takes one prepared-commit share (#3105).
+    GuestShare(usize),
+    /// A guest member releases one prepared-commit share.
+    GuestUnshare(usize),
     Supply(usize),
     AdmitChunk(usize, usize),
     CancelChunk(usize),
@@ -472,6 +484,8 @@ fn grant_ops(world: &GrantWorld) -> Vec<GrantOp> {
         ops.extend([
             GrantOp::GuestHold(mm),
             GrantOp::GuestRelease(mm),
+            GrantOp::GuestShare(mm),
+            GrantOp::GuestUnshare(mm),
             GrantOp::BeginSettle(mm),
             GrantOp::Exit(mm),
             GrantOp::BeginRelease(mm),
@@ -532,6 +546,26 @@ fn grant_step(world: &mut GrantWorld, op: GrantOp) -> Result<(), String> {
         GrantOp::GuestRelease(mm) => {
             world.core.guest_editor(mm_key(mm), false);
         }
+        GrantOp::GuestShare(mm) => {
+            // The editor word admits a share only while no exclusive editor
+            // holds it, and only for a live MM with members.
+            let shares = match world.core.editor(mm_key(mm)) {
+                None | Some(MmEditor::Free) => Some(0),
+                Some(MmEditor::GuestCommits(shares)) => Some(shares.get()),
+                Some(MmEditor::Guest | MmEditor::Host(_)) => None,
+            };
+            if shares.is_some_and(|held| held < MAX_SHARES)
+                && world
+                    .core
+                    .mm_life(mm_key(mm))
+                    .is_none_or(|life| life == MmLife::Live)
+            {
+                world.core.guest_commit(mm_key(mm), true);
+            }
+        }
+        GrantOp::GuestUnshare(mm) => {
+            world.core.guest_commit(mm_key(mm), false);
+        }
         GrantOp::Supply(mm) => {
             let excluded = ExcludedMm::claimed(mm_key(mm));
             match world.core.supply_cow(&excluded, 0x1000) {
@@ -540,6 +574,7 @@ fn grant_step(world: &mut GrantWorld, op: GrantOp) -> Result<(), String> {
                         return Err("supplied while the guest held the editor".into());
                     }
                     world.busy_then_supplied[mm] |= world.refused_busy[mm];
+                    world.drained_then_supplied[mm] |= world.refused_drain[mm];
                     match supply {
                         CowSupply::Carved(ticket) => {
                             world.carved_from_chunk = true;
@@ -561,6 +596,17 @@ fn grant_step(world: &mut GrantWorld, op: GrantOp) -> Result<(), String> {
                         return Err("a not-now supply changed the core".into());
                     }
                     world.refused_busy[mm] = true;
+                }
+                Err(MmRefusal::NotNow(NotNow::CommitsDrain(key))) => {
+                    if key != mm_key(mm)
+                        || !matches!(world.core.editor(key), Some(MmEditor::GuestCommits(_)))
+                    {
+                        return Err("a commits-drain not now named the wrong editor".into());
+                    }
+                    if world.core != before {
+                        return Err("a not-now supply changed the core".into());
+                    }
+                    world.refused_drain[mm] = true;
                 }
                 Err(MmRefusal::Refused(_)) => {
                     if world.core != before {
@@ -667,6 +713,16 @@ fn grant_step(world: &mut GrantWorld, op: GrantOp) -> Result<(), String> {
                     return Err("a not-now exit changed the core".into());
                 }
             }
+            Err(MmRefusal::NotNow(NotNow::CommitsDrain(key))) => {
+                if key != mm_key(mm)
+                    || !matches!(before.0.editor(key), Some(MmEditor::GuestCommits(_)))
+                {
+                    return Err("an exit's commits-drain named the wrong editor".into());
+                }
+                if world.core != before {
+                    return Err("a not-now exit changed the core".into());
+                }
+            }
             Err(MmRefusal::Refused(_)) => {
                 if world.core != before {
                     return Err("a refused exit changed the core".into());
@@ -753,11 +809,49 @@ fn grant_step(world: &mut GrantWorld, op: GrantOp) -> Result<(), String> {
             Err(_) => {}
         },
     }
+    check_shares_exclude_host_edits(world, &before, op)?;
     reconcile_grants(world)?;
     world
         .core
         .check_invariants()
         .map_err(|violation| format!("{violation:?}"))
+}
+
+/// G5 (#3105): while guest commit shares hold an MM, no host transition
+/// changes anything the core records about it: its editor, its life, its
+/// grants or its arena. Only the guest's own share ops move its editor.
+fn check_shares_exclude_host_edits(
+    world: &GrantWorld,
+    before: &Snapshot,
+    op: GrantOp,
+) -> Result<(), String> {
+    if matches!(op, GrantOp::GuestShare(_) | GrantOp::GuestUnshare(_)) {
+        return Ok(());
+    }
+    for (&mm, record) in &before.0.mms {
+        if !matches!(record.editor, MmEditor::GuestCommits(_)) {
+            continue;
+        }
+        let after = world.core.mms.get(&mm);
+        let grants = |core: &GrantCore| {
+            core.grants
+                .values()
+                .filter(|g| g.mm == mm)
+                .map(|g| g.id)
+                .collect::<Vec<_>>()
+        };
+        let chunks = |core: &GrantCore| core.chunks.values().filter(|c| c.mm == mm).count();
+        if after.map(|a| (a.editor, a.life, a.chunk))
+            != Some((record.editor, record.life, record.chunk))
+            || grants(&world.core) != grants(&before.0)
+            || chunks(&world.core) != chunks(&before.0)
+        {
+            return Err(format!(
+                "G5: {op:?} edited {mm:?} while guest commit shares held it"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn take_returned(world: &mut GrantWorld, returned: &[u8], mm: Option<MmKey>) -> Result<(), String> {
@@ -843,6 +937,10 @@ struct GrantsReached {
     carved_from_chunk: bool,
     not_now_then_released: bool,
     released_with_a_grant: bool,
+    /// Two commit shares held one MM at once.
+    two_shares: bool,
+    /// A supply was refused for an MM's commit shares, then admitted.
+    drained_then_supplied: bool,
 }
 
 fn explore_grants(depth: usize) -> Result<(usize, GrantsReached), String> {
@@ -865,6 +963,8 @@ fn explore_grants(depth: usize) -> Result<(usize, GrantsReached), String> {
         ended: false,
         not_now_then_released: [false; 2],
         deferred: [false; 2],
+        refused_drain: [false; 2],
+        drained_then_supplied: [false; 2],
     };
     let mut seen = HashSet::new();
     let mut reached = GrantsReached::default();
@@ -897,6 +997,12 @@ fn explore_grants(depth: usize) -> Result<(usize, GrantsReached), String> {
             reached.not_now_then_released |= next.not_now_then_released.iter().any(|&b| b);
             reached.released_with_a_grant |=
                 matches!(op, GrantOp::BeginRelease(_)) && next.in_core.len() < world.in_core.len();
+            reached.two_shares |= next
+                .core
+                .mms
+                .values()
+                .any(|m| matches!(m.editor, MmEditor::GuestCommits(s) if s.get() == 2));
+            reached.drained_then_supplied |= next.drained_then_supplied.iter().any(|&b| b);
             if seen.insert(next.clone()) {
                 queue.push_back((next, next_trace));
             }
@@ -922,7 +1028,9 @@ fn every_bounded_grant_sequence_keeps_the_mm_and_grant_invariants() {
             && reached.settled_while_other_supplies
             && reached.carved_from_chunk
             && reached.not_now_then_released
-            && reached.released_with_a_grant,
+            && reached.released_with_a_grant
+            && reached.two_shares
+            && reached.drained_then_supplied,
         "depth {GRANT_DEPTH} ({states} states) missed a shape: {reached:?}"
     );
     std::println!("explored {states} distinct grant states to depth {GRANT_DEPTH}: {reached:?}");
@@ -939,11 +1047,18 @@ fn every_seeded_release_mutant_is_found() {
         Mutant::ReleasesLive,
         Mutant::EditsAfterExit,
         Mutant::BrokenDefers,
+        Mutant::CommitsAdmitHostEdit,
     ] {
         let found = mutant::with(which, || explore_grants(RELEASE_MUTANT_DEPTH));
         match found {
             Err(counterexample) => {
                 std::println!("mutant {which:?} found: {counterexample}");
+                if which == Mutant::CommitsAdmitHostEdit {
+                    assert!(
+                        counterexample.starts_with("G5:"),
+                        "G5's mutant must be found by G5, not {counterexample}"
+                    );
+                }
             }
             Ok((states, _)) => {
                 panic!("mutant {which:?} survived {states} states to depth {RELEASE_MUTANT_DEPTH}")

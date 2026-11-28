@@ -1,3 +1,8 @@
+# #3105 PR 2: sched-core `spaces.rs` adds prepared-commit shares of an
+# entry's editor word and builds on loom atomics under loom. Publication,
+# the gate, installs and the exact editor's admission are unchanged; a host
+# pause still waits for the word to clear. This contract's semantics,
+# bindings and budgets are unchanged.
 # #1733 (core capture reads under its own exclusion): mm_occupancy.rs
 # adds capture's exclusion proof, a nested counted raise of the gate its
 # pause already holds. Only core capture's read path changes; this

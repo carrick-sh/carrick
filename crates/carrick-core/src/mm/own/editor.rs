@@ -29,11 +29,21 @@ pub enum HostEdit {
 }
 
 /// Who holds an MM's editor.
+///
+/// G5: the editor has one holder kind at a time, so an exclusive edit (the
+/// guest's or the host's) and prepared-commit shares can't hold one MM
+/// together; and no host transition edits an MM while shares hold it.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum MmEditor {
     Free,
     /// A guest member edits the MM in ring.
     Guest,
+    /// Guest members commit prepared first-touch leaves under shared
+    /// admission (#3105): the guest editor word's commit-share count
+    /// (`carrick_sched_core::spaces::EditorWord::Commits`). A share can only
+    /// turn a prepared leaf present and record that commit, so it changes no
+    /// structure the core records; every host edit waits for the last share.
+    GuestCommits(core::num::NonZeroU16),
     /// The shell edits the MM under its exclusion.
     Host(HostEdit),
 }
@@ -77,4 +87,19 @@ impl<'a> ExcludedMm<'a> {
 pub enum NotNow {
     /// A guest member holds the MM's editor: rerun after its release.
     EditorRelease(MmKey),
+    /// Guest prepared-commit shares hold the MM: rerun after the last one's
+    /// release, which frees the word and publishes the editor release.
+    CommitsDrain(MmKey),
+}
+
+impl MmEditor {
+    /// The "not now" a host edit of `mm` answers while the guest holds this
+    /// editor, or `None` when the guest doesn't hold it.
+    pub(super) const fn guest_not_now(self, mm: MmKey) -> Option<NotNow> {
+        match self {
+            Self::Guest => Some(NotNow::EditorRelease(mm)),
+            Self::GuestCommits(_) => Some(NotNow::CommitsDrain(mm)),
+            Self::Free | Self::Host(_) => None,
+        }
+    }
 }

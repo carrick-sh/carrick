@@ -32,12 +32,17 @@
 //! lock; EL1 reads them, records COW coverage, and claims the exact entry's
 //! single page-table editor word before mutating live descriptors.
 
+#[cfg(all(test, feature = "loom"))]
+mod loom_models;
 pub mod notification;
 use crate::ThreadCtx;
 use notification::{NotificationSource, SpaceNotificationLease, SpaceReleaseVenue, SpaceWaitCause};
 
 use core::num::NonZeroU64;
+#[cfg(not(all(test, feature = "loom")))]
 use core::sync::atomic::{AtomicU64, Ordering};
+#[cfg(all(test, feature = "loom"))]
+use loom::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(feature = "test-support")]
 static INJECT_EDITOR_BUSY: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
@@ -69,7 +74,11 @@ pub fn release_injected_editor_busy() -> bool {
 /// Entries in the table: the address spaces the host has published at once.
 /// A full table leaves an MM unpublished, so its threads reach a vCPU
 /// through their executors, as before this step.
+#[cfg(not(all(test, feature = "loom")))]
 pub const ADDRESS_SPACES: usize = 1024;
+/// Two under loom: one space the actors contend on, and one to probe past.
+#[cfg(all(test, feature = "loom"))]
+pub const ADDRESS_SPACES: usize = 2;
 
 /// Gate bit: EL1 may not install the address space (being published, or
 /// its ASID is retiring). The low bits count the raised page-table pauses.
@@ -80,6 +89,89 @@ pub const GATE_INITIAL_BIND: u64 = 1 << 62;
 
 /// A freed entry (skipped by lookups, reused by publications).
 const FREED: u64 = u64::MAX;
+
+/// Editor-word tag: the word counts prepared-commit shares ([`SpaceCommit`]).
+const COMMIT_SHARES: u64 = 1 << 62;
+/// With [`COMMIT_SHARES`]: an exclusive editor was refused by the shares and
+/// waits for them to drain, so no new share is admitted until the word is
+/// free. The last share's release clears it with the count.
+const COMMIT_DRAIN: u64 = 1 << 61;
+/// The share count's bits.
+const COMMIT_COUNT: u64 = COMMIT_DRAIN - 1;
+
+/// What an entry's editor word holds. One word, so the exact editor, the
+/// commit shares and a host pause's wait all read and change it atomically.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EditorWord {
+    /// No editor and no share: a host pause may exclude the space.
+    Free,
+    /// The exact guest EL1 editor ([`SpaceEditor`]); its owner is below
+    /// [`COMMIT_DRAIN`].
+    Exclusive(NonZeroU64),
+    /// Prepared-commit shares, and whether an exclusive editor is waiting
+    /// for them to drain.
+    Commits { shares: NonZeroU64, draining: bool },
+}
+
+impl EditorWord {
+    pub fn decode(word: u64) -> Self {
+        if word & COMMIT_SHARES != 0 {
+            match NonZeroU64::new(word & COMMIT_COUNT) {
+                Some(shares) => Self::Commits {
+                    shares,
+                    draining: word & COMMIT_DRAIN != 0,
+                },
+                None => unreachable!("a commit-share word counts at least one share"),
+            }
+        } else {
+            match NonZeroU64::new(word) {
+                Some(owner) => Self::Exclusive(owner),
+                None => Self::Free,
+            }
+        }
+    }
+
+    pub const fn encode(self) -> u64 {
+        match self {
+            Self::Free => 0,
+            Self::Exclusive(owner) => owner.get(),
+            Self::Commits { shares, draining } => {
+                COMMIT_SHARES | if draining { COMMIT_DRAIN } else { 0 } | shares.get()
+            }
+        }
+    }
+
+    /// The word with one more share, or `None` when a share is "not now":
+    /// the exact editor holds the space, or one waits for the shares.
+    fn with_one_more_share(self) -> Option<Self> {
+        match self {
+            Self::Free => Some(Self::Commits {
+                shares: NonZeroU64::MIN,
+                draining: false,
+            }),
+            Self::Commits {
+                shares,
+                draining: false,
+            } if shares.get() < COMMIT_COUNT => shares.checked_add(1).map(|shares| Self::Commits {
+                shares,
+                draining: false,
+            }),
+            _ => None,
+        }
+    }
+
+    /// The word with one share fewer; the last share frees it, draining or
+    /// not. `None` if the word holds no share (a broken invariant).
+    fn without_one_share(self) -> Option<Self> {
+        match self {
+            Self::Commits { shares, draining } => match NonZeroU64::new(shares.get() - 1) {
+                Some(shares) => Some(Self::Commits { shares, draining }),
+                None => Some(Self::Free),
+            },
+            _ => None,
+        }
+    }
+}
 
 /// Served VMA edits one space's journal holds before EL1 must hand the next
 /// one to the host instead ([`JournalFull`]).
@@ -148,7 +240,8 @@ pub struct SpaceEntry {
     cow_published: AtomicU64,
     /// Publications an EL1 broadcast invalidation covered.
     cow_covered: AtomicU64,
-    /// The exact guest EL1 page-table editor, or zero. A host pause raises
+    /// Who edits the space's tables ([`EditorWord`]): zero, the exact guest
+    /// EL1 editor, or a count of prepared-commit shares. A host pause raises
     /// `gate` and waits for this word to clear before mutating the same tables.
     active_editor: AtomicU64,
     /// Monotonic bump cursor for anonymous private mmap allocations in the mmap arena.
@@ -288,18 +381,24 @@ impl ExcludedEditor<'_> {
     }
 }
 
+/// The translation identity an admitted holder of `entry`'s editor word
+/// runs against.
+fn grant_of(entry: &SpaceEntry, index: SpaceIndex) -> SpaceGrant {
+    let published = entry.cow_published.load(Ordering::Acquire);
+    let covered = entry.cow_covered.load(Ordering::Acquire);
+    SpaceGrant {
+        index,
+        ttbr0: entry.ttbr0.load(Ordering::Acquire),
+        ttbr1: entry.ttbr1.load(Ordering::Acquire),
+        cow_owed: (published != covered).then_some(published),
+    }
+}
+
 impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> SpaceEditor<'a, C> {
     /// The admitted editor retains this exact translation identity even if
     /// a host pause raises the gate while waiting for this guard to leave.
     pub fn grant(&self) -> SpaceGrant {
-        let published = self.entry.cow_published.load(Ordering::Acquire);
-        let covered = self.entry.cow_covered.load(Ordering::Acquire);
-        SpaceGrant {
-            index: self.index,
-            ttbr0: self.entry.ttbr0.load(Ordering::Acquire),
-            ttbr1: self.entry.ttbr1.load(Ordering::Acquire),
-            cow_owed: (published != covered).then_some(published),
-        }
+        grant_of(self.entry, self.index)
     }
 
     pub fn mmap_next(&self) -> u64 {
@@ -360,34 +459,120 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> SpaceEditor<'_, C> {
 }
 impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for SpaceEditor<'_, C> {
     fn drop(&mut self) {
-        let needs_late_release = self.release.is_none() && self.entry.notifications.attached();
-        let late_release = needs_late_release
-            .then(|| {
-                self.venue.and_then(|venue| {
-                    venue
-                        .zone
-                        .editor_notification(self.index, self.key)
-                        .map(|lease| (venue, lease))
-                })
-            })
-            .flatten();
-        assert!(
-            !needs_late_release || late_release.is_some(),
-            "held admitted editor requires exact source release"
+        release_editor_word(
+            self.entry,
+            self.release.as_ref(),
+            self.venue,
+            self.index,
+            self.key,
+            || {
+                self.release_editor();
+                true
+            },
         );
-        if let Some((venue, lease)) = self.release.as_ref().or(late_release.as_ref()) {
-            let completion = |effects: crate::object_wait::OwnedObjectWakeEffects<'_, C>| {
-                venue.deliver.invoke(venue.zone, venue.waker, effects)
-            };
-            let ticket = lease.reserve(SpaceWaitCause::Editor);
-            self.release_editor();
-            // A contender may observe and refuse right up to the unlock.
-            // Advance afterward so that observation cannot outlive the
-            // last release and become a park with no producer.
+    }
+}
+
+/// Release one hold of an entry's editor word and, when `unlock` reports the
+/// word free, publish the exact `Editor` release its waiters enrolled on.
+/// The ticket is reserved before the unlock: a contender may observe and
+/// refuse right up to it, so advancing afterward means that observation
+/// cannot outlive the last release and become a park with no producer.
+fn release_editor_word<'a, C: Copy + Send + Sync + zerocopy::FromZeros>(
+    entry: &'a SpaceEntry,
+    release: Option<&(SpaceReleaseVenue<'a, C>, SpaceNotificationLease<'a, C>)>,
+    venue: Option<SpaceReleaseVenue<'a, C>>,
+    index: SpaceIndex,
+    key: u64,
+    unlock: impl FnOnce() -> bool,
+) {
+    let needs_late_release = release.is_none() && entry.notifications.attached();
+    let late_release = needs_late_release
+        .then(|| {
+            venue.and_then(|venue| {
+                venue
+                    .zone
+                    .editor_notification(index, key)
+                    .map(|lease| (venue, lease))
+            })
+        })
+        .flatten();
+    assert!(
+        !needs_late_release || late_release.is_some(),
+        "held admitted editor requires exact source release"
+    );
+    if let Some((venue, lease)) = release.or(late_release.as_ref()) {
+        let completion = |effects: crate::object_wait::OwnedObjectWakeEffects<'_, C>| {
+            venue.deliver.invoke(venue.zone, venue.waker, effects)
+        };
+        let ticket = lease.reserve(SpaceWaitCause::Editor);
+        if unlock() {
             ticket.publish(venue.waker, &completion);
-        } else {
-            self.release_editor();
         }
+        // A share that left others holding the word publishes nothing: no
+        // waiter can be admitted before the word is free, and the last
+        // share's release publishes then.
+    } else {
+        unlock();
+    }
+}
+
+/// Shared admission for one prepared first-touch commit of a published
+/// address space (#3105). Any number of shares run together; none runs
+/// beside the exact [`SpaceEditor`] or a host pause, and a structural edit
+/// can't be made through one: the guard grants only the space's translation
+/// identity. The fault owner wraps it in the token that may commit a
+/// prepared leaf (one PTE compare-and-swap) and record that commit.
+///
+/// Dropping the last share frees the word and publishes the `Editor`
+/// release an exclusive editor or a host pause enrolled on.
+pub struct SpaceCommit<'a, C: Copy + Send + Sync + zerocopy::FromZeros = ThreadCtx> {
+    entry: &'a SpaceEntry,
+    release: Option<(SpaceReleaseVenue<'a, C>, SpaceNotificationLease<'a, C>)>,
+    venue: Option<SpaceReleaseVenue<'a, C>>,
+    index: SpaceIndex,
+    key: u64,
+}
+
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> SpaceCommit<'_, C> {
+    /// The translation identity the shares run against. A host pause can't
+    /// change it while a share is held: it waits for the word to clear.
+    pub fn grant(&self) -> SpaceGrant {
+        grant_of(self.entry, self.index)
+    }
+
+    /// The exact MM the share admits.
+    pub fn key(&self) -> u64 {
+        self.key
+    }
+}
+
+impl<C: Copy + Send + Sync + zerocopy::FromZeros> Drop for SpaceCommit<'_, C> {
+    fn drop(&mut self) {
+        let entry = self.entry;
+        release_editor_word(
+            entry,
+            self.release.as_ref(),
+            self.venue,
+            self.index,
+            self.key,
+            || {
+                #[cfg(test)]
+                editor_test_hook::before_release();
+                let previous =
+                    entry
+                        .active_editor
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |word| {
+                            EditorWord::decode(word)
+                                .without_one_share()
+                                .map(EditorWord::encode)
+                        });
+                let Ok(previous) = previous else {
+                    unreachable!("a held commit share is counted in its editor word");
+                };
+                EditorWord::decode(previous).without_one_share() == Some(EditorWord::Free)
+            },
+        );
     }
 }
 
@@ -397,33 +582,59 @@ impl Default for AddressSpaces {
     }
 }
 
-impl AddressSpaces {
-    pub const fn new() -> Self {
-        Self {
+/// `[$value; N]` for a value that isn't `Copy`: a `const` block in the
+/// production build, and `from_fn` under loom, whose atomics have no `const`
+/// constructor.
+#[cfg(not(all(test, feature = "loom")))]
+macro_rules! repeat {
+    ($value:expr; $n:expr) => {
+        [const { $value }; $n]
+    };
+}
+#[cfg(all(test, feature = "loom"))]
+macro_rules! repeat {
+    ($value:expr; $n:expr) => {
+        core::array::from_fn::<_, { $n }, _>(|_| $value)
+    };
+}
+
+/// The one body of [`AddressSpaces::new`], for both of its builds.
+macro_rules! address_spaces {
+    () => {
+        AddressSpaces {
             idle_ttbr: AtomicU64::new(0),
-            entries: [const {
-                SpaceEntry {
-                    key: AtomicU64::new(0),
-                    ttbr0: AtomicU64::new(0),
-                    ttbr1: AtomicU64::new(0),
-                    gate: AtomicU64::new(0),
-                    cow_published: AtomicU64::new(0),
-                    cow_covered: AtomicU64::new(0),
-                    active_editor: AtomicU64::new(0),
-                    mmap_next: AtomicU64::new(0),
-                    brk_current: AtomicU64::new(0),
-                    journal_head: AtomicU64::new(0),
-                    journal_tail: AtomicU64::new(0),
-                    notifications: NotificationSource::new(),
-                    journal: [const {
-                        JournalSlot {
-                            start: AtomicU64::new(0),
-                            end_prot: AtomicU64::new(0),
-                        }
-                    }; VMA_JOURNAL_ENTRIES],
-                }
+            entries: repeat![SpaceEntry {
+                key: AtomicU64::new(0),
+                ttbr0: AtomicU64::new(0),
+                ttbr1: AtomicU64::new(0),
+                gate: AtomicU64::new(0),
+                cow_published: AtomicU64::new(0),
+                cow_covered: AtomicU64::new(0),
+                active_editor: AtomicU64::new(0),
+                mmap_next: AtomicU64::new(0),
+                brk_current: AtomicU64::new(0),
+                journal_head: AtomicU64::new(0),
+                journal_tail: AtomicU64::new(0),
+                notifications: NotificationSource::new(),
+                journal: repeat![JournalSlot {
+                    start: AtomicU64::new(0),
+                    end_prot: AtomicU64::new(0),
+                }; VMA_JOURNAL_ENTRIES],
             }; ADDRESS_SPACES],
         }
+    };
+}
+
+impl AddressSpaces {
+    #[cfg(not(all(test, feature = "loom")))]
+    pub const fn new() -> Self {
+        address_spaces!()
+    }
+
+    /// Under loom (its atomics are built at run time, inside the model).
+    #[cfg(all(test, feature = "loom"))]
+    pub fn new() -> Self {
+        address_spaces!()
     }
 
     fn entry(&self, index: SpaceIndex) -> &SpaceEntry {
@@ -891,10 +1102,37 @@ impl AddressSpaces {
         } else {
             None
         };
-        entry
-            .active_editor
-            .compare_exchange(0, owner.get(), Ordering::SeqCst, Ordering::SeqCst)
-            .map_err(|_| EditAdmissionRefusal::Editor)?;
+        assert!(
+            owner.get() < COMMIT_DRAIN,
+            "an exact editor's owner leaves the commit-share tags clear"
+        );
+        if let Err(held) =
+            entry
+                .active_editor
+                .compare_exchange(0, owner.get(), Ordering::SeqCst, Ordering::SeqCst)
+        {
+            // Shares hold the space: ask them to drain, so this editor's
+            // rerun after the last share's release isn't overtaken by new
+            // shares forever. A lost race here leaves the word to the next
+            // refusal; the refusal is "not now" either way.
+            if let EditorWord::Commits {
+                shares,
+                draining: false,
+            } = EditorWord::decode(held)
+            {
+                let _ = entry.active_editor.compare_exchange(
+                    held,
+                    EditorWord::Commits {
+                        shares,
+                        draining: true,
+                    }
+                    .encode(),
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+            }
+            return Err(EditAdmissionRefusal::Editor);
+        }
         let editor = SpaceEditor {
             entry,
             owner,
@@ -923,6 +1161,84 @@ impl AddressSpaces {
             return Err(EditAdmissionRefusal::Gate);
         }
         Ok(editor)
+    }
+
+    /// Guest EL1: take one shared admission for a prepared first-touch
+    /// commit of the exact, open MM (#3105). Shares run together; the
+    /// refusals are those of [`Self::try_begin_edit_cause`]:
+    /// [`EditAdmissionRefusal::Editor`] while the exact editor holds the
+    /// space or waits for the shares to drain, and
+    /// [`EditAdmissionRefusal::Gate`] while a host pause is raised. Both are
+    /// "not now": enrol on the cause's release, probe once, rerun.
+    pub fn try_begin_commit<'a, C: Copy + Send + Sync + zerocopy::FromZeros>(
+        &'a self,
+        index: SpaceIndex,
+        key: u64,
+        venue: Option<SpaceReleaseVenue<'a, C>>,
+    ) -> Result<SpaceCommit<'a, C>, EditAdmissionRefusal> {
+        #[cfg(feature = "test-support")]
+        if injected_editor_busy() {
+            return Err(EditAdmissionRefusal::Editor);
+        }
+        let entry = self.entry(index);
+        assert!(
+            !entry.notifications.attached() || venue.is_some(),
+            "admitted commit requires release venue"
+        );
+        if venue.is_some_and(|v| !core::ptr::eq(&v.zone.spaces, self)) {
+            return Err(EditAdmissionRefusal::Stale);
+        }
+        let release = if entry.notifications.attached() {
+            let venue = venue.ok_or(EditAdmissionRefusal::Stale)?;
+            Some((
+                venue,
+                venue
+                    .zone
+                    .editor_notification(index, key)
+                    .ok_or(EditAdmissionRefusal::Stale)?,
+            ))
+        } else {
+            None
+        };
+        // A compare-and-swap that lost to another share's count change
+        // retries at once: that is progress by another lane, never a wait on
+        // a holder. A holder that refuses the share ends the attempt.
+        entry
+            .active_editor
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |word| {
+                EditorWord::decode(word)
+                    .with_one_more_share()
+                    .map(EditorWord::encode)
+            })
+            .map_err(|_| EditAdmissionRefusal::Editor)?;
+        let commit = SpaceCommit {
+            entry,
+            release,
+            venue,
+            index,
+            key,
+        };
+        #[cfg(test)]
+        editor_test_hook::run();
+        // As for the exact editor: the share is visible before the gate is
+        // read, so a racing host pause either sees it and waits, or this
+        // share sees the pause, releases and refuses.
+        if entry.key.load(Ordering::SeqCst) != key {
+            return Err(EditAdmissionRefusal::Stale);
+        }
+        let gate = entry.gate.load(Ordering::SeqCst);
+        if gate & GATE_CLOSED != 0 {
+            return Err(EditAdmissionRefusal::Closed);
+        }
+        if gate != 0 {
+            return Err(EditAdmissionRefusal::Gate);
+        }
+        Ok(commit)
+    }
+
+    /// What the entry's editor word holds (tests and diagnostics).
+    pub fn editor_word(&self, index: SpaceIndex) -> EditorWord {
+        EditorWord::decode(self.entry(index).active_editor.load(Ordering::SeqCst))
     }
 
     /// Claim a never-runnable child while its publication gate remains closed.
@@ -1061,7 +1377,9 @@ impl AddressSpaces {
         })
     }
 
-    /// Exact active guest editor (tests and diagnostics).
+    /// The editor word while anything holds it: the exact guest editor's
+    /// owner, or the encoded commit shares ([`Self::editor_word`] reads
+    /// which). `None` only when the space is free to exclude.
     pub fn active_editor(&self, index: SpaceIndex) -> Option<NonZeroU64> {
         NonZeroU64::new(self.entry(index).active_editor.load(Ordering::SeqCst))
     }

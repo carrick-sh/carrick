@@ -297,3 +297,78 @@ fn an_exit_waits_for_the_guest_editor_and_a_not_now_release_reruns() {
         assert!(core.teardown().is_ok());
     });
 }
+
+/// #3105: two guest members hold prepared-commit shares of one MM while the
+/// shell supplies a copy-on-write grant. The supply is "not now" for the
+/// shares' drain, changes nothing, and is admitted only after the last share
+/// is released (G5); the shares leave in either order and the editor ends
+/// free with the grant supplied exactly once.
+#[test]
+fn a_cow_supply_waits_for_the_last_commit_share() {
+    loom::model(|| {
+        let mm = MmKey::new(NonZeroU64::MIN);
+        let mut core = GrantCore::new(carrier());
+        assert!(core.guest_commit(mm, true));
+        assert!(core.guest_commit(mm, true));
+        let shell = Arc::new(GrantShell {
+            core: Mutex::new(core),
+        });
+        let members: Vec<_> = (0..2)
+            .map(|_| {
+                let shell = Arc::clone(&shell);
+                thread::spawn(move || shell.with(|core| assert!(core.guest_commit(mm, false))))
+            })
+            .collect();
+        let supplier = {
+            let shell = Arc::clone(&shell);
+            thread::spawn(move || {
+                let excluded = ExcludedMm::claimed(mm);
+                loop {
+                    let supplied = shell.with(|core| {
+                        let shares = core.editor(mm);
+                        let answer = core.supply_cow(&excluded, 0x1000);
+                        if answer.is_ok() {
+                            // G5: admitted only once no share holds the MM.
+                            assert_eq!(shares, Some(MmEditor::Free));
+                        }
+                        answer
+                    });
+                    match supplied {
+                        Ok(CowSupply::Carved(_)) => panic!("the MM has no chunk yet"),
+                        Ok(CowSupply::NeedsChunk(demand)) => {
+                            let chunk = extent(0x200_000, demand.chunk_len());
+                            let ticket =
+                                shell.with(|core| core.admit_chunk(demand, chunk).unwrap());
+                            shell.with(|core| {
+                                core.finish_supply_cow(ticket, Supplied::Published(7))
+                                    .unwrap()
+                            });
+                            return;
+                        }
+                        // A real shell enrols on the last share's release
+                        // and probes once; the model yields to the members.
+                        Err(MmRefusal::NotNow(NotNow::CommitsDrain(key))) => {
+                            assert_eq!(key, mm);
+                            thread::yield_now();
+                        }
+                        Err(other) => panic!("supply refused: {other:?}"),
+                    }
+                }
+            })
+        };
+        for member in members {
+            member.join().unwrap();
+        }
+        supplier.join().unwrap();
+        let mut core = Arc::try_unwrap(shell)
+            .ok()
+            .unwrap()
+            .core
+            .into_inner()
+            .unwrap();
+        assert_eq!(core.editor(mm), Some(MmEditor::Free));
+        assert_eq!(core.grant_count(), 1);
+        assert_eq!(core.retire_all_mms().unwrap(), [7]);
+        assert!(core.teardown().is_ok());
+    });
+}
