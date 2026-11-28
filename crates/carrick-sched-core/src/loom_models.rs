@@ -62,6 +62,7 @@ fn make_zone() -> Arc<Box<ZoneTables>> {
         init!(slots, core::array::from_fn(|_| ZoneSlot::default()));
         init!(entries, core::array::from_fn(|_| ZoneEntry::default()));
         init!(counters, ZoneCounters::default());
+        init!(spaces, AddressSpaces::new());
         init!(timers, timer_index::Index::default());
         init!(record_map, core::array::from_fn(|_| AtomicU64::new(0)));
         init!(entry_map, core::array::from_fn(|_| AtomicU64::new(0)));

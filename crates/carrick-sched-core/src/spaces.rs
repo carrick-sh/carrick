@@ -32,12 +32,17 @@
 //! lock; EL1 reads them, records COW coverage, and claims the exact entry's
 //! single page-table editor word before mutating live descriptors.
 
+#[cfg(all(test, feature = "loom"))]
+mod loom_models;
 pub mod notification;
 use crate::ThreadCtx;
 use notification::{NotificationSource, SpaceNotificationLease, SpaceReleaseVenue, SpaceWaitCause};
 
 use core::num::NonZeroU64;
+#[cfg(not(all(test, feature = "loom")))]
 use core::sync::atomic::{AtomicU64, Ordering};
+#[cfg(all(test, feature = "loom"))]
+use loom::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(feature = "test-support")]
 static INJECT_EDITOR_BUSY: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
@@ -69,7 +74,11 @@ pub fn release_injected_editor_busy() -> bool {
 /// Entries in the table: the address spaces the host has published at once.
 /// A full table leaves an MM unpublished, so its threads reach a vCPU
 /// through their executors, as before this step.
+#[cfg(not(all(test, feature = "loom")))]
 pub const ADDRESS_SPACES: usize = 1024;
+/// Two under loom: one space the actors contend on, and one to probe past.
+#[cfg(all(test, feature = "loom"))]
+pub const ADDRESS_SPACES: usize = 2;
 
 /// Gate bit: EL1 may not install the address space (being published, or
 /// its ASID is retiring). The low bits count the raised page-table pauses.
@@ -573,33 +582,59 @@ impl Default for AddressSpaces {
     }
 }
 
-impl AddressSpaces {
-    pub const fn new() -> Self {
-        Self {
+/// `[$value; N]` for a value that isn't `Copy`: a `const` block in the
+/// production build, and `from_fn` under loom, whose atomics have no `const`
+/// constructor.
+#[cfg(not(all(test, feature = "loom")))]
+macro_rules! repeat {
+    ($value:expr; $n:expr) => {
+        [const { $value }; $n]
+    };
+}
+#[cfg(all(test, feature = "loom"))]
+macro_rules! repeat {
+    ($value:expr; $n:expr) => {
+        core::array::from_fn::<_, { $n }, _>(|_| $value)
+    };
+}
+
+/// The one body of [`AddressSpaces::new`], for both of its builds.
+macro_rules! address_spaces {
+    () => {
+        AddressSpaces {
             idle_ttbr: AtomicU64::new(0),
-            entries: [const {
-                SpaceEntry {
-                    key: AtomicU64::new(0),
-                    ttbr0: AtomicU64::new(0),
-                    ttbr1: AtomicU64::new(0),
-                    gate: AtomicU64::new(0),
-                    cow_published: AtomicU64::new(0),
-                    cow_covered: AtomicU64::new(0),
-                    active_editor: AtomicU64::new(0),
-                    mmap_next: AtomicU64::new(0),
-                    brk_current: AtomicU64::new(0),
-                    journal_head: AtomicU64::new(0),
-                    journal_tail: AtomicU64::new(0),
-                    notifications: NotificationSource::new(),
-                    journal: [const {
-                        JournalSlot {
-                            start: AtomicU64::new(0),
-                            end_prot: AtomicU64::new(0),
-                        }
-                    }; VMA_JOURNAL_ENTRIES],
-                }
+            entries: repeat![SpaceEntry {
+                key: AtomicU64::new(0),
+                ttbr0: AtomicU64::new(0),
+                ttbr1: AtomicU64::new(0),
+                gate: AtomicU64::new(0),
+                cow_published: AtomicU64::new(0),
+                cow_covered: AtomicU64::new(0),
+                active_editor: AtomicU64::new(0),
+                mmap_next: AtomicU64::new(0),
+                brk_current: AtomicU64::new(0),
+                journal_head: AtomicU64::new(0),
+                journal_tail: AtomicU64::new(0),
+                notifications: NotificationSource::new(),
+                journal: repeat![JournalSlot {
+                    start: AtomicU64::new(0),
+                    end_prot: AtomicU64::new(0),
+                }; VMA_JOURNAL_ENTRIES],
             }; ADDRESS_SPACES],
         }
+    };
+}
+
+impl AddressSpaces {
+    #[cfg(not(all(test, feature = "loom")))]
+    pub const fn new() -> Self {
+        address_spaces!()
+    }
+
+    /// Under loom (its atomics are built at run time, inside the model).
+    #[cfg(all(test, feature = "loom"))]
+    pub fn new() -> Self {
+        address_spaces!()
     }
 
     fn entry(&self, index: SpaceIndex) -> &SpaceEntry {
