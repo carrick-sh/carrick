@@ -31,7 +31,7 @@
 //! `/proc/<pid>/maps` of a delegated MM is the root's anonymous projection
 //! merged once with the host rows, which never describe root-owned memory.
 
-use super::el1_reservations::{DelegatedRoot, ForkSeed};
+use super::el1_reservations::{DelegatedRoot, ForkSeed, MetadataProvision};
 use super::*;
 use carrick_el1::memory::reservations::{Decision, Mapping, Placement, Refusal, Reservations};
 use carrick_el1_abi::{
@@ -182,6 +182,20 @@ pub(in crate::dispatch) enum HostMetadataNeed {
     Mapping,
     Retire(ReservationRange),
     Break(GuestVa),
+}
+
+/// What a host mapping syscall may do once it asked for its metadata
+/// ([`SyscallDispatcher::secure_host_venue_metadata`]).
+#[derive(::core::clone::Clone, ::core::marker::Copy, ::core::fmt::Debug, PartialEq, Eq)]
+pub(in crate::dispatch) enum HostVenueMetadata {
+    /// The root holds the nodes this syscall's host commits may consume.
+    Secured,
+    /// The syscall's answer, given before anything changed (ENOMEM).
+    Refused(LinuxErrno),
+    /// Another supplier holds the carrier's bank append window: the syscall
+    /// commits nothing and parks on this observed Metadata cause, which the
+    /// holder's close wakes, then reruns (#3085).
+    NotNow(carrick_el1_abi::PortalOwnerWait),
 }
 
 impl HostMetadataNeed {
@@ -1828,9 +1842,9 @@ impl MemView<'_> {
     pub(in crate::dispatch) fn secure_host_venue_metadata(
         &self,
         need: HostMetadataNeed,
-    ) -> Result<Option<LinuxErrno>, DispatchError> {
+    ) -> Result<HostVenueMetadata, DispatchError> {
         let Some(root) = self.mem().lock().delegated_root().cloned() else {
-            return Ok(None);
+            return Ok(HostVenueMetadata::Secured);
         };
         let secure = || {
             root.with_root(|model| {
@@ -1847,12 +1861,17 @@ impl MemView<'_> {
                 // The failed proposal held no committed edit. No MemState
                 // or root lock is retained across carrier allocation.
                 match root.provision_metadata() {
-                    Ok(()) => {}
+                    Ok(MetadataProvision::Grown) => {}
+                    // A guest fork (or any other supplier) holds the bank
+                    // window: not now, never a dispatch failure.
+                    Ok(MetadataProvision::NotNow(wait)) => {
+                        return Ok(HostVenueMetadata::NotNow(wait));
+                    }
                     // A real capacity request has now failed. Linux also
                     // answers ENOMEM when mapping metadata cannot be
                     // allocated; this MM remains admitted and unchanged.
                     Err(RootAccessRefusal::Refused(Refusal::Limit | Refusal::MetadataRequired)) => {
-                        return Ok(Some(LINUX_ENOMEM));
+                        return Ok(HostVenueMetadata::Refused(LINUX_ENOMEM));
                     }
                     Err(refusal) => return Err(root_refusal(refusal)),
                 }
@@ -1861,8 +1880,10 @@ impl MemView<'_> {
             result => result,
         };
         match secured {
-            Ok(()) => Ok(None),
-            Err(RootAccessRefusal::Refused(Refusal::MetadataRequired)) => Ok(Some(LINUX_ENOMEM)),
+            Ok(()) => Ok(HostVenueMetadata::Secured),
+            Err(RootAccessRefusal::Refused(Refusal::MetadataRequired)) => {
+                Ok(HostVenueMetadata::Refused(LINUX_ENOMEM))
+            }
             Err(refusal) => Err(root_refusal(refusal)),
         }
     }
