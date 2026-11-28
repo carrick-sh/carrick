@@ -24,13 +24,14 @@
 //          Linux (native oracle), since a timed wait is not restarted
 //          after a handler runs. The waiter stays alive until the sender
 //          has stopped, so no signal can target an exited thread
-//   pool   16 timed waits on one word, all served by the main thread's
-//          release while it keeps running: each answers 0 (woken) or EAGAIN
-//          (it entered after the release), never ETIMEDOUT or ENOSYS, and
-//          only once the word has been released. The waits answering 0 are
-//          exactly the ones the release's single FUTEX_WAKE counted
-//          ("wakes" otherwise). Ordered on events only (the waiters' arm
-//          count, then the done count); no timing decides the verdict
+//   pool   16 timed waits on one unchanging word, released by the main
+//          thread while it keeps running: the sum of the counts its
+//          FUTEX_WAKE calls returned, 16, with every wait answering 0. The
+//          word never changes, so EAGAIN, ETIMEDOUT, ENOSYS or a failed wake
+//          reads "wrong", and a wait that answered 0 without being counted
+//          leaves the sum short (unless a wake also over-counted). Ordered on
+//          events only (wake counts and the done count); no timing decides
+//          the verdict
 //
 // A word "early" or "late" in a field means the wait returned before its
 // deadline, or long after it. The fork child prints its own line; the run
@@ -223,28 +224,20 @@ static void interrupt(struct waiter *w, int sig) {
     finish(w);
 }
 
-// The pool word is 0 until the driver releases the waiters, then 1.
-// `pool_armed` counts the waits pool threads are about to enter,
-// `pool_served` the waits that answered 0 or EAGAIN with the word already
-// released (the word only goes from 0 to 1, so an answer that still reads 0
-// came before the release: not served by it), `pool_woken` the waits that
-// answered 0, and `pool_done` the threads that have finished.
+// The pool word is always 0: a correct wait on it parks until woken, and
+// answers 0. `pool_wrong` counts the waits that answered anything else, and
+// `pool_done` the threads that have finished.
 static volatile int pool_word;
-static volatile int pool_armed;
-static volatile int pool_served;
-static volatile int pool_woken;
+static volatile int pool_wrong;
 static volatile int pool_done;
-// One deadline for the whole pool, past the run's own bound: a wait the
-// release misses never answers in time, and the run fails on its bound.
+// One deadline for the whole pool, past the run's own bound: a waiter the
+// driver cannot wake holds the run until it fails on that bound.
 static struct kernel_timespec pool_deadline;
 
 static void pool_entry(long i) {
     (void)i;
-    __atomic_add_fetch(&pool_armed, 1, __ATOMIC_RELEASE);
-    long r = wait_bitset(&pool_word, 0, CLOCK_MONOTONIC, &pool_deadline);
-    int released = __atomic_load_n(&pool_word, __ATOMIC_ACQUIRE);
-    if ((r == 0 || r == -11) && released) __atomic_add_fetch(&pool_served, 1, __ATOMIC_RELEASE);
-    if (r == 0) __atomic_add_fetch(&pool_woken, 1, __ATOMIC_RELEASE);
+    if (wait_bitset(&pool_word, 0, CLOCK_MONOTONIC, &pool_deadline) != 0)
+        __atomic_add_fetch(&pool_wrong, 1, __ATOMIC_RELEASE);
     bump(&pool_done);
 }
 
@@ -324,24 +317,28 @@ static void run(const char *who) {
     if (w.returned_ns >= w.deadline_ns) p = put(p, "late");
     if (__atomic_load_n(&hits, __ATOMIC_RELAXED) < 1) p = put(p, "unsignalled");
 
-    // The pool: 16 timed waits, all served while this thread keeps running.
-    // It runs (yields) until every waiter has armed, then releases the word
-    // and wakes them, and waits for every waiter to finish. A waiter still
-    // between arming and its wait answers EAGAIN; a parked one is woken (0).
+    // The pool: wake until every waiter has finished, counting the waiters
+    // each FUTEX_WAKE woke. Each waiter waits once, so a correct kernel
+    // counts exactly 16, whichever order they park in.
     pool_word = 0;
-    pool_armed = 0;
-    pool_served = 0;
-    pool_woken = 0;
+    pool_wrong = 0;
     pool_done = 0;
     pool_deadline = at(now_ns(CLOCK_MONOTONIC) + 60000 * MS);
     for (long i = 0; i < POOL; i++) spawn(pool_entry, i);
-    while (__atomic_load_n(&pool_armed, __ATOMIC_ACQUIRE) < POOL) sc(24, 0, 0, 0, 0, 0, 0);
-    __atomic_store_n(&pool_word, 1, __ATOMIC_RELEASE);
-    long released = sc(202, (long)&pool_word, FUTEX_WAKE_PRIVATE, 0x7fffffff, 0, 0, 0);
+    long woken = 0;
+    while (__atomic_load_n(&pool_done, __ATOMIC_ACQUIRE) < POOL) {
+        long n = sc(202, (long)&pool_word, FUTEX_WAKE_PRIVATE, 0x7fffffff, 0, 0, 0);
+        if (n < 0) {
+            __atomic_add_fetch(&pool_wrong, 1, __ATOMIC_RELEASE);
+            break;
+        }
+        woken += n;
+        if (n == 0) sc(24, 0, 0, 0, 0, 0, 0);
+    }
     wait_eq(&pool_done, POOL);
     p = put(p, " pool=");
-    p = put_long(p, __atomic_load_n(&pool_served, __ATOMIC_ACQUIRE));
-    if (released != __atomic_load_n(&pool_woken, __ATOMIC_ACQUIRE)) p = put(p, "wakes");
+    p = put_long(p, woken);
+    if (__atomic_load_n(&pool_wrong, __ATOMIC_ACQUIRE)) p = put(p, "wrong");
     p = put(p, "\n");
     sc(1, 1, (long)line, p - line, 0, 0, 0);
 }

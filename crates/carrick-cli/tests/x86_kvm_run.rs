@@ -2159,9 +2159,9 @@ fn mounted_static_x86_thread_handlers_run_on_untouched_alternate_stacks() {
 /// in a fork child and then in the run root: ETIMEDOUT on both clocks (never
 /// early), a past deadline, EAGAIN, EINVAL, EFAULT, the timespec read before
 /// an empty bitset or a misaligned word (EFAULT first, then EINVAL), a
-/// counted wake, EINTR with and without SA_RESTART, and 16 timed waits all
-/// served by one release (woken by its single wake, or EAGAIN after it)
-/// while the main thread keeps running. On main the ring declined every timed bitset wait, which a fork
+/// counted wake, EINTR with and without SA_RESTART, and 16 timed waits on
+/// an unchanging word that all answer 0 while the main thread keeps running
+/// and its FUTEX_WAKE counts sum to 16. On main the ring declined every timed bitset wait, which a fork
 /// child answers ENOSYS.
 #[test]
 fn mounted_static_x86_timed_futex_bitset_matches_native_in_root_and_fork_child() {
