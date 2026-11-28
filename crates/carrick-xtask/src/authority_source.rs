@@ -1610,8 +1610,15 @@ impl SourceCensus {
                 })
             })
     }
+    /// Test code, non-product files and build programs are outside product
+    /// authority. A build program (`build.rs` and the modules it declares)
+    /// runs only at compile time, and the census refuses any source shared
+    /// between it and production, so its host calls never reach a product
+    /// binary (#3172).
     pub fn is_outside_production_at(&self, file: &str, line: usize, column: usize) -> bool {
-        self.non_product_files.contains(file) || self.is_test_at(file, line, column)
+        self.non_product_files.contains(file)
+            || self.is_build_file(file)
+            || self.is_test_at(file, line, column)
     }
     /// Source-bound verdict; consumers must validate both the complete file set
     /// and the hashes before applying any exclusion. Policy identity is built
@@ -2576,11 +2583,7 @@ impl Scanner<'_> {
             .push((span.start(), span.end()));
     }
     fn lane(&self) -> Lane {
-        if self.census.is_build_file(&self.file) {
-            Lane::BuildTime
-        } else {
-            Lane::module(&self.krate, &self.modules)
-        }
+        Lane::module(&self.krate, &self.modules)
     }
     fn prefix(&self) -> String {
         std::iter::once(self.krate.as_str())

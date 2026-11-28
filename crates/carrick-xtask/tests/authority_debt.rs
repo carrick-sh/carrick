@@ -134,7 +134,7 @@ fn a_cross_crate_owner_move_lands_in_the_destination_crate_lane() {
             .contains("exceeds what the source gave up"),
         "a cross-crate move still cannot grow"
     );
-    for profile in [Lane::MacosHvfDefault, Lane::LinuxCli, Lane::BuildTime] {
+    for profile in [Lane::MacosHvfDefault, Lane::LinuxCli] {
         assert_eq!(profile.moved_to(TO), profile, "a build's lane stays");
     }
     assert_eq!(Lane::Shared.moved_to("carrick_vmm_kvm::run"), Lane::Kvm);
@@ -3352,6 +3352,23 @@ fn build_program_authority_is_outside_product_authority() {
         "expansion":null,"operation":"std::fs::read","profiles":["linux-cli"]
     }]});
     assert!(verify_host(&production, &empty, &census).is_err());
+}
+
+/// #3172: a base from before the change still holds `build_time` cohorts;
+/// they leave the ratchet instead of reading as removed debt.
+#[test]
+fn base_build_time_cohorts_leave_the_ratchet() {
+    use carrick_xtask::authority_debt::base_ceilings;
+    let base = base_ceilings(
+        r#"{"schema":1,"counters":[
+            {"family":"build_time","operation":"std::fs::read","owner":"carrick_vmm_kvm::build_program::main","lane":"linux_cli","ceiling":1},
+            {"family":"k1_epoll_wait","operation":"read_open_files","owner":"carrick_kernel::poll","lane":"shared","ceiling":3}
+        ]}"#,
+    )
+    .unwrap();
+    assert_eq!(base.counters.len(), 1);
+    ceilings(3).ratchet(&base, &MoveMap::default()).unwrap();
+    assert!(ceilings(4).ratchet(&base, &MoveMap::default()).is_err());
 }
 
 #[test]
