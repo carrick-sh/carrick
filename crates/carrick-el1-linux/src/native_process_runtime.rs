@@ -591,7 +591,8 @@ impl NativeFailure {
         match self {
             Self::Invalid | Self::Stale => -22,
             Self::Exhausted => -11,
-            Self::Fault => -14,
+            // DIAGNOSTICS ONLY (#2890, never lands): a generic native fault.
+            Self::Fault => -240,
             Self::Unsupported | Self::GroupExitCustody => -38,
             Self::Quarantined | Self::ServiceQuarantined(_) => -5,
             Self::NoChild => -10,
