@@ -5130,6 +5130,7 @@ fn interrupt_parked_futex_wakes_single_entry_user_return_with_eintr() {
         (-4i64) as u64,
         &ShortLockSpin,
         &mut effects,
+        &OwedPasses::new(),
     ));
     assert!(zone.interrupt_parked_futex(
         reference,
@@ -5137,6 +5138,7 @@ fn interrupt_parked_futex_wakes_single_entry_user_return_with_eintr() {
         (-4i64) as u64,
         &ShortLockSpin,
         &mut effects,
+        &OwedPasses::new(),
     ));
     assert_eq!(zone.record(record).entry_count(), 0);
     assert_eq!(
@@ -5178,6 +5180,7 @@ fn interrupt_parked_futex_preserves_a_resumed_waiters_new_timer() {
         (-4i64) as u64,
         &ShortLockSpin,
         &mut WakeEffects::default(),
+        &OwedPasses::new(),
     ));
     if !reparked.load(Ordering::Acquire) {
         let selected = zone.switch_in_full(SLOT, &OwedPasses::new()).unwrap();
@@ -5250,6 +5253,7 @@ fn interrupt_parked_futex_rechecks_claim_after_futex_enrollment() {
             (-4i64) as u64,
             &wait,
             &mut WakeEffects::default(),
+            &OwedPasses::new(),
         );
         // On the bad implementation, OnCpu is read before the bucket lock.
         if !wait.notified.swap(true, Ordering::AcqRel) {

@@ -892,8 +892,11 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                 ) => return Ok(()),
                 Err(_) => return Err(NativeFailure::Quarantined),
             };
-            let owned = queue.wake_owner_operation(record, &operation, slot, Handback::Signal);
+            let passes = carrick_sched_core::OwedPasses::new();
+            let owned =
+                queue.wake_owner_operation(record, &operation, slot, Handback::Signal, &passes);
             drop(queue);
+            service.send_owed_passes(passes);
             if let Some(owned) = owned {
                 // The interrupted waiter of an in-zone object is the ring's
                 // own: publish its exact detached transfer here and place it,
@@ -1009,8 +1012,16 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                     OperationToken::new(u64::from(record.id.raw()), request.identity.sequence.get())
                 }
                 .ok_or(NativeFailure::Stale)?;
-                let owned = queue.wake_owner_operation(record, &operation, slot, Handback::Resumed);
+                let passes = carrick_sched_core::OwedPasses::new();
+                let owned = queue.wake_owner_operation(
+                    record,
+                    &operation,
+                    slot,
+                    Handback::Resumed,
+                    &passes,
+                );
                 drop(queue);
+                service.send_owed_passes(passes);
                 if let Some(owned) = owned {
                     let (_, wake) = owned.into_parts();
                     effects = wake;
@@ -1060,9 +1071,16 @@ impl<'a, M: Clone, C: ProcessContext> NativeProcessRuntime<'a, M, C> {
                         )
                     }
                     .ok_or(NativeFailure::Stale)?;
-                    let owned =
-                        queue.wake_owner_operation(record, &operation, slot, Handback::Resumed);
+                    let passes = carrick_sched_core::OwedPasses::new();
+                    let owned = queue.wake_owner_operation(
+                        record,
+                        &operation,
+                        slot,
+                        Handback::Resumed,
+                        &passes,
+                    );
                     drop(queue);
+                    service.send_owed_passes(passes);
                     if let Some(owned) = owned {
                         let (_, wake) = owned.into_parts();
                         effects = wake;

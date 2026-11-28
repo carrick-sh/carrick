@@ -5923,7 +5923,8 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             .cancel_service(record, self.source.slot, self.service)?;
         if !self.runtime.graph.lock().has_member_wait(&record) {
             let mut effects = WakeEffects::default();
-            if self.source.zone.interrupt_parked_futex(
+            let passes = carrick_sched_core::OwedPasses::new();
+            let claimed = self.source.zone.interrupt_parked_futex(
                 record,
                 self.source.slot,
                 carrick_syscall_abi::LINUX_EINTR.guest_retval() as u64,
@@ -5933,7 +5934,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     probe: self.publication_wait_probe,
                 },
                 &mut effects,
-            ) {
+                &passes,
+            );
+            // A lost claim still owes the passes its queue-lock release did.
+            self.service.send_owed_passes(passes);
+            if claimed {
                 self.service.wake_effects(effects);
                 return Ok(());
             }

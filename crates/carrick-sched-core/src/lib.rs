@@ -4057,6 +4057,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
     /// queue. The caller holds the record's bucket lock. `unlink_wait`
     /// removes the old wait entry after winning ownership and before the
     /// target's queue lock is released; no consumer may run it earlier.
+    /// The caller applies `effects` on every outcome, a lost claim (false)
+    /// included: the claim's release of the target's queue lock can owe idle
+    /// scans a pass either way, and it is folded into `effects`. A caller
+    /// that drops `effects` on a lost claim uses [`Self::claim_for_el1_owing`]
+    /// with its own [`OwedPasses`] instead.
     fn claim_for_el1(
         &self,
         record: RecordId,
@@ -4268,6 +4273,11 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
 
     /// Interrupt an exact single-entry futex park (`UserReturn`) with `result`
     /// (`-EINTR`) and queue the record on an eligible guest slot.
+    ///
+    /// The claim takes the target slot's queue lock, and releasing it can owe
+    /// idle scans enrolled on that lock a pass (#3083) whether or not the
+    /// claim wins: those go into `passes`, which the caller delivers on every
+    /// outcome, never into `effects`, which a lost claim's caller drops.
     pub fn interrupt_parked_futex(
         &self,
         record: RecordRef,
@@ -4275,6 +4285,7 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
         result: u64,
         wait: &impl ShortLockWait,
         effects: &mut WakeEffects,
+        passes: &OwedPasses,
     ) -> bool {
         loop {
             let Some(rec) = self.live(record) else {
@@ -4312,12 +4323,19 @@ impl<C: Copy + Send + Sync + zerocopy::FromZeros> ZoneTables<C> {
             {
                 return false;
             }
-            let claimed = self.claim_for_el1(record.id, seq, result, waker, effects, || {
-                self.unlink(&guard, entry_id);
-                self.drop_entry(rec, entry_id);
-                // A published consumer may immediately re-park with a new timer.
-                self.timers.cancel_record(record.id);
-            });
+            let claimed = self.claim_for_el1_owing(
+                (record.id, seq, result),
+                waker,
+                effects,
+                || {
+                    self.unlink(&guard, entry_id);
+                    self.drop_entry(rec, entry_id);
+                    // A published consumer may immediately re-park with a new timer.
+                    self.timers.cancel_record(record.id);
+                },
+                false,
+                passes,
+            );
             drop(guard);
             if claimed
                 && let Some(counter) = self.counters.host_claims.get(Handback::Signal as usize)

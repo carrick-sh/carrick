@@ -1741,12 +1741,18 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'a, C> {
     /// End exactly one owned park under its queue authority. Readiness keeps
     /// the existing guest placement; interruption retains an owned handback
     /// for publication after unlock through the carrier completion boundary.
+    ///
+    /// A readiness claim takes the target slot's queue lock, and releasing it
+    /// can owe idle scans a pass (#3083) even when the claim is lost and this
+    /// returns `None`: those go into `passes`, which the caller delivers on
+    /// every outcome.
     pub fn wake_owner_operation(
         &self,
         record: RecordRef,
         operation: &OperationToken,
         waker: SlotId,
         kind: Handback,
+        passes: &OwedPasses,
     ) -> Option<OwnedObjectWakeEffects<'a, C>> {
         let rec = self.zone.live(record)?;
         if rec.object.queue.load(Ordering::Acquire) != self.key.index
@@ -1762,12 +1768,14 @@ impl<'a, C: Copy + Send + Sync + zerocopy::FromZeros> ObjectWaitGuard<'a, C> {
         let mut effects = WakeEffects::default();
         let handed = match kind {
             Handback::Resumed => {
-                if !self
-                    .zone
-                    .claim_for_el1(record.id, seq, 0, waker, &mut effects, || {
-                        self.unlink(record.id)
-                    })
-                {
+                if !self.zone.claim_for_el1_owing(
+                    (record.id, seq, 0),
+                    waker,
+                    &mut effects,
+                    || self.unlink(record.id),
+                    false,
+                    passes,
+                ) {
                     return None;
                 }
                 0
