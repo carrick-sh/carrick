@@ -727,11 +727,17 @@ fn decide_mremap<G: ReservationGeometry, C: Copy + Send + Sync + zerocopy::FromZ
             // mremap(2) EFAULT: `old_address` is unmapped, or a growing old
             // range is not one mapping (a shrink spans any mappings and
             // holes, #3171). Only the allocation layout is this root's to
-            // answer for; a source outside it is not proven unmapped.
+            // answer for; a source outside it is not proven unmapped. A
+            // shrink is decided by its `old_address` page alone.
             Refusal::Hole => {
                 let layout = model.layout();
+                let decided = if request.new_size <= request.old_size {
+                    source.start() + PAGE_SIZE
+                } else {
+                    source.end()
+                };
                 let within =
-                    |r: ReservationRange| r.start() <= source.start() && source.end() <= r.end();
+                    |r: ReservationRange| r.start() <= source.start() && decided <= r.end();
                 if within(layout.heap) || within(layout.arena) {
                     MremapLeave::Return(-EFAULT)
                 } else {
@@ -741,6 +747,8 @@ fn decide_mremap<G: ReservationGeometry, C: Copy + Send + Sync + zerocopy::FromZ
             // Growth over a limit, or nothing in place and no room.
             Refusal::Limit => MremapLeave::Return(-ENOMEM),
             Refusal::Invalid => MremapLeave::Return(-EINVAL),
+            // A host-owned node in the way, or in a shrink's tail (as for
+            // munmap, #3171): a counted refusal on a ring-only MM.
             Refusal::ForeignMapping | Refusal::Collision => MremapLeave::Forward,
             error @ (Refusal::Busy
             | Refusal::PreparedConflict

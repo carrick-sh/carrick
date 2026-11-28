@@ -2840,6 +2840,53 @@ fn delegated_mremap_shrink_spans_mappings_and_holes_as_linux() {
         assert_eq!(root.node(a + page * PAGE), None, "page {page} retired");
     }
     assert_eq!(memory.read_bytes(a, 4).unwrap(), b"root");
+
+    // A host-owned (shared) file mapping in the tail is retired with it,
+    // as munmap retires it, and the root keeps its anonymous head.
+    install_host_file_fd(&dispatcher, FILE_FD, &[0x5a; PAGE as usize]);
+    let b = anon_mmap(&mut dispatcher, &mut memory, 0, 3 * PAGE);
+    let unmap = call(
+        &mut dispatcher,
+        &mut memory,
+        SYS_MUNMAP,
+        [b + 2 * PAGE, PAGE, 0, 0, 0, 0],
+    );
+    assert_eq!(returned(unmap), 0);
+    let file = returned(host_mmap(
+        &mut dispatcher,
+        &mut memory,
+        b + 2 * PAGE,
+        PAGE,
+        LINUX_PROT_READ,
+        LINUX_MAP_SHARED | LINUX_MAP_FIXED,
+        FILE_FD,
+    )) as u64;
+    assert_eq!(file, b + 2 * PAGE);
+    assert!(proc_row_at(&dispatcher, file).is_some());
+    assert!(
+        root.node(file).is_none_or(|node| !node.2),
+        "the shared file row is not the root's anonymous memory"
+    );
+    assert_eq!(
+        returned(mremap(
+            &mut dispatcher,
+            &mut memory,
+            [b, 3 * PAGE, PAGE, 0, 0]
+        )) as u64,
+        b
+    );
+    // (The head may coalesce with the first shape's surviving row.)
+    assert_eq!(
+        root.node(b).map(|node| (node.1, node.2)),
+        Some((b + PAGE, true))
+    );
+    assert_eq!(root.node(b + PAGE), None);
+    assert_eq!(root.node(file), None);
+    assert!(
+        proc_row_at(&dispatcher, file).is_none(),
+        "the file mapping is retired"
+    );
+    assert!(host_owns_no_anonymous_row(&dispatcher, b, b + 3 * PAGE));
 }
 
 #[test]
