@@ -6538,6 +6538,15 @@ fn a_lock_release_owing_a_scan_pass_cannot_be_dropped_undelivered() {
     drop(passes);
 }
 
+/// A durable wake a [`ScriptedIdle`] publishes once its slot is IdleWfi,
+/// between the publication and the final recheck.
+#[derive(Clone, Copy)]
+enum LateWake {
+    Resched,
+    HostWork,
+    OwedKick,
+}
+
 /// A scripted [`IdleVenue`] that records each step of an [`idle_pass`] and
 /// the slot's state when it halts.
 struct ScriptedIdle<'z> {
@@ -6550,6 +6559,12 @@ struct ScriptedIdle<'z> {
     host_work: bool,
     kicks_sent: bool,
     halted_in: Option<SlotState>,
+    /// Queued on the slot by the drain: work whose vector the drain takes.
+    queue_at_drain: Option<RecordId>,
+    /// Published at the `IdlePublished` stop, with the slot IdleWfi.
+    late_wake: Option<LateWake>,
+    /// The slot's state when the final recheck read the host-work word.
+    host_work_read_in: core::cell::Cell<Option<SlotState>>,
 }
 
 impl<'z> ScriptedIdle<'z> {
@@ -6564,6 +6579,9 @@ impl<'z> ScriptedIdle<'z> {
             host_work: false,
             kicks_sent: true,
             halted_in: None,
+            queue_at_drain: None,
+            late_wake: None,
+            host_work_read_in: core::cell::Cell::new(None),
         }
     }
 }
@@ -6571,6 +6589,13 @@ impl<'z> ScriptedIdle<'z> {
 impl IdleVenue for ScriptedIdle<'_> {
     fn drain(&mut self) {
         self.log.push("drain");
+        if let Some(record) = self.queue_at_drain.take() {
+            assert!(
+                self.zone
+                    .requeue_preempted(self.slot, record, &OwedPasses::new())
+                    .is_queued()
+            );
+        }
     }
     fn leaves_for_host(&mut self) -> bool {
         self.log.push("leaves_for_host");
@@ -6600,8 +6625,11 @@ impl IdleVenue for ScriptedIdle<'_> {
         false
     }
     fn host_work_pending(&self) -> bool {
+        self.host_work_read_in
+            .set(Some(self.zone.slot(self.slot).state()));
         self.host_work
     }
+
     fn owed_kicks_sent(&mut self) -> bool {
         self.log.push("owed_kicks_sent");
         self.kicks_sent
@@ -6618,6 +6646,20 @@ impl IdleVenue for ScriptedIdle<'_> {
         self.log.push("end_pass");
     }
     fn stop(&mut self, point: IdleStop) {
+        if point == IdleStop::IdlePublished
+            && let Some(wake) = self.late_wake.take()
+        {
+            assert_eq!(self.zone.slot(self.slot).state(), SlotState::IdleWfi);
+            match wake {
+                LateWake::Resched => self
+                    .zone
+                    .slot(self.slot)
+                    .resched_owed
+                    .store(1, Ordering::Release),
+                LateWake::HostWork => self.host_work = true,
+                LateWake::OwedKick => self.kicks_sent = false,
+            }
+        }
         self.log.push(match point {
             IdleStop::AfterDrain => "stop:after_drain",
             IdleStop::BeforeScan => "stop:before_scan",
@@ -6665,25 +6707,52 @@ fn an_idle_pass_drains_first_and_halts_only_past_its_final_recheck() {
 /// keeps the CPU awake for another pass.
 #[test]
 fn an_idle_pass_never_halts_owing_a_durable_wake() {
+    // Each wake is published after the slot is IdleWfi (the venue asserts
+    // it), with no vector: only the final recheck, read after the
+    // publication, can see it. A read cached before the publication misses
+    // it and halts.
     let zone = zone();
     enter(&zone, SLOT, 0);
-    zone.slot(SLOT).resched_owed.store(1, Ordering::Release);
     let mut venue = ScriptedIdle::new(&zone, SLOT);
+    venue.late_wake = Some(LateWake::Resched);
     assert_eq!(idle_pass(&zone, SLOT, &mut venue), IdlePass::Again);
     assert!(!venue.log.contains(&"halt"), "{:?}", venue.log);
     assert!(venue.log.contains(&"rejoin"));
     assert!(!zone.take_resched(SLOT), "the recheck consumed it");
 
     let mut venue = ScriptedIdle::new(&zone, SLOT);
-    venue.host_work = true;
+    venue.late_wake = Some(LateWake::HostWork);
     assert_eq!(idle_pass(&zone, SLOT, &mut venue), IdlePass::Again);
     assert!(!venue.log.contains(&"halt"), "{:?}", venue.log);
+    assert_eq!(
+        venue.host_work_read_in.get(),
+        Some(SlotState::IdleWfi),
+        "the host-work word is read after the publication"
+    );
 
     let mut venue = ScriptedIdle::new(&zone, SLOT);
-    venue.kicks_sent = false;
+    venue.late_wake = Some(LateWake::OwedKick);
     assert_eq!(idle_pass(&zone, SLOT, &mut venue), IdlePass::Again);
     assert!(!venue.log.contains(&"halt"), "{:?}", venue.log);
     assert!(venue.log.contains(&"owed_kicks_sent"));
+}
+
+/// Work queued while the vectors are drained (its vector is the one the
+/// drain takes) is taken by the same pass: every condition is read after
+/// the drain. A scan moved before the drain would miss it and sleep with
+/// its vector consumed.
+#[test]
+fn an_idle_pass_takes_work_queued_as_it_drains() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    let record = zone.alloc_record(identity(61)).unwrap();
+    let mut venue = ScriptedIdle::new(&zone, SLOT);
+    venue.queue_at_drain = Some(record);
+    match idle_pass(&zone, SLOT, &mut venue) {
+        IdlePass::Took(taken) => assert_eq!(taken.record, record),
+        other => panic!("the pass missed work queued at its drain: {other:?}"),
+    }
+    assert!(!venue.log.contains(&"halt"), "{:?}", venue.log);
 }
 
 /// A queued thread is taken before any sleep, and the slot stops idling;

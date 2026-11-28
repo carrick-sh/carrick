@@ -2,8 +2,9 @@
 //!
 //! An idle CPU repeats [`idle_pass`] until it takes a record or leaves for
 //! its host. The order is the lost-wakeup argument, so it lives here once,
-//! for ARM's `Sched::idle` and the x86 CPL0 `schedule` alike (#3075 found
-//! the x86 copy missing ARM's drain-first and pre-sleep recheck):
+//! for ARM's `Sched::idle` and the x86 CPL0 `schedule` alike. The two used
+//! to be copies, and #3075 had to add ARM's drain-first and pre-sleep
+//! recheck to the x86 one; one pass keeps them from drifting again:
 //!
 //! 1. **Drain** the vectors latched while interrupts were masked. A
 //!    reschedule vector carries no state: its sender publishes a condition,
