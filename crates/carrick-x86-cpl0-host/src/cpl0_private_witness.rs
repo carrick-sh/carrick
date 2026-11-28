@@ -133,7 +133,10 @@ impl PrivateAnonymousWitness {
                             .map_err(|_| fail("private witness frame unavailable"))?
                             != backing
                     {
-                        return Err(fail("private witness terminal/backing mismatch"));
+                        return Err(fail(&format!(
+                            "private witness terminal/backing mismatch: va={va:#x} entry={entry:#x} size={size:#x} pa={pa:#x} span={:#x}+{:#x}",
+                            span.va, span.len
+                        )));
                     }
                     leaves.push((va, pa, backing.frame_id.get()));
                 }

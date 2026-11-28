@@ -1875,9 +1875,12 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
             self.quarantined = true;
             return Err(error("guest MMU publication transaction identity mismatch"));
         }
-        if !self.guest_postcondition(txn, custody) {
+        if let Err((va, entry)) = self.guest_postcondition(txn, custody) {
             self.quarantined = true;
-            return Err(error("guest MMU publication live descriptor mismatch"));
+            return Err(error(format!(
+                "guest MMU publication live descriptor mismatch: va={va:#x} entry={entry:#x} op={:?} custody={custody:?}",
+                txn.op
+            )));
         }
         let target = match self.authenticate(txn.id.mm_key, txn.op) {
             Ok(index) => index,
@@ -1930,10 +1933,14 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
 
     /// Read the terminal graph after the guest edit. Only bounded terminal
     /// leaves in the edited span are visited; unrelated branches cost nothing.
-    fn guest_postcondition(&self, txn: &DescriptorTxn<'_>, custody: SettlementCustody) -> bool {
+    fn guest_postcondition(
+        &self,
+        txn: &DescriptorTxn<'_>,
+        custody: SettlementCustody,
+    ) -> Result<(), (u64, u64)> {
         let span = txn.op.span();
         let Some(end) = span.end() else {
-            return false;
+            return Err((span.va, 0));
         };
         let words = self.words();
         let mut va = span.va;
@@ -1953,7 +1960,7 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
                 {
                     (0, PAGE)
                 }
-                Err(_) => return false,
+                Err(_) => return Err((va, u64::MAX)),
             };
             let physical = entry & ADDRESS;
             let expected_base = match txn.op {
@@ -1966,10 +1973,10 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
             };
             if let Some(base) = expected_base {
                 let Some(expected) = base.checked_add(va - span.va) else {
-                    return false;
+                    return Err((va, entry));
                 };
                 if physical != expected {
-                    return false;
+                    return Err((va, entry));
                 }
             }
             let valid = match txn.op {
@@ -2091,14 +2098,14 @@ impl<M: CarrierMemoryIo> CarrierMemory<M> {
                 }
             };
             if !valid {
-                return false;
+                return Err((va, entry));
             }
             let Some(next) = va.checked_add(size - (va & (size - 1))) else {
-                return false;
+                return Err((va, entry));
             };
             va = next.min(end);
         }
-        true
+        Ok(())
     }
 
     /// A hardware write needs the MAY_WRITE ceiling, and execution (NX

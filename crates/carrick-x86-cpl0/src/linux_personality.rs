@@ -1951,9 +1951,16 @@ impl Personality for LinuxPersonality {
                                 }
                                 None
                             }
-                            UserFaultSupply::Signal { .. } | UserFaultSupply::Unresolved(_) => {
-                                Some(stage.refused())
+                            UserFaultSupply::Signal { code, .. } => {
+                                Some(HostFileStage::Returned(SyscallResult::from_errno(
+                                    carrick_syscall_abi::LinuxErrno::new(0x2f0 + code),
+                                )))
                             }
+                            UserFaultSupply::Unresolved(reason) => Some(HostFileStage::Returned(
+                                SyscallResult::from_errno(carrick_syscall_abi::LinuxErrno::new(
+                                    0x300 + (reason as i32 & 0xff),
+                                )),
+                            )),
                         }
                     }
                     None => Some(stage),

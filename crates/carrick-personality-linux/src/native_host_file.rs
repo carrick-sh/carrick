@@ -1053,7 +1053,7 @@ impl HostFileStage {
     /// copied, and a write that copied a prefix returns that short count.
     pub fn refused(self) -> Self {
         match self {
-            Self::Fault { .. } => errno(carrick_syscall_abi::LINUX_EFAULT),
+            Self::Fault { .. } => errno(carrick_syscall_abi::LinuxErrno::new(231)),
             Self::PrepareOutput { .. } => Self::Crossing,
             Self::FaultAfterPrefix { prefix, output, .. } => Self::Request {
                 record: prefix,
@@ -3020,7 +3020,7 @@ impl HostFileCompletion {
     pub fn fault_answer(&self, delivered: usize) -> SyscallResult {
         match self.on_fault {
             FaultAnswer::Delivered if delivered > 0 => SyscallResult::new(delivered as i64),
-            _ => SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
+            _ => SyscallResult::from_errno(carrick_syscall_abi::LinuxErrno::new(234)),
         }
     }
 
