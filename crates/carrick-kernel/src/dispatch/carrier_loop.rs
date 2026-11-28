@@ -543,7 +543,24 @@ impl SingleCarrierHandbackWait {
     fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
     }
+
+    /// A witness's watchdog: release a parked waiter whose wake never came,
+    /// so a broken wake fails the witness instead of hanging its partition.
+    /// The caller records the miss ([`MissedWake`]) and must fail on it.
+    #[cfg(test)]
+    pub(crate) fn release_missed_wake_for_test(&self) -> MissedWake {
+        self.ready.store(true, Ordering::Release);
+        self.waiter_thread.unpark();
+        MissedWake(())
+    }
 }
+
+/// Proof that a witness's watchdog, not the production wake, released a
+/// parked waiter. Only [`SingleCarrierHandbackWait::release_missed_wake_for_test`]
+/// mints it.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MissedWake(());
 
 /// Outcome of one [`wait_for_owner_memory_release`] enrollment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
