@@ -15,7 +15,6 @@ pub const CEILINGS_PATH: &str = "scripts/migrate/authority-debt-ceilings.json";
 #[serde(rename_all = "snake_case")]
 pub enum Family {
     ContentionVariant,
-    BuildTime,
     RawLock,
     K1CreateInstall,
     K1EpollWait,
@@ -41,7 +40,6 @@ pub enum Family {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Lane {
-    BuildTime,
     Shared,
     Hvf,
     X86,
@@ -94,7 +92,7 @@ impl Lane {
     /// module for the `x86_` rule; owner paths add only impl and item names,
     /// which never take that prefix.
     pub fn moved_to(self, owner: &str) -> Self {
-        if self.is_profile() || self == Self::BuildTime {
+        if self.is_profile() {
             return self;
         }
         let mut segments = owner.split("::");
@@ -198,17 +196,7 @@ impl AuthorityDebtCeilings {
                 counter.family,
                 Family::HostSubstrate | Family::HostBacking | Family::HostForbiddenSemantic
             );
-            if counter.family == Family::BuildTime
-                && counter.lane != Lane::BuildTime
-                && !counter.lane.is_profile()
-            {
-                return fail(
-                    "build-time cohorts require the build-time boundary or a compiled profile",
-                );
-            }
-            if counter.family != Family::BuildTime
-                && (counter.lane == Lane::BuildTime || host != counter.lane.is_profile())
-            {
+            if host != counter.lane.is_profile() {
                 return fail(
                     "host cohorts require a real compiled profile; source cohorts require a source lane",
                 );
@@ -499,15 +487,14 @@ fn source_counts(
         )?;
         let operation = text(row, "category")?;
         let lane = source.lane(&owner)?;
-        let family = if source.is_build_file(file) {
-            Family::BuildTime
-        } else {
-            Family::RawLock
-        };
-        policy.assign(&[family], operation, &owner, lane)?;
-        add(&mut actual, family, operation, &owner, lane);
+        policy.assign(&[Family::RawLock], operation, &owner, lane)?;
+        add(&mut actual, Family::RawLock, operation, &owner, lane);
     }
-    for site in &source.contention_variants {
+    for site in source
+        .contention_variants
+        .iter()
+        .filter(|site| !source.is_build_file(&site.file))
+    {
         policy.assign(
             &[Family::ContentionVariant],
             &site.operation,
@@ -522,17 +509,12 @@ fn source_counts(
             site.lane,
         );
     }
-    for site in &source.k1 {
-        let family = policy.assign(
-            if source.is_build_file(&site.file) {
-                &[Family::BuildTime]
-            } else {
-                K1_FAMILIES
-            },
-            &site.operation,
-            &site.owner,
-            site.lane,
-        )?;
+    for site in source
+        .k1
+        .iter()
+        .filter(|site| !source.is_build_file(&site.file))
+    {
+        let family = policy.assign(K1_FAMILIES, &site.operation, &site.owner, site.lane)?;
         add(&mut actual, family, &site.operation, &site.owner, site.lane);
     }
     for row in rows(&globals?)? {
@@ -547,32 +529,17 @@ fn source_counts(
         let owner = finding_owner(source, row)?;
         let operation = format!("global:{}", text(row, "kind")?);
         let lane = source.lane(&owner)?;
-        let family = policy.assign(
-            if source.is_build_file(file) {
-                &[Family::BuildTime]
-            } else {
-                GLOBAL_FAMILIES
-            },
-            &operation,
-            &owner,
-            lane,
-        )?;
+        let family = policy.assign(GLOBAL_FAMILIES, &operation, &owner, lane)?;
         add(&mut actual, family, &operation, &owner, lane);
     }
     for row in rows(&aborts?)? {
+        if source.is_build_file(text(row, "file")?) {
+            continue;
+        }
         let owner = finding_owner(source, row)?;
         let operation = format!("fatal:{}", text(row, "domain")?);
         let lane = source.lane(&owner)?;
-        let family = policy.assign(
-            if source.is_build_file(text(row, "file")?) {
-                &[Family::BuildTime]
-            } else {
-                FATAL_FAMILIES
-            },
-            &operation,
-            &owner,
-            lane,
-        )?;
+        let family = policy.assign(FATAL_FAMILIES, &operation, &owner, lane)?;
         add(&mut actual, family, &operation, &owner, lane);
     }
     Ok(actual)
@@ -590,6 +557,11 @@ fn host_counts(
             &row["source"]
         };
         let file = text(point, "file")?;
+        // A build program runs at compile time, never in the product: its
+        // host calls are not product authority (#3172).
+        if source.is_build_file(file) {
+            continue;
+        }
         let line = point["line_start"]
             .as_u64()
             .ok_or_else(|| DebtError::Policy("missing compiler diagnostic line".into()))?
@@ -606,11 +578,7 @@ fn host_counts(
                     .as_str()
                     .ok_or_else(|| DebtError::Policy("unknown profile".into()))?,
             )?;
-            let family = if source.is_build_file(file) {
-                policy.assign(&[Family::BuildTime], operation, &owner, lane)?
-            } else {
-                policy.assign(HOST_FAMILIES, operation, &owner, lane)?
-            };
+            let family = policy.assign(HOST_FAMILIES, operation, &owner, lane)?;
             add(&mut actual, family, operation, &owner, lane);
         }
     }
@@ -646,6 +614,17 @@ pub(crate) fn comparison_base(
     }
     Ok(Some(base))
 }
+/// A base's ceilings. A base from before #3172 still counted build programs
+/// as a `build_time` family; they are outside product authority, so their
+/// cohorts leave the ratchet rather than reading as removed debt. Delete
+/// this filter once no open PR's base predates #3172.
+pub fn base_ceilings(text: &str) -> Result<AuthorityDebtCeilings, DebtError> {
+    let mut value: Value = serde_json::from_str(text)?;
+    if let Some(counters) = value["counters"].as_array_mut() {
+        counters.retain(|counter| counter["family"] != "build_time");
+    }
+    Ok(serde_json::from_value(value)?)
+}
 fn base_policy(
     root: &Path,
     base: &str,
@@ -657,7 +636,7 @@ fn base_policy(
     let exists = command::run_checked("git", ["ls-tree", base, "--", CEILINGS_PATH], Some(root))?;
     if !exists.stdout.trim().is_empty() {
         let output = command::run_checked("git", ["show", &path], Some(root))?;
-        let mut policy: AuthorityDebtCeilings = serde_json::from_str(&output.stdout)?;
+        let mut policy = base_ceilings(&output.stdout)?;
         if introducing_contention
             && !policy
                 .counters
