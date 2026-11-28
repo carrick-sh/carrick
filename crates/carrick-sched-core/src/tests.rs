@@ -6224,6 +6224,27 @@ fn linked_on(zone: &ZoneTables, slot: SlotId, record: RecordId) -> bool {
 /// says `Queued { slot }` must be linked on that slot's run queue whenever
 /// no scheduler step is in flight: one that is not is runnable work no vCPU
 /// will ever take (go vet hung with both slots in WFI and such a record).
+/// The owed-pass sink of a stress thread whose idle CPUs never sleep:
+/// each spins straight into its next scan, so a pass a release owes it is
+/// already served, and the sink delivers it nowhere when it drops (#3117:
+/// an idle steal on a busy victim now enrols at once instead of spinning).
+#[derive(Default)]
+struct SpinningPasses(OwedPasses);
+
+impl core::ops::Deref for SpinningPasses {
+    type Target = OwedPasses;
+
+    fn deref(&self) -> &OwedPasses {
+        &self.0
+    }
+}
+
+impl Drop for SpinningPasses {
+    fn drop(&mut self) {
+        core::mem::take(&mut self.0).deliver(|_| {});
+    }
+}
+
 #[test]
 fn two_slots_never_leave_a_queued_record_off_its_run_queue() {
     use std::sync::atomic::AtomicU64 as StdAtomicU64;
@@ -6264,34 +6285,36 @@ fn two_slots_never_leave_a_queued_record_off_its_run_queue() {
                         &|owned| {
                             let _ = owned.into_parts();
                         },
-                        &OwedPasses::new(),
+                        &SpinningPasses::default(),
                     );
                     held.retain(|record| {
-                        zone.place_from_host(*record, &OwedPasses::new()).is_none()
+                        zone.place_from_host(*record, &SpinningPasses::default())
+                            .is_none()
                     });
                     if next() % 64 == 0 {
                         // An exit: the executor holds the stopped vCPU and
                         // moves its EL0-ready queue to slots in the guest.
-                        zone.leave_guest(slot, &HostWait, &OwedPasses::new());
+                        zone.leave_guest(slot, &HostWait, &SpinningPasses::default());
                         zone.relocate(
                             slot,
                             None,
                             &mut |record, discard| {
                                 assert!(!discard);
                                 if zone
-                                    .place_from_host(record.id, &OwedPasses::new())
+                                    .place_from_host(record.id, &SpinningPasses::default())
                                     .is_none()
                                 {
                                     held.push(record.id);
                                 }
                             },
                             &mut |_| {},
-                            &OwedPasses::new(),
+                            &SpinningPasses::default(),
                         );
                         zone.enter_guest(slot);
                     }
-                    let Some(switched) = zone.take_idle_work(slot, &OwedPasses::new()) else {
-                        if zone.enter_idle(slot, true, &OwedPasses::new()) {
+                    let Some(switched) = zone.take_idle_work(slot, &SpinningPasses::default())
+                    else {
+                        if zone.enter_idle(slot, true, &SpinningPasses::default()) {
                             for _ in 0..16 {
                                 core::hint::spin_loop();
                             }
@@ -6324,7 +6347,9 @@ fn two_slots_never_leave_a_queued_record_off_its_run_queue() {
                             if let Some(ready) = woken.take_ready(&HostWait, &|owned| {
                                 let _ = owned.into_parts();
                             }) && matches!(zone.record(ready.id).claim(), Claim::Host { .. })
-                                && zone.place_from_host(ready.id, &OwedPasses::new()).is_none()
+                                && zone
+                                    .place_from_host(ready.id, &SpinningPasses::default())
+                                    .is_none()
                             {
                                 held.push(ready.id);
                             }
@@ -6334,7 +6359,7 @@ fn two_slots_never_leave_a_queued_record_off_its_run_queue() {
                     zone.migrate_queued(slot, &mut WakeEffects::default());
                     if roll % 3 == 0 && zone.runnable_head(slot).is_some() {
                         assert!(
-                            zone.requeue_preempted(slot, record, &OwedPasses::new())
+                            zone.requeue_preempted(slot, record, &SpinningPasses::default())
                                 .is_queued()
                         );
                         continue;
@@ -6350,7 +6375,7 @@ fn two_slots_never_leave_a_queued_record_off_its_run_queue() {
                     if zone.arm_timer(slot, record, seq).is_err() {
                         drop(guard);
                         assert!(
-                            zone.requeue_preempted(slot, record, &OwedPasses::new())
+                            zone.requeue_preempted(slot, record, &SpinningPasses::default())
                                 .is_queued()
                         );
                         continue;
@@ -6366,7 +6391,10 @@ fn two_slots_never_leave_a_queued_record_off_its_run_queue() {
                             zone.handback_current(slot, record),
                             CurrentHandback::HandedBack
                         );
-                        if zone.place_from_host(record, &OwedPasses::new()).is_none() {
+                        if zone
+                            .place_from_host(record, &SpinningPasses::default())
+                            .is_none()
+                        {
                             held.push(record);
                         }
                         continue;
@@ -6388,7 +6416,10 @@ fn two_slots_never_leave_a_queued_record_off_its_run_queue() {
                 rng ^= rng << 13;
                 rng ^= rng >> 7;
                 rng ^= rng << 17;
-                held.retain(|record| zone.place_from_host(*record, &OwedPasses::new()).is_none());
+                held.retain(|record| {
+                    zone.place_from_host(*record, &SpinningPasses::default())
+                        .is_none()
+                });
                 let record = records[rng as usize % records.len()];
                 if rng.is_multiple_of(4) {
                     // A host futex wake that places in the guest.
@@ -6406,13 +6437,15 @@ fn two_slots_never_leave_a_queued_record_off_its_run_queue() {
                         true,
                         &mut |transfer| handed.push(transfer),
                         &mut |_| {},
-                        &OwedPasses::new(),
+                        &SpinningPasses::default(),
                     );
                     drop(guard);
                     for transfer in handed {
                         if let Some(ready) = transfer.finish(&HostWait, &|owned| {
                             let _ = owned.into_parts();
-                        }) && zone.place_from_host(ready.id, &OwedPasses::new()).is_none()
+                        }) && zone
+                            .place_from_host(ready.id, &SpinningPasses::default())
+                            .is_none()
                         {
                             held.push(ready.id);
                         }
@@ -6428,9 +6461,11 @@ fn two_slots_never_leave_a_queued_record_off_its_run_queue() {
                         &|owned| {
                             let _ = owned.into_parts();
                         },
-                        &OwedPasses::new(),
+                        &SpinningPasses::default(),
                     ) == HostClaim::Claimed
-                        && zone.place_from_host(record, &OwedPasses::new()).is_none()
+                        && zone
+                            .place_from_host(record, &SpinningPasses::default())
+                            .is_none()
                     {
                         held.push(record);
                     }
