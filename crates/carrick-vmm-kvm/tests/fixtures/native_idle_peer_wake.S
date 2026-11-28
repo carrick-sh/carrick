@@ -68,13 +68,13 @@
  * two resends, one transition, at the syscall's own return, and one stall
  * (exit 93 or a fatal otherwise).
  *
- * -DLATE_ARM (#3136): as AFTER_IDLE_READ, but the arming completes only
- * once a peer pass begun after the arming vector went out (so its drain
- * took it) has found the arming incomplete with no wake pending, as a host
- * that deschedules this vCPU right after the send allows. That same pass
- * must stop at its ordering point: a pass that went on and slept has no
- * wake left, and the bounded child reaches its bound. Exit 92: the pass
- * that stopped is not the one that took the vector.
+ * -DLATE_ARM (#3136): as AFTER_IDLE_READ, but the peer is first parked
+ * past its final idle recheck, so the arming vector is what ends its
+ * sleep, and the arming completes only once the pass that vector woke has
+ * found the arming incomplete, as a host that deschedules this vCPU right
+ * after the send allows. That pass took the only vector: it must stop at
+ * its ordering point. One that went on and slept has no wake left, and the
+ * bounded child reaches its bound.
  *
  * -DIDLE_OWED (#3129 P0 2): every send of this CPU finds the ICR busy, and
  * the scheduler owes the other CPU a reschedule when this CPU's task parks
@@ -159,7 +159,6 @@
 #define INJECT_RESCHED_TWO_OWED_STALLED    0xfffffffffffffe64
 #define INJECT_RESCHED_OWED_AT_PARK        0xfffffffffffffe65
 #define INJECT_ORDER_PEER_AFTER_IDLE_READ_LATE_ARM 0xfffffffffffffe70
-#define INJECT_ORDER_PEER_LATE_ARM_CENSUS  0xfffffffffffffe71
 #define SPIN_USER                          0x1000000
 #ifdef LATE_ARM
 #define AFTER_IDLE_READ 1
@@ -282,12 +281,6 @@ taken:
     syscall
     cmp $1, %rax
     jne fail_census
-#ifdef LATE_ARM
-    mov $INJECT_ORDER_PEER_LATE_ARM_CENSUS, %rax
-    syscall
-    cmp $1, %rax
-    jne fail_late_census
-#endif
 #ifdef BUSY_RESCHED
     mov $INJECT_RESCHED_BUSY_CENSUS, %rax
     syscall
@@ -312,9 +305,6 @@ fail_busy_census:
     jmp die
 fail_census:
     mov $91, %edi
-    jmp die
-fail_late_census:
-    mov $92, %edi
 die:
     mov $231, %eax
     syscall

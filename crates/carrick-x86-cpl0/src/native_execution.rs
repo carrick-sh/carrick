@@ -60,8 +60,6 @@ pub fn schedule(slot: SlotId) -> ! {
         // past it. Read after, the condition is either visible to this pass
         // or its vector is still pending at the `sti; hlt`, which then
         // returns at once.
-        #[cfg(feature = "test-support")]
-        crate::test_support::idle_pass_begins(slot);
         unsafe {
             core::arch::asm!("sti", "nop", "cli", options(nomem, nostack));
         }
