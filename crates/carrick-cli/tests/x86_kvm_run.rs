@@ -5747,18 +5747,19 @@ fn mounted_static_x86_xattr_crossings_in_a_fork_child_refuse_in_ring() {
     assert_eq!(ranking["rows"][0]["unrouted"], 2);
 }
 
-/// #3012: a fork the carrier refuses names the stage that refused it. The
-/// root forks live children until a fork fails (Linux forks all 64). Every
-/// EAGAIN the guest sees must be a fork stock capacity refusal in the
-/// terminal census, counted under the one resource that refused it
-/// (`capacity_refusal.<resource>`), with the last refusal's values, and
-/// `carrick debug el1-census --refusals` must print both. On main the census
-/// carries no fork refusals at all.
-#[test]
-fn mounted_static_x86_fork_refusal_names_its_resource() {
-    if skip_without_kvm() {
-        return;
-    }
+/// One run of `x86_fork_until_refused.c` (after its native oracle): the
+/// guest's fork count and errno, its terminal census, and the census
+/// directory, kept alive by the returned temporary directory.
+struct ForkUntilRefused {
+    forked: u64,
+    errno: u64,
+    census: serde_json::Value,
+    census_dir: std::path::PathBuf,
+    cli: std::path::PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+fn run_fork_until_refused(tag: &str) -> ForkUntilRefused {
     let dir = tempfile::tempdir().unwrap();
     let elf = dir.path().join("fork-until-refused");
     compile_assembly_with_flags(
@@ -5795,8 +5796,8 @@ fn mounted_static_x86_fork_refusal_names_its_resource() {
         String::from_utf8_lossy(&load.stderr)
     );
     let scoped_run_id = match std::env::var("CARRICK_RUN_ID") {
-        Ok(scope) => format!("{scope}-x86-kvm-fork-refusal-test"),
-        Err(_) => "x86-kvm-fork-refusal-test".to_owned(),
+        Ok(scope) => format!("{scope}-x86-kvm-{tag}"),
+        Err(_) => format!("x86-kvm-{tag}"),
     };
     let run = Command::new(&cli)
         .timeout(Duration::from_secs(60))
@@ -5842,6 +5843,36 @@ fn mounted_static_x86_fork_refusal_names_its_resource() {
     assert_eq!(census_files.len(), 1);
     let census: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&census_files[0]).unwrap()).unwrap();
+    ForkUntilRefused {
+        forked,
+        errno,
+        census,
+        census_dir,
+        cli,
+        _dir: dir,
+    }
+}
+
+/// #3012: a fork the carrier refuses names the stage that refused it. The
+/// root forks live children until a fork fails (Linux forks all 64). Every
+/// EAGAIN the guest sees must be a fork stock capacity refusal in the
+/// terminal census, counted under the one resource that refused it
+/// (`capacity_refusal.<resource>`), with the last refusal's values, and
+/// `carrick debug el1-census --refusals` must print both. On main the census
+/// carries no fork refusals at all.
+#[test]
+fn mounted_static_x86_fork_refusal_names_its_resource() {
+    if skip_without_kvm() {
+        return;
+    }
+    let ForkUntilRefused {
+        forked,
+        errno,
+        census,
+        census_dir,
+        cli,
+        _dir,
+    } = run_fork_until_refused("fork-refusal-test");
     let fork = &census["fork_refusals"];
     assert!(
         fork.is_object(),
@@ -5903,6 +5934,35 @@ fn mounted_static_x86_fork_refusal_names_its_resource() {
         }
         other => panic!("fork answered errno {other}, which names no stock stage: {fork}"),
     }
+}
+
+/// #3012: a root keeps 64 children live at once, as on Linux. The carrier
+/// booted only `FORK_LIFECYCLE_SLOTS` (8) lifecycle records, so main's 9th
+/// fork answered EAGAIN (`forked=8 errno=11`). The fork stock now draws a
+/// never-issued record from its lifecycle reserve whenever none is free to
+/// reuse, and the census counts each draw: the witness requires the draws,
+/// not only the fork count.
+#[test]
+fn mounted_static_x86_keeps_64_forked_children_live_as_linux() {
+    if skip_without_kvm() {
+        return;
+    }
+    let run = run_fork_until_refused("fork-64-live-test");
+    let fork = &run.census["fork_refusals"];
+    eprintln!(
+        "fork-64-live: forked={} errno={} fork_refusals={fork}",
+        run.forked, run.errno
+    );
+    assert_eq!(
+        (run.forked, run.errno),
+        (64, 0),
+        "Linux forks all 64 live children: {fork}"
+    );
+    let drawn = fork["reserve_lifecycles_drawn"].as_u64().unwrap_or(0);
+    assert!(
+        drawn >= 64 - 8,
+        "the children past the boot records drew reserve lifecycle records: {fork}"
+    );
 }
 
 /// #2107: the mounted CLI root must share the host file authority, even

@@ -995,9 +995,9 @@ fn exhaustion_with_live_children_is_a_counted_capacity_refusal() {
     for attempt in 1..=3 {
         assert_eq!(
             loan(&mut stock, parent(), 304, 1, 1),
-            Err(ForkStockRefusal::Capacity(ForkCapacityResource::Lifecycle))
+            Err(ForkStockRefusal::NoMemory)
         );
-        assert_eq!(stock.counters().capacity_refusals, attempt);
+        assert_eq!(stock.counters().no_memory_refusals, attempt);
     }
     assert!(stock.pending(CpuId::new(0)).is_none());
     assert_eq!(stock.table_stock().len(), 14);
@@ -1440,7 +1440,7 @@ fn kvm_unclearable_lifecycle_record_is_never_reissued_dirty() {
     assert!(window.clear(granted.lifecycle));
     assert_eq!(
         x86_loan(&mut stock, window, 303),
-        Err(ForkStockRefusal::Capacity(ForkCapacityResource::Lifecycle))
+        Err(ForkStockRefusal::NoMemory)
     );
 }
 
@@ -1469,9 +1469,9 @@ fn kvm_live_children_beyond_lifecycle_records_are_counted_refusals() {
     }
     assert_eq!(
         x86_loan(&mut stock, window, 310),
-        Err(ForkStockRefusal::Capacity(ForkCapacityResource::Lifecycle))
+        Err(ForkStockRefusal::NoMemory)
     );
-    assert_eq!(stock.counters().capacity_refusals, 1);
+    assert_eq!(stock.counters().no_memory_refusals, 1);
     assert_eq!(stock.live_children(), 8);
     // The limit counts live children, not forks: once one child is retired
     // and reclaimed, the refused fork is admitted.
@@ -1488,13 +1488,85 @@ fn kvm_live_children_beyond_lifecycle_records_are_counted_refusals() {
         .unwrap();
     assert_eq!(returned, 1);
     assert!(x86_loan(&mut stock, window, 310).is_ok());
-    assert_eq!(stock.counters().capacity_refusals, 1);
+    assert_eq!(stock.counters().no_memory_refusals, 1);
     assert!(
         stock
             .counters()
             .families()
-            .contains(&("capacity_refusal", 1))
+            .contains(&("no_memory_refusal", 1))
     );
+}
+
+/// #3012: a stock with a lifecycle reserve keeps forking live children past
+/// its boot records, drawing one never-issued record per fork that finds none
+/// to reuse; only a spent reserve refuses, as ENOMEM, and the refusal still
+/// names the lifecycle resource. A returned record is reused before any draw.
+#[test]
+fn kvm_live_children_beyond_boot_records_draw_the_lifecycle_reserve() {
+    let mut bytes = MetadataBytes::new();
+    let window = bytes.window();
+    let mut stock = ForkStock::new(
+        CARRIER,
+        ForkControlCapacity::unused(0x1_0000_0000),
+        UntaggedRoots,
+    );
+    stock
+        .install(
+            (0..32).map(|n| page(0x20_0000 + n * 4096)).collect(),
+            crate::fork_stock::TableReserve::EMPTY,
+            x86_lifecycles(2),
+        )
+        .unwrap();
+    let base = carrick_el1_abi::X86_CPL0_DYNAMIC_METADATA_BASE;
+    let reserve = crate::fork_stock::LifecycleReserve::new(
+        base,
+        base + X86_FORK_LIFECYCLE_OFFSET + 2 * crate::fork_stock::LIFECYCLE_SLOT_STRIDE,
+        3,
+    )
+    .unwrap();
+    // A reserve may not overlap the installed records.
+    assert_eq!(
+        stock.install_lifecycle_reserve(
+            crate::fork_stock::LifecycleReserve::new(base, base + X86_FORK_LIFECYCLE_OFFSET, 1)
+                .unwrap()
+        ),
+        Err(ForkStockServiceError::InvalidRecord)
+    );
+    stock.install_lifecycle_reserve(reserve).unwrap();
+    let mut granted = Vec::new();
+    for child_mm in 302..307 {
+        let loan = x86_loan(&mut stock, window, child_mm).unwrap();
+        guest_initializes(window, loan.lifecycle);
+        commit(&mut stock, parent(), loan, 1, 0).unwrap();
+        granted.push(loan);
+    }
+    assert_eq!(stock.live_children(), 5);
+    assert_eq!(stock.counters().reserve_lifecycles_drawn, 3);
+    assert!(!stock.lifecycle_available());
+    assert_eq!(
+        x86_loan(&mut stock, window, 307),
+        Err(ForkStockRefusal::NoMemory)
+    );
+    assert_eq!(stock.counters().capacity_refusals, 0);
+    let refusal = stock.admission_refusal().unwrap();
+    assert_eq!(refusal.resource, ForkCapacityResource::Lifecycle);
+    assert_eq!(refusal.available_lifecycles, 0);
+    // A reclaimed reserve record is reused; the reserve is never drawn again.
+    retire(&mut stock, child_of(granted[4], 900)).unwrap();
+    let returned = stock
+        .reclaim(
+            &mut NoTableLedger,
+            mm(PARENT_MM),
+            absent,
+            |_| true,
+            |life| window.clear(life),
+            |_| done(true),
+        )
+        .unwrap();
+    assert_eq!(returned, 1);
+    let again = x86_loan(&mut stock, window, 307).unwrap();
+    assert_eq!(again.lifecycle, granted[4].lifecycle);
+    assert_eq!(stock.counters().reserve_lifecycles_drawn, 3);
 }
 
 #[test]
@@ -2036,7 +2108,7 @@ fn refusal_reports_installed_quarantine_and_exact_lifecycle_resource() {
     assert_eq!(reclaim(&mut stock, |_| false, &cleared), 0);
     assert_eq!(
         loan(&mut stock, parent(), 303, 1, 1),
-        Err(ForkStockRefusal::Capacity(ForkCapacityResource::Lifecycle))
+        Err(ForkStockRefusal::NoMemory)
     );
     let refusal = stock.admission_refusal().unwrap();
     assert_eq!(refusal.resource, ForkCapacityResource::Lifecycle);
@@ -2050,7 +2122,7 @@ fn refusal_reports_installed_quarantine_and_exact_lifecycle_resource() {
         }]
     );
     assert!(cleared.borrow().is_empty());
-    assert_eq!(stock.counters().capacity_refusals, 1);
+    assert_eq!(stock.counters().no_memory_refusals, 1);
 }
 
 #[test]

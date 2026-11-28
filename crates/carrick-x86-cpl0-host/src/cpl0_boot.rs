@@ -506,6 +506,39 @@ const _: () = {
     );
     assert!(FORK_LIFECYCLE_OFFSET + FORK_LIFECYCLE_SLOTS * FORK_LIFECYCLE_STRIDE <= META_LEN);
 };
+/// The fork lifecycle reserve (#3012): never-issued slots the fork stock
+/// draws one at a time once the boot records are all in use, so live tasks
+/// are bounded by carrier memory, not by `FORK_LIFECYCLE_SLOTS`. A
+/// production carrier maps it into the dynamic metadata aperture above the
+/// zone, backed by its own private window that the host commits only as
+/// records are first touched.
+pub const FORK_LIFECYCLE_RESERVE_OFFSET: u64 = (carrick_core_abi::X86_CPL0_ZONE_OFFSET
+    + size_of::<X86Cpl0Zone>() as u64)
+    .next_multiple_of(0x20_0000);
+/// Every slot the aperture holds above the zone, up to 2048.
+pub const FORK_LIFECYCLE_RESERVE_SLOTS: u64 = {
+    let fits = (carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE - FORK_LIFECYCLE_RESERVE_OFFSET)
+        / FORK_LIFECYCLE_STRIDE;
+    if fits < 2048 { fits } else { 2048 }
+};
+pub const FORK_LIFECYCLE_RESERVE_LEN: u64 = FORK_LIFECYCLE_RESERVE_SLOTS * FORK_LIFECYCLE_STRIDE;
+pub const FORK_LIFECYCLE_RESERVE_VA: u64 = METADATA_VA + FORK_LIFECYCLE_RESERVE_OFFSET;
+pub const FORK_LIFECYCLE_RESERVE_GPA: u64 =
+    (ALLOCATOR_GPA + EL1_BOOTSTRAP_METADATA_SIZE).next_multiple_of(0x20_0000);
+const _: () = {
+    assert!(
+        carrick_core_abi::X86_CPL0_ZONE_OFFSET + size_of::<X86Cpl0Zone>() as u64
+            <= FORK_LIFECYCLE_RESERVE_OFFSET
+    );
+    assert!(FORK_LIFECYCLE_RESERVE_OFFSET.is_multiple_of(0x20_0000));
+    // More than the boot records: the reserve must add capacity.
+    assert!(FORK_LIFECYCLE_RESERVE_SLOTS > FORK_LIFECYCLE_SLOTS);
+    assert!(
+        FORK_LIFECYCLE_RESERVE_OFFSET + FORK_LIFECYCLE_RESERVE_LEN
+            <= carrick_el1_abi::EL1_DYNAMIC_METADATA_SIZE
+    );
+    assert!(FORK_LIFECYCLE_RESERVE_GPA + FORK_LIFECYCLE_RESERVE_LEN <= KERNEL_REGION_GPA);
+};
 pub const USER_CODE: u64 = 0x1_0000;
 pub use carrick_x86::cpl0_entry::DIRECT_VA;
 // Startup stocks one initial MM and its first fork child's private COW branch.
@@ -6374,6 +6407,10 @@ pub(crate) struct Cpl0HostCustody<M: CarrierMemoryIo> {
     space_retired_crossings: u64,
     run_failure_crossings: u64,
     metadata_base: RetainedMetadataPtr,
+    /// Host backing of the fork lifecycle reserve
+    /// (`FORK_LIFECYCLE_RESERVE_GPA`), retained for the VM lifetime; `None`
+    /// for a carrier that maps no reserve (#3012).
+    lifecycle_reserve_base: Option<RetainedMetadataPtr>,
     host_forwards: u64,
     /// Host forwards captured from a task stopped on the idle peer (CPU 1),
     /// so a fixture can prove where EL1 placed the forwarding task.
@@ -7770,6 +7807,13 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             )
             .ok_or_else(|| fail("null metadata backing"))?,
         );
+        let lifecycle_reserve_base = ram
+            .host_ptr(
+                FORK_LIFECYCLE_RESERVE_GPA,
+                FORK_LIFECYCLE_RESERVE_LEN as usize,
+            )
+            .and_then(NonNull::new)
+            .map(RetainedMetadataPtr);
         let fork_stock = carrick_hal::fork_stock::ForkStock::new(
             memory.identity().nonzero(),
             carrick_hal::fork_stock::ForkControlCapacity::unused(KERNEL_REGION_GPA),
@@ -7851,6 +7895,7 @@ impl<M: CarrierMemoryIo> BootstrapCustody<M> {
             space_retired_crossings: 0,
             run_failure_crossings: 0,
             metadata_base,
+            lifecycle_reserve_base,
             initial_sources: None,
             host_forwards: 0,
             idle_peer_forwards: 0,
@@ -8547,6 +8592,12 @@ pub fn prepare_boot(
             .map_err(|e| fail(e.to_string()))?;
         ram.add_window(PRODUCTION_METADATA_GPA, region_bytes, WindowKind::Private)
             .map_err(|e| fail(e.to_string()))?;
+        ram.add_window(
+            FORK_LIFECYCLE_RESERVE_GPA,
+            FORK_LIFECYCLE_RESERVE_LEN as usize,
+            WindowKind::Private,
+        )
+        .map_err(|e| fail(e.to_string()))?;
     } else {
         ram.add_window(0, RAM_SIZE, WindowKind::Private)
             .map_err(|e| fail(e.to_string()))?;
@@ -8656,6 +8707,14 @@ pub fn prepare_boot(
         exec: false,
     });
     if initial_extent_bytes.is_some() {
+        maps.push(Pml4MapSpec {
+            va: FORK_LIFECYCLE_RESERVE_VA,
+            gpa: FORK_LIFECYCLE_RESERVE_GPA,
+            len: FORK_LIFECYCLE_RESERVE_LEN,
+            user: false,
+            write: true,
+            exec: false,
+        });
         maps.push(Pml4MapSpec {
             va: METADATA_VA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,
             gpa: PRODUCTION_METADATA_GPA + carrick_core_abi::X86_CPL0_ZONE_OFFSET,

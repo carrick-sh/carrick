@@ -560,6 +560,109 @@ pub fn lifecycle_slots(
         .collect()
 }
 
+/// Never-issued lifecycle slots behind the reusable records, drawn one at a
+/// time when a fork finds none to reuse, so the number of live tasks
+/// follows the carrier's memory, the way Linux allocates a task from
+/// ordinary memory, not a pool fixed at boot (#3012). Slots leave it in
+/// address order and never return to it: a record that comes back joins
+/// the reusable stock. Every drawn record is still proven cold at loan time.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LifecycleReserve {
+    aperture: u64,
+    next: u64,
+    end: u64,
+}
+
+impl LifecycleReserve {
+    /// No reserve: the stock holds only the records it was installed with.
+    pub const EMPTY: Self = Self {
+        aperture: 0,
+        next: 0,
+        end: 0,
+    };
+
+    /// `count` slots of the one [`lifecycle_slots`] shape from `first_page`
+    /// inside the metadata aperture at `aperture`; `None` when any slot
+    /// would not be a valid lifecycle loan.
+    pub fn new(aperture: u64, first_page: u64, count: u64) -> Option<Self> {
+        let end = first_page.checked_add(count.checked_mul(LIFECYCLE_SLOT_STRIDE)?)?;
+        if count != 0 {
+            // The first and the last slot bound every slot between them.
+            lifecycle_slots(aperture, first_page, 1)?;
+            lifecycle_slots(aperture, end - LIFECYCLE_SLOT_STRIDE, 1)?;
+        }
+        Some(Self {
+            aperture,
+            next: first_page,
+            end,
+        })
+    }
+
+    /// Slots not yet drawn.
+    pub fn slots(&self) -> usize {
+        usize::try_from((self.end - self.next) / LIFECYCLE_SLOT_STRIDE).unwrap_or(usize::MAX)
+    }
+
+    fn overlaps(&self, record: ForkLifecycleLoan) -> bool {
+        (self.next..self.end).contains(&record.page.raw())
+            || (self.next..self.end).contains(&record.controls.raw())
+    }
+
+    /// Take the next slot.
+    fn take(&mut self) -> Option<ForkLifecycleLoan> {
+        if self.next >= self.end {
+            return None;
+        }
+        let record = lifecycle_slots(self.aperture, self.next, 1)?.pop()?;
+        self.next += LIFECYCLE_SLOT_STRIDE;
+        Some(record)
+    }
+}
+
+/// The metadata windows a carrier keeps lifecycle records in: its boot
+/// stock's and its [`LifecycleReserve`]'s. Each record lies wholly in one.
+#[derive(Clone, Copy, Debug)]
+pub struct LifecycleWindows<const N: usize>(pub [LifecycleWindow; N]);
+
+impl<const N: usize> LifecycleWindows<N> {
+    fn holding(&self, lifecycle: ForkLifecycleLoan) -> Option<LifecycleWindow> {
+        self.0
+            .iter()
+            .copied()
+            .find(|window| window.ranges(lifecycle).is_some())
+    }
+
+    /// [`LifecycleWindow::prepare_affinity_aliases`] in the window holding
+    /// the record.
+    pub fn prepare_affinity_aliases(
+        self,
+        lifecycle: ForkLifecycleLoan,
+    ) -> Option<PreparedLifecycleAffinity> {
+        self.holding(lifecycle)?.prepare_affinity_aliases(lifecycle)
+    }
+
+    /// [`LifecycleWindow::is_zero`] in the window holding the record.
+    pub fn is_zero(self, lifecycle: ForkLifecycleLoan) -> bool {
+        self.holding(lifecycle)
+            .is_some_and(|window| window.is_zero(lifecycle))
+    }
+
+    /// [`LifecycleWindow::clear`] in the window holding the record.
+    pub fn clear(self, lifecycle: ForkLifecycleLoan) -> bool {
+        self.holding(lifecycle)
+            .is_some_and(|window| window.clear(lifecycle))
+    }
+}
+
+impl<const N: usize> LifecycleHygiene for LifecycleWindows<N> {
+    fn is_zero(&self, lifecycle: ForkLifecycleLoan) -> bool {
+        LifecycleWindows::is_zero(*self, lifecycle)
+    }
+    fn clear(&self, lifecycle: ForkLifecycleLoan) -> bool {
+        LifecycleWindows::clear(*self, lifecycle)
+    }
+}
+
 /// The one lifecycle hygiene policy every carrier implements: an issued
 /// record must be proven cold (all zero) and a returned record is cleared
 /// before it reenters the stock. A dirty record at loan time is withdrawn.
@@ -1000,6 +1103,9 @@ pub struct ForkStockCounters {
     /// The part of [`Self::reserve_tables_drawn`] a fork loan's own table
     /// arenas drew ([`ForkStock::loan`]).
     pub fork_loan_tables_drawn: u64,
+    /// Never-issued lifecycle records the stock drew from its
+    /// [`LifecycleReserve`] (#3012).
+    pub reserve_lifecycles_drawn: u64,
 }
 
 impl ForkStockCounters {
@@ -1026,6 +1132,7 @@ impl ForkStockCounters {
             ("successor_table_refusal", self.successor_table_refusals),
             ("reserve_table_drawn", self.reserve_tables_drawn),
             ("fork_loan_table_drawn", self.fork_loan_tables_drawn),
+            ("reserve_lifecycle_drawn", self.reserve_lifecycles_drawn),
         ]
         .into_iter()
         .chain(ForkCapacityResource::ALL.into_iter().map(|resource| {
@@ -1507,6 +1614,9 @@ pub struct ForkStock<T: ChildAddressTags, C = ()> {
     unused_control: Option<ForkControlCapacity>,
     tables: TableStock,
     lifecycles: Vec<ForkLifecycleLoan>,
+    /// The never-issued slots [`Self::loan`] draws a record from when
+    /// `lifecycles` holds none (#3012).
+    lifecycle_reserve: LifecycleReserve,
     pending: Vec<Option<PendingForkLoan<T::Tag, C>>>,
     next_loan: NonZeroU64,
     next_exec_predecessor: NonZeroU64,
@@ -1543,6 +1653,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
             unused_control: control.filter(|control| !control.is_exclusive()),
             tables: TableStock::default(),
             lifecycles: Vec::new(),
+            lifecycle_reserve: LifecycleReserve::EMPTY,
             pending: Vec::new(),
             next_loan: NonZeroU64::MIN,
             next_exec_predecessor: NonZeroU64::MIN,
@@ -1763,7 +1874,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
 
     /// True when a fork can be admitted a lifecycle record right now.
     pub fn lifecycle_available(&self) -> bool {
-        !self.lifecycles.is_empty()
+        !self.lifecycles.is_empty() || self.lifecycle_reserve.slots() != 0
     }
 
     /// Whether the next loan needs another ISA control window.
@@ -2828,6 +2939,39 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
         Ok(())
     }
 
+    /// Put a never-issued [`LifecycleReserve`] behind the installed records,
+    /// before any guest can request a loan. No reserve slot may overlap an
+    /// installed record, and a stock holds at most one reserve.
+    pub fn install_lifecycle_reserve(
+        &mut self,
+        reserve: LifecycleReserve,
+    ) -> Result<(), ForkStockServiceError> {
+        if self.lifecycle_reserve.slots() != 0
+            || self.counters.loans != 0
+            || self.pending.iter().any(Option::is_some)
+            || self
+                .lifecycles
+                .iter()
+                .any(|record| reserve.overlaps(*record))
+        {
+            return Err(ForkStockServiceError::InvalidRecord);
+        }
+        self.lifecycle_reserve = reserve;
+        Ok(())
+    }
+
+    /// Draw one record from the reserve into the reusable records; false
+    /// (nothing drawn) when the reserve is spent.
+    fn draw_lifecycle(&mut self) -> bool {
+        let Some(record) = self.lifecycle_reserve.take() else {
+            return false;
+        };
+        self.lifecycles.push(record);
+        self.counters.reserve_lifecycles_drawn =
+            self.counters.reserve_lifecycles_drawn.saturating_add(1);
+        true
+    }
+
     /// Last refusal retained for a carrier's structured run report.
     pub fn admission_refusal(&self) -> Option<ForkAdmissionRefusal> {
         self.last_refusal.clone()
@@ -2848,7 +2992,7 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
                 child_pages: request.child_bytes / TABLE_PAGE_BYTES,
                 parent_pages: request.parent_bytes / TABLE_PAGE_BYTES,
                 available_pages: self.tables.len(),
-                available_lifecycles: self.lifecycles.len(),
+                available_lifecycles: self.lifecycles.len() + self.lifecycle_reserve.slots(),
                 quarantine: self
                     .quarantine
                     .iter()
@@ -2956,8 +3100,12 @@ impl<T: ChildAddressTags, C> ForkStock<T, C> {
                 execution.cpu,
             );
         }
-        if self.lifecycles.is_empty() {
-            return self.refuse_capacity(exchange, ForkCapacityResource::Lifecycle, execution.cpu);
+        if self.lifecycles.is_empty() && !self.draw_lifecycle() {
+            // The reserve is the carrier's lifecycle memory: once it is
+            // spent, the fork has no kernel memory for its task (ENOMEM),
+            // never an admission limit (#3012). The census still names it.
+            self.record_capacity(exchange, ForkCapacityResource::Lifecycle, execution.cpu);
+            return self.refuse(exchange, ForkStockRefusal::NoMemory);
         }
         if self.controls.is_empty() && self.unused_control.is_none() {
             return self.refuse_capacity(exchange, ForkCapacityResource::Control, execution.cpu);

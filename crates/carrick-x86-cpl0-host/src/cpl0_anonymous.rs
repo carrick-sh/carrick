@@ -5,8 +5,8 @@ use carrick_core::mm::own::{BrokenRelease, ReleaseOutcome, ReleaseWait};
 use carrick_el1_abi::{MmPortalSlots, PortalGrantWindow};
 use carrick_guest_arch::KernelVa;
 use carrick_hal::fork_stock::{
-    ForkStockServiceError, GrantExecution, LifecycleWindow, NoTableLedger, SlotAbsence,
-    lifecycle_slots,
+    ForkStockServiceError, GrantExecution, LifecycleWindow, LifecycleWindows, NoTableLedger,
+    SlotAbsence, lifecycle_slots,
 };
 use carrick_hal::guest_arch_binding::{
     GuestArchBinding,
@@ -1376,6 +1376,18 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
         self.fork_stock
             .install(tables, reserve, lifecycles)
             .map_err(|e| fail(format!("fork stock install: {e:?}")))?;
+        if self.lifecycle_reserve_base.is_some() {
+            // Never-issued slots: each is proven cold when it is drawn.
+            let reserve = carrick_hal::fork_stock::LifecycleReserve::new(
+                METADATA_VA,
+                super::FORK_LIFECYCLE_RESERVE_VA,
+                super::FORK_LIFECYCLE_RESERVE_SLOTS,
+            )
+            .ok_or_else(|| fail("fork lifecycle reserve layout"))?;
+            self.fork_stock
+                .install_lifecycle_reserve(reserve)
+                .map_err(|e| fail(format!("fork lifecycle reserve install: {e:?}")))?;
+        }
         let mm = carrick_el1_abi::ReservationMm::new(context.mm.raw().get())
             .ok_or_else(|| fail("initial root MM"))?;
         // SAFETY: the boot reply and installed address context admit this exact root.
@@ -1391,11 +1403,27 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             .map_err(|e| fail(format!("fork stock root registration: {e:?}")))
     }
 
-    /// The retained metadata window holding the fork lifecycle stock.
-    fn lifecycle_window(&self) -> LifecycleWindow {
+    /// The retained metadata windows holding the fork lifecycle stock: the
+    /// boot records' and, when mapped, the lifecycle reserve's (#3012).
+    fn lifecycle_window(&self) -> LifecycleWindows<2> {
         // SAFETY: `metadata_base` retains META_LEN host bytes backing
         // METADATA_VA for the VM lifetime.
-        unsafe { LifecycleWindow::new(self.metadata_base.0, METADATA_VA, META_LEN) }
+        let boot = unsafe { LifecycleWindow::new(self.metadata_base.0, METADATA_VA, META_LEN) };
+        let reserve = match &self.lifecycle_reserve_base {
+            // SAFETY: the reserve window retains FORK_LIFECYCLE_RESERVE_LEN
+            // host bytes backing FORK_LIFECYCLE_RESERVE_VA for the VM lifetime.
+            Some(base) => unsafe {
+                LifecycleWindow::new(
+                    base.0,
+                    super::FORK_LIFECYCLE_RESERVE_VA,
+                    super::FORK_LIFECYCLE_RESERVE_LEN,
+                )
+            },
+            // An empty window holds no record.
+            // SAFETY: zero bytes are licensed.
+            None => unsafe { LifecycleWindow::new(self.metadata_base.0, 0, 0) },
+        };
+        LifecycleWindows([boot, reserve])
     }
 
     /// Return quarantined child stock whose MM no zone slot has installed.

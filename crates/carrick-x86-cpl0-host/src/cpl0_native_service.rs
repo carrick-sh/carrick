@@ -93,6 +93,14 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
             && len != 0
         {
             FrameGpa::new(META_GPA + address.raw() - METADATA_VA)
+        } else if self.lifecycle_reserve_base.is_some()
+            && address.raw() >= FORK_LIFECYCLE_RESERVE_VA
+            && end <= FORK_LIFECYCLE_RESERVE_VA + FORK_LIFECYCLE_RESERVE_LEN
+            && address.raw().is_multiple_of(alignment as u64)
+            && len != 0
+        {
+            // A lifecycle record drawn from the fork lifecycle reserve (#3012).
+            FrameGpa::new(FORK_LIFECYCLE_RESERVE_GPA + address.raw() - FORK_LIFECYCLE_RESERVE_VA)
         } else {
             kernel_pod_physical(&self.kernel_pod_storage, address, len, alignment)
                 .ok_or_else(|| fail("native service outside retained supervisor storage"))?

@@ -203,6 +203,10 @@ pub struct Census {
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ForkRefusalCensus {
     pub refusals: std::collections::BTreeMap<String, u64>,
+    /// Lifecycle records the stock drew from its never-issued reserve
+    /// because none was free to reuse.
+    #[serde(default)]
+    pub reserve_lifecycles_drawn: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_refusal: Option<carrick_observability::compat::ForkAdmissionRefusal>,
 }
@@ -221,6 +225,7 @@ impl ForkRefusalCensus {
                 .filter(|(family, _)| family.contains("refusal"))
                 .map(|(family, count)| (family.to_owned(), count))
                 .collect(),
+            reserve_lifecycles_drawn: counters.reserve_lifecycles_drawn,
             last_refusal,
         }
     }
@@ -988,6 +993,7 @@ mod tests {
             ]
             .into_iter()
             .collect(),
+            reserve_lifecycles_drawn: 0,
             last_refusal: Some(carrick_observability::compat::ForkAdmissionRefusal {
                 carrier: 1,
                 mm: 9,
