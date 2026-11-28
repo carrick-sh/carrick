@@ -49,7 +49,6 @@ struct Slot {
     taken: bool,
     put: bool,
     bumped: bool,
-    epoch: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -81,7 +80,6 @@ impl Protocol for StaleObservation {
             taken: false,
             put: false,
             bumped: false,
-            epoch: 0,
         }
     }
     fn enabled(&self, s: &Slot, out: &mut Vec<SlotOp>) {
@@ -114,7 +112,7 @@ impl Protocol for StaleObservation {
                     s.full = false;
                     s.taken = true;
                 } else {
-                    s.observed = Some(s.epoch);
+                    s.observed = Some(ledger.epoch(W1));
                 }
                 Class::Done
             }
@@ -126,7 +124,7 @@ impl Protocol for StaleObservation {
                 s.observed = None;
                 Class::Done
             }
-            SlotOp::Settle if self.fixed && s.observed != Some(s.epoch) => {
+            SlotOp::Settle if self.fixed && s.observed != Some(ledger.epoch(W1)) => {
                 let observed = s.observed.take().unwrap_or(0);
                 Class::Rerun(W1.at(observed))
             }
@@ -134,14 +132,12 @@ impl Protocol for StaleObservation {
             SlotOp::Put => {
                 s.put = true;
                 s.full = true;
-                s.epoch += 1;
-                ledger.notify(W1);
+                ledger.publish(W1);
                 Class::Done
             }
             SlotOp::Bump => {
                 s.bumped = true;
-                s.epoch += 1;
-                ledger.notify(W1);
+                ledger.publish(W1);
                 Class::Done
             }
         })
@@ -151,9 +147,6 @@ impl Protocol for StaleObservation {
     }
     fn invariant(&self, v: &Never) -> &'static str {
         match *v {}
-    }
-    fn epoch(&self, s: &Slot, _: WaitId) -> u64 {
-        s.epoch
     }
     fn publishers(&self, _: &Slot, _: WaitId, out: &mut Vec<usize>) {
         out.push(1);
@@ -215,7 +208,6 @@ struct Race {
     divert_in_flight: bool,
     diverted: bool,
     answered: bool,
-    epoch: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -244,7 +236,6 @@ impl Protocol for Race2 {
             divert_in_flight: true,
             diverted: false,
             answered: false,
-            epoch: 0,
         }
     }
     fn enabled(&self, s: &Race, out: &mut Vec<RaceOp>) {
@@ -290,8 +281,7 @@ impl Protocol for Race2 {
                 if !s.diverted {
                     s.free += 1;
                 }
-                s.epoch += 1;
-                ledger.notify(W1);
+                ledger.publish(W1);
                 Class::Done
             }
             RaceOp::FinishDivert => {
@@ -306,9 +296,6 @@ impl Protocol for Race2 {
     }
     fn invariant(&self, v: &Never) -> &'static str {
         match *v {}
-    }
-    fn epoch(&self, s: &Race, _: WaitId) -> u64 {
-        s.epoch
     }
     fn publishers(&self, s: &Race, _: WaitId, out: &mut Vec<usize>) {
         if s.release_in_flight {
@@ -349,18 +336,36 @@ struct Edge {
     in_flight: bool,
     broke: bool,
     answered: bool,
+    closed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum EdgeOp {
     Take,
     Finish,
+    /// Actor 2 parks on W1 (the `Close` form only).
+    Wait,
 }
 
 #[derive(Debug)]
 struct EdgeBroke;
 
-struct DrainEdge;
+/// What goes wrong inside the drain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EdgeMode {
+    /// The peer finish breaks the protocol's own invariant.
+    Check,
+    /// The retry answers Broken on a legal state (I5): `eb4cacbdf`'s retry
+    /// bypassed every check and would have passed it.
+    Retry,
+    /// The peer finish is a two-phase close that forgets its wake (I3),
+    /// met as a drain edge.
+    Close,
+}
+
+struct DrainEdge {
+    mode: EdgeMode,
+}
 
 impl Protocol for DrainEdge {
     type State = Edge;
@@ -373,6 +378,7 @@ impl Protocol for DrainEdge {
             in_flight: true,
             broke: false,
             answered: false,
+            closed: false,
         }
     }
     fn enabled(&self, s: &Edge, out: &mut Vec<EdgeOp>) {
@@ -382,27 +388,42 @@ impl Protocol for DrainEdge {
         if s.in_flight {
             out.push(EdgeOp::Finish);
         }
-    }
-    fn actor(&self, op: EdgeOp) -> usize {
-        usize::from(op == EdgeOp::Finish)
-    }
-    fn kind(&self, op: EdgeOp) -> OpKind {
-        match op {
-            EdgeOp::Take => OpKind::Begin,
-            EdgeOp::Finish => OpKind::Finish(Effect::None),
+        if self.mode == EdgeMode::Close && !s.closed {
+            out.push(EdgeOp::Wait);
         }
     }
-    fn step(&self, s: &mut Edge, op: EdgeOp, _: &mut WaitLedger) -> Result<Class, EdgeBroke> {
+    fn actor(&self, op: EdgeOp) -> usize {
+        match op {
+            EdgeOp::Take => 0,
+            EdgeOp::Finish => 1,
+            EdgeOp::Wait => 2,
+        }
+    }
+    fn kind(&self, op: EdgeOp) -> OpKind {
+        match (op, self.mode) {
+            (EdgeOp::Finish, EdgeMode::Close) => OpKind::Finish(Effect::Close(W1)),
+            (EdgeOp::Finish, _) => OpKind::Finish(Effect::None),
+            (EdgeOp::Take | EdgeOp::Wait, _) => OpKind::Begin,
+        }
+    }
+    fn step(&self, s: &mut Edge, op: EdgeOp, ledger: &mut WaitLedger) -> Result<Class, EdgeBroke> {
         Ok(match op {
+            EdgeOp::Take if self.mode == EdgeMode::Retry && !s.in_flight => Class::Broken,
             EdgeOp::Take => {
                 s.answered = true;
                 Class::Answer(Answer::Settled)
             }
             EdgeOp::Finish => {
                 s.in_flight = false;
-                s.broke = true;
+                match self.mode {
+                    EdgeMode::Check => s.broke = true,
+                    // The bug: the close forgets `ledger.wake(W1)`.
+                    EdgeMode::Close => s.closed = true,
+                    EdgeMode::Retry => {}
+                }
                 Class::Done
             }
+            EdgeOp::Wait => Class::NotNow(W1.at(ledger.epoch(W1))),
         })
     }
     fn check(&self, s: &Edge) -> Result<(), EdgeBroke> {
@@ -411,24 +432,37 @@ impl Protocol for DrainEdge {
     fn invariant(&self, _: &EdgeBroke) -> &'static str {
         "edge"
     }
-    fn epoch(&self, _: &Edge, _: WaitId) -> u64 {
-        0
+    fn publishers(&self, s: &Edge, _: WaitId, out: &mut Vec<usize>) {
+        if s.in_flight {
+            out.push(1);
+        }
     }
-    fn publishers(&self, _: &Edge, _: WaitId, _: &mut Vec<usize>) {}
     fn reads(&self, _: &Edge, _: EdgeOp, _: ObjectId) -> bool {
         false
     }
 }
 
 #[test]
-fn a_peer_finish_that_breaks_an_invariant_inside_the_drain_is_found() {
-    let counterexample = explore(&DrainEdge, Bound::depth(1)).expect_err("the drain edge breaks");
-    assert_eq!(counterexample.invariant, InvariantId::Protocol("edge"));
-    assert!(
-        counterexample.violation.contains("in the I2 drain"),
-        "{counterexample:?}"
-    );
-    assert_eq!(counterexample.trace.len(), 1);
+fn a_failure_inside_the_drain_is_found_through_the_drain() {
+    // Each is reported through the drain first: the outer exploration
+    // meets the same failure no earlier.
+    for (mode, depth, expected) in [
+        (EdgeMode::Check, 1, InvariantId::Protocol("edge")),
+        (EdgeMode::Retry, 1, InvariantId::I5),
+        (EdgeMode::Close, 2, InvariantId::I3),
+    ] {
+        let counterexample =
+            explore(&DrainEdge { mode }, Bound::depth(depth)).expect_err("the drain fails");
+        assert_eq!(
+            counterexample.invariant, expected,
+            "{mode:?}: {counterexample:?}"
+        );
+        assert!(
+            counterexample.violation.contains("in the I2 drain"),
+            "{mode:?}: {counterexample:?}"
+        );
+        assert_eq!(counterexample.trace.len(), depth, "{mode:?}");
+    }
 }
 
 /// I4: a peer commits a publication on an unrelated wait, and the actor
@@ -440,7 +474,6 @@ struct Unpaid {
     published: bool,
     reran: bool,
     done: bool,
-    epoch2: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -466,7 +499,6 @@ impl Protocol for UnpaidRerun {
             published: false,
             reran: false,
             done: false,
-            epoch2: 0,
         }
     }
     fn enabled(&self, s: &Unpaid, out: &mut Vec<UnpaidOp>) {
@@ -497,8 +529,7 @@ impl Protocol for UnpaidRerun {
             }
             UnpaidOp::PublishOther => {
                 s.published = true;
-                s.epoch2 += 1;
-                ledger.notify(W2);
+                ledger.publish(W2);
                 Class::Done
             }
             // The bug: it claims its observation of W1 moved; nothing did.
@@ -517,9 +548,6 @@ impl Protocol for UnpaidRerun {
     }
     fn invariant(&self, v: &Never) -> &'static str {
         match *v {}
-    }
-    fn epoch(&self, s: &Unpaid, wait: WaitId) -> u64 {
-        if wait == W2 { s.epoch2 } else { 0 }
     }
     fn publishers(&self, _: &Unpaid, _: WaitId, out: &mut Vec<usize>) {
         out.push(0);
@@ -581,9 +609,6 @@ impl Protocol for Deadlock {
     }
     fn invariant(&self, v: &Never) -> &'static str {
         match *v {}
-    }
-    fn epoch(&self, _: &Pair, _: WaitId) -> u64 {
-        0
     }
     fn publishers(&self, _: &Pair, wait: WaitId, out: &mut Vec<usize>) {
         out.push(if wait == W1 { 1 } else { 0 });
@@ -652,9 +677,6 @@ impl Protocol for VanishedPublisher {
     fn invariant(&self, v: &Never) -> &'static str {
         match *v {}
     }
-    fn epoch(&self, _: &Leaving, _: WaitId) -> u64 {
-        0
-    }
     fn publishers(&self, s: &Leaving, _: WaitId, out: &mut Vec<usize>) {
         if !s.gone {
             out.push(1);
@@ -717,7 +739,7 @@ impl Protocol for SpuriousWake {
         Ok(match op {
             NudgeOp::Wait => Class::NotNow(W1.at(0)),
             NudgeOp::Nudge => {
-                ledger.notify(W1);
+                ledger.wake(W1);
                 if self.from_not_now {
                     Class::NotNow(W2.at(0))
                 } else {
@@ -733,11 +755,8 @@ impl Protocol for SpuriousWake {
     fn invariant(&self, v: &Never) -> &'static str {
         match *v {}
     }
-    fn epoch(&self, _: &Nudged, _: WaitId) -> u64 {
-        0
-    }
     fn publishers(&self, _: &Nudged, wait: WaitId, out: &mut Vec<usize>) {
-        out.push(if wait == W1 { 1 } else { 2 });
+        out.push(if wait == W1 { 1 } else { 0 });
     }
     fn reads(&self, _: &Nudged, _: NudgeOp, _: ObjectId) -> bool {
         false
@@ -748,9 +767,14 @@ impl Protocol for SpuriousWake {
 fn a_wake_without_a_publication_is_polling() {
     for from_not_now in [false, true] {
         let protocol = SpuriousWake { from_not_now };
-        let depth = killed_by(&protocol, Bound::depth(5), InvariantId::I4);
+        let counterexample = explore(&protocol, Bound::depth(5)).expect_err("a spurious wake");
+        assert_eq!(counterexample.invariant, InvariantId::I4);
+        assert!(
+            counterexample.violation.contains("spurious"),
+            "{counterexample:?}"
+        );
         // Wait parks, Nudge wakes it.
-        assert_eq!(depth, 2, "from_not_now {from_not_now}");
+        assert_eq!(counterexample.trace.len(), 2, "from_not_now {from_not_now}");
     }
 }
 
@@ -829,9 +853,6 @@ impl Protocol for WrongObject {
     fn invariant(&self, v: &Never) -> &'static str {
         match *v {}
     }
-    fn epoch(&self, _: &Objects, _: WaitId) -> u64 {
-        0
-    }
     fn publishers(&self, _: &Objects, _: WaitId, _: &mut Vec<usize>) {}
     fn reads(&self, _: &Objects, op: ObjectsOp, object: ObjectId) -> bool {
         // ReadB reads only B; nothing reads A.
@@ -896,9 +917,6 @@ impl Protocol for StartsBroken {
     fn invariant(&self, _: &BornBroken) -> &'static str {
         "born"
     }
-    fn epoch(&self, _: &Born, _: WaitId) -> u64 {
-        0
-    }
     fn publishers(&self, _: &Born, _: WaitId, _: &mut Vec<usize>) {}
     fn reads(&self, _: &Born, _: SlotOp, _: ObjectId) -> bool {
         false
@@ -922,9 +940,7 @@ fn a_protocol_that_starts_broken_fails_at_depth_zero() {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct Gate {
     locked: bool,
-    lock_epoch: u64,
     closed: bool,
-    item_epoch: u64,
     answered: bool,
 }
 
@@ -946,9 +962,7 @@ impl Protocol for BusyClose {
     fn init(&self) -> Gate {
         Gate {
             locked: true,
-            lock_epoch: 0,
             closed: false,
-            item_epoch: 0,
             answered: false,
         }
     }
@@ -983,18 +997,16 @@ impl Protocol for BusyClose {
                 s.answered = true;
                 Class::Answer(Answer::Settled)
             }
-            GateOp::Take => Class::NotNow(W1.at(s.item_epoch)),
-            GateOp::Close if s.locked => Class::NotNow(W2.at(s.lock_epoch)),
+            GateOp::Take => Class::NotNow(W1.at(ledger.epoch(W1))),
+            GateOp::Close if s.locked => Class::NotNow(W2.at(ledger.epoch(W2))),
             GateOp::Close => {
                 s.closed = true;
-                s.item_epoch += 1;
-                ledger.notify(W1);
+                ledger.publish(W1);
                 Class::Done
             }
             GateOp::Unlock => {
                 s.locked = false;
-                s.lock_epoch += 1;
-                ledger.notify(W2);
+                ledger.publish(W2);
                 Class::Done
             }
         })
@@ -1004,13 +1016,6 @@ impl Protocol for BusyClose {
     }
     fn invariant(&self, v: &Never) -> &'static str {
         match *v {}
-    }
-    fn epoch(&self, s: &Gate, wait: WaitId) -> u64 {
-        if wait == W1 {
-            s.item_epoch
-        } else {
-            s.lock_epoch
-        }
     }
     fn publishers(&self, s: &Gate, wait: WaitId, out: &mut Vec<usize>) {
         if wait == W1 && !s.closed {
@@ -1029,4 +1034,269 @@ impl Protocol for BusyClose {
 fn a_close_that_is_not_now_closes_nothing() {
     let report = explore(&BusyClose, Bound::depth(6)).expect("a busy close is legal");
     assert!(report.states > 1);
+}
+
+/// I4: one stale observation pays one rerun. The broken retry never
+/// refreshes its observation, so it reruns forever on the same one;
+/// `7c4387f47` accepted every such rerun.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct Retrying {
+    observed: Option<u64>,
+    published: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum RetryOp {
+    Observe,
+    Publish,
+    Retry,
+}
+
+struct RerunLoop;
+
+impl Protocol for RerunLoop {
+    type State = Retrying;
+    type Op = RetryOp;
+    type Violation = Never;
+    const NAME: &'static str = "kat-rerun-loop";
+
+    fn init(&self) -> Retrying {
+        Retrying {
+            observed: None,
+            published: false,
+        }
+    }
+    fn enabled(&self, s: &Retrying, out: &mut Vec<RetryOp>) {
+        if s.observed.is_none() {
+            out.push(RetryOp::Observe);
+        } else {
+            out.push(RetryOp::Retry);
+        }
+        if !s.published {
+            out.push(RetryOp::Publish);
+        }
+    }
+    fn actor(&self, op: RetryOp) -> usize {
+        usize::from(op == RetryOp::Publish)
+    }
+    fn kind(&self, op: RetryOp) -> OpKind {
+        match op {
+            RetryOp::Publish => OpKind::Commit(Effect::Publish(W1)),
+            RetryOp::Observe | RetryOp::Retry => OpKind::Begin,
+        }
+    }
+    fn step(&self, s: &mut Retrying, op: RetryOp, ledger: &mut WaitLedger) -> Result<Class, Never> {
+        Ok(match op {
+            RetryOp::Observe => {
+                s.observed = Some(ledger.epoch(W1));
+                Class::Done
+            }
+            RetryOp::Publish => {
+                s.published = true;
+                ledger.publish(W1);
+                Class::Done
+            }
+            // The bug: it reruns, keeping the stale observation.
+            RetryOp::Retry if s.observed != Some(ledger.epoch(W1)) => {
+                Class::Rerun(W1.at(s.observed.unwrap_or(0)))
+            }
+            RetryOp::Retry => Class::Done,
+        })
+    }
+    fn check(&self, _: &Retrying) -> Result<(), Never> {
+        Ok(())
+    }
+    fn invariant(&self, v: &Never) -> &'static str {
+        match *v {}
+    }
+    fn publishers(&self, _: &Retrying, _: WaitId, out: &mut Vec<usize>) {
+        out.push(1);
+    }
+    fn reads(&self, _: &Retrying, _: RetryOp, _: ObjectId) -> bool {
+        false
+    }
+}
+
+#[test]
+fn one_stale_observation_pays_one_rerun() {
+    // Observe, Publish, Retry (paid), Retry (the same observation again).
+    let depth = killed_by(&RerunLoop, Bound::depth(5), InvariantId::I4);
+    assert_eq!(depth, 4);
+}
+
+/// The inverse: one atomic step that publishes two waits (a shutdown that
+/// wakes two queues) is legal. `7c4387f47` allowed a step to wake only the
+/// one wait its kind names.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct Shutdown {
+    shut: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum ShutdownOp {
+    WaitOne,
+    WaitTwo,
+    Shut,
+}
+
+struct MultiQueue;
+
+impl Protocol for MultiQueue {
+    type State = Shutdown;
+    type Op = ShutdownOp;
+    type Violation = Never;
+    const NAME: &'static str = "kat-multi-queue";
+
+    fn init(&self) -> Shutdown {
+        Shutdown { shut: false }
+    }
+    fn enabled(&self, s: &Shutdown, out: &mut Vec<ShutdownOp>) {
+        out.push(ShutdownOp::WaitOne);
+        out.push(ShutdownOp::WaitTwo);
+        if !s.shut {
+            out.push(ShutdownOp::Shut);
+        }
+    }
+    fn actor(&self, op: ShutdownOp) -> usize {
+        match op {
+            ShutdownOp::WaitOne => 0,
+            ShutdownOp::Shut => 1,
+            ShutdownOp::WaitTwo => 2,
+        }
+    }
+    fn kind(&self, op: ShutdownOp) -> OpKind {
+        match op {
+            ShutdownOp::Shut => OpKind::Commit(Effect::Publish(W1)),
+            ShutdownOp::WaitOne | ShutdownOp::WaitTwo => OpKind::Begin,
+        }
+    }
+    fn step(
+        &self,
+        s: &mut Shutdown,
+        op: ShutdownOp,
+        ledger: &mut WaitLedger,
+    ) -> Result<Class, Never> {
+        Ok(match op {
+            ShutdownOp::WaitOne | ShutdownOp::WaitTwo if s.shut => Class::Done,
+            ShutdownOp::WaitOne => Class::NotNow(W1.at(ledger.epoch(W1))),
+            ShutdownOp::WaitTwo => Class::NotNow(W2.at(ledger.epoch(W2))),
+            ShutdownOp::Shut => {
+                s.shut = true;
+                ledger.publish(W1);
+                ledger.publish(W2);
+                Class::Done
+            }
+        })
+    }
+    fn check(&self, _: &Shutdown) -> Result<(), Never> {
+        Ok(())
+    }
+    fn invariant(&self, v: &Never) -> &'static str {
+        match *v {}
+    }
+    fn publishers(&self, s: &Shutdown, _: WaitId, out: &mut Vec<usize>) {
+        if !s.shut {
+            out.push(1);
+        }
+    }
+    fn reads(&self, _: &Shutdown, _: ShutdownOp, _: ObjectId) -> bool {
+        false
+    }
+}
+
+#[test]
+fn one_step_may_publish_two_waits() {
+    explore(&MultiQueue, Bound::depth(6)).expect("an atomic two-queue publication is legal");
+    // Both wait, then the shutdown wakes both.
+    let (_, _, ledger) =
+        crate::explore::replay_to(&MultiQueue, &[0, 0, 0], Bound::depth(6)).expect("a legal path");
+    assert!(ledger.parked(0).is_some_and(|park| park.woken.is_some()));
+    assert!(ledger.parked(2).is_some_and(|park| park.woken.is_some()));
+}
+
+/// I4: the waiter's publisher is not parked, but it has nothing it can
+/// run: its release is enabled only after the waiter arms it, and the
+/// waiter parked first. `7c4387f47` counted any unparked publisher as live.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct Arming {
+    armed: bool,
+    released: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum ArmingOp {
+    Wait,
+    Arm,
+    Release,
+}
+
+struct DisabledPublisher;
+
+impl Protocol for DisabledPublisher {
+    type State = Arming;
+    type Op = ArmingOp;
+    type Violation = Never;
+    const NAME: &'static str = "kat-disabled-publisher";
+
+    fn init(&self) -> Arming {
+        Arming {
+            armed: false,
+            released: false,
+        }
+    }
+    fn enabled(&self, s: &Arming, out: &mut Vec<ArmingOp>) {
+        if !s.released {
+            out.push(ArmingOp::Wait);
+        }
+        if !s.armed {
+            out.push(ArmingOp::Arm);
+        }
+        if s.armed && !s.released {
+            out.push(ArmingOp::Release);
+        }
+    }
+    fn actor(&self, op: ArmingOp) -> usize {
+        usize::from(op == ArmingOp::Release)
+    }
+    fn kind(&self, op: ArmingOp) -> OpKind {
+        match op {
+            ArmingOp::Release => OpKind::Commit(Effect::Publish(W1)),
+            ArmingOp::Wait | ArmingOp::Arm => OpKind::Begin,
+        }
+    }
+    fn step(&self, s: &mut Arming, op: ArmingOp, ledger: &mut WaitLedger) -> Result<Class, Never> {
+        Ok(match op {
+            // The bug: it waits before it arms its own release.
+            ArmingOp::Wait => Class::NotNow(W1.at(ledger.epoch(W1))),
+            ArmingOp::Arm => {
+                s.armed = true;
+                Class::Done
+            }
+            ArmingOp::Release => {
+                s.released = true;
+                ledger.publish(W1);
+                Class::Done
+            }
+        })
+    }
+    fn check(&self, _: &Arming) -> Result<(), Never> {
+        Ok(())
+    }
+    fn invariant(&self, v: &Never) -> &'static str {
+        match *v {}
+    }
+    fn publishers(&self, s: &Arming, _: WaitId, out: &mut Vec<usize>) {
+        if !s.released {
+            out.push(1);
+        }
+    }
+    fn reads(&self, _: &Arming, _: ArmingOp, _: ObjectId) -> bool {
+        false
+    }
+}
+
+#[test]
+fn a_publisher_with_nothing_enabled_is_not_live() {
+    let depth = killed_by(&DisabledPublisher, Bound::depth(4), InvariantId::I4);
+    assert_eq!(depth, 1);
 }

@@ -52,7 +52,6 @@ struct Mailbox {
     closed: bool,
     corrupt: bool,
     /// The item wait's revision: every publication and the close advance it.
-    item_epoch: u64,
     taken: [u8; 2],
     /// Only the `NotNowCounts` mutant writes it.
     misses: u8,
@@ -88,7 +87,6 @@ impl Protocol for Toy {
             puts_left: 2,
             closed: false,
             corrupt: false,
-            item_epoch: 0,
             taken: [0; 2],
             misses: 0,
         }
@@ -139,9 +137,9 @@ impl Protocol for Toy {
                 s.put_in_flight = false;
                 s.slot = Some(2 - s.puts_left);
                 if !mutant::is(Mutant::SilentPut) {
-                    s.item_epoch += 1;
+                    ledger.advance(ITEM);
                     if !mutant::is(Mutant::NoWakeOnPut) {
-                        ledger.notify(ITEM);
+                        ledger.wake(ITEM);
                     }
                 }
                 Class::Done
@@ -149,8 +147,7 @@ impl Protocol for Toy {
             Op::Close => {
                 s.closed = true;
                 if !mutant::is(Mutant::CloseNoWake) {
-                    s.item_epoch += 1;
-                    ledger.notify(ITEM);
+                    ledger.wake(ITEM);
                 }
                 Class::Done
             }
@@ -168,7 +165,7 @@ impl Protocol for Toy {
                     if mutant::is(Mutant::NotNowCounts) {
                         s.misses += 1;
                     }
-                    Class::NotNow(ITEM.at(s.item_epoch))
+                    Class::NotNow(ITEM.at(ledger.epoch(ITEM)))
                 }
             }
             Op::Corrupt => {
@@ -191,10 +188,6 @@ impl Protocol for Toy {
         match violation {
             Violation::Conservation => "conservation",
         }
-    }
-
-    fn epoch(&self, s: &Mailbox, wait: WaitId) -> u64 {
-        if wait == ITEM { s.item_epoch } else { 0 }
     }
 
     fn publishers(&self, s: &Mailbox, wait: WaitId, out: &mut Vec<usize>) {

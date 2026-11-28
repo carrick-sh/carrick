@@ -39,7 +39,8 @@ pub trait Protocol {
     fn enabled(&self, state: &Self::State, out: &mut Vec<Self::Op>);
     fn actor(&self, op: Self::Op) -> usize;
     fn kind(&self, op: Self::Op) -> OpKind;
-    /// Run `op`. A production notify calls [`WaitLedger::notify`]. `Err` is
+    /// Run `op`. A production revision bump or wake calls
+    /// [`WaitLedger::advance`] or [`WaitLedger::wake`]. `Err` is
     /// a protocol invariant broken inside the step. A panic is caught and
     /// judged as `Broken` (I5).
     fn step(
@@ -53,10 +54,10 @@ pub trait Protocol {
     fn check(&self, state: &Self::State) -> Result<(), Self::Violation>;
     /// The name of a protocol invariant's failure (`"V5"`, `"G5"`).
     fn invariant(&self, violation: &Self::Violation) -> &'static str;
-    /// The epoch of `wait` in `state`: in production, the queue's revision.
-    fn epoch(&self, state: &Self::State, wait: WaitId) -> u64;
-    /// The actors that can still publish `wait` in `state` (I4: one of them,
-    /// other than the waiter, must be runnable).
+    /// The actors that can still publish `wait` in `state` (I4: one of
+    /// them, other than the waiter, must be able to step, or wait on a chain
+    /// that ends at one that can). Epochs are the ledger's
+    /// ([`WaitLedger::epoch`]), never the protocol's.
     fn publishers(&self, state: &Self::State, wait: WaitId, out: &mut Vec<usize>);
     /// Whether `op` reads `object` (I5 is per object). No default: a wrong
     /// guess either way hides a bug.
@@ -230,24 +231,19 @@ fn advance<P: Protocol>(
         reads_corruption,
         panic,
     };
+    next_ledger.account(facts, ledger).map_err(with_class)?;
+    next_ledger.check_wakes().map_err(with_class)?;
+    let mut enabled = Vec::new();
+    protocol.enabled(&next, &mut enabled);
     next_ledger
-        .account(facts, |after, w| {
-            if after {
-                protocol.epoch(&next, w)
-            } else {
-                protocol.epoch(state, w)
-            }
-        })
-        .map_err(with_class)?;
-    next_ledger
-        .check_wakes(|w| protocol.epoch(&next, w))
-        .map_err(with_class)?;
-    next_ledger
-        .check_stranded(|w| {
-            let mut out = Vec::new();
-            protocol.publishers(&next, w, &mut out);
-            out
-        })
+        .check_stranded(
+            |w| {
+                let mut out = Vec::new();
+                protocol.publishers(&next, w, &mut out);
+                out
+            },
+            |peer| enabled.iter().any(|&op| protocol.actor(op) == peer),
+        )
         .map_err(with_class)?;
     if judge && class == Class::Answer(Answer::Settled) {
         no_false_refusal(protocol, state, ledger, op, bound).map_err(with_class)?;

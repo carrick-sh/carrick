@@ -76,7 +76,7 @@ pub enum Answer {
 /// A "not now"'s enrolment: the wait, and the epoch of it the actor
 /// observed before it decided to park. In production, the
 /// `ObjectWaitSnapshot` the probe compares against.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Enrolment {
     pub wait: WaitId,
     pub observed: u64,
@@ -203,15 +203,6 @@ impl OpKind {
         match self {
             OpKind::Finish(effect) | OpKind::Commit(effect) => effect,
             OpKind::Begin | OpKind::Corrupt(_) => Effect::None,
-        }
-    }
-
-    /// The wait a committed step of this kind may notify: the one it
-    /// publishes or closes.
-    pub const fn notifies(self) -> Option<WaitId> {
-        match self.effect() {
-            Effect::Publish(wait) | Effect::Close(wait) => Some(wait),
-            Effect::None => None,
         }
     }
 }

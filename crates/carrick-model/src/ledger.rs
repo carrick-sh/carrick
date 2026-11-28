@@ -1,12 +1,16 @@
 //! The wait ledger: ghost state that records every actor's waits, so the
 //! harness checks I1 to I5 for every protocol the same way.
 //!
-//! It is also the model of the wait queue: a protocol's production notify
-//! calls [`WaitLedger::notify`], which wakes every actor parked on the wait
-//! and records which step woke it. What the ledger never does is wake anyone
-//! on its own: a step that publishes without notifying leaves its waiter
-//! parked, and I1 or I3 finds it. It is plain data, compared and hashed with
-//! the protocol's state.
+//! It is also the model of the wait queue, and it owns every wait's epoch
+//! (its revision), so an epoch only ever moves forward, by
+//! [`WaitLedger::advance`]. A protocol's step calls the production pair the
+//! ledger models: [`advance`](WaitLedger::advance) where production bumps
+//! the queue's revision, and [`wake`](WaitLedger::wake) where it wakes the
+//! queue ([`publish`](WaitLedger::publish) does both). The ledger never
+//! wakes anyone on its own: a step that advances without waking leaves its
+//! waiter parked on a moved epoch (I1), and a wake without an advance (or a
+//! committed close) of the same wait in the same step is a spurious wake
+//! (I4). It is plain data, compared and hashed with the protocol's state.
 //!
 //! The queue it models wakes everyone (wake-all). A wake-one queue, whose
 //! woken waiter passes the wake on, is outside it: I1 as stated would call
@@ -34,20 +38,27 @@ pub struct Park {
     pub wait: WaitId,
     /// The epoch of the wait it observed before it parked.
     pub epoch: u64,
-    /// The step whose notify claimed it, if one has.
+    /// The step whose wake claimed it, if one has.
     pub woken: Option<Waker>,
 }
 
 /// The ledger. See the module documentation.
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
 pub struct WaitLedger {
+    /// Every wait's epoch; absent is zero.
+    epochs: BTreeMap<WaitId, u64>,
     parked: BTreeMap<usize, Park>,
     closed: BTreeSet<WaitId>,
     corrupted: BTreeSet<ObjectId>,
+    /// The stale observations each actor's reruns have been paid by: one
+    /// observation pays one rerun.
+    paid: BTreeMap<usize, BTreeSet<Enrolment>>,
     ended: bool,
     /// The step running now, for [`Waker`].
     stepping: Option<Waker>,
-    /// The waits the running step's notifies woke someone on.
+    /// The waits the running step advanced.
+    advanced: BTreeSet<WaitId>,
+    /// The waits the running step's wakes woke someone on.
     woke: BTreeSet<WaitId>,
 }
 
@@ -68,9 +79,20 @@ pub(crate) struct Facts {
 }
 
 impl WaitLedger {
-    /// The production notify of `wait` ran: every actor parked on it is
-    /// woken, by the step running now.
-    pub fn notify(&mut self, wait: WaitId) {
+    /// `wait`'s epoch: what an actor observes before it decides to park.
+    pub fn epoch(&self, wait: WaitId) -> u64 {
+        self.epochs.get(&wait).copied().unwrap_or(0)
+    }
+
+    /// The production revision bump of `wait` ran.
+    pub fn advance(&mut self, wait: WaitId) {
+        *self.epochs.entry(wait).or_insert(0) += 1;
+        self.advanced.insert(wait);
+    }
+
+    /// The production wake of `wait`'s queue ran: every actor parked on it
+    /// is woken, by the step running now.
+    pub fn wake(&mut self, wait: WaitId) {
         let waker = self.stepping.unwrap_or(Waker {
             actor: usize::MAX,
             kind: OpKind::Begin,
@@ -81,6 +103,13 @@ impl WaitLedger {
                 self.woke.insert(wait);
             }
         }
+    }
+
+    /// A publication of `wait`: [`advance`](Self::advance), then
+    /// [`wake`](Self::wake).
+    pub fn publish(&mut self, wait: WaitId) {
+        self.advance(wait);
+        self.wake(wait);
     }
 
     /// Whether `actor` may run: not parked, or woken.
@@ -110,18 +139,14 @@ impl WaitLedger {
         self.corrupted.iter().copied()
     }
 
-    /// The step about to run, so a notify inside it records its waker.
+    /// The step about to run, so a wake inside it records its waker.
     pub(crate) fn begin_step(&mut self, actor: usize, kind: OpKind) {
         self.stepping = Some(Waker { actor, kind });
     }
 
-    /// Account one step and check the step-local invariants. `epoch` reads
-    /// the state before (`false`) or after (`true`) the step.
-    pub(crate) fn account(
-        &mut self,
-        facts: Facts,
-        epoch: impl Fn(bool, WaitId) -> u64,
-    ) -> Result<(), Broken> {
+    /// Account one step and check the step-local invariants. `before` is
+    /// the ledger as the step found it.
+    pub(crate) fn account(&mut self, facts: Facts, before: &WaitLedger) -> Result<(), Broken> {
         let Facts {
             actor,
             kind,
@@ -132,6 +157,7 @@ impl WaitLedger {
         } = facts;
         self.stepping = None;
         let woke = core::mem::take(&mut self.woke);
+        let advanced = core::mem::take(&mut self.advanced);
         // I5: broken is fatal, contention is not, per object.
         let broken = class == Class::Broken;
         if reads_corruption && !broken {
@@ -153,19 +179,22 @@ impl WaitLedger {
         if broken {
             self.ended = true;
         }
-        // I4: only a committed publication or close of a wait wakes its
-        // waiters. A wake from anything else (a "not now", a step that
-        // publishes another wait) is a spurious wake: the waiter re-probes
-        // an unmoved epoch, which is polling.
+        // I4: a wake is a publication's or a committed close's. A wake of a
+        // wait the step didn't advance (and didn't close) is spurious: the
+        // waiter re-probes an unmoved epoch, which is polling.
+        let closes = match (class, kind.effect()) {
+            (Class::Done, Effect::Close(wait)) => Some(wait),
+            _ => None,
+        };
         if let Some(&wait) = woke
             .iter()
-            .find(|&&wait| class != Class::Done || kind.notifies() != Some(wait))
+            .find(|&&wait| !advanced.contains(&wait) && closes != Some(wait))
         {
             return Err((
                 InvariantId::I4,
                 format!(
-                    "actor {actor}'s {kind:?} answered {class:?} and woke the waiters of {wait:?}: \
-                     only a committed publication or close of a wait may wake them"
+                    "actor {actor}'s {kind:?} ({class:?}) woke the waiters of {wait:?} without \
+                     advancing or closing it: a spurious wake"
                 ),
             ));
         }
@@ -175,7 +204,7 @@ impl WaitLedger {
         self.parked.remove(&actor);
         match class {
             Class::NotNow(Enrolment { wait, observed }) => {
-                let now = epoch(true, wait);
+                let now = self.epoch(wait);
                 if now != observed {
                     return Err((
                         InvariantId::I1,
@@ -185,7 +214,7 @@ impl WaitLedger {
                         ),
                     ));
                 }
-                if !state_unchanged {
+                if !state_unchanged || !advanced.is_empty() {
                     return Err((
                         InvariantId::I4,
                         format!("actor {actor}'s \"not now\" on {wait:?} changed the state"),
@@ -206,13 +235,22 @@ impl WaitLedger {
                     },
                 );
             }
-            Class::Rerun(Enrolment { wait, observed }) => {
-                if epoch(false, wait) == observed {
+            Class::Rerun(enrolment @ Enrolment { wait, observed }) => {
+                if before.epoch(wait) == observed {
                     return Err((
                         InvariantId::I4,
                         format!(
                             "actor {actor} reran on {wait:?} observed at epoch {observed}, and the \
                              wait is still there: nothing moved under the observation"
+                        ),
+                    ));
+                }
+                if !self.paid.entry(actor).or_default().insert(enrolment) {
+                    return Err((
+                        InvariantId::I4,
+                        format!(
+                            "actor {actor} reran again on its observation of {wait:?} at epoch \
+                             {observed}: one stale observation pays one rerun"
                         ),
                     ));
                 }
@@ -223,12 +261,12 @@ impl WaitLedger {
         // closes nothing.
         if class == Class::Done {
             match kind.effect() {
-                Effect::Publish(wait) if epoch(true, wait) == epoch(false, wait) => {
+                Effect::Publish(wait) if !advanced.contains(&wait) => {
                     return Err((
                         InvariantId::I1,
                         format!(
                             "actor {actor}'s committed {kind:?} left {wait:?} at epoch {}",
-                            epoch(false, wait)
+                            self.epoch(wait)
                         ),
                     ));
                 }
@@ -251,24 +289,29 @@ impl WaitLedger {
         Ok(())
     }
 
-    /// I4, in every state: every parked, unwoken actor waits on a wait with
-    /// a live publisher in the state reached. Checked after every step, so a
-    /// waiter whose last publisher later finishes without publishing, or
-    /// parks behind it, is stranded there.
+    /// I4, in every state of a live world: every parked, unwoken actor
+    /// waits on a wait with a live publisher. `publishers` lists who can
+    /// publish a wait, and `can_step` whether an actor has an enabled
+    /// operation, both in the state reached. A world a legal `Broken` ended
+    /// owes no one a wake.
     pub(crate) fn check_stranded(
         &self,
         publishers: impl Fn(WaitId) -> Vec<usize>,
+        can_step: impl Fn(usize) -> bool,
     ) -> Result<(), Broken> {
+        if self.ended {
+            return Ok(());
+        }
         for (&actor, park) in &self.parked {
             if park.woken.is_some() {
                 continue;
             }
             let mut visited = BTreeSet::from([actor]);
-            if !self.live_publisher(park.wait, &publishers, &mut visited) {
+            if !self.live_publisher(park.wait, &publishers, &can_step, &mut visited) {
                 return Err((
                     InvariantId::I4,
                     format!(
-                        "actor {actor} waits on {:?}, and no runnable peer will publish it \
+                        "actor {actor} waits on {:?}, and no peer that can run will publish it \
                          (publishers {:?})",
                         park.wait,
                         publishers(park.wait)
@@ -280,26 +323,32 @@ impl WaitLedger {
     }
 
     /// Whether some publisher of `wait` outside `visited` can run: it is
-    /// runnable, or it is parked on a wait that, in turn, has one (a chain
-    /// of waits ending at a runnable actor). A cycle back to `visited` (the
-    /// waiter itself, to start with) is a deadlock, not a publisher.
+    /// runnable and has an enabled operation, or it is parked on a wait
+    /// that, in turn, has one (a chain of waits ending at an actor that can
+    /// step). A cycle back to `visited` (the waiter itself, to start with)
+    /// is a deadlock, not a publisher.
     fn live_publisher(
         &self,
         wait: WaitId,
         publishers: &impl Fn(WaitId) -> Vec<usize>,
+        can_step: &impl Fn(usize) -> bool,
         visited: &mut BTreeSet<usize>,
     ) -> bool {
         for peer in publishers(wait) {
             if !visited.insert(peer) {
                 continue;
             }
-            if self.is_runnable(peer) {
-                return true;
-            }
-            if let Some(park) = self.parked.get(&peer)
-                && self.live_publisher(park.wait, publishers, visited)
-            {
-                return true;
+            match self.parked.get(&peer) {
+                Some(park) if park.woken.is_none() => {
+                    if self.live_publisher(park.wait, publishers, can_step, visited) {
+                        return true;
+                    }
+                }
+                _ => {
+                    if can_step(peer) {
+                        return true;
+                    }
+                }
             }
         }
         false
@@ -307,9 +356,9 @@ impl WaitLedger {
 
     /// I1, in every state: no parked actor's wait moved past the epoch it
     /// parked at without a wake for it.
-    pub(crate) fn check_wakes(&self, epoch: impl Fn(WaitId) -> u64) -> Result<(), Broken> {
+    pub(crate) fn check_wakes(&self) -> Result<(), Broken> {
         for (&actor, park) in &self.parked {
-            let now = epoch(park.wait);
+            let now = self.epoch(park.wait);
             if park.woken.is_none() && now != park.epoch {
                 return Err((
                     InvariantId::I1,
