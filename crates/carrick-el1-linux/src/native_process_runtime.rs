@@ -17164,7 +17164,11 @@ mod tests {
         };
         activate(&runtime, peer_source, &peer_task, child);
         let before = root_channel.generation.generation();
-        let parent_before = parent_channel.generation.generation();
+        // The parent's own exit (inside the probe) may publish its channel,
+        // ending its members' signal-channel waits (#3081). The claim here is
+        // that the reparented child's exit publishes it no further, so the
+        // generation is measured once the parent has exited.
+        let parent_after_exit = std::sync::OnceLock::new();
         let probe_calls = core::sync::atomic::AtomicU32::new(0);
         let probe = || {
             assert_eq!(probe_calls.fetch_add(1, Ordering::AcqRel), 0);
@@ -17223,6 +17227,11 @@ mod tests {
                 done.send(()).unwrap();
                 result.unwrap();
             });
+            assert!(
+                parent_after_exit
+                    .set(parent_channel.generation.generation())
+                    .is_ok()
+            );
             if adopter_caught {
                 let (_, info) = root_signals
                     .take_timedwait(
@@ -17293,8 +17302,8 @@ mod tests {
             "no delivery to departed parent"
         );
         assert_eq!(
-            parent_channel.generation.generation(),
-            parent_before,
+            Some(&parent_channel.generation.generation()),
+            parent_after_exit.get(),
             "no stale channel publication"
         );
         // Parent and child each publish once to the adopter. Standard SIGCHLD
