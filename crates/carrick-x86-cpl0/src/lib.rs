@@ -295,11 +295,13 @@ mod test_support {
     static ORDER_ARMING_PASSES: core::sync::atomic::AtomicU64 =
         core::sync::atomic::AtomicU64::new(0);
     /// The late arming's park of the ordered slot past its final idle
-    /// recheck, right before `sti; hlt` (#3136): requested, parked, released.
+    /// recheck, right before `sti; hlt` (#3136): requested (its wake not
+    /// yet known sent), sent, parked, released.
     static LATE_PARK: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
     const PARK_REQUESTED: u8 = 1;
-    const PARK_PARKED: u8 = 2;
-    const PARK_RELEASED: u8 = 3;
+    const PARK_SENT: u8 = 2;
+    const PARK_PARKED: u8 = 3;
+    const PARK_RELEASED: u8 = 4;
     /// The stopped peer's current task, published at its ordering point.
     static ORDER_PEER_TASK: core::sync::atomic::AtomicUsize =
         core::sync::atomic::AtomicUsize::new(0);
@@ -779,18 +781,23 @@ mod test_support {
     /// arming, so the next pass begins only after a vector woke this CPU
     /// (#3136).
     pub fn park_after_idle_recheck(slot: carrick_sched_core::SlotId) {
-        if ORDER_SLOT.load(Ordering::Acquire) != slot.raw() + 1
-            || LATE_PARK.load(Ordering::Acquire) != PARK_REQUESTED
-            // A wake already pending would end the HLT by itself: this pass
-            // goes on and the next one parks.
+        if ORDER_SLOT.load(Ordering::Acquire) != slot.raw() + 1 {
+            return;
+        }
+        // The request's wake may be in flight, as the arming's is: the
+        // same one-word handshake. Wait until it is known sent, then a wake
+        // still pending (that one, or any other) would end the HLT by
+        // itself: this pass goes on and the next one parks. Parked, the
+        // request's wake is taken, so only the arming's can end the sleep.
+        let mut park = LATE_PARK.load(Ordering::Acquire);
+        while park == PARK_REQUESTED {
+            core::hint::spin_loop();
+            park = LATE_PARK.load(Ordering::Acquire);
+        }
+        if park != PARK_SENT
             || wake_vector_pending()
             || LATE_PARK
-                .compare_exchange(
-                    PARK_REQUESTED,
-                    PARK_PARKED,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
+                .compare_exchange(PARK_SENT, PARK_PARKED, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
         {
             return;
@@ -921,6 +928,7 @@ mod test_support {
             carrick_el1::isa::x86::interrupt::send_resched(peer)
                 .unwrap_or_else(|_| carrick_x86_carrier::entry::fatal_boot!());
             deliver_owed_now();
+            LATE_PARK.store(PARK_SENT, Ordering::Release);
             while LATE_PARK.load(Ordering::Acquire) != PARK_PARKED {
                 core::hint::spin_loop();
             }
