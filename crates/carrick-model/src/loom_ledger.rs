@@ -6,8 +6,24 @@
 //! did instead, at the points that matter to I1: the read of the conditions
 //! a wait guards ([`LoomLedger::probe`]), a publication
 //! ([`LoomLedger::publish`]), a notify, and a park. The ledger is the same
-//! [`WaitLedger`] the explorer uses, checked the same way: at every halt
-//! and at the end of each execution ([`LoomLedger::finish`]).
+//! [`WaitLedger`] the explorer uses, and I1 is checked at the end of each
+//! execution ([`LoomLedger::finish`]), once every actor has run to its end
+//! and so every wake a publisher owes has been sent.
+//!
+//! Never at a halt: a publisher may advance the epoch, then reach a loom
+//! scheduling point before it sends the wake, and a waiter that halts in
+//! between is woken by that send. A halt-time check would call that correct
+//! protocol a lost wake (#3061 S1 pre-review).
+//!
+//! **The probe's contract.** An actor probes a wait right before the read
+//! of the conditions it guards, and parks (halts) only when that read found
+//! nothing to do. A publisher publishes once what it published is visible
+//! to that read: in a model, right after the production call that made it
+//! visible returns, never before. So a publication after the probe either
+//! was seen by the read (the actor didn't park) or needs a wake, and the
+//! probe's epoch is the one the park waits from. The ghost epoch may lag
+//! the real publication, never lead it, so it can miss no lost wake that
+//! the end state shows.
 //!
 //! It sits behind a `std` mutex, never a loom one: it is ghost state, so it
 //! adds no interleavings of its own, and each call is one indivisible step
@@ -189,7 +205,8 @@ impl<'a> ModelIrq<'a> {
 
     /// `actor` halts (`sti; hlt`, WFI). Returns `true` if it sleeps: no
     /// vector was pending. A pending vector ends the halt at once and is
-    /// taken. Either way, I1 is checked here.
+    /// taken. A sleeping actor stays parked until a send wakes it; whether
+    /// one ever does is [`LoomLedger::finish`]'s I1.
     pub fn halt(&self, actor: usize) -> bool {
         self.ledger.with(|inner| {
             LoomLedger::park(inner, actor, Self::wait(actor));
@@ -197,7 +214,6 @@ impl<'a> ModelIrq<'a> {
             if pending {
                 LoomLedger::unpark(inner, actor);
             }
-            raise(inner.check());
             !pending
         })
     }
@@ -262,14 +278,29 @@ mod tests {
             ledger.finish();
         });
         assert!(message.starts_with("I1: "), "{message}");
-        // Published between the probe and the halt: found at the halt.
+        // Published between the probe and the halt, never sent: found at
+        // the end too.
         let message = panics_with(|| {
             let ledger = LoomLedger::new();
             let irq = ModelIrq::new(&ledger);
             irq.probe(1);
             ledger.publish(0, ModelIrq::wait(1));
-            irq.halt(1);
+            assert!(irq.halt(1));
+            ledger.finish();
         });
         assert!(message.starts_with("I1: "), "{message}");
+    }
+
+    #[test]
+    fn a_halt_between_the_publication_and_its_send_is_woken_by_the_send() {
+        // The publisher advances the epoch, the waiter halts, then the send
+        // comes: a correct protocol, never a lost wake.
+        let ledger = LoomLedger::new();
+        let irq = ModelIrq::new(&ledger);
+        irq.probe(1);
+        ledger.publish(0, ModelIrq::wait(1));
+        assert!(irq.halt(1));
+        irq.send(1);
+        ledger.finish();
     }
 }
