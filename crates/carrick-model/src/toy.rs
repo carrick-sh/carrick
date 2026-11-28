@@ -24,13 +24,15 @@ enum Mutant {
     CloseNoWake,
     NotNowCounts,
     BusyIsBroken,
+    SilentPut,
 }
 crate::mutants!(Mutant {
     NoWakeOnPut,
     FalseEmpty,
     CloseNoWake,
     NotNowCounts,
-    BusyIsBroken
+    BusyIsBroken,
+    SilentPut
 });
 use crate::Mutant as _;
 use crate::mutant;
@@ -133,9 +135,11 @@ impl Protocol for Toy {
             Op::FinishPut => {
                 s.put_in_flight = false;
                 s.slot = Some(2 - s.puts_left);
-                s.item_epoch += 1;
-                if !mutant::is(Mutant::NoWakeOnPut) {
-                    ledger.notify(ITEM);
+                if !mutant::is(Mutant::SilentPut) {
+                    s.item_epoch += 1;
+                    if !mutant::is(Mutant::NoWakeOnPut) {
+                        ledger.notify(ITEM);
+                    }
                 }
                 Class::Done
             }
@@ -271,6 +275,7 @@ fn each_toy_mutant_is_killed_by_its_invariant_at_its_shortest_depth() {
             Mutant::BusyIsBroken.name(),
             InvariantId::I5,
         ),
+        (Mutant::SilentPut, Mutant::SilentPut.name(), InvariantId::I1),
     ];
     assert_eq!(cases.len(), Mutant::ALL.len());
     let found = mutants_killed(&cases, |which| {
@@ -306,7 +311,7 @@ fn each_toy_mutant_is_killed_by_its_invariant_at_its_shortest_depth() {
 /// - CloseNoWake: take parks, close leaves it parked: 2;
 /// - NotNowCounts: the first take's "not now" writes the state: 1;
 /// - BusyIsBroken: begin, take meets the put in flight as Broken: 2.
-const TOY_KILL_LENGTHS: [usize; 5] = [3, 2, 2, 1, 2];
+const TOY_KILL_LENGTHS: [usize; 6] = [3, 2, 2, 1, 2, 3];
 
 #[test]
 fn a_correct_path_replays_clean() {
@@ -338,5 +343,59 @@ fn a_nested_mutant_scope_restores_the_outer_mutant() {
     assert!(
         !mutant::is(Mutant::FalseEmpty),
         "no mutant outside every scope"
+    );
+}
+
+/// The replay line alone reproduces a mutant's kill: it names the mutant
+/// and the drain bound (#3181 pre-review).
+#[test]
+fn a_replay_line_names_its_mutant_and_drain() {
+    let counterexample = mutant::with(Mutant::FalseEmpty, || explore(&Toy, Bound::depth(DEPTH)))
+        .expect_err("FalseEmpty is killed");
+    let line = counterexample.replay_line();
+    assert!(line.contains("FalseEmpty"), "no mutant in {line}");
+    assert!(line.contains("drain=32"), "no drain bound in {line}");
+}
+
+/// With no drain budget, an answer during a put in flight is unproven, not
+/// green (#3181 pre-review).
+#[test]
+fn an_exhausted_drain_budget_is_not_a_pass() {
+    let bound = Bound {
+        depth: DEPTH,
+        drain: 0,
+    };
+    let explored = mutant::with(Mutant::FalseEmpty, || explore(&Toy, bound));
+    let counterexample = explored.expect_err("a partial drain certifies nothing");
+    assert_eq!(counterexample.invariant, InvariantId::I2);
+}
+
+/// "Woken by the close" means the close did the wake: here the put woke the
+/// consumer, and then the producer closed.
+#[test]
+fn a_wake_by_an_earlier_put_is_not_a_wake_by_the_close() {
+    let mut state = Toy.init();
+    let mut ledger = WaitLedger::default();
+    for op in [Op::Take(1), Op::BeginPut, Op::FinishPut, Op::Close] {
+        let before = state.clone();
+        let class = Toy.step(&mut state, op, &mut ledger).unwrap();
+        ledger
+            .account(
+                Toy.actor(op),
+                Toy.kind(op),
+                class,
+                state == before,
+                false,
+                |w| Toy.epoch(&state, w),
+                |w| Toy.has_publisher(&before, w),
+            )
+            .unwrap();
+    }
+    let mut coverage = Coverage::default();
+    Toy.reached(&state, &ledger, &mut coverage);
+    assert!(
+        !coverage.has("parked, then woken by the close"),
+        "the put woke it: {:?}",
+        coverage.shapes().collect::<Vec<_>>()
     );
 }

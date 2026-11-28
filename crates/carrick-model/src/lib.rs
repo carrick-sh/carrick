@@ -29,6 +29,8 @@ extern crate std;
 
 #[cfg(any(test, feature = "std"))]
 pub mod explore;
+#[cfg(test)]
+mod kats;
 #[cfg(any(test, feature = "std"))]
 pub mod ledger;
 #[cfg(any(test, feature = "std"))]
