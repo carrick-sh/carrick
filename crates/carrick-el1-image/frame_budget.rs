@@ -892,7 +892,8 @@ pub(crate) fn check_switch_venues(disassembly: &str) -> Result<(), String> {
             continue;
         };
         let mut words = instruction.split_whitespace();
-        if !matches!(words.next(), Some("bl" | "b")) {
+        let mnemonic = words.next();
+        if !matches!(mnemonic, Some("bl" | "b")) {
             continue;
         }
         let Some(target) = instruction
@@ -901,9 +902,15 @@ pub(crate) fn check_switch_venues(disassembly: &str) -> Result<(), String> {
         else {
             continue;
         };
-        // A branch to a label inside the caller itself (`<f+0x98>` from `f`)
-        // is control flow within that function, not a call into a switch.
-        if target.split_once('+').map_or(target, |(base, _)| base) == caller {
+        // A plain `b` to an interior label of the caller itself
+        // (`b <f+0x98>` from `f`) is control flow within that function, not
+        // a call into a switch. A `bl` adds a frame even to the caller itself,
+        // and a `b` to its entry is a re-entry: both are still measured.
+        if mnemonic == Some("b")
+            && target
+                .split_once('+')
+                .is_some_and(|(base, offset)| base == caller && is_interior_offset(offset))
+        {
             continue;
         }
         if !SWITCHES.iter().any(|switch| target.starts_with(switch)) {
@@ -924,6 +931,15 @@ pub(crate) fn check_switch_venues(disassembly: &str) -> Result<(), String> {
     } else {
         Err(failures.into_iter().collect::<Vec<_>>().join("\n"))
     }
+}
+
+/// `0x98` (from `f+0x98`): a nonzero hexadecimal offset, so a label past
+/// the function's entry.
+fn is_interior_offset(offset: &str) -> bool {
+    offset
+        .strip_prefix("0x")
+        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+        .is_some_and(|value| value != 0)
 }
 
 #[cfg(test)]
@@ -1002,6 +1018,41 @@ mod tests {
         );
         let error = check_switch_venues(&loop_only).unwrap_err();
         assert!(!error.contains("+0x98"), "{error}");
+    }
+
+    /// #3117 pre-review P0 3: the exemption is a `b` to an interior label
+    /// only. A recursive `bl` from a switch outside the venues adds a frame
+    /// and is refused, even beside a valid venue edge that sets `seen`; so
+    /// is a `b` back to the switch's own entry.
+    #[test]
+    fn a_recursive_call_or_entry_branch_of_a_switch_is_still_refused() {
+        let run_ready = "carrick_el1::substrate::sched::Sched$LT$C$C$U$GT$::run_ready::h8";
+        let venue = "carrick_el1_syscall";
+        for (edge, shown) in [
+            (
+                format!("bl 0x1000 <{run_ready}>"),
+                format!("{run_ready} -> {run_ready}"),
+            ),
+            (
+                format!("bl 0x1098 <{run_ready}+0x98>"),
+                format!("{run_ready} -> {run_ready}+0x98"),
+            ),
+            (
+                format!("b 0x1000 <{run_ready}+0x0>"),
+                format!("{run_ready} -> {run_ready}+0x0"),
+            ),
+            (
+                format!("b 0x1000 <{run_ready}>"),
+                format!("{run_ready} -> {run_ready}"),
+            ),
+        ] {
+            let disassembly = format!(
+                "1000 <{run_ready}>:\n1010: {edge}\n1098: ret\n\
+                 2000 <{IDLE}>:\n2000: ret\n3000 <{venue}>:\n3000: bl 0x2000 <{IDLE}>\n"
+            );
+            let error = check_switch_venues(&disassembly).unwrap_err();
+            assert!(error.contains(&shown), "{edge}: {error}");
+        }
     }
 
     #[test]
