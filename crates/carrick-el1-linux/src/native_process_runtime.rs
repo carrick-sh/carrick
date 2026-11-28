@@ -12979,12 +12979,16 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         // Convert once: every re-park of this sleep keeps this deadline.
         let deadline = match request.deadline {
             SleepDeadline::Relative(nanos) => self.service.signal_deadline(nanos).map_err(errno)?,
-            SleepDeadline::Monotonic(nanos) => {
+            SleepDeadline::Absolute(deadline) => {
                 let frequency = self.service.signal_frequency().map_err(errno)?.raw().get();
-                let ticks = (u128::from(nanos) * u128::from(frequency)).div_ceil(1_000_000_000);
-                carrick_guest_arch::Deadline(carrick_guest_arch::CounterTick::new(
-                    u64::try_from(ticks).unwrap_or(u64::MAX),
-                ))
+                // `sleep::invoke` builds only monotonic absolute sleeps, which
+                // always convert; a realtime one has no epoch without the
+                // zone's offset.
+                carrick_guest_arch::Deadline(
+                    deadline
+                        .counter_tick(frequency, self.source.zone.realtime_offset())
+                        .ok_or(carrick_syscall_abi::LINUX_EINVAL)?,
+                )
             }
         };
         let channel = self

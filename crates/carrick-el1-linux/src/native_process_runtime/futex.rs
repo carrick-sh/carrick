@@ -54,6 +54,7 @@ struct Adapter<'e, 'r, 'a, M: Clone, C: ProcessContext, S: NativeProcessService<
     mapping_refusal: Option<LifecycleOutcome>,
     now: CounterTick,
     frequency: FutexFrequency,
+    realtime_offset: Option<u64>,
     retained: Option<RelativeFutexWait>,
 }
 impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
@@ -104,6 +105,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Fu
     }
     fn now(&self) -> CounterTick {
         self.now
+    }
+    fn realtime_offset(&self) -> Option<u64> {
+        self.realtime_offset
     }
     fn retained_deadline(&self) -> Option<CounterTick> {
         self.retained.as_ref().map(|wait| wait.deadline)
@@ -337,9 +341,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if !call.admitted() {
             return None;
         }
-        let (now, frequency) = if call.args[3] != 0
-            && call.args[1] == carrick_personality_linux::sched::FUTEX_WAIT_PRIVATE
-        {
+        let wake = call.args[1] == carrick_personality_linux::sched::FUTEX_WAKE_PRIVATE
+            || call.args[1] == carrick_personality_linux::sched::FUTEX_WAKE_BITSET_PRIVATE;
+        // A timed wait's clock: the counter, and the zone's realtime
+        // calibration for a FUTEX_CLOCK_REALTIME deadline.
+        let (now, frequency) = if call.args[3] != 0 && !wake {
             (
                 self.service.signal_now().ok()?,
                 self.service.counter_frequency().ok()?,
@@ -347,6 +353,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         } else {
             (CounterTick::new(0), FutexFrequency::from_hz(1))
         };
+        let realtime_offset = self.source.zone.realtime_offset();
         let retained = self.take_relative_futex_wait();
         let mut adapter = Adapter {
             entry: self,
@@ -356,10 +363,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             mapping_refusal: None,
             now,
             frequency,
+            realtime_offset,
             retained,
         };
-        let wake = call.args[1] == carrick_personality_linux::sched::FUTEX_WAKE_PRIVATE
-            || call.args[1] == carrick_personality_linux::sched::FUTEX_WAKE_BITSET_PRIVATE;
         let result = if shared.is_some()
             && wake
             && adapter.authenticate_mapping(UserVa::new(call.args[0])) != Some(true)

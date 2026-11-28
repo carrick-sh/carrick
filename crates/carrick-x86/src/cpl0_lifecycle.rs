@@ -1586,6 +1586,9 @@ impl FutexVenue for NativeLane<'_> {
         }
         carrick_guest_arch::CounterTick::new(0)
     }
+    fn realtime_offset(&self) -> Option<u64> {
+        self.zone.realtime_offset()
+    }
     fn invalid(&mut self, result: SyscallResult) -> Option<Self::Served> {
         self.frame.rax = result.raw() as u64;
         Some(carrick_core::Served::Returned { switched: false })

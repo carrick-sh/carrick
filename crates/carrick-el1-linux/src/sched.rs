@@ -180,6 +180,9 @@ impl<C: ThreadCpu, U: UserWord> FutexVenue for Adapter<'_, '_, '_, C, U> {
     fn now(&self) -> CounterTick {
         CounterTick::new(self.sched.cpu.now())
     }
+    fn realtime_offset(&self) -> Option<u64> {
+        self.sched.zone.realtime_offset()
+    }
     fn retained_deadline(&self) -> Option<CounterTick> {
         self.operation.as_ref().map(|op| op.deadline)
     }

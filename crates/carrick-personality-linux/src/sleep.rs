@@ -16,7 +16,7 @@
 use crate::abi::entry::SyscallResult;
 use crate::signal::{SignalNative, SignalOutcome};
 use carrick_core::user_copy::CopyOutcome;
-use carrick_guest_arch::{GuestIsa, UserVa};
+use carrick_guest_arch::{CounterTick, GuestIsa, UserVa};
 use carrick_syscall_abi::{
     LINUX_CLOCK_BOOTTIME, LINUX_CLOCK_BOOTTIME_ALARM, LINUX_CLOCK_CPU_PERTHREAD,
     LINUX_CLOCK_CPU_WHICH_MASK, LINUX_CLOCK_FD, LINUX_CLOCK_MONOTONIC,
@@ -144,13 +144,63 @@ pub fn timespec_bytes(nanos: u64) -> [u8; 16] {
     bytes
 }
 
+/// An absolute deadline on a guest clock, in that clock's nanoseconds. A
+/// timed futex wait and an absolute sleep both convert one, once, at entry,
+/// with [`AbsoluteDeadline::counter_tick`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AbsoluteDeadline {
+    /// Monotonic-domain nanoseconds: guest counter / frequency, the epoch of
+    /// `clock_gettime(CLOCK_MONOTONIC)` in ring and in the vDSO.
+    Monotonic(u64),
+    /// `CLOCK_REALTIME` nanoseconds: the monotonic domain plus the carrier's
+    /// ring-published realtime offset, as `clock_gettime(CLOCK_REALTIME)`.
+    Realtime(u64),
+}
+
+impl AbsoluteDeadline {
+    /// The first guest counter tick at or after this deadline, for a counter
+    /// running at `frequency_hz`: it never fires before the guest clock reads
+    /// the deadline. A deadline already past is tick 1, which every timer
+    /// owner sees as expired (tick 0 means "no deadline" to the zone).
+    ///
+    /// A realtime deadline needs `realtime_offset_ns`, the zone's published
+    /// calibration; without one it is `None` and the caller leaves the call
+    /// unserved rather than guess an epoch.
+    ///
+    /// Converting a realtime deadline once is exact only while the guest
+    /// cannot step `CLOCK_REALTIME` under a parked waiter: Linux re-arms a
+    /// realtime futex or `TIMER_ABSTIME` sleep when the clock is set. No ring
+    /// venue serves a clock step, and
+    /// `tests::no_ring_venue_steps_the_realtime_clock` holds that as a
+    /// checked fact: if a venue ever serves `clock_settime`,
+    /// `settimeofday`, `adjtimex` or `clock_adjtime`, that test fails, and
+    /// the parked realtime waits must re-arm on the step.
+    pub fn counter_tick(
+        self,
+        frequency_hz: u64,
+        realtime_offset_ns: Option<u64>,
+    ) -> Option<CounterTick> {
+        let monotonic = match self {
+            Self::Monotonic(nanos) => nanos,
+            // Before the counter's epoch is already past.
+            Self::Realtime(nanos) => nanos.saturating_sub(realtime_offset_ns?),
+        };
+        let ticks =
+            (u128::from(monotonic) * u128::from(frequency_hz)).div_ceil(NANOS_PER_SECOND.into());
+        Some(CounterTick::new(
+            u64::try_from(ticks).unwrap_or(u64::MAX).max(1),
+        ))
+    }
+}
+
 /// The deadline the process owner converts into guest counter ticks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SleepDeadline {
     /// Nanoseconds from now, measured on the guest counter.
     Relative(u64),
-    /// Absolute monotonic-domain nanoseconds (guest counter / frequency).
-    Monotonic(u64),
+    /// An absolute deadline; today only [`AbsoluteDeadline::Monotonic`]
+    /// (an absolute REALTIME or TAI sleep stays unserved, #1981).
+    Absolute(AbsoluteDeadline),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -220,7 +270,7 @@ pub fn invoke(
     let deadline = match absolute {
         false if nanos == 0 => return returned(0),
         false => SleepDeadline::Relative(nanos),
-        true => SleepDeadline::Monotonic(nanos),
+        true => SleepDeadline::Absolute(AbsoluteDeadline::Monotonic(nanos)),
     };
     // An absolute sleep never writes `rem` (clock_nanosleep(2)).
     let remaining = (!absolute && remaining != 0).then_some(UserVa::new(remaining));
@@ -282,6 +332,76 @@ mod tests {
             (u64::from((!1_u32 << 3) | 0b111), Unserved),
         ] {
             assert_eq!(sleep_clock(clock), class, "clock {clock:#x}");
+        }
+    }
+
+    /// Absolute deadlines convert on the counter epoch, never early, with a
+    /// past deadline as an expired tick and no realtime epoch as unserved.
+    #[test]
+    fn absolute_deadlines_convert_once_on_the_counter_epoch() {
+        use AbsoluteDeadline::{Monotonic, Realtime};
+        // 24 MHz: 1 ns is 0.024 ticks, so any fraction rounds up.
+        let hz = 24_000_000;
+        assert_eq!(
+            Monotonic(2_000_000_000).counter_tick(hz, None),
+            Some(CounterTick::new(48_000_000))
+        );
+        assert_eq!(
+            Monotonic(1).counter_tick(hz, None),
+            Some(CounterTick::new(1))
+        );
+        assert_eq!(
+            Monotonic(0).counter_tick(hz, None),
+            Some(CounterTick::new(1))
+        );
+        let offset = 1_700_000_000_000_000_000;
+        assert_eq!(
+            Realtime(offset + 2_000_000_000).counter_tick(hz, Some(offset)),
+            Some(CounterTick::new(48_000_000))
+        );
+        assert_eq!(
+            Realtime(offset - 5).counter_tick(hz, Some(offset)),
+            Some(CounterTick::new(1)),
+            "a realtime deadline before the counter epoch is past"
+        );
+        assert_eq!(Realtime(offset).counter_tick(hz, None), None);
+        // A deadline past the counter's range saturates; it never wraps early.
+        assert_eq!(
+            Monotonic(u64::MAX).counter_tick(10_000_000_000, None),
+            Some(CounterTick::new(u64::MAX))
+        );
+    }
+
+    /// The fact [`AbsoluteDeadline::counter_tick`] relies on: no ring venue
+    /// steps `CLOCK_REALTIME`. Every clock-step syscall is unrouted on both
+    /// ISAs and on neither crossing allowlist, so a guest step is a counted
+    /// ENOSYS, and the zone's realtime offset cannot move under a parked
+    /// realtime wait. Serving one of these calls must make this test fail,
+    /// and the parked realtime waits must then re-arm on the step.
+    #[test]
+    fn no_ring_venue_steps_the_realtime_clock() {
+        use crate::crossing::HostCrossingSet;
+        use crate::dispatch::{Family, route_aarch64, route_x86};
+        use carrick_syscall_abi::CanonicalNr;
+        // Canonical (asm-generic) numbers.
+        for (canonical, name) in [
+            (112, "clock_settime"),
+            (170, "settimeofday"),
+            (171, "adjtimex"),
+            (266, "clock_adjtime"),
+        ] {
+            assert_eq!(
+                route_aarch64(canonical, u64::MAX),
+                Family::Unported,
+                "{name}"
+            );
+            assert_eq!(route_x86(canonical, u64::MAX), Family::Unported, "{name}");
+            for set in [HostCrossingSet::Aarch64, HostCrossingSet::X86] {
+                assert!(
+                    !set.is_allowed(CanonicalNr::new(canonical)),
+                    "{name} crosses on {set:?}"
+                );
+            }
         }
     }
 
