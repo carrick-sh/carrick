@@ -471,3 +471,9 @@ test = "authority_debt::build_program_compiler_authority_requires_a_separate_cei
 reason = "#3172: build programs are outside product authority, so their host calls take no ceiling; the witness now proves they are not counted."
 replaced_by = "authority_debt::build_program_authority_is_outside_product_authority"
 pr = 3189
+
+[[retired]]
+test = "carrick_el1_linux::aarch64_process_tests::native_child_handoff_tests::forked_child_timed_futex_wait_decline_stays_a_counted_refusal"
+reason = "#3174: serve_futex now answers a timespec out of range with Linux's EINVAL in ring instead of declining it to a counted ENOSYS, so the decline witness became the EINVAL witness and was renamed for what it proves."
+replaced_by = "carrick_el1_linux::aarch64_process_tests::native_child_handoff_tests::forked_child_timed_futex_wait_with_an_invalid_timespec_answers_einval"
+pr = 3185
