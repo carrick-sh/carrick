@@ -12,6 +12,17 @@ pub(super) struct BuildRoot {
     pub source: String,
 }
 
+/// Cargo target kinds that build product code.
+const PRODUCT_KINDS: &[&str] = &[
+    "lib",
+    "rlib",
+    "dylib",
+    "cdylib",
+    "staticlib",
+    "proc-macro",
+    "bin",
+];
+
 pub(super) fn metadata_roots(root: &Path) -> Result<Vec<BuildRoot>, DebtError> {
     let output = command::run_checked(
         "cargo",
@@ -41,10 +52,38 @@ pub(super) fn metadata_roots(root: &Path) -> Result<Vec<BuildRoot>, DebtError> {
             .as_array()
             .ok_or_else(|| DebtError::Policy("missing Cargo targets".into()))?
         {
-            if target["kind"]
+            let kinds = target["kind"]
                 .as_array()
-                .is_some_and(|kinds| kinds.iter().any(|kind| kind == "custom-build"))
+                .ok_or_else(|| DebtError::Policy("missing Cargo target kind".into()))?;
+            // Build programs are outside product authority (#3172) only
+            // because the census sees every product source and refuses any
+            // it shares with a build program. That needs every product
+            // target's root inside a `crates/<crate>/src` tree the census
+            // scans; a root elsewhere could share build source unseen.
+            if kinds
+                .iter()
+                .any(|kind| PRODUCT_KINDS.contains(&kind.as_str().unwrap_or("")))
             {
+                let source =
+                    Path::new(target["src_path"].as_str().ok_or_else(|| {
+                        DebtError::Policy("missing product target source".into())
+                    })?)
+                    .canonicalize()?;
+                let relative = source.strip_prefix(root).map_err(|_| {
+                    DebtError::Policy("product target source escapes workspace".into())
+                })?;
+                let mut parts = relative.components().map(|part| part.as_os_str());
+                if parts.next() != Some("crates".as_ref())
+                    || parts.next().is_none()
+                    || parts.next() != Some("src".as_ref())
+                {
+                    return Err(DebtError::Policy(format!(
+                        "product target outside the census tree: {}",
+                        relative.display()
+                    )));
+                }
+            }
+            if kinds.iter().any(|kind| kind == "custom-build") {
                 let source = Path::new(
                     target["src_path"]
                         .as_str()
