@@ -1951,9 +1951,43 @@ enum Loc {
     Fresh(Option<u64>),
 }
 
+/// Which walk of an operation an [`Executor`] is taking. Every operation
+/// but [`DescriptorOp::Relink`] takes one walk over its own span.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Walk {
+    Span,
+    /// Install each source word, verbatim, at its empty destination page.
+    RelinkInstall {
+        src: u64,
+        dst: u64,
+    },
+    /// Clear each source word the install copied.
+    RelinkClear {
+        src: u64,
+        dst: u64,
+    },
+}
+
+/// The walks `op` takes over the live graph, in order, under one journal.
+/// A relink installs its destination before it clears its source, so a
+/// failure in either walk rolls both back.
+fn walks(op: &DescriptorOp) -> [Option<(PageSpan, Walk)>; 2] {
+    match *op {
+        DescriptorOp::Relink { src, dst } => [
+            Some((
+                PageSpan::new(dst, src.len),
+                Walk::RelinkInstall { src: src.va, dst },
+            )),
+            Some((src, Walk::RelinkClear { src: src.va, dst })),
+        ],
+        _ => [Some((op.span(), Walk::Span)), None],
+    }
+}
+
 struct Executor<'a> {
     words: &'a dyn LiveDescriptorWords,
     op: DescriptorOp,
+    walk: Walk,
     start: u64,
     end: u64,
     apply: bool,
@@ -2078,6 +2112,8 @@ impl Executor<'_> {
             && match self.op {
                 DescriptorOp::Retire(_) => true,
                 DescriptorOp::Protect(edit) => edit.absent == crate::aarch64::AbsentLeaves::Lazy,
+                // A lazy source page moves as a lazy destination page.
+                DescriptorOp::Relink { .. } => matches!(self.walk, Walk::RelinkClear { .. }),
                 _ => false,
             }
         {
@@ -2099,6 +2135,18 @@ impl Executor<'_> {
             };
         }
         let covers_entry = self.start <= base && base + span <= self.end;
+        if let DescriptorOp::Relink { .. } = self.op
+            && level > 0
+            && level < 3
+            && descriptor != 0
+        {
+            // A move never splits a block: a destination block is occupied,
+            // and a source block is no private page.
+            return Err(match self.walk {
+                Walk::RelinkInstall { .. } => DescriptorRefusal::Occupied,
+                _ => DescriptorRefusal::NotPrivateAnonymous,
+            });
+        }
         if let DescriptorOp::Terminal { edit, .. } = self.op {
             if level > 0 && level < 3 && descriptor != 0 && edit.rule.requires_private_pages() {
                 return self.descend(level, loc, descriptor, base);
@@ -2134,7 +2182,8 @@ impl Executor<'_> {
             if !matches!(
                 self.op,
                 DescriptorOp::Prepare { .. } | DescriptorOp::MapAlias { .. }
-            ) {
+            ) && !matches!(self.walk, Walk::RelinkInstall { .. })
+            {
                 return Err(DescriptorRefusal::MissingTable);
             }
         }
@@ -2205,6 +2254,7 @@ impl Executor<'_> {
                     | DescriptorOp::Terminal { .. }
                     | DescriptorOp::MapAlias { .. }
             )
+            && !matches!(self.walk, Walk::RelinkInstall { .. })
         {
             return Err(DescriptorRefusal::MissingTable);
         }
@@ -2323,7 +2373,70 @@ impl Executor<'_> {
         }
     }
 
+    /// The L3 word at `va` in the live graph, or 0 where no table reaches
+    /// it. A block on the way is no private page.
+    fn leaf_at(&self, va: u64) -> Result<u64, DescriptorRefusal> {
+        let mut table = self.root;
+        for level in 0..3 {
+            let descriptor = self
+                .words
+                .load(table + ((va >> (39 - 9 * level)) & 511) * 8)?;
+            if descriptor == 0 {
+                return Ok(0);
+            }
+            if !is_table(descriptor, level) {
+                return Err(DescriptorRefusal::NotPrivateAnonymous);
+            }
+            table = descriptor & PA_MASK_TABLE;
+        }
+        self.words.load(table + ((va >> 12) & 511) * 8)
+    }
+
+    /// The word a relink installs at an empty destination page: the source
+    /// page's word, verbatim (output, permissions and COW state alike). A
+    /// lazy source page installs nothing.
+    fn relink_install(&self, descriptor: u64, source_va: u64) -> Result<u64, DescriptorRefusal> {
+        if descriptor != 0 {
+            return Err(DescriptorRefusal::Occupied);
+        }
+        let source = self.leaf_at(source_va)?;
+        if source != 0
+            && !matches!(
+                el1_private_leaf_state(source),
+                El1PrivateLeafState::Prepared | El1PrivateLeafState::Resident
+            )
+        {
+            return Err(DescriptorRefusal::NotPrivateAnonymous);
+        }
+        Ok(source)
+    }
+
+    /// Clear one source page to empty, with no retired lease: its frame now
+    /// belongs to the destination leaf. Applying, that leaf must already
+    /// hold this exact word, so the move copies and never rebuilds.
+    fn relink_clear(&self, descriptor: u64, destination_va: u64) -> Result<u64, DescriptorRefusal> {
+        if !matches!(
+            el1_private_leaf_state(descriptor),
+            El1PrivateLeafState::Prepared | El1PrivateLeafState::Resident
+        ) {
+            return Err(DescriptorRefusal::NotPrivateAnonymous);
+        }
+        if self.apply && self.leaf_at(destination_va)? != descriptor {
+            return Err(DescriptorRefusal::Contended);
+        }
+        Ok(0)
+    }
+
     fn edit(&self, descriptor: u64, level: usize, base: u64) -> Result<u64, DescriptorRefusal> {
+        match self.walk {
+            Walk::RelinkInstall { src, dst } => {
+                return self.relink_install(descriptor, src + (base - dst));
+            }
+            Walk::RelinkClear { src, dst } => {
+                return self.relink_clear(descriptor, dst + (base - src));
+            }
+            Walk::Span => {}
+        }
         let state = el1_private_leaf_state(descriptor);
         match self.op {
             DescriptorOp::MapAlias {
@@ -2553,7 +2666,8 @@ impl Executor<'_> {
             // Terminal rules share the host editor's definition and are
             // applied in `visit_entry` before this per-op table.
             DescriptorOp::Terminal { .. } => Err(DescriptorRefusal::Malformed),
-            DescriptorOp::Relink { .. } => Err(DescriptorRefusal::BadEncoding),
+            // A relink takes its own two walks, above.
+            DescriptorOp::Relink { .. } => Err(DescriptorRefusal::Malformed),
         }
     }
 }
@@ -2691,14 +2805,13 @@ fn plan_validated(
     root: u64,
     op: DescriptorOp,
 ) -> Result<DescriptorPlan, DescriptorRefusal> {
-    let span = op.span();
-    let end = span.end().ok_or(DescriptorRefusal::BadRange)?;
     let mut no_journal = SliceJournal::new(&mut []);
     let mut plan = Executor {
         words,
         op,
-        start: span.va,
-        end,
+        walk: Walk::Span,
+        start: 0,
+        end: 0,
         apply: false,
         grants: &[],
         grants_used: 0,
@@ -2709,15 +2822,20 @@ fn plan_validated(
         reclaimed_count: 0,
         reclaimed: ReclaimedTables::NONE,
     };
-    plan.visit_live_table(root, 0, 0).inspect_err(|&reason| {
-        words.descriptor_diagnostic(DescriptorDiagnostic::PlanRefused {
-            site: DescriptorPlanRefusalSite::Walk,
-            reason,
-            op_kind: op.kind(),
-            live_stores: plan.planned_live_stores,
-            table_grants: plan.grants_used,
-        });
-    })?;
+    for (span, walk) in walks(&op).into_iter().flatten() {
+        plan.start = span.va;
+        plan.end = span.end().ok_or(DescriptorRefusal::BadRange)?;
+        plan.walk = walk;
+        plan.visit_live_table(root, 0, 0).inspect_err(|&reason| {
+            words.descriptor_diagnostic(DescriptorDiagnostic::PlanRefused {
+                site: DescriptorPlanRefusalSite::Walk,
+                reason,
+                op_kind: op.kind(),
+                live_stores: plan.planned_live_stores,
+                table_grants: plan.grants_used,
+            });
+        })?;
+    }
     Ok(DescriptorPlan {
         table_grants: plan.grants_used,
         live_stores: plan.planned_live_stores,
@@ -2800,7 +2918,6 @@ fn execute_descriptor_op_dyn(
         Err(refusal) => return DescriptorOutcome::Refused(refusal),
     };
     let span = op.span();
-    let end = span.va + span.len;
     let (grants_needed, live_stores) = (plan.table_grants, plan.live_stores);
     if grants_needed > tables.len() {
         words.descriptor_diagnostic(DescriptorDiagnostic::PlanRefused {
@@ -2825,8 +2942,9 @@ fn execute_descriptor_op_dyn(
     let mut apply = Executor {
         words,
         op,
-        start: span.va,
-        end,
+        walk: Walk::Span,
+        start: 0,
+        end: 0,
         apply: true,
         grants: tables.as_slice(),
         grants_used: 0,
@@ -2837,7 +2955,16 @@ fn execute_descriptor_op_dyn(
         reclaimed_count: 0,
         reclaimed: ReclaimedTables::NONE,
     };
-    let result = apply.visit_live_table(root, 0, 0);
+    let mut result = Ok(false);
+    for (walked, walk) in walks(&op).into_iter().flatten() {
+        apply.start = walked.va;
+        apply.end = walked.va + walked.len;
+        apply.walk = walk;
+        result = apply.visit_live_table(root, 0, 0);
+        if result.is_err() {
+            break;
+        }
+    }
     let tables_linked = apply.grants_used;
     let reclaimed = apply.reclaimed;
     match result {
@@ -6220,7 +6347,9 @@ mod carrick_owned_window_tests {
         }
     }
 
-    fn ops(span: PageSpan) -> [DescriptorOp; 8] {
+    fn ops(span: PageSpan) -> [DescriptorOp; 10] {
+        // A relink names two spans: the window may be either one.
+        let far = 0x1000_0000;
         let ipa = SubstrateGpa(0x40_0000_0000);
         [
             DescriptorOp::Prepare {
@@ -6273,6 +6402,14 @@ mod carrick_owned_window_tests {
             DescriptorOp::Terminal {
                 span,
                 edit: TerminalEdit::unmap_reclaiming(true, 0, 0),
+            },
+            DescriptorOp::Relink {
+                src: span,
+                dst: far,
+            },
+            DescriptorOp::Relink {
+                src: PageSpan::new(far, span.len),
+                dst: span.va,
             },
         ]
     }

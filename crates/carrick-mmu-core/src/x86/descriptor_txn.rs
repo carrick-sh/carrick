@@ -325,7 +325,38 @@ pub struct DescriptorPlan {
     id: DescriptorTxnId,
     digest: u64,
     span: PageSpan,
+    /// A relink's destination, which an undo must drain as well: its
+    /// installs made not-present entries present (empty otherwise).
+    destination: PageSpan,
     op_kind: u64,
+}
+
+/// Which walk of an operation the [`Planner`] is taking. Every operation
+/// but [`DescriptorOp::Relink`] takes one walk over its own span.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Walk {
+    Span,
+    /// Install each source word at its empty destination page.
+    RelinkInstall {
+        src: u64,
+    },
+    /// Clear each source word the install copied.
+    RelinkClear,
+}
+
+/// The walks `op` takes, in order, under one journal. A relink installs its
+/// destination before it clears its source, so a failure rolls both back.
+fn walks(op: DescriptorOp) -> [Option<(PageSpan, Walk)>; 2] {
+    match op {
+        DescriptorOp::Relink { src, dst } => [
+            Some((
+                PageSpan::new(dst, src.len),
+                Walk::RelinkInstall { src: src.va },
+            )),
+            Some((src, Walk::RelinkClear)),
+        ],
+        _ => [Some((op.span(), Walk::Span)), None],
+    }
 }
 impl DescriptorPlan {
     pub fn live_stores(&self) -> usize {
@@ -407,6 +438,8 @@ pub fn plan_descriptor_txn<W: LiveDescriptorWords + ?Sized>(
     let mut editor = Planner {
         words,
         txn,
+        walk: Walk::Span,
+        base: span.va,
         overlay: BTreeMap::new(),
         entries: Vec::new(),
         used: 0,
@@ -452,18 +485,36 @@ pub fn plan_descriptor_txn<W: LiveDescriptorWords + ?Sized>(
             size: LeafSize::Page,
             ..
         } => return Err(DescriptorRefusal::BadRange),
+        DescriptorOp::Relink { src, dst } => {
+            let target = PageSpan::new(dst, src.len);
+            // Disjoint: a word installed at `dst` is never a source word yet
+            // to be read or cleared.
+            if !valid_span(target)
+                || !matches!((src.end(), target.end()), (Some(a), Some(b)) if a <= dst || b <= src.va)
+            {
+                return Err(DescriptorRefusal::BadRange);
+            }
+        }
         _ => {}
     }
-    let mut offset = 0;
-    while offset < span.len {
-        offset += editor.edit(
-            txn.root.address().raw(),
-            0,
-            span.va + offset,
-            offset,
-            leaf_level(size),
-        )?;
+    for (walked, walk) in walks(txn.op).into_iter().flatten() {
+        editor.walk = walk;
+        editor.base = walked.va;
+        let mut offset = 0;
+        while offset < walked.len {
+            offset += editor.edit(
+                txn.root.address().raw(),
+                0,
+                walked.va + offset,
+                offset,
+                leaf_level(size),
+            )?;
+        }
     }
+    let destination = match txn.op {
+        DescriptorOp::Relink { src, dst } => PageSpan::new(dst, src.len),
+        _ => PageSpan::EMPTY,
+    };
     Ok(DescriptorPlan {
         entries: editor.entries,
         tables_linked: editor.used,
@@ -471,6 +522,7 @@ pub fn plan_descriptor_txn<W: LiveDescriptorWords + ?Sized>(
         id: txn.id,
         digest: txn.digest(),
         span,
+        destination,
         op_kind: txn.op.kind(),
     })
 }
@@ -640,6 +692,9 @@ pub fn arm_cow_terminal(entry: u64) -> Result<u64, DescriptorRefusal> {
 struct Planner<'a, 't, W: LiveDescriptorWords + ?Sized> {
     words: &'a W,
     txn: &'a DescriptorTxn<'t>,
+    walk: Walk,
+    /// First VA of the span the current walk edits.
+    base: u64,
     overlay: BTreeMap<u64, u64>,
     entries: Vec<JournalEntry>,
     used: usize,
@@ -733,23 +788,32 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
         // protection change is the root model's metadata alone, which the
         // first touch maps from (mprotect(2) ignores residency, #3073).
         if entry == 0
-            && matches!(
-                self.txn.op,
-                DescriptorOp::Unmap(_)
-                    | DescriptorOp::UnmapWindow(_)
-                    | DescriptorOp::Retire(_)
-                    | DescriptorOp::Protect {
-                        absent: carrick_guest_arch::AbsentLeaves::Lazy,
-                        ..
-                    }
-                    | DescriptorOp::ProtectNone {
-                        absent: carrick_guest_arch::AbsentLeaves::Lazy,
-                        ..
-                    }
-                    | DescriptorOp::ProtectWindow { .. }
-            )
+            && (self.walk == Walk::RelinkClear
+                || matches!(
+                    self.txn.op,
+                    DescriptorOp::Unmap(_)
+                        | DescriptorOp::UnmapWindow(_)
+                        | DescriptorOp::Retire(_)
+                        | DescriptorOp::Protect {
+                            absent: carrick_guest_arch::AbsentLeaves::Lazy,
+                            ..
+                        }
+                        | DescriptorOp::ProtectNone {
+                            absent: carrick_guest_arch::AbsentLeaves::Lazy,
+                            ..
+                        }
+                        | DescriptorOp::ProtectWindow { .. }
+                ))
         {
             return Ok(remaining.min(bytes - (va & (bytes - 1))));
+        }
+        if self.walk != Walk::Span && level > 0 && level < 3 && entry & HUGE != 0 {
+            // A move never splits a block: a destination block is occupied,
+            // and a source block is no private page.
+            return Err(match self.walk {
+                Walk::RelinkInstall { .. } => DescriptorRefusal::Occupied,
+                _ => DescriptorRefusal::NotPrivateAnonymous,
+            });
         }
         let coarse = level > 0
             && level < 3
@@ -778,7 +842,8 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
             if !matches!(
                 self.txn.op,
                 DescriptorOp::Map { .. } | DescriptorOp::Prepare { .. }
-            ) {
+            ) && !matches!(self.walk, Walk::RelinkInstall { .. })
+            {
                 return Err(DescriptorRefusal::MissingTable);
             }
             child = self.grant()?;
@@ -898,10 +963,7 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                         | if cow.user { USER } else { 0 }
                         | if cow.executable { MAY_EXEC } else { NX }
                         | if cow.write_intent { MAY_WRITE } else { 0 };
-                    check_leaf_privilege_matches_range(
-                        UserVa::new(self.txn.op.span().va + offset),
-                        new,
-                    )?;
+                    check_leaf_privilege_matches_range(UserVa::new(self.base + offset), new)?;
                     return self.set(slot, new);
                 }
                 // Write stays a leaf fact: MAY_WRITE says the frame is this
@@ -976,10 +1038,53 @@ impl<W: LiveDescriptorWords + ?Sized> Planner<'_, '_, W> {
                 entry & !(WRITE | USER | NX) | (permissions(p) & (WRITE | USER | NX))
             }
             DescriptorOp::Coalesce { .. } => self.coalesced(entry, level)?,
-            DescriptorOp::Relink { .. } => return Err(DescriptorRefusal::BadEncoding),
+            DescriptorOp::Relink { .. } => match self.walk {
+                Walk::RelinkInstall { src } => self.relink_install(entry, src + offset)?,
+                Walk::RelinkClear => relink_clear(entry)?,
+                Walk::Span => return Err(DescriptorRefusal::Malformed),
+            },
         };
-        check_leaf_privilege_matches_range(UserVa::new(self.txn.op.span().va + offset), new)?;
+        check_leaf_privilege_matches_range(UserVa::new(self.base + offset), new)?;
         self.set(slot, new)
+    }
+    /// The PT word at `va`, through this plan's own stores, or 0 where no
+    /// table reaches it. A block or non-present table is no private page.
+    fn source_leaf(&mut self, va: u64) -> Result<u64, DescriptorRefusal> {
+        let mut table = self.txn.root.address().raw();
+        for level in 0..3 {
+            let entry = self.read(table + ((va >> (39 - level * 9)) & 511) * 8)?;
+            validate_entry(entry, level)?;
+            if entry == 0 {
+                return Ok(0);
+            }
+            if entry & (HUGE | PRESENT) != PRESENT {
+                return Err(DescriptorRefusal::NotPrivateAnonymous);
+            }
+            table = entry & ADDRESS;
+        }
+        let leaf = self.read(table + ((va >> 12) & 511) * 8)?;
+        validate_entry(leaf, 3)?;
+        Ok(leaf)
+    }
+
+    /// The word a relink installs at an empty destination page: the source
+    /// page's word, verbatim (frame, permissions, ceilings and `COW`), with
+    /// the walker bits a present source may still gain until its clear. A
+    /// lazy source page installs nothing.
+    fn relink_install(&mut self, entry: u64, source_va: u64) -> Result<u64, DescriptorRefusal> {
+        if entry != 0 {
+            return Err(DescriptorRefusal::Occupied);
+        }
+        let source = self.source_leaf(source_va)?;
+        if source == 0 {
+            return Ok(0);
+        }
+        relink_clear(source)?;
+        Ok(if source & PRESENT != 0 {
+            source | WALKER_SET
+        } else {
+            source
+        })
     }
     fn coalesced(&mut self, entry: u64, level: usize) -> Result<u64, DescriptorRefusal> {
         if entry & PRESENT == 0 || entry & HUGE != 0 {
@@ -1132,6 +1237,17 @@ impl DescriptorTxn<'_> {
         Ok(())
     }
 }
+/// Clear one relinked source page to empty, with no `RETIRED` predecessor:
+/// its frame now belongs to the destination leaf. Only private custody
+/// (prepared, resident or no-access) moves.
+fn relink_clear(entry: u64) -> Result<u64, DescriptorRefusal> {
+    use carrick_guest_arch::El1PrivateLeafState;
+    match private_leaf_state(entry) {
+        El1PrivateLeafState::Prepared | El1PrivateLeafState::Resident => Ok(0),
+        _ => Err(DescriptorRefusal::NotPrivateAnonymous),
+    }
+}
+
 /// The bits an x86 page walker (the CPU, or the soft walker) stores into a
 /// live entry by itself. It only ever sets them, and only in a present
 /// entry; it never clears them or touches any other bit.
@@ -1179,7 +1295,7 @@ fn replace_live_entry<W: LiveDescriptorWords + ?Sized>(
 fn undo<W: LiveDescriptorWords + ?Sized>(
     words: &W,
     entries: &[JournalEntry],
-    span: PageSpan,
+    spans: [PageSpan; 2],
 ) -> bool {
     let mut restored = true;
     for entry in entries.iter().rev() {
@@ -1189,7 +1305,9 @@ fn undo<W: LiveDescriptorWords + ?Sized>(
         );
     }
     words.publish_barrier();
-    words.invalidate_range(span.va, span.len);
+    for span in spans.into_iter().filter(|span| !span.is_empty()) {
+        words.invalidate_range(span.va, span.len);
+    }
     restored
 }
 /// Undo an applied plan before owner admission reopens (inventory/slot failure).
@@ -1198,7 +1316,7 @@ pub fn rollback_descriptor_plan<W: LiveDescriptorWords + ?Sized>(
     words: &W,
     plan: &DescriptorPlan,
 ) -> DescriptorOutcome {
-    if undo(words, &plan.entries, plan.span) {
+    if undo(words, &plan.entries, [plan.span, plan.destination]) {
         DescriptorOutcome::RolledBack(DescriptorRefusal::Contended)
     } else {
         DescriptorOutcome::Indeterminate(DescriptorRefusal::Contended)
@@ -1260,7 +1378,7 @@ pub fn apply_descriptor_plan<W: LiveDescriptorWords + ?Sized, J: DescriptorJourn
                 live_stores: plan.entries.len(),
                 table_grants: plan.tables_linked,
             });
-            if undo(words, journal.entries(), plan.span) && restored {
+            if undo(words, journal.entries(), [plan.span, plan.destination]) && restored {
                 DescriptorOutcome::RolledBack(reason)
             } else {
                 DescriptorOutcome::Indeterminate(reason)
