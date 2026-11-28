@@ -358,10 +358,16 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                                 self.native_backing_pending.insert(address, *pending);
                                 true
                             }
-                            Ok(
-                                anonymous_owner::BackingPreparation::FilePastEnd
-                                | anonymous_owner::BackingPreparation::TablesExhausted,
-                            ) => false,
+                            Ok(anonymous_owner::BackingPreparation::FilePastEnd) => {
+                                return Err(fail(format!(
+                                    "C1DIAG fault FilePastEnd window={window:?}"
+                                )));
+                            }
+                            Ok(anonymous_owner::BackingPreparation::TablesExhausted) => {
+                                return Err(fail(format!(
+                                    "C1DIAG fault TablesExhausted window={window:?}"
+                                )));
+                            }
                             // A peer published into the fault window or closed MM
                             // release after this selection was staged. Report
                             // `Supplied` with an empty reply slot so the ring
@@ -376,7 +382,11 @@ impl<M: CarrierMemoryIo> Cpl0HostCustody<M> {
                     }
                     // No physical supply was selected (including an inaccessible
                     // backing): the shared copyout owner returns EFAULT or prefix.
-                    _ => false,
+                    (selected, reply) => {
+                        return Err(fail(format!(
+                            "C1DIAG fault selection absent selected={selected:?} reply={reply:?}"
+                        )));
+                    }
                 }
             }
             _ => return Err(fail("unsupported CPL0 native service operation")),

@@ -1105,7 +1105,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             };
             result = match self.finish_copyout(*output) {
                 Err(NativeProcessError::Fault) => Ok(NativeResume::Returned(
-                    SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT),
+                    SyscallResult::from_errno(carrick_syscall_abi::LinuxErrno::new(220)),
                 )),
                 result => result,
             };
@@ -1632,7 +1632,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         // with an invalid owner operation or overflowing transfer record.
         if !carrick_guest_arch::lower_half_range(request.address.raw(), request.len.raw()) {
             observe(InputPreparationRefusal::Fault);
-            return Ok(returned(carrick_syscall_abi::LINUX_EFAULT.guest_retval()));
+            return Ok(returned(
+                carrick_syscall_abi::LinuxErrno::new(221).guest_retval(),
+            ));
         }
         let mm = self
             .runtime
@@ -1663,7 +1665,9 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             Ok(()) => return Ok(LifecycleOutcome::Redispatch),
             Err(NativeProcessError::Fault) => {
                 observe(InputPreparationRefusal::Fault);
-                return Ok(returned(carrick_syscall_abi::LINUX_EFAULT.guest_retval()));
+                return Ok(returned(
+                    carrick_syscall_abi::LinuxErrno::new(222).guest_retval(),
+                ));
             }
             Err(NativeProcessError::OwnerWait(wait)) => {
                 observe(InputPreparationRefusal::OwnerDependency);
@@ -4861,7 +4865,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
             None
         } else {
             Some(self.retire_adapter_result(SyscallResult::new(
-                carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
+                carrick_syscall_abi::LinuxErrno::new(223).guest_retval(),
             ))?)
         };
         self.release_service_claim(claim)?;
@@ -4988,7 +4992,11 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     let next = self.prepare_fault_repark(request, pending, wait)?;
                     return self.park_owner_wait(&next, wait);
                 }
-                Err(_) => result = ServiceResult::Refused,
+                Err(_) => {
+                    result = ServiceResult::Failed(
+                        carrick_core_abi::service::ServiceFailureCode::new(230).unwrap(),
+                    )
+                }
             }
         }
         self.finish_service_result(request, result, pending, retry_syscall_after_supply)
@@ -5186,7 +5194,15 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                         Ok(entropy_copy_fault(output.offset))
                     } else {
                         Ok(NativeResume::Returned(SyscallResult::new(
-                            carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
+                            carrick_syscall_abi::LinuxErrno::new(match result {
+                                ServiceResult::BackingFault => 200,
+                                ServiceResult::Refused => 203,
+                                ServiceResult::Cancelled => 204,
+                                ServiceResult::Wait(_) => 205,
+                                ServiceResult::Failed(code) => code.raw() as i32,
+                                _ => 209,
+                            })
+                            .guest_retval(),
                         )))
                     }
                 } else {
@@ -5220,7 +5236,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                     | ServiceResult::BackingFault
                     | ServiceResult::Cancelled
                     | ServiceResult::Failed(_) => Ok(NativeResume::Returned(SyscallResult::new(
-                        carrick_syscall_abi::LINUX_EFAULT.guest_retval(),
+                        carrick_syscall_abi::LinuxErrno::new(225).guest_retval(),
                     ))),
                     ServiceResult::Wait(_) | ServiceResult::ExecPrepared(_) => {
                         Err(NativeProcessError::ServiceQuarantined(
@@ -5567,7 +5583,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
 }
 fn entropy_copy_fault(committed: usize) -> NativeResume {
     NativeResume::Returned(if committed == 0 {
-        SyscallResult::from_errno(carrick_syscall_abi::LINUX_EFAULT)
+        SyscallResult::from_errno(carrick_syscall_abi::LinuxErrno::new(226))
     } else {
         SyscallResult::new(committed as i64)
     })
