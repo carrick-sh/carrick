@@ -653,7 +653,14 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
             assert_eq!(
                 counters.forwarded[nr as usize].load(Ordering::Relaxed),
                 0,
-                "nr={nr} args={args:?} forwarded"
+                "nr={nr} args={args:?} forwarded, leaves {:?}",
+                carrick_el1_abi::AnonymousLeave::ALL
+                    .iter()
+                    .filter(|leave| counters.anonymous_leaves[**leave as usize]
+                        .load(Ordering::Relaxed)
+                        > 0)
+                    .map(|leave| leave.name())
+                    .collect::<Vec<_>>()
             );
             use carrick_personality_linux::dispatch::CompletionRoute;
             assert!(
@@ -669,6 +676,7 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
         fixture.task.linux.mark_pending_host_work();
         if case == ChildStockCase::MremapPopulated {
             const PAGE: u64 = 4096;
+            use carrick_mmu_core::aarch64::descriptor_txn as txn;
             let portal = super::super::aarch64_process::Portal::for_zone(
                 NonZeroU64::MIN,
                 fixture.region.table(),
@@ -682,10 +690,12 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
                     .unwrap()
                     .observe_range(
                         carrick_el1_abi::ReservationRange::new(start, end).unwrap(),
+                        // Clipped to the query: the arena's earlier rows
+                        // may coalesce with the first one.
                         &mut |mapping| {
                             rows.push((
-                                mapping.range.start(),
-                                mapping.range.end(),
+                                mapping.range.start().max(start),
+                                mapping.range.end().min(end),
                                 mapping.protection.bits(),
                             ))
                         },
@@ -701,45 +711,181 @@ fn child_thread_admission(count: u32, rounds: u32, case: ChildStockCase) {
                 .address()
                 .raw();
             let parent_root = fixture.address.root.address().raw();
-            // The parent's private row at VA, inherited by the child with
-            // its resident page.
-            let inherited = rows(VA, VA + PAGE);
-            let [(start, end, protection)] = inherited[..] else {
-                panic!("the child inherits one private row at VA: {inherited:?}");
-            };
-            let before = leaf(words, child_root, VA);
-            assert_eq!(before & 1, 1, "the inherited row is populated: {before:#x}");
-            let parent_before = leaf(words, parent_root, VA);
-            // Grow the row's populated page at VA to two pages: the row's
-            // own next page blocks growth in place, so MAYMOVE moves it.
-            assert!(
-                start == VA && end >= VA + 2 * PAGE,
-                "a row of two pages or more from VA: {inherited:?}"
-            );
-            let to = call(216, [VA, PAGE, 2 * PAGE, 1, 0, 0]);
-            assert!(to > 0 && to as u64 != VA, "moved: {to}");
-            let to = to as u64;
-            assert_eq!(rows(to, to + 2 * PAGE), [(to, to + 2 * PAGE, protection)]);
-            assert!(rows(VA, VA + PAGE).is_empty(), "the moved source is vacant");
+            // A ring-born private row the child maps itself, with a
+            // blocker right after it so growth cannot stay in place.
+            let m = call(222, [0, PAGE, 3, 0x22, u64::MAX, 0]);
+            assert!(m > 0 && (m as u64).is_multiple_of(PAGE), "mmap: {m}");
+            let m = m as u64;
             assert_eq!(
-                rows(VA + PAGE, end),
-                [(VA + PAGE, end, protection)],
-                "the rest of the row stays"
+                call(222, [m + PAGE, PAGE, 1, 0x100022, u64::MAX, 0]),
+                (m + PAGE) as i64,
+                "blocker"
+            );
+            assert_eq!(
+                rows(m, m + PAGE),
+                [(m, m + PAGE, 3)],
+                "the row is the ring's"
+            );
+            assert_eq!(leaf(words, child_root, m) & 1, 0, "the row starts lazy");
+            // First touch: the child's write fault selects a backing window
+            // through the production fault entry, and the portal's grant
+            // service applies the supplied private frame.
+            let slots = fixture.region.portal_slots();
+            assert!(slots.bind_carrier(NonZeroU64::MIN));
+            // SAFETY: the birth control slot outlives the synchronous fixture.
+            let control = unsafe { &*(identity.control_slot as *const ThreadControlSlot) };
+            let handle = control
+                .service
+                .bound_mm(
+                    fixture.zone.record_ref(child),
+                    carrick_el1_abi::EntryThreadGeneration::from_raw(identity.serial),
+                )
+                .unwrap();
+            let mailbox = carrick_el1_abi::FrameGrantMailbox::new();
+            let supply = OwnerFaultSupply::new(slots).with_handle(handle);
+            let mut fault = carrick_el1_abi::TrapFrame {
+                esr: 0x92000046, // EL0 write translation fault.
+                far: m,
+                ..Default::default()
+            };
+            assert_eq!(
+                carrick_el1::fault::dispatch_fault_with_prepared(
+                    &mut fault,
+                    &counters,
+                    core::slice::from_ref(&fixture.task),
+                    access,
+                    crate::cow_resolver::native_fault_supply(
+                        true,
+                        carrick_el1::fault::GrantMailboxes::own(&mailbox),
+                        &supply,
+                    ),
+                    Some(carrick_el1::fault::PreparedFaultPath {
+                        residency: &residency,
+                        resolver: &mut SelectionWords(words),
+                        roots: Some(fixture.region.table()),
+                        file_slots: Some(slots),
+                    }),
+                    &mut carrick_el1::fault::NoopCowResolver,
+                ),
+                carrick_el1_abi::Action::Forward,
+                "first touch asks the host for supply"
+            );
+            assert_eq!(supply.outcome(), OwnerFaultSupplyOutcome::Selected);
+            let grant = slots.grant(0).unwrap();
+            let (_, window) = grant.pending_fault_selection(identity.mm, m).unwrap();
+            const FRAME_IPA: u64 = 0xa002_0000;
+            let id = NonZeroU64::MIN;
+            let supplied = txn::DescriptorTxn {
+                id: txn::DescriptorTxnId {
+                    mm_key: NonZeroU64::new(identity.mm).unwrap(),
+                    generation: window.operation.sequence,
+                },
+                root: carrick_mmu_core::aarch64::SubstrateGpa(
+                    child_root & AARCH64_ROOT_ADDRESS_MASK,
+                ),
+                op: txn::DescriptorOp::Prepare {
+                    publication: carrick_mmu_core::aarch64::GuestLeafPublication {
+                        va: window.range.start(),
+                        ipa: FRAME_IPA,
+                        len: window.range.len(),
+                        writable: true,
+                        executable: false,
+                    },
+                    resident: txn::PageSpan::new(m, PAGE),
+                    backing: txn::BackingIdentity {
+                        frame_id: id,
+                        mapping_id: id,
+                        owner_generation: id,
+                        inventory_revision: id,
+                    },
+                },
+                tables: txn::TableGrants::NONE,
+            };
+            assert!(grant.submit(window, &supplied));
+            let mm_owner =
+                crate::mm_portal::MmPortal::<crate::mm_portal::test_support::NoPin>::for_zone(
+                    NonZeroU64::MIN,
+                    fixture.region.table(),
+                    fixture.zone,
+                );
+            let receipt = carrick_core::mm::frames::serve_grant(
+                &mm_owner,
+                grant,
+                words,
+                &residency,
+                u32::from(fixture.slot.raw()),
+                || {},
+            )
+            .unwrap()
+            .unwrap();
+            assert!(
+                matches!(receipt.outcome, txn::DescriptorOutcome::Applied(_)),
+                "{receipt:?}"
+            );
+            assert!(grant.take_receipt(window, &supplied).is_some());
+            let before = leaf(words, child_root, m);
+            assert_eq!(before & 1, 1, "first touch populated the row: {before:#x}");
+            assert_eq!(
+                before & AARCH64_ROOT_ADDRESS_MASK,
+                FRAME_IPA,
+                "the row's leaf names the supplied frame"
+            );
+            // The ring declines a move whose source has a terminal on
+            // main: this is the precondition the witness turns on.
+            assert_eq!(
+                carrick_el1::memory::AnonymousBackingProbe::backing(
+                    &mut FixtureMapping {
+                        words,
+                        residency: &residency,
+                    },
+                    carrick_guest_arch::AddressSpaceRegister::from_register(child_root),
+                    UserVa::new(m),
+                    carrick_guest_arch::GuestLen::new(PAGE),
+                )
+                .summary,
+                carrick_el1::memory::RangeBacking::Private,
+                "the source is populated private backing"
+            );
+            let parent_before = leaf(words, parent_root, VA);
+            let declined_before = counters.anonymous_leaves
+                [carrick_el1_abi::AnonymousLeave::RootDeclined as usize]
+                .load(Ordering::Relaxed);
+            // Grow the populated row past its blocker: MAYMOVE moves it.
+            let to = call(216, [m, PAGE, 2 * PAGE, 1, 0, 0]);
+            assert!(to > 0 && to as u64 != m, "moved: {to}");
+            let to = to as u64;
+            assert_eq!(rows(to, to + 2 * PAGE), [(to, to + 2 * PAGE, 3)]);
+            assert!(rows(m, m + PAGE).is_empty(), "the moved source is vacant");
+            assert_eq!(
+                rows(m + PAGE, m + 2 * PAGE),
+                [(m + PAGE, m + 2 * PAGE, 1)],
+                "the blocker stays"
             );
             // Custody transfer, not a copy: the moved leaf names the same
-            // frame, the old address has no leaf, the growth is lazy.
+            // frame, the old address has no leaf, and the growth is lazy.
             let moved = leaf(words, child_root, to);
             assert_eq!(moved & 1, 1, "the moved page is resident: {moved:#x}");
             assert_eq!(
                 moved & AARCH64_ROOT_ADDRESS_MASK,
-                before & AARCH64_ROOT_ADDRESS_MASK,
+                FRAME_IPA,
                 "the moved leaf names the frame the old leaf did"
             );
-            assert_eq!(leaf(words, child_root, VA) & 1, 0, "the old leaf is gone");
+            assert_eq!(leaf(words, child_root, m) & 1, 0, "the old leaf is gone");
+            assert_eq!(
+                leaf(words, child_root, to + PAGE) & 1,
+                0,
+                "the growth is lazy"
+            );
             assert_eq!(
                 leaf(words, parent_root, VA),
                 parent_before,
-                "the parent's leaf is untouched"
+                "the live parent's leaf is untouched"
+            );
+            assert_eq!(
+                counters.anonymous_leaves[carrick_el1_abi::AnonymousLeave::RootDeclined as usize]
+                    .load(Ordering::Relaxed),
+                declined_before,
+                "the ring did not decline the move"
             );
             assert_eq!(counters.refused[216].load(Ordering::Relaxed), 0);
             assert_eq!(counters.refused_child[216].load(Ordering::Relaxed), 0);
