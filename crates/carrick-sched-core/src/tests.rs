@@ -6512,3 +6512,28 @@ fn two_slots_never_leave_a_queued_record_off_its_run_queue() {
         }
     }
 }
+
+/// #3117 pre-review P0s: a slot lock's release that owes an enrolled idle
+/// scan a pass fills its caller's sink, and that sink can never be dropped
+/// with the pass still owed, in any build. A release build used to forget it
+/// (the check was a `debug_assert!`), so a lost claim's dropped pass was a
+/// silent lost wake there.
+#[test]
+#[should_panic(expected = "an owed idle-scan pass was dropped undelivered")]
+fn a_lock_release_owing_a_scan_pass_cannot_be_dropped_undelivered() {
+    let zone = zone();
+    enter(&zone, SLOT, 0);
+    enter(&zone, OTHER, 1);
+    let queued = zone.alloc_record(identity(70)).unwrap();
+    assert!(
+        zone.requeue_preempted(SLOT, queued, &OwedPasses::new())
+            .is_queued()
+    );
+    let passes = OwedPasses::new();
+    let held = zone.slot_lock(SLOT, &HostWait, &passes).unwrap();
+    // OTHER's idle scan finds SLOT's lock busy and enrols on its release.
+    assert!(zone.take_idle_work(OTHER, &OwedPasses::new()).is_none());
+    drop(held);
+    assert!(passes.owes(OTHER), "the release owes the enrolled scan");
+    drop(passes);
+}
