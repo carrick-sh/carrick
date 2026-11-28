@@ -980,8 +980,14 @@ fn native_exec_call(
                         anonymous::ContendedFault::Refused => fatal_boot!(),
                     }
                 }
-                UserFaultSupply::Signal { .. } | UserFaultSupply::Unresolved(_) => {
-                    frame.rax = carrick_syscall_abi::LINUX_EFAULT.guest_retval() as u64;
+                UserFaultSupply::Signal { code, .. } => {
+                    frame.rax =
+                        carrick_syscall_abi::LinuxErrno::new(0x3f0 + code).guest_retval() as u64;
+                    CompletionRoute::Served
+                }
+                UserFaultSupply::Unresolved(reason) => {
+                    frame.rax = carrick_syscall_abi::LinuxErrno::new(0x400 + (reason as i32 & 0xff))
+                        .guest_retval() as u64;
                     CompletionRoute::Served
                 }
             };
@@ -2007,7 +2013,7 @@ impl Personality for LinuxPersonality {
                             ) {
                                 0
                             } else {
-                                carrick_syscall_abi::LINUX_EFAULT.guest_retval()
+                                carrick_syscall_abi::LinuxErrno::new(0xeb).guest_retval()
                             },
                         )
                     }
