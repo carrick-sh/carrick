@@ -2142,7 +2142,8 @@ fn mounted_static_x86_mremap_grows_shrinks_and_moves_anonymous_rows_as_native() 
         (guest.status.code(), guest.stdout.as_slice()),
         (native.status.code(), native.stdout.as_slice()),
         "11-14 a root shape (grow in place, shrink, grow by move, the moved \
-         source vacant), 21-24 the child's, 33 a parent row the child changed, 9 \
+         source vacant), 21-24 the child's, 25 the child's shrink of its \
+         inherited row, 33 a parent row the child changed, 9 \
          a setup map; the errno or bad value is printed. stdout: {} \
          stderr: {}",
         String::from_utf8_lossy(&guest.stdout),
@@ -2193,13 +2194,13 @@ fn mounted_static_x86_ring_refusal_appears_in_the_compat_report() {
         .as_array()
         .unwrap_or_else(|| panic!("no ring refusals in the report: {}", report["report"]));
     // `tuxcall` has no canonical syscall, so the ring counts it in its
-    // overflow bucket (native 512, "unknown"): one root refusal.
+    // overflow bucket (native 512, "unknown"): two calls, one root row.
     assert!(
         rows.iter().any(|row| row["native"] == 512
             && row["name"] == "unknown"
             && row["caller"] == "root"
-            && row["count"] == 1),
-        "tuxcall is one root ring refusal: {rows:?}"
+            && row["count"] == 2),
+        "two tuxcalls are one root ring-refusal row of count 2: {rows:?}"
     );
     let summary = &report["report"]["summary"];
     assert_eq!(
@@ -2207,7 +2208,14 @@ fn mounted_static_x86_ring_refusal_appears_in_the_compat_report() {
         rows.len(),
         "{summary}"
     );
-    let invocations: u64 = rows.iter().filter_map(|row| row["count"].as_u64()).sum();
+    let invocations: u64 = rows
+        .iter()
+        .map(|row| {
+            row["count"]
+                .as_u64()
+                .expect("every row has a numeric count")
+        })
+        .sum();
     assert_eq!(
         summary["ring_refused_invocations"].as_u64(),
         Some(invocations),

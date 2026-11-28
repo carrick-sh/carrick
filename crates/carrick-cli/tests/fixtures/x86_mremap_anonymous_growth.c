@@ -9,8 +9,9 @@
 //   3. grow by move: an untouched one-page row with a blocker right after
 //      it grows to two pages with MREMAP_MAYMOVE at a new address, reads 0
 //      and takes a store, and its old address is vacant again (14 / 24).
-// After the child exits, the parent rechecks its own kept and moved rows
-// (33).
+// The child first shrinks the moved row it inherited (25). After the child
+// exits, the parent rechecks its own kept and moved rows, the moved row
+// still two pages (33).
 // Exit 7 and `mremap ok`. A failed shape exits 10 + shape in the root and
 // 20 + shape in the child, after writing the errno (or the bad value) as
 // decimal. No libc: built -nostdlib -static.
@@ -111,6 +112,10 @@ void start_c(void) {
     long pid = sc(57, 0, 0, 0, 0, 0);
     if (pid < 0) fail(30, pid);
     if (pid == 0) {
+        // The child shrinks the moved row it inherited (a resident page in
+        // its copy); the parent's row must keep both pages (33).
+        long inherited = kept_moved;
+        if (sc(MREMAP, inherited, 2 * PAGE, PAGE, 0, 0) != inherited) fail(25, 0);
         shapes(20);
         sc(EXIT_GROUP, 0, 0, 0, 0, 0);
     }
@@ -120,6 +125,8 @@ void start_c(void) {
     // The child's edits left the parent's own rows as the parent made them.
     if (((volatile unsigned char *)kept_row)[17] != 0x5a) fail(33, -1);
     if (((volatile unsigned char *)kept_moved)[PAGE + 1] != 0x44) fail(33, -2);
+    if (sc(MMAP, kept_moved + PAGE, PAGE, 3, PRIVATE_ANON | FIXED_NOREPLACE, -1) != -17)
+        fail(33, -3);
     sc(WRITE, 1, (long)"mremap ok\n", 10, 0, 0);
     sc(EXIT_GROUP, 7, 0, 0, 0, 0);
 }
