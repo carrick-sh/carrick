@@ -1769,12 +1769,8 @@ impl<'a> PendingFamilies<'a> for NativeLane<'a> {
         // never declines once policy runs, so it is decided first. A shared
         // wait reads and validates its timeout in policy before its key
         // (`wait` declines a word outside the aperture).
-        let wake = matches!(
-            self.args[1] | 128,
-            carrick_personality_linux::sched::FUTEX_WAKE_PRIVATE
-                | carrick_personality_linux::sched::FUTEX_WAKE_BITSET_PRIVATE
-        );
-        if candidate.is_some() && wake && self.futex_key(UserVa::new(original)).is_none() {
+        if candidate.is_some() && call.is_wake() && self.futex_key(UserVa::new(original)).is_none()
+        {
             return FamilyCompletion::Forward;
         }
         let Some(served) =

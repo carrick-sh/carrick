@@ -227,13 +227,15 @@ static volatile int pool_word;
 static volatile int pool_armed;
 static volatile int pool_done;
 static long pool_errors;
+// One deadline for the whole pool, taken before any waiter is spawned and
+// well past the driver's probe bound: no waiter can time out while probed.
+static struct kernel_timespec pool_deadline;
 
 static void pool_entry(long i) {
     (void)i;
-    struct kernel_timespec deadline = at(now_ns(CLOCK_MONOTONIC) + 5000 * MS);
     for (;;) {
         __atomic_add_fetch(&pool_armed, 1, __ATOMIC_RELEASE);
-        long r = wait_bitset(&pool_word, 0, CLOCK_MONOTONIC, &deadline);
+        long r = wait_bitset(&pool_word, 0, CLOCK_MONOTONIC, &pool_deadline);
         // Woken (0) or released before entering (EAGAIN): re-park until the
         // driver releases the pool. Anything else is a wrong answer.
         if (r != 0 && r != -11) __atomic_add_fetch(&pool_errors, 1, __ATOMIC_RELAXED);
@@ -323,28 +325,38 @@ static void run(const char *who) {
     // once, while this thread keeps running. Each probe waits until every
     // woken waiter has armed its next wait; a waiter between arming and
     // parking only lowers that probe's count, and it re-parks. Ordered on
-    // the waiters' own arm counts; the bound is a hang guard below their
-    // 5 s deadline, never a verdict.
+    // the waiters' own arm counts. After they have all armed, a 2 ms pause
+    // lets a waiter between arming and entering its wait park (pacing for
+    // the probe count only). The 6 s bound is a hang guard below the pool's
+    // 12 s deadline, never a verdict.
     pool_word = 0;
     pool_armed = 0;
     pool_done = 0;
     pool_errors = 0;
+    pool_deadline = at(now_ns(CLOCK_MONOTONIC) + 12000 * MS);
     for (long i = 0; i < POOL; i++) spawn(pool_entry, i);
     long woken = 0, most = 0;
-    long give_up = now_ns(CLOCK_MONOTONIC) + 4000 * MS;
+    long give_up = now_ns(CLOCK_MONOTONIC) + 6000 * MS;
+    struct kernel_timespec pace = {0, 2 * MS};
     while (most < POOL && now_ns(CLOCK_MONOTONIC) < give_up) {
         while (__atomic_load_n(&pool_armed, __ATOMIC_ACQUIRE) < POOL + woken
                && now_ns(CLOCK_MONOTONIC) < give_up)
             sc(24, 0, 0, 0, 0, 0, 0);
+        sc(35, (long)&pace, 0, 0, 0, 0, 0);
         long n = sc(202, (long)&pool_word, FUTEX_WAKE_PRIVATE, 0x7fffffff, 0, 0, 0);
         if (n < 0) break;
         woken += n;
         if (n > most) most = n;
     }
+    // Release the pool and drain it, bounded: a waiter left parked past this
+    // reads as a short pool count, never a hang.
     __atomic_store_n(&pool_word, 1, __ATOMIC_RELEASE);
-    while (__atomic_load_n(&pool_done, __ATOMIC_ACQUIRE) < POOL)
-        if (sc(202, (long)&pool_word, FUTEX_WAKE_PRIVATE, 0x7fffffff, 0, 0, 0) == 0)
+    long drain_until = now_ns(CLOCK_MONOTONIC) + 6000 * MS;
+    while (__atomic_load_n(&pool_done, __ATOMIC_ACQUIRE) < POOL
+           && now_ns(CLOCK_MONOTONIC) < drain_until)
+        if (sc(202, (long)&pool_word, FUTEX_WAKE_PRIVATE, 0x7fffffff, 0, 0, 0) <= 0)
             sc(24, 0, 0, 0, 0, 0, 0);
+    if (__atomic_load_n(&pool_done, __ATOMIC_ACQUIRE) < POOL) pool_errors++;
     p = put(p, " pool=");
     p = put_long(p, most);
     if (pool_errors) p = put(p, "wrong");

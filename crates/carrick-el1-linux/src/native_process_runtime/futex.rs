@@ -173,9 +173,14 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>> Fu
         if word != wait.expected {
             return Some(returned(wait.mismatch_result.raw()));
         }
-        // An expired deadline answers before any park is published.
-        if wait.expired_at(self.now) {
-            return Some(returned(wait.timeout_result.raw()));
+        // An expired deadline answers before any park is published, on the
+        // counter read now, after the word matched: the entry sample may be
+        // older than a timespec copy or a bucket acquisition.
+        if wait.deadline.is_some() {
+            let now = self.entry.service.signal_now().unwrap_or(self.now);
+            if wait.expired_at(now) {
+                return Some(returned(wait.timeout_result.raw()));
+            }
         }
         let start =
             carrick_core::entry::prepare_handoff(self.entry.binding, self.entry.source, record)?;
@@ -344,8 +349,7 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
         if !call.admitted() {
             return None;
         }
-        let wake = call.args[1] == carrick_personality_linux::sched::FUTEX_WAKE_PRIVATE
-            || call.args[1] == carrick_personality_linux::sched::FUTEX_WAKE_BITSET_PRIVATE;
+        let wake = call.is_wake();
         // A timed wait's clock: the counter, and the zone's realtime
         // calibration for a FUTEX_CLOCK_REALTIME deadline.
         let (now, frequency) = if call.args[3] != 0 && !wake {
@@ -385,10 +389,23 @@ impl<'a, M: Clone, C: ProcessContext, S: NativeProcessService<'a, C, Mm = M>>
                 Some(returned(carrick_syscall_abi::LINUX_EFAULT.guest_retval()))
             }
             Some(CopyOutcome::NotYet(request)) => {
+                let retains = adapter.retained.is_some();
                 if let Some(retained) = adapter.retained {
                     adapter.entry.retain_relative_futex_wait(retained);
                 }
-                Some(adapter.entry.wait_guest_copy(request))
+                let outcome = adapter.entry.wait_guest_copy(request);
+                // Only a continuation that reruns this syscall keeps its
+                // deadline; a terminal answer (EFAULT from a synchronous
+                // owner fault) must not leave it for the next futex call.
+                if retains
+                    && !matches!(
+                        outcome,
+                        LifecycleOutcome::Redispatch | LifecycleOutcome::Transferred { .. }
+                    )
+                {
+                    let _ = adapter.entry.take_relative_futex_wait();
+                }
+                Some(outcome)
             }
             Some(CopyOutcome::Done) => Some(
                 adapter

@@ -101,6 +101,12 @@ impl FutexCall {
         self.args[1] |= 128;
         self.admitted().then_some(self)
     }
+    /// Whether this is a wake spelling (private or shared, plain or bitset):
+    /// the one classification every venue uses.
+    pub fn is_wake(self) -> bool {
+        let private = self.args[1] | 128;
+        private == FUTEX_WAKE_PRIVATE || private == FUTEX_WAKE_BITSET_PRIVATE
+    }
     pub fn admitted(self) -> bool {
         match self.args[1] {
             // Every private wait spelling is admitted whatever its operands:
@@ -225,7 +231,7 @@ pub fn serve_futex<V: FutexVenue>(call: FutexCall, venue: &mut V) -> Option<V::S
     };
     let operands_invalid = address.raw() & 3 != 0 || bitset == 0;
     let einval = SyscallResult::new(LINUX_EINVAL.guest_retval());
-    if matches!(op, FUTEX_WAKE_PRIVATE | FUTEX_WAKE_BITSET_PRIVATE) {
+    if call.is_wake() {
         if operands_invalid {
             return venue.invalid(einval);
         }

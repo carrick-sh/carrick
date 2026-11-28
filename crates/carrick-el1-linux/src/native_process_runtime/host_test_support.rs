@@ -13021,6 +13021,82 @@ fn native_root_stock_busy_claim_parks_then_release_retries_same_clone() {
     }
 }
 
+/// #3174 (pre-review): the shared native runtime decides expiry on the
+/// counter read after the word matched, not on its entry sample. The clock
+/// reads 1000 at entry (a one-second relative wait at 1000 Hz is deadline
+/// 2000) and 2500 once the timespec has been copied: the wait answers
+/// ETIMEDOUT and publishes no park, arms no timer and keeps no deadline.
+/// On the entry sample it parked, so a pending signal could still claim it.
+#[test]
+#[cfg(all(test, not(target_os = "macos")))]
+fn native_futex_expired_after_entry_answers_etimedout_without_parking() {
+    use carrick_core::user_copy::{CopyOutcome, UserCopy};
+    use carrick_personality_linux::sched::FutexCall;
+    struct Copy;
+    impl UserCopy for Copy {
+        fn copy_in(&mut self, dst: &mut [u8], src: UserVa) -> CopyOutcome {
+            assert_eq!(dst.len(), 8);
+            dst.copy_from_slice(&(if src.raw() == 0x2000 { 1_u64 } else { 0 }).to_le_bytes());
+            // The counter passes the deadline while the timespec is copied.
+            script_signal_clock(&[2500]);
+            CopyOutcome::Done
+        }
+        fn copy_out(&mut self, _: UserVa, _: &[u8]) -> CopyOutcome {
+            panic!("futex must not write guest bytes")
+        }
+        fn atomic_load_u32(&mut self, address: UserVa, out: &mut u32) -> CopyOutcome {
+            assert_eq!(address, UserVa::new(0x1000));
+            *out = 0;
+            CopyOutcome::Done
+        }
+    }
+    let fixture = native_exec_fixture();
+    let source = BornInZoneSource {
+        zone: fixture.zone,
+        slot: fixture.slot,
+    };
+    let mut service = fixture.service();
+    let mut entry = fixture
+        .runtime
+        .enter_registered(
+            fixture.registry,
+            source,
+            fixture.task,
+            fixture.address,
+            &words(fixture.address),
+            &mut service,
+        )
+        .unwrap();
+    script_signal_clock(&[]);
+    let parks = fixture.zone.counters.el1_parks.load(Ordering::Relaxed);
+    let outcome = entry.native_futex(
+        FutexCall {
+            args: [0x1000, 128, 0, 0x2000, 0, 0],
+        },
+        &mut Copy,
+    );
+    assert!(
+        matches!(
+            outcome,
+            Some(LifecycleOutcome::Returned { result, .. }) if result.raw() == -110
+        ),
+        "ETIMEDOUT, answered without a park"
+    );
+    assert!(entry.take_handoff_receipt().is_none(), "no park published");
+    assert!(entry.take_run_failure().is_none());
+    assert!(
+        entry.take_relative_futex_wait().is_none(),
+        "no deadline kept"
+    );
+    drop(entry);
+    assert_eq!(
+        fixture.zone.counters.el1_parks.load(Ordering::Relaxed),
+        parks
+    );
+    assert!(fixture.zone.timer_deadline(fixture.slot).is_none());
+    script_signal_clock(&[]);
+}
+
 #[test]
 #[cfg(test)]
 fn native_futex_atomic_owner_retry_keeps_deadline_and_key_scope() {

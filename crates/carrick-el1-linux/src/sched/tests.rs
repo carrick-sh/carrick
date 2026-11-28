@@ -737,6 +737,92 @@ fn an_expired_bitset_deadline_answers_etimedout_without_parking() {
     assert_eq!(zone.counters.el1_timeouts.load(Ordering::Relaxed), 0);
 }
 
+/// #3174 (pre-review): the scheduler adapter tells a timeout pointer the
+/// guest cannot read (EFAULT, in ring) from one whose page is not backed yet
+/// (a guest-copy request naming that page, which the dispatcher turns into
+/// an owner wait and a rerun). A timespec straddling two pages whose first
+/// page reads names the second page. Once backed, the rerun completes.
+#[test]
+fn a_timed_wait_timeout_copy_faults_or_waits_for_its_page() {
+    use carrick_core::user_copy::CopyOutcome;
+    use carrick_guest_arch::GuestLen;
+    use core::cell::Cell;
+    const LAZY: u64 = 0x10_0000_0000;
+    struct LazyTimeout {
+        backed: Cell<bool>,
+    }
+    impl UserWord for LazyTimeout {
+        fn read_u32(&self, task: &CurrentTask, uaddr: u64) -> Option<u32> {
+            HardwareUserWord.read_u32(task, uaddr)
+        }
+        fn read_u64(&self, _: &CurrentTask, uaddr: u64) -> Option<u64> {
+            // Page LAZY - 4096 reads; page LAZY reads only once supplied.
+            // Every readable word is zero: a deadline at the counter epoch.
+            let readable = |byte: u64| {
+                (LAZY - 4096..LAZY).contains(&byte)
+                    || (self.backed.get() && (LAZY..LAZY + 4096).contains(&byte))
+            };
+            (readable(uaddr) && readable(uaddr + 7)).then_some(0)
+        }
+    }
+    let zone = zone();
+    let word = AtomicU32::new(0);
+    let uaddr = word.as_ptr() as u64;
+    let task = task_for(101);
+    let user = LazyTimeout {
+        backed: Cell::new(false),
+    };
+    let serve_with = |timeout: u64| {
+        let (mut frame, mut cpu) = live(0xA, uaddr, FUTEX_WAIT_BITSET_PRIVATE, 0);
+        frame.x[5] = u64::from(u32::MAX);
+        frame.x[3] = timeout;
+        let result = Sched {
+            handoff: None,
+            zone: &zone,
+            slot: SLOT,
+            task: &task,
+            cpu: &mut cpu,
+            user: &user,
+            counters: counters(),
+        }
+        .serve_futex_operation(&mut frame, &mut None, None);
+        (result, frame.x[0] as i64)
+    };
+    // Outside the user half: EFAULT, never a decline or a copy wait.
+    let (result, x0) = serve_with(0xffff_8000_0000_0000);
+    assert!(matches!(
+        result,
+        Ok(Some(Served::Returned { switched: false }))
+    ));
+    assert_eq!(x0, -14, "EFAULT");
+    // Not backed yet: a request for exactly that page.
+    let (result, _) = serve_with(LAZY);
+    assert!(
+        matches!(result, Err(FutexRefusal::Copy(CopyOutcome::NotYet(request)))
+            if request.address.raw() == LAZY && request.len == GuestLen::new(8)),
+        "lazy timespec"
+    );
+    // tv_sec reads on the first page, tv_nsec straddles into the second:
+    // the request names the second page, from its first byte.
+    let (result, _) = serve_with(LAZY - 12);
+    assert!(
+        matches!(result, Err(FutexRefusal::Copy(CopyOutcome::NotYet(request)))
+            if request.address.raw() == LAZY && request.len == GuestLen::new(4)),
+        "straddling timespec"
+    );
+    // Supplied: the rerun reads a deadline already past and answers it.
+    user.backed.set(true);
+    for timeout in [LAZY, LAZY - 12] {
+        let (result, x0) = serve_with(timeout);
+        assert!(matches!(
+            result,
+            Ok(Some(Served::Returned { switched: false }))
+        ));
+        assert_eq!(x0, -110, "ETIMEDOUT after the page is backed, {timeout:#x}");
+    }
+    assert_eq!(zone.counters.el1_parks.load(Ordering::Relaxed), 0);
+}
+
 /// A switched-in thread owns its timer lease even when it is not this
 /// vCPU's host record. An invalid timespec is Linux's EINVAL, in ring.
 #[test]
