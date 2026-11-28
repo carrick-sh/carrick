@@ -2161,6 +2161,45 @@ fn mounted_static_x86_host_file_reads_into_fresh_maps_beside_a_vfork() {
     threads_vfork_exec_matches_native(&["-DREADERS"], "threads-vfork-exec-readers");
 }
 
+/// #3170: a first-touch write to a read-only private file mapping. Linux
+/// answers SIGSEGV with `SEGV_ACCERR` at the written byte: the page is mapped
+/// and its protection denies the write. The root admits a host-backed page
+/// whatever its protection, so the first-touch window selection is where the
+/// protection is judged; on main its `Limit` refusal was reported as a hole,
+/// `SEGV_MAPERR` (exit 94).
+#[test]
+fn mounted_static_x86_first_write_to_a_read_only_file_map_is_an_access_error() {
+    if skip_without_kvm() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let elf = dir.path().join("write-readonly-file-map");
+    compile_assembly_with_flags(
+        "x86_write_readonly_file_map.c",
+        &elf,
+        &[
+            "-fno-stack-protector",
+            "-fno-asynchronous-unwind-tables",
+            "-O1",
+        ],
+    );
+    let native = Command::new(&elf)
+        .timeout(Duration::from_secs(10))
+        .output()
+        .expect("run native read-only file map oracle");
+    assert_eq!(native.status.code(), Some(7), "native oracle");
+
+    let guest = run_mounted_binary(&elf, "write-readonly-file-map", false);
+    assert_eq!(
+        guest.status.code(),
+        native.status.code(),
+        "94 is SEGV_MAPERR where Linux gives SEGV_ACCERR; 93 the write landed; \
+         95 another si_code; 96 a wrong si_addr; 90-92 setup. Stdout: {} Stderr: {}",
+        String::from_utf8_lossy(&guest.stdout),
+        String::from_utf8_lossy(&guest.stderr)
+    );
+}
+
 /// #3004: Go's preemption shape. Two clone threads each register a mapped,
 /// never-touched alternate signal stack and a `SA_ONSTACK` SIGURG handler,
 /// and the root sends SIGURG at them. Linux makes each stack page resident
