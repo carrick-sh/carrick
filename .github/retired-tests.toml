@@ -465,3 +465,9 @@ test = "soft_zone::soft_root_rt_sigaction_refuses_a_handler_it_cannot_deliver"
 reason = "#2814: the admitted soft root now delivers a caught handler (soft_root_delivers_a_caught_sigusr1_and_returns_through_rt_sigreturn), so the refusal witness became the served shape and was renamed for what it proves."
 replaced_by = "soft_zone::soft_root_rt_sigaction_serves_a_handler_an_ignore_and_a_query_in_ring"
 pr = 3118
+
+[[retired]]
+test = "authority_debt::build_program_compiler_authority_requires_a_separate_ceiling"
+reason = "#3172: build programs are outside product authority, so their host calls take no ceiling; the witness now proves they are not counted."
+replaced_by = "authority_debt::build_program_authority_is_outside_product_authority"
+pr = 0
