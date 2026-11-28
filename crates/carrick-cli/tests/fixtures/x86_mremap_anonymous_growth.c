@@ -8,7 +8,9 @@
 //      address and keeps its byte;
 //   3. grow by move: an untouched one-page row with a blocker right after
 //      it grows to two pages with MREMAP_MAYMOVE at a new address, reads 0
-//      and takes a store.
+//      and takes a store, and its old address is vacant again (14 / 24).
+// After the child exits, the parent rechecks its own kept and moved rows
+// (33).
 // Exit 7 and `mremap ok`. A failed shape exits 10 + shape in the root and
 // 20 + shape in the child, after writing the errno (or the bad value) as
 // decimal. No libc: built -nostdlib -static.
@@ -58,6 +60,10 @@ static long map_anon(long hint, long len, long flags) {
     return addr;
 }
 
+// The last shapes' rows, which the parent rechecks after its child exits.
+static long kept_row;
+static long kept_moved;
+
 // Exits through `fail` on the first shape that differs from Linux.
 static void shapes(long base) {
     // 1. Grow in place. Reserve three pages so the two above the row are
@@ -93,6 +99,11 @@ static void shapes(long base) {
     if (q[0] != 0 || q[PAGE + 4095] != 0) fail(base + 3, -1003);
     q[PAGE + 1] = 0x44;
     if (q[PAGE + 1] != 0x44) fail(base + 3, -1004);
+    // The move retired the source: its old address is vacant again.
+    long vacant = sc(MMAP, fresh, PAGE, 3, PRIVATE_ANON | FIXED_NOREPLACE, -1);
+    if (vacant != fresh) fail(base + 4, vacant);
+    kept_row = row;
+    kept_moved = to;
 }
 
 void start_c(void) {
@@ -106,6 +117,9 @@ void start_c(void) {
     int status = -1;
     if (sc(61, pid, (long)&status, 0, 0, 0) != pid) fail(31, 0);
     if (status != 0) fail(32, status);
+    // The child's edits left the parent's own rows as the parent made them.
+    if (((volatile unsigned char *)kept_row)[17] != 0x5a) fail(33, -1);
+    if (((volatile unsigned char *)kept_moved)[PAGE + 1] != 0x44) fail(33, -2);
     sc(WRITE, 1, (long)"mremap ok\n", 10, 0, 0);
     sc(EXIT_GROUP, 7, 0, 0, 0, 0);
 }

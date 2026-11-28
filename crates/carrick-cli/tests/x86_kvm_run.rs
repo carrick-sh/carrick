@@ -2141,8 +2141,9 @@ fn mounted_static_x86_mremap_grows_shrinks_and_moves_anonymous_rows_as_native() 
     assert_eq!(
         (guest.status.code(), guest.stdout.as_slice()),
         (native.status.code(), native.stdout.as_slice()),
-        "11-13 a root shape (grow in place, shrink, grow by move), 21-23 the \
-         child's, 9 a setup map; the errno or bad value is printed. stdout: {} \
+        "11-14 a root shape (grow in place, shrink, grow by move, the moved \
+         source vacant), 21-24 the child's, 33 a parent row the child changed, 9 \
+         a setup map; the errno or bad value is printed. stdout: {} \
          stderr: {}",
         String::from_utf8_lossy(&guest.stdout),
         String::from_utf8_lossy(&guest.stderr)
@@ -2206,8 +2207,10 @@ fn mounted_static_x86_ring_refusal_appears_in_the_compat_report() {
         rows.len(),
         "{summary}"
     );
-    assert!(
-        summary["ring_refused_invocations"].as_u64() >= Some(1),
+    let invocations: u64 = rows.iter().filter_map(|row| row["count"].as_u64()).sum();
+    assert_eq!(
+        summary["ring_refused_invocations"].as_u64(),
+        Some(invocations),
         "{summary}"
     );
 }
